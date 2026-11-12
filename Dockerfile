@@ -15,8 +15,8 @@ COPY --from=build /clipwire-server /usr/local/bin/clipwire-server
 COPY --from=build --chown=65532:65532 /data /data
 ENV CLIPWIRE_DATA_DIR=/data \
     CLIPWIRE_RELAY_BIND=0.0.0.0:3340 \
-    CLIPWIRE_QUIC_BIND=0.0.0.0:7842
+    CLIPWIRE_QUIC_BIND=0.0.0.0:7843
 VOLUME /data
-EXPOSE 3340/tcp 7842/udp
+EXPOSE 3340/tcp 7843/udp
 ENTRYPOINT ["/usr/local/bin/clipwire-server"]
 CMD ["run"]

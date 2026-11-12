@@ -100,6 +100,11 @@ async fn main() -> Result<()> {
     {
         println!("путь A → сервер: {info:?}");
     }
+    // Закрываем аккуратно, иначе сервер ещё полминуты ждёт таймаута.
+    for c in [a, b] {
+        c._conn.close(0u32.into(), b"probe done");
+        c.ep.close().await;
+    }
     println!("OK");
     Ok(())
 }

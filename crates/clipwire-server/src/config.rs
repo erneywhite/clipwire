@@ -19,6 +19,9 @@ pub struct Config {
     /// Где слушает HTTP встроенного relay (nginx проксирует сюда).
     pub relay_bind: SocketAddr,
     /// UDP-порт iroh для прямых QUIC-соединений. Если он закрыт, всё идёт через relay.
+    /// Не 7842: этот порт iroh по умолчанию пробует для QUIC Address Discovery
+    /// (`iroh_relay::defaults::DEFAULT_RELAY_QUIC_PORT`), и наш эндпоинт на нём
+    /// получал бы чужие пробы.
     pub quic_bind: SocketAddr,
     /// Токен доступа к relay. Если не задан, генерируется и сохраняется в `data_dir`.
     pub relay_token: Option<String>,
@@ -65,7 +68,7 @@ impl Config {
             public_url: public_url.trim_end_matches('/').to_string(),
             self_relay_url,
             relay_bind,
-            quic_bind: parse("CLIPWIRE_QUIC_BIND", "0.0.0.0:7842".parse()?)?,
+            quic_bind: parse("CLIPWIRE_QUIC_BIND", "0.0.0.0:7843".parse()?)?,
             relay_token: var("CLIPWIRE_RELAY_TOKEN"),
             max_item_bytes: parse("CLIPWIRE_MAX_ITEM_BYTES", 1024 * 1024)?,
             history_len: parse("CLIPWIRE_HISTORY_LEN", 50)?,
