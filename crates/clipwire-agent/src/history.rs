@@ -38,6 +38,9 @@ pub struct History {
     /// Новые первыми.
     entries: Vec<Entry>,
     by_hash: HashMap<[u8; 32], ItemId>,
+    /// Миниатюры картинок (PNG) для списка в окне вставки. В базе — отдельной
+    /// зашифрованной колонкой, чтобы формат самих записей не менялся.
+    thumbs: HashMap<ItemId, Vec<u8>>,
 }
 
 pub fn now_ms() -> i64 {
@@ -89,28 +92,45 @@ impl History {
                  data    BLOB NOT NULL
              );",
         )?;
+        // Колонки миниатюр появились вместе с картинками — в старых базах их нет.
+        let has_thumb: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('entries') WHERE name = 'thumb'")?
+            .exists([])?;
+        if !has_thumb {
+            conn.execute_batch(
+                "ALTER TABLE entries ADD COLUMN thumb_nonce BLOB;
+                 ALTER TABLE entries ADD COLUMN thumb BLOB;",
+            )?;
+        }
         let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("ключ 32 байта");
         let mut h = Self {
             conn,
             cipher,
             entries: Vec::new(),
             by_hash: HashMap::new(),
+            thumbs: HashMap::new(),
         };
         h.load_all()?;
         Ok(h)
     }
 
     fn load_all(&mut self) -> Result<()> {
+        type Row = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
         let mut stmt = self
             .conn
-            .prepare("SELECT nonce, data FROM entries ORDER BY seen_ms DESC")?;
-        let rows: Vec<(Vec<u8>, Vec<u8>)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .prepare("SELECT nonce, data, thumb_nonce, thumb FROM entries ORDER BY seen_ms DESC")?;
+        let rows: Vec<Row> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<Result<_, _>>()?;
         drop(stmt);
-        for (nonce, data) in rows {
+        for (nonce, data, tn, tdata) in rows {
             match self.decrypt(&nonce, &data) {
                 Ok(e) => {
+                    if let (Some(tn), Some(td)) = (tn, tdata)
+                        && let Ok(t) = self.open_blob(&tn, &td)
+                    {
+                        self.thumbs.insert(e.id, t);
+                    }
                     self.by_hash.insert(e.content.hash(), e.id);
                     self.entries.push(e);
                 }
@@ -122,14 +142,53 @@ impl History {
     }
 
     fn decrypt(&self, nonce: &[u8], data: &[u8]) -> Result<Entry> {
+        Ok(postcard::from_bytes(&self.open_blob(nonce, data)?)?)
+    }
+
+    fn open_blob(&self, nonce: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         let nonce: [u8; 24] = nonce
             .try_into()
             .map_err(|_| anyhow::anyhow!("битый nonce"))?;
-        let plain = self
-            .cipher
+        self.cipher
             .decrypt(&XNonce::from(nonce), data)
-            .map_err(|_| anyhow::anyhow!("чужой ключ или данные повреждены"))?;
-        Ok(postcard::from_bytes(&plain)?)
+            .map_err(|_| anyhow::anyhow!("чужой ключ или данные повреждены"))
+    }
+
+    fn seal_blob(&self, plain: &[u8]) -> Result<([u8; 24], Vec<u8>)> {
+        let mut nonce = [0u8; 24];
+        getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("нет случайных байтов: {e}"))?;
+        let data = self
+            .cipher
+            .encrypt(&XNonce::from(nonce), plain)
+            .map_err(|_| anyhow::anyhow!("не удалось зашифровать"))?;
+        Ok((nonce, data))
+    }
+
+    /// Сделать и сохранить миниатюру картинки. Ошибка не фатальна: в списке
+    /// тогда будет значок вместо превью.
+    fn store_thumb(&mut self, e: &Entry) {
+        let Content::Image { png, .. } = &e.content else {
+            return;
+        };
+        let res = crate::image::thumbnail(png).and_then(|t| {
+            let (nonce, data) = self.seal_blob(&t)?;
+            self.conn.execute(
+                "UPDATE entries SET thumb_nonce = ?1, thumb = ?2 WHERE id = ?3",
+                params![&nonce[..], data, &e.id.as_bytes()[..]],
+            )?;
+            Ok(t)
+        });
+        match res {
+            Ok(t) => {
+                self.thumbs.insert(e.id, t);
+            }
+            Err(err) => tracing::warn!("миниатюра не сделалась: {err:#}"),
+        }
+    }
+
+    /// Миниатюра картинки (PNG), если есть.
+    pub fn thumb(&self, id: ItemId) -> Option<&[u8]> {
+        self.thumbs.get(&id).map(Vec::as_slice)
     }
 
     fn write(&self, e: &Entry) -> Result<()> {
@@ -166,6 +225,7 @@ impl History {
             return Ok(());
         }
         self.write(&entry)?;
+        self.store_thumb(&entry);
         self.by_hash.insert(hash, entry.id);
         self.entries.insert(0, entry);
         Ok(())
@@ -185,6 +245,12 @@ impl History {
                 q.is_empty()
                     || match &e.content {
                         Content::Text(t) => t.to_lowercase().contains(&q),
+                        // Картинки находятся по словам «картинка», «скрин» и т. п.
+                        Content::Image { .. } => {
+                            ["картин", "изображ", "скрин", "снимок", "image", "фото"]
+                                .iter()
+                                .any(|w| w.starts_with(q.as_str()) || q.starts_with(w))
+                        }
                         #[allow(unreachable_patterns)]
                         _ => false,
                     }
@@ -233,6 +299,7 @@ impl History {
         if let Some(pos) = self.entries.iter().position(|e| e.id == id) {
             let e = self.entries.remove(pos);
             self.by_hash.remove(&e.content.hash());
+            self.thumbs.remove(&id);
         }
         Ok(())
     }
@@ -378,6 +445,31 @@ mod tests {
         // Повторное копирование того же текста поднимает отредактированный элемент.
         text(&mut h, "итог", 3);
         assert_eq!(h.len(), 1);
+    }
+
+    #[test]
+    fn image_gets_encrypted_thumbnail_that_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("clipwire-thumb-{}", Uuid::now_v7()));
+        let px: Vec<u8> = (0..800 * 600)
+            .flat_map(|i| [(i % 251) as u8, 120, 200, 255])
+            .collect();
+        let content = crate::image::content_from_rgba(800, 600, &px).unwrap();
+        let id;
+        {
+            let mut h = History::open(&dir).unwrap();
+            let e = local_entry(DeviceId([1; 32]), "ПК", content.clone());
+            id = e.id;
+            h.add(e).unwrap();
+            let t = crate::image::decode_png(h.thumb(id).unwrap()).unwrap();
+            assert_eq!(t.dimensions(), (320, 240));
+            // Картинка находится поиском по слову «скрин».
+            assert_eq!(h.list("скрин", false, 10).len(), 1);
+        }
+        let h = History::open(&dir).unwrap();
+        assert!(h.thumb(id).is_some());
+        assert_eq!(h.get(id).unwrap().content, content);
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

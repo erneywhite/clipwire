@@ -100,16 +100,32 @@ pub struct EntryDto {
     pub local: bool,
     pub pinned: bool,
     pub seen_ms: i64,
+    /// Картинка: размеры в пикселях и вес PNG.
+    pub width: u32,
+    pub height: u32,
+    pub bytes: usize,
+    /// Миниатюра картинки для списка — data URL.
+    pub thumb: Option<String>,
+    /// Полная картинка — только в `history_get`, для предпросмотра.
+    pub image: Option<String>,
 }
 
 /// Сколько символов текста отдавать в список: хватает на две строки превью.
 const LIST_PREVIEW_CHARS: usize = 400;
 
-fn to_dto(e: &Entry, full: bool) -> EntryDto {
-    let (kind, text) = match &e.content {
-        Content::Text(t) => ("text", t.as_str()),
+fn png_url(png: &[u8]) -> String {
+    format!(
+        "data:image/png;base64,{}",
+        data_encoding::BASE64.encode(png)
+    )
+}
+
+fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool) -> EntryDto {
+    let (kind, text, width, height, image) = match &e.content {
+        Content::Text(t) => ("text", t.as_str(), 0, 0, None),
+        Content::Image { width, height, png } => ("image", "", *width, *height, Some(png)),
         #[allow(unreachable_patterns)]
-        _ => ("other", ""),
+        _ => ("other", "", 0, 0, None),
     };
     let shown: String = if full {
         text.to_string()
@@ -126,6 +142,15 @@ fn to_dto(e: &Entry, full: bool) -> EntryDto {
         local: e.local,
         pinned: e.pinned,
         seen_ms: e.seen_ms,
+        width,
+        height,
+        bytes: e.content.len(),
+        thumb: thumb.map(png_url),
+        image: if full {
+            image.map(|p| png_url(p))
+        } else {
+            None
+        },
     }
 }
 
@@ -145,7 +170,7 @@ pub fn history_list(
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
     h.list(&query, pinned_only, limit.min(500))
         .into_iter()
-        .map(|e| to_dto(e, false))
+        .map(|e| to_dto(e, h.thumb(e.id), false))
         .collect()
 }
 
@@ -154,7 +179,7 @@ pub fn history_get(state: State<'_, AppState>, id: String) -> CmdResult<EntryDto
     let id = parse_id(&id)?;
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
     h.get(id)
-        .map(|e| to_dto(e, true))
+        .map(|e| to_dto(e, h.thumb(e.id), true))
         .ok_or_else(|| "Элемента уже нет в истории".into())
 }
 

@@ -110,15 +110,12 @@ impl Service {
                             }
                         }
                         Event::Incoming(item) => {
-                            if !paused.load(Ordering::Relaxed)
-                                && let Content::Text(text) = &item.content
-                            {
+                            if !paused.load(Ordering::Relaxed) {
                                 guard.wrote(&item.content);
-                                let text = text.clone();
-                                let res = tokio::task::spawn_blocking(move || {
-                                    clipboard::write_text(&text)
-                                })
-                                .await;
+                                let content = item.content.clone();
+                                let res =
+                                    tokio::task::spawn_blocking(move || clipboard::write(&content))
+                                        .await;
                                 if let Ok(Err(e)) = res {
                                     tracing::warn!("{e:#}");
                                 }
@@ -213,8 +210,13 @@ impl Service {
     /// Положить текст в буфер, не отправляя его в синхронизацию: выбор
     /// элемента из истории, копирование кода приглашения.
     pub fn put_quietly(&self, text: &str) -> Result<()> {
-        self.guard.wrote(&Content::Text(text.to_string()));
-        clipboard::write_text(text)
+        self.put_content_quietly(&Content::Text(text.to_string()))
+    }
+
+    /// То же для любого содержимого (картинка из истории).
+    pub fn put_content_quietly(&self, content: &Content) -> Result<()> {
+        self.guard.wrote(content);
+        clipboard::write(content)
     }
 
     /// Остановить: слежение снимается, движок дошлёт очередь и закроется.

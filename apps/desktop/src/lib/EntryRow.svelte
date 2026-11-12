@@ -2,7 +2,7 @@
   // Строка элемента истории. Общая для окна вставки и для превью в настройках,
   // чтобы превью выглядело ровно как настоящее окно.
   import type { Entry } from './api'
-  import { ago, isUrl, looksLikeCode, sizeLabel } from './format'
+  import { ago, bytesLabel, isUrl, looksLikeCode, sizeLabel } from './format'
 
   let {
     item,
@@ -11,7 +11,7 @@
     onselect,
     onpaste,
   }: {
-    item: Entry & { thumb?: string; width?: number; height?: number }
+    item: Entry
     index: number
     selected?: boolean
     onselect?: () => void
@@ -23,7 +23,7 @@
     [
       item.local ? 'Это устройство' : item.device_name || 'Другое устройство',
       ago(item.seen_ms),
-      kind === 'image' && item.width ? `${item.width}×${item.height}` : sizeLabel(item.chars, item.lines),
+      kind === 'image' ? `${item.width}×${item.height} · ${bytesLabel(item.bytes)}` : sizeLabel(item.chars, item.lines),
     ].join(' · '),
   )
 </script>
@@ -50,10 +50,18 @@
   </span>
   <span class="body">
     {#if kind === 'image'}
-      <span class="image-row">
-        <span class="thumb" style:background={item.thumb ?? 'var(--c-surface)'}></span>
-        <span class="text">{item.text}</span>
-      </span>
+      <!-- Картинка в списке крупно: по ней и узнают, что копировали. -->
+      {#if item.thumb}
+        <img
+          class="thumb"
+          src={item.thumb}
+          alt="Картинка {item.width}×{item.height}"
+          draggable="false"
+          style:--ratio={item.width && item.height ? item.width / item.height : 16 / 9}
+        />
+      {:else}
+        <span class="thumb empty">Картинка</span>
+      {/if}
     {:else}
       <span class="text" class:mono={kind === 'code'}>{item.text}</span>
     {/if}
@@ -113,18 +121,26 @@
     font-family: var(--font-mono);
     font-size: var(--text-s);
   }
-  .image-row {
-    display: flex;
-    gap: var(--space-2);
-    align-items: center;
-    min-width: 0;
-  }
+  /* Рамка ровно по пропорции картинки: не выше 132 px и не шире строки,
+   * без полей по бокам у широких скриншотов. */
   .thumb {
-    flex: none;
-    width: 64px;
-    height: 40px;
+    display: block;
+    aspect-ratio: var(--ratio);
+    width: min(100%, calc(132px * var(--ratio)));
+    height: auto;
+    object-fit: cover;
     border-radius: var(--radius-s);
     border: 1px solid var(--c-border);
+    background: var(--c-surface);
+    margin: 2px 0;
+  }
+  .thumb.empty {
+    width: 100%;
+    height: 72px;
+    display: grid;
+    place-items: center;
+    color: var(--c-muted);
+    font-size: var(--text-s);
   }
   .meta {
     font-family: var(--font-mono);

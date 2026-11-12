@@ -8,7 +8,7 @@ services:
     environment:
       CLIPWIRE_PUBLIC_URL: https://clip.example.com
       # Необязательные, значения по умолчанию:
-      # CLIPWIRE_MAX_ITEM_BYTES: 1048576
+      # CLIPWIRE_MAX_ITEM_BYTES: 8388608
       # CLIPWIRE_HISTORY_LEN: 50
       # CLIPWIRE_TTL_HOURS: 24
       # RUST_LOG: info

@@ -15,9 +15,10 @@ use tokio::sync::mpsc;
 
 use crate::state::AgentState;
 
-/// Больше этого не отправляем: сервер по умолчанию принимает до 1 МиБ
-/// шифротекста, а postcard и AEAD добавляют немного сверху.
-pub const MAX_TEXT_BYTES: usize = 900 * 1024;
+/// Больше этого не отправляем: сервер по умолчанию принимает до 8 МиБ
+/// шифротекста, а postcard и AEAD добавляют немного сверху. Картинки в PNG
+/// обычно сотни килобайт — пара мегабайт.
+pub const MAX_ITEM_BYTES: usize = 7 * 1024 * 1024 + 512 * 1024;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -254,7 +255,7 @@ impl Engine {
     }
 
     async fn push(&mut self, send: &mut iroh::endpoint::SendStream, c: Content) -> Result<()> {
-        if c.len() > MAX_TEXT_BYTES {
+        if c.len() > MAX_ITEM_BYTES {
             tracing::info!(len = c.len(), "слишком большой элемент, не отправляю");
             return Ok(());
         }

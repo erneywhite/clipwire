@@ -202,17 +202,15 @@ pub async fn popup_paste(
         .parse()
         .map(clipwire_core::ItemId)
         .map_err(|_| "Неверный id элемента".to_string())?;
-    let text = {
+    let content = {
         let state = app.state::<AppState>();
         let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        match h.get(id).map(|e| &e.content) {
-            Some(clipwire_core::Content::Text(t)) => t.clone(),
-            #[allow(unreachable_patterns)]
-            Some(_) => return Err("Этот тип пока не вставляется".into()),
+        match h.get(id) {
+            Some(e) => e.content.clone(),
             None => return Err("Элемента уже нет в истории".into()),
         }
     };
-    paste_text(&app, &text, into_active).await
+    paste_content(&app, &content, into_active).await
 }
 
 /// Вставить произвольный текст: изменённый в предпросмотре вариант.
@@ -222,12 +220,16 @@ pub async fn popup_paste_text(
     text: String,
     into_active: Option<bool>,
 ) -> Result<(), String> {
-    paste_text(&app, &text, into_active).await
+    paste_content(&app, &clipwire_core::Content::Text(text), into_active).await
 }
 
-/// Положить текст в буфер и, если включено, вставить в окно, которое было
+/// Положить содержимое в буфер и, если включено, вставить в окно, которое было
 /// активным до показа.
-async fn paste_text(app: &AppHandle, text: &str, into_active: Option<bool>) -> Result<(), String> {
+async fn paste_content(
+    app: &AppHandle,
+    content: &clipwire_core::Content,
+    into_active: Option<bool>,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let paste = into_active.unwrap_or_else(|| {
         state
@@ -241,8 +243,8 @@ async fn paste_text(app: &AppHandle, text: &str, into_active: Option<bool>) -> R
     {
         let svc = state.service.lock().unwrap_or_else(|e| e.into_inner());
         match svc.as_ref() {
-            Some(s) => s.put_quietly(text),
-            None => clipwire_agent::clipboard::write_text(text),
+            Some(s) => s.put_content_quietly(content),
+            None => clipwire_agent::clipboard::write(content),
         }
         .map_err(|e| format!("{e:#}"))?;
     }

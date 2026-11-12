@@ -10,16 +10,88 @@ use anyhow::Result;
 /// Записать текст в буфер ОС.
 pub fn write_text(text: &str) -> Result<()> {
     use anyhow::Context;
-    let mut cb = arboard::Clipboard::new().context("буфер недоступен")?;
-    cb.set_text(text).context("не удалось записать в буфер")?;
+    with_retry(|c| c.set_text(text)).context("не удалось записать в буфер")?;
     Ok(())
 }
 
 /// Прочитать текст из буфера ОС, если там текст.
+/// Записать картинку (PNG) в буфер ОС.
+pub fn write_image(png: &[u8]) -> Result<()> {
+    use anyhow::Context;
+    let img = crate::image::decode_png(png)?;
+    let (w, h) = img.dimensions();
+    let raw = img.into_raw();
+    with_retry(|c| {
+        c.set_image(arboard::ImageData {
+            width: w as usize,
+            height: h as usize,
+            bytes: std::borrow::Cow::Borrowed(&raw),
+        })
+    })
+    .context("не удалось записать картинку в буфер")?;
+    Ok(())
+}
+
+/// Записать в буфер любое содержимое.
+pub fn write(content: &clipwire_core::Content) -> Result<()> {
+    match content {
+        clipwire_core::Content::Text(t) => write_text(t),
+        clipwire_core::Content::Image { png, .. } => write_image(png),
+        #[allow(unreachable_patterns)]
+        _ => anyhow::bail!("этот тип пока не записывается в буфер"),
+    }
+}
+
+/// Прочитать картинку из буфера ОС, если там картинка.
+pub fn read_image() -> Option<clipwire_core::Content> {
+    let img = match with_retry(|c| c.get_image()) {
+        Ok(img) => img,
+        Err(e) => {
+            tracing::debug!("в буфере нет картинки, которую можно прочитать: {e}");
+            return None;
+        }
+    };
+    match crate::image::content_from_rgba(img.width as u32, img.height as u32, &img.bytes) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::info!("картинку из буфера не взяли: {e:#}");
+            None
+        }
+    }
+}
+
+/// Выполнить чтение буфера, повторяя, пока он занят другой программой.
+/// В момент копирования буфер одновременно читают все менеджеры буфера
+/// (история Windows, Ditto, другой Clipwire), и первая попытка часто
+/// натыкается на «занято» — это не значит, что данных нет.
+fn with_retry<T>(
+    mut f: impl FnMut(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
+) -> Result<T, arboard::Error> {
+    let mut last = arboard::Error::ClipboardOccupied;
+    for attempt in 0..8 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        match arboard::Clipboard::new().and_then(|mut c| f(&mut c)) {
+            Err(arboard::Error::ClipboardOccupied) => last = arboard::Error::ClipboardOccupied,
+            other => return other,
+        }
+    }
+    Err(last)
+}
+
 pub fn read_text() -> Option<String> {
-    arboard::Clipboard::new()
-        .and_then(|mut c| c.get_text())
-        .ok()
+    match with_retry(|c| c.get_text()) {
+        Ok(t) => Some(t),
+        Err(arboard::Error::ContentNotAvailable) => {
+            tracing::debug!("в буфере нет текста");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("текст из буфера не прочитался: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -40,13 +112,15 @@ mod win {
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-        GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, MSG, PostMessageW, PostQuitMessage,
-        RegisterClassW, SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-        WM_CLIPBOARDUPDATE, WNDCLASSW, WS_OVERLAPPED,
+        GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, KillTimer, MSG, PostMessageW,
+        PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, TranslateMessage,
+        WINDOW_EX_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
     };
     use windows::core::{HSTRING, w};
 
     const WM_STOP: u32 = WM_APP + 7;
+    const READ_TIMER: usize = 1;
+    const READ_DELAY_MS: u32 = 60;
 
     /// Колбэк получает содержимое и имя exe программы-владельца буфера, если удалось узнать.
     type Callback = Box<dyn FnMut(Content, Option<String>)>;
@@ -119,7 +193,17 @@ mod win {
 
     unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         match msg {
+            // Программы кладут данные в буфер в несколько шагов (очистить,
+            // записать, закрыть), и на каждый шаг Windows шлёт уведомление.
+            // Читать сразу — значит иногда застать буфер пустым. Поэтому ждём
+            // тишины READ_DELAY_MS и читаем один раз: таймер перезапускается
+            // каждым новым уведомлением.
             WM_CLIPBOARDUPDATE => {
+                unsafe { SetTimer(Some(hwnd), READ_TIMER, READ_DELAY_MS, None) };
+                LRESULT(0)
+            }
+            WM_TIMER if wp.0 == READ_TIMER => {
+                let _ = unsafe { KillTimer(Some(hwnd), READ_TIMER) };
                 let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Ctx;
                 // SAFETY: указатель положен в create_window и живёт до drop_ctx;
                 // всё в одном потоке, поэтому &mut без гонок.
@@ -129,7 +213,11 @@ mod win {
                     } else if let Some(text) = super::read_text()
                         && !text.is_empty()
                     {
+                        // Если в буфере и текст, и картинка (Excel, редакторы),
+                        // берём текст: он и есть то, что человек копировал.
                         (ctx.on_change)(Content::Text(text), owner_exe());
+                    } else if let Some(img) = super::read_image() {
+                        (ctx.on_change)(img, owner_exe());
                     }
                 }
                 LRESULT(0)

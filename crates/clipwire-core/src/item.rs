@@ -31,11 +31,29 @@ impl Default for ItemId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DeviceId(pub [u8; 32]);
 
-/// Содержимое элемента. Картинки и файлы добавятся на этапах 4 и 5.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Содержимое элемента. Файлы добавятся на этапе файлов.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Content {
     Text(String),
+    /// Картинка в PNG (без потерь) и её размеры в пикселях.
+    Image {
+        width: u32,
+        height: u32,
+        png: Vec<u8>,
+    },
+}
+
+// Картинку не печатаем байтами в отладочный вывод: это мегабайты в логе.
+impl std::fmt::Debug for Content {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Content::Text(s) => f.debug_tuple("Text").field(s).finish(),
+            Content::Image { width, height, png } => {
+                write!(f, "Image({width}×{height}, {} байт PNG)", png.len())
+            }
+        }
+    }
 }
 
 impl Content {
@@ -50,6 +68,12 @@ impl Content {
                 h.update(b"text\0");
                 h.update(s.as_bytes());
             }
+            Content::Image { width, height, png } => {
+                h.update(b"image\0");
+                h.update(width.to_le_bytes());
+                h.update(height.to_le_bytes());
+                h.update(png);
+            }
         }
         h.finalize().into()
     }
@@ -58,6 +82,7 @@ impl Content {
     pub fn len(&self) -> usize {
         match self {
             Content::Text(s) => s.len(),
+            Content::Image { png, .. } => png.len(),
         }
     }
 
@@ -108,6 +133,22 @@ mod tests {
         let a = ItemId::new();
         let b = ItemId::new();
         assert!(a < b);
+    }
+
+    #[test]
+    fn image_hash_differs_by_size_and_debug_is_short() {
+        let a = Content::Image {
+            width: 2,
+            height: 1,
+            png: vec![1, 2, 3],
+        };
+        let b = Content::Image {
+            width: 1,
+            height: 2,
+            png: vec![1, 2, 3],
+        };
+        assert_ne!(a.hash(), b.hash());
+        assert_eq!(format!("{a:?}"), "Image(2×1, 3 байт PNG)");
     }
 
     #[test]

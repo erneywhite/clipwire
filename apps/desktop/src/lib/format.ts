@@ -30,6 +30,13 @@ export function sizeLabel(chars: number, lines: number): string {
   return `${chars} ${plural(chars, ['символ', 'символа', 'символов'])}`
 }
 
+/** «340 КБ», «1,2 МБ». */
+export function bytesLabel(n: number): string {
+  if (n < 1024) return `${n} Б`
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} КБ`
+  return `${(n / 1024 / 1024).toFixed(1).replace('.', ',')} МБ`
+}
+
 /** Похоже на код или команду — показывать моноширинным. */
 export function looksLikeCode(text: string): boolean {
   if (/^\s*(\$ |docker |git |npm |cargo |sudo |cd |ls |kubectl )/m.test(text)) return true

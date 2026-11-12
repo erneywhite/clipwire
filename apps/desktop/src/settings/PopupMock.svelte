@@ -9,9 +9,26 @@
 
   const now = Date.now()
   const min = 60_000
-  const base = { local: true, pinned: false, device_name: '', lines: 1 }
-  const samples: (Entry & { thumb?: string; width?: number; height?: number })[] = [
-    { ...base, id: '1', kind: 'image', text: 'Снимок экрана', chars: 0, seen_ms: now - 1 * min, local: false, device_name: 'MacBook', width: 1280, height: 720, thumb: 'color-mix(in oklch, var(--c-accent) 35%, var(--c-surface))' },
+  const base = { local: true, pinned: false, device_name: '', lines: 1, width: 0, height: 0, bytes: 0, thumb: null, image: null }
+  // Образец картинки: схематичный скриншот окна (16:9), чтобы превью показывало
+  // настоящую высоту строки с картинкой.
+  const sampleShot =
+    'data:image/svg+xml;utf8,' +
+    encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180">
+        <rect width="320" height="180" fill="#2b2f36"/>
+        <rect width="320" height="22" fill="#3a3f48"/>
+        <circle cx="12" cy="11" r="4" fill="#e5484d"/><circle cx="26" cy="11" r="4" fill="#f0b030"/><circle cx="40" cy="11" r="4" fill="#3fbf7a"/>
+        <rect x="14" y="36" width="90" height="130" rx="4" fill="#353a43"/>
+        <rect x="118" y="36" width="188" height="14" rx="3" fill="#e2a63b"/>
+        <rect x="118" y="60" width="160" height="8" rx="3" fill="#596070"/>
+        <rect x="118" y="76" width="176" height="8" rx="3" fill="#596070"/>
+        <rect x="118" y="92" width="120" height="8" rx="3" fill="#596070"/>
+        <rect x="118" y="114" width="188" height="52" rx="4" fill="#3d4450"/>
+      </svg>`,
+    )
+  const samples: Entry[] = [
+    { ...base, id: '1', kind: 'image', text: '', chars: 0, seen_ms: now - 1 * min, local: false, device_name: 'MacBook', width: 1920, height: 1080, bytes: 348_000, thumb: sampleShot },
     { ...base, id: '2', kind: 'text', text: 'https://github.com/erneywhite/clipwire', chars: 38, seen_ms: now - 4 * min },
     { ...base, id: '3', kind: 'text', text: 'docker compose pull && docker compose up -d', chars: 43, seen_ms: now - 9 * min },
     { ...base, id: '4', kind: 'text', text: 'Созвон завтра в 10:00, ссылку пришлю утром', chars: 42, seen_ms: now - 25 * min, local: false, device_name: 'MacBook', pinned: true },

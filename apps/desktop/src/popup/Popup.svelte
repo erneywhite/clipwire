@@ -3,7 +3,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, type Entry, type Settings } from '../lib/api'
   import { applyTheme } from '../lib/theme'
-  import { ago, isUrl, looksLikeCode, sizeLabel } from '../lib/format'
+  import { ago, bytesLabel, isUrl, looksLikeCode, sizeLabel } from '../lib/format'
   import EntryRow from '../lib/EntryRow.svelte'
 
   let query = $state('')
@@ -238,6 +238,22 @@
 
   {#if preview}
     <section class="preview-pane" aria-label="Предпросмотр">
+      {#if preview.entry.kind === 'image'}
+        <div class="image-view">
+          {#if preview.entry.image}
+            <img src={preview.entry.image} alt="Картинка {preview.entry.width}×{preview.entry.height}" draggable="false" />
+          {/if}
+        </div>
+        <div class="preview-meta">
+          {preview.entry.local ? 'Это устройство' : preview.entry.device_name} · {ago(preview.entry.seen_ms)} · {preview.entry.width}×{preview.entry.height} · {bytesLabel(preview.entry.bytes)}
+        </div>
+        <div class="actions">
+          <button class="primary" onclick={() => paste(preview?.entry)}>Вставить</button>
+          <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
+            {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
+          </button>
+        </div>
+      {:else}
       {#if isUrl(preview.entry.text)}
         <p class="note">Карточки ссылок появятся в следующей версии</p>
       {/if}
@@ -267,6 +283,7 @@
           </button>
         {/if}
       </div>
+      {/if}
     </section>
   {/if}
 </div>
@@ -426,6 +443,20 @@
   .editor:focus {
     border-color: var(--c-accent);
     background: var(--c-bg);
+  }
+  .image-view {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    place-items: center;
+    background: var(--c-bg);
+    border-radius: var(--radius-m);
+    overflow: hidden;
+  }
+  .image-view img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
   }
   .note {
     margin: 0;

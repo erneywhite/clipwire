@@ -70,7 +70,7 @@ impl Config {
             relay_bind,
             quic_bind: parse("CLIPWIRE_QUIC_BIND", "0.0.0.0:7843".parse()?)?,
             relay_token: var("CLIPWIRE_RELAY_TOKEN"),
-            max_item_bytes: parse("CLIPWIRE_MAX_ITEM_BYTES", 1024 * 1024)?,
+            max_item_bytes: parse("CLIPWIRE_MAX_ITEM_BYTES", 8 * 1024 * 1024)?,
             history_len: parse("CLIPWIRE_HISTORY_LEN", 50)?,
             ttl: Duration::from_secs(ttl_hours * 3600),
         })

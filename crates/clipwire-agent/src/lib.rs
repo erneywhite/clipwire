@@ -3,6 +3,7 @@
 
 pub mod clipboard;
 pub mod history;
+pub mod image;
 pub mod loopguard;
 pub mod secret;
 pub mod service;

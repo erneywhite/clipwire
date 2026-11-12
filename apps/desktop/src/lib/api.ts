@@ -37,6 +37,14 @@ export interface Entry {
   local: boolean
   pinned: boolean
   seen_ms: number
+  /** Картинка: размеры и вес PNG. */
+  width: number
+  height: number
+  bytes: number
+  /** Миниатюра картинки (data URL) — в списке. */
+  thumb: string | null
+  /** Полная картинка (data URL) — только из history_get. */
+  image: string | null
 }
 
 export type Status =
