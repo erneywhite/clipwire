@@ -13,3 +13,6 @@ Thumbs.db
 
 # Rust
 /target/
+
+# Личные заметки для Claude Code
+CLAUDE.local.md
