@@ -4,9 +4,11 @@
 mod commands;
 mod tray;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use clipwire_agent::history::{History, now_ms};
 use clipwire_agent::service::{Service, UiEvent};
+use clipwire_agent::settings::Settings;
 use clipwire_agent::state::Paths;
 use clipwire_agent::sync::Status;
 use serde::Serialize;
@@ -15,6 +17,8 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 /// Общее состояние приложения.
 pub struct AppState {
     pub paths: Paths,
+    pub settings: Mutex<Settings>,
+    pub history: Arc<Mutex<History>>,
     pub service: Mutex<Option<Service>>,
 }
 
@@ -66,13 +70,20 @@ pub fn start_service(app: &AppHandle) -> anyhow::Result<bool> {
         return Ok(false);
     };
     let handle = app.clone();
+    let device_name = state
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .device_name
+        .clone();
     let service = Service::start(
         tauri::async_runtime::handle().inner(),
         agent,
         Paths::resolve()?,
+        device_name,
+        state.history.clone(),
         std::sync::Arc::new(move |e| match e {
             UiEvent::Status(_) => publish_status(&handle),
-            // История и окно вставки — следующий шаг; пока только сигнал окнам.
             UiEvent::Copied(_) | UiEvent::Received(_) => {
                 let _ = handle.emit("clipwire://history-changed", ());
             }
@@ -81,6 +92,35 @@ pub fn start_service(app: &AppHandle) -> anyhow::Result<bool> {
     *state.service.lock().unwrap_or_else(|e| e.into_inner()) = Some(service);
     publish_status(app);
     Ok(true)
+}
+
+/// Раз в час и на старте удаляет историю старше срока хранения.
+fn spawn_pruner(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            tick.tick().await;
+            let state = app.state::<AppState>();
+            let retention = state
+                .settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retention;
+            let res = state
+                .history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .prune(retention, now_ms());
+            match res {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!("из истории удалено устаревших: {n}");
+                    let _ = app.emit("clipwire://history-changed", ());
+                }
+                Err(e) => tracing::warn!("очистка истории не удалась: {e:#}"),
+            }
+        }
+    });
 }
 
 pub fn show_settings(app: &AppHandle) {
@@ -120,12 +160,25 @@ pub fn run() {
             commands::invite_code,
             commands::create_group,
             commands::join_group,
+            commands::history_list,
+            commands::history_get,
+            commands::history_pin,
+            commands::history_delete,
+            commands::history_clear,
+            commands::get_settings,
+            commands::save_settings,
         ])
         .setup(|app| {
+            let paths = Paths::resolve()?;
+            let settings = Settings::load(&paths.dir);
+            let history = History::open(&paths.dir)?;
             app.manage(AppState {
-                paths: Paths::resolve()?,
+                paths,
+                settings: Mutex::new(settings),
+                history: Arc::new(Mutex::new(history)),
                 service: Mutex::new(None),
             });
+            spawn_pruner(app.handle().clone());
             tray::build(app.handle())?;
 
             let configured = match start_service(app.handle()) {

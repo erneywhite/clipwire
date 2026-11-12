@@ -11,6 +11,7 @@ use clipwire_core::{Content, DeviceId, Item};
 use tokio::sync::mpsc;
 
 use crate::clipboard::{self, Watcher};
+use crate::history::{Entry, History, local_entry, now_ms};
 use crate::loopguard::LoopGuard;
 use crate::state::{AgentState, Paths};
 use crate::sync::{Engine, Event, Status};
@@ -43,6 +44,8 @@ impl Service {
         rt: &tokio::runtime::Handle,
         state: AgentState,
         paths: Paths,
+        device_name: String,
+        history: Arc<Mutex<History>>,
         on_event: UiCallback,
     ) -> Result<Self> {
         let paused = Arc::new(AtomicBool::new(false));
@@ -58,17 +61,24 @@ impl Service {
 
         let (local_tx, local_rx) = mpsc::channel::<Content>(32);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
-        let engine = Engine::new(state, paths.load_cursor(), event_tx, Arc::new(|| {}));
+        let engine = Engine::new(
+            state,
+            device_name.clone(),
+            paths.load_cursor(),
+            event_tx,
+            Arc::new(|| {}),
+        );
         let device = engine.device();
         let engine = rt.spawn(engine.run(local_rx));
 
         // События движка.
         {
-            let (paused, status, guard, on_event) = (
+            let (paused, status, guard, on_event, history) = (
                 paused.clone(),
                 status.clone(),
                 guard.clone(),
                 on_event.clone(),
+                history.clone(),
             );
             rt.spawn(async move {
                 while let Some(ev) = event_rx.recv().await {
@@ -96,6 +106,18 @@ impl Service {
                                     tracing::warn!("{e:#}");
                                 }
                             }
+                            record(
+                                &history,
+                                Entry {
+                                    id: item.id,
+                                    origin: item.origin,
+                                    device_name: item.device_name.clone(),
+                                    local: false,
+                                    content: item.content.clone(),
+                                    seen_ms: now_ms(),
+                                    pinned: false,
+                                },
+                            );
                             on_event(UiEvent::Received(item));
                         }
                     }
@@ -106,6 +128,7 @@ impl Service {
         // Изменения буфера ОС.
         let watcher = {
             let (paused, guard, tx) = (paused.clone(), guard.clone(), local_tx.clone());
+            let history = history.clone();
             Watcher::start(move |content| {
                 if paused.load(Ordering::Relaxed) || !guard.should_send(&content) {
                     return;
@@ -113,6 +136,7 @@ impl Service {
                 if tx.try_send(content.clone()).is_err() {
                     tracing::warn!("очередь отправки переполнена, копирование пропущено");
                 }
+                record(&history, local_entry(device, &device_name, content.clone()));
                 on_event(UiEvent::Copied(content));
             })?
         };
@@ -166,5 +190,12 @@ impl Service {
         if let Some(e) = self.engine.take() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(3), e).await;
         }
+    }
+}
+
+fn record(history: &Mutex<History>, entry: Entry) {
+    let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = h.add(entry) {
+        tracing::warn!("не записалось в историю: {e:#}");
     }
 }

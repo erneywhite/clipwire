@@ -3,8 +3,12 @@
 //! Ошибки возвращаются строкой: интерфейс показывает их как есть, поэтому
 //! текст должен быть понятен человеку.
 
+use clipwire_agent::history::Entry;
+use clipwire_agent::settings::Settings;
 use clipwire_agent::state::{AgentState, random_key};
-use clipwire_core::{GroupKey, Invite, ServerInfo};
+use clipwire_core::{Content, GroupKey, Invite, ItemId, ServerInfo};
+use serde::Serialize;
+use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
 
 use crate::{AppState, StatusDto, current_status, publish_status, start_service};
@@ -80,5 +84,144 @@ pub fn join_group(app: AppHandle, invite_code: String) -> CmdResult<()> {
     };
     app.state::<AppState>().paths.save(&agent).map_err(err)?;
     start_service(&app).map_err(err)?;
+    Ok(())
+}
+
+/// Элемент истории для интерфейса. В списке текст обрезан, полный — через `history_get`.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryDto {
+    pub id: String,
+    pub kind: &'static str,
+    pub text: String,
+    /// Полная длина в символах (для «44 символа» и решения, нужен ли предпросмотр).
+    pub chars: usize,
+    pub lines: usize,
+    pub device_name: String,
+    pub local: bool,
+    pub pinned: bool,
+    pub seen_ms: i64,
+}
+
+/// Сколько символов текста отдавать в список: хватает на две строки превью.
+const LIST_PREVIEW_CHARS: usize = 400;
+
+fn to_dto(e: &Entry, full: bool) -> EntryDto {
+    let (kind, text) = match &e.content {
+        Content::Text(t) => ("text", t.as_str()),
+        #[allow(unreachable_patterns)]
+        _ => ("other", ""),
+    };
+    let shown: String = if full {
+        text.to_string()
+    } else {
+        text.chars().take(LIST_PREVIEW_CHARS).collect()
+    };
+    EntryDto {
+        id: e.id.0.to_string(),
+        kind,
+        text: shown,
+        chars: text.chars().count(),
+        lines: text.lines().count().max(1),
+        device_name: e.device_name.clone(),
+        local: e.local,
+        pinned: e.pinned,
+        seen_ms: e.seen_ms,
+    }
+}
+
+fn parse_id(id: &str) -> CmdResult<ItemId> {
+    id.parse()
+        .map(ItemId)
+        .map_err(|_| "Неверный id элемента".to_string())
+}
+
+#[tauri::command]
+pub fn history_list(
+    state: State<'_, AppState>,
+    query: String,
+    pinned_only: bool,
+    limit: usize,
+) -> Vec<EntryDto> {
+    let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+    h.list(&query, pinned_only, limit.min(500))
+        .into_iter()
+        .map(|e| to_dto(e, false))
+        .collect()
+}
+
+#[tauri::command]
+pub fn history_get(state: State<'_, AppState>, id: String) -> CmdResult<EntryDto> {
+    let id = parse_id(&id)?;
+    let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+    h.get(id)
+        .map(|e| to_dto(e, true))
+        .ok_or_else(|| "Элемента уже нет в истории".into())
+}
+
+#[tauri::command]
+pub fn history_pin(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    pinned: bool,
+) -> CmdResult<()> {
+    let id = parse_id(&id)?;
+    state
+        .history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_pinned(id, pinned)
+        .map_err(err)?;
+    let _ = app.emit("clipwire://history-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn history_delete(app: AppHandle, state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    let id = parse_id(&id)?;
+    state
+        .history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .delete(id)
+        .map_err(err)?;
+    let _ = app.emit("clipwire://history-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn history_clear(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    keep_pinned: bool,
+) -> CmdResult<()> {
+    state
+        .history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear(keep_pinned)
+        .map_err(err)?;
+    let _ = app.emit("clipwire://history-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_settings(state: State<'_, AppState>) -> Settings {
+    state
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+#[tauri::command]
+pub fn save_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    settings: Settings,
+) -> CmdResult<()> {
+    settings.save(&state.paths.dir).map_err(err)?;
+    *state.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings.clone();
+    let _ = app.emit("clipwire://settings-changed", &settings);
     Ok(())
 }

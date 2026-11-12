@@ -71,6 +71,9 @@ impl Content {
 pub struct Item {
     pub id: ItemId,
     pub origin: DeviceId,
+    /// Человекочитаемое имя устройства-источника («MacBook», «Рабочий ПК»).
+    /// Лежит внутри шифротекста, сервер его не видит.
+    pub device_name: String,
     pub created_at_ms: u64,
     pub content: Content,
 }
@@ -84,9 +87,15 @@ impl Item {
         Self {
             id: ItemId::new(),
             origin,
+            device_name: String::new(),
             created_at_ms,
             content,
         }
+    }
+
+    pub fn with_device_name(mut self, name: impl Into<String>) -> Self {
+        self.device_name = name.into();
+        self
     }
 }
 

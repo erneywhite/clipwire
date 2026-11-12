@@ -117,7 +117,8 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
         let (etx, mut erx) = mpsc::unbounded_channel();
         let (ltx, lrx) = mpsc::channel(4);
         // Курсор не сохраняем и не берём: режим отладочный, историю не применяем.
-        let engine = Engine::new(state, None, etx, Arc::new(|| {}));
+        let name = clipwire_agent::settings::default_device_name();
+        let engine = Engine::new(state, name, None, etx, Arc::new(|| {}));
         let task = tokio::spawn(engine.run(lrx));
         let mut ltx = Some(ltx);
         while let Some(ev) = erx.recv().await {
@@ -151,11 +152,20 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
     use clipwire_agent::sync::Status;
     use std::sync::Arc;
 
+    use clipwire_agent::history::History;
+    use clipwire_agent::settings::Settings;
+    use std::sync::Mutex;
+
+    let settings = Settings::load(&paths.dir);
+    let mut history = History::open(&paths.dir)?;
+    history.prune(settings.retention, clipwire_agent::history::now_ms())?;
     let rt = tokio::runtime::Runtime::new()?;
     let service = Service::start(
         rt.handle(),
         state,
         paths,
+        settings.device_name,
+        Arc::new(Mutex::new(history)),
         Arc::new(|e| match e {
             UiEvent::Status(Status::Online) => eprintln!("на связи"),
             UiEvent::Status(Status::Offline(r)) => eprintln!("нет связи: {r}"),

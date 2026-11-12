@@ -46,6 +46,7 @@ pub type Notify = Arc<dyn Fn() + Send + Sync>;
 pub struct Engine {
     state: AgentState,
     device: DeviceId,
+    device_name: String,
     cursor: Option<ItemId>,
     events: mpsc::UnboundedSender<Event>,
     notify: Notify,
@@ -57,6 +58,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(
         state: AgentState,
+        device_name: String,
         cursor: Option<ItemId>,
         events: mpsc::UnboundedSender<Event>,
         notify: Notify,
@@ -65,6 +67,7 @@ impl Engine {
         Self {
             state,
             device,
+            device_name,
             cursor,
             events,
             notify,
@@ -255,7 +258,7 @@ impl Engine {
             tracing::info!(len = c.len(), "слишком большой элемент, не отправляю");
             return Ok(());
         }
-        let item = Item::new(self.device, c);
+        let item = Item::new(self.device, c).with_device_name(self.device_name.clone());
         let sealed = self.state.invite.group_key.seal(&item)?;
         write_msg(send, &ClientMsg::Push(sealed)).await?;
         // Свой элемент тоже двигает курсор: он новее всего, что было в истории.

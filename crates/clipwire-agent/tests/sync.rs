@@ -50,7 +50,7 @@ impl Agent {
         };
         let (etx, events) = mpsc::unbounded_channel();
         let (local, lrx) = mpsc::channel(16);
-        let engine = Engine::new(state, cursor, etx, Arc::new(|| {}));
+        let engine = Engine::new(state, "тест".into(), cursor, etx, Arc::new(|| {}));
         let task = tokio::spawn(engine.run(lrx));
         Ok(Self {
             local,
