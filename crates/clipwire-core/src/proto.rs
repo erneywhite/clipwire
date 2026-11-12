@@ -73,6 +73,78 @@ pub fn decode_body<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, FrameErr
     Ok(postcard::from_bytes(body)?)
 }
 
+/// Асинхронное чтение и запись кадров поверх любого tokio-потока
+/// (в агенте и сервере это QUIC-стримы iroh).
+#[cfg(feature = "tokio")]
+pub mod io {
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    use super::{FrameError, decode_body, encode_frame, frame_len};
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum IoError {
+        #[error(transparent)]
+        Frame(#[from] FrameError),
+        #[error("ошибка потока: {0}")]
+        Io(#[from] std::io::Error),
+    }
+
+    pub async fn write_msg<W, T>(w: &mut W, msg: &T) -> Result<(), IoError>
+    where
+        W: AsyncWrite + Unpin,
+        T: Serialize,
+    {
+        let frame = encode_frame(msg)?;
+        w.write_all(&frame).await?;
+        w.flush().await?;
+        Ok(())
+    }
+
+    /// Читает одно сообщение. `Ok(None)` — собеседник аккуратно закрыл поток
+    /// между кадрами.
+    pub async fn read_msg<R, T>(r: &mut R) -> Result<Option<T>, IoError>
+    where
+        R: AsyncRead + Unpin,
+        T: DeserializeOwned,
+    {
+        let mut prefix = [0u8; 4];
+        match r.read_exact(&mut prefix).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let len = frame_len(prefix)?;
+        let mut body = vec![0u8; len];
+        r.read_exact(&mut body).await?;
+        Ok(Some(decode_body(&body)?))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::proto::ServerMsg;
+
+        #[tokio::test]
+        async fn duplex_roundtrip() {
+            let (mut a, mut b) = tokio::io::duplex(1024);
+            write_msg(&mut a, &ServerMsg::Error("x".into()))
+                .await
+                .unwrap();
+            write_msg(&mut a, &ServerMsg::Joined { history: vec![] })
+                .await
+                .unwrap();
+            drop(a);
+            let m1: ServerMsg = read_msg(&mut b).await.unwrap().unwrap();
+            let m2: ServerMsg = read_msg(&mut b).await.unwrap().unwrap();
+            assert_eq!(m1, ServerMsg::Error("x".into()));
+            assert_eq!(m2, ServerMsg::Joined { history: vec![] });
+            assert!(read_msg::<_, ServerMsg>(&mut b).await.unwrap().is_none());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,24 @@
+# Сервер Clipwire для aaPanel или любого хоста с Docker.
+# Перед запуском поменяй CLIPWIRE_PUBLIC_URL на свой домен.
+services:
+  clipwire:
+    build: ..
+    image: clipwire-server
+    restart: unless-stopped
+    environment:
+      CLIPWIRE_PUBLIC_URL: https://clip.example.com
+      # Необязательные, значения по умолчанию:
+      # CLIPWIRE_MAX_ITEM_BYTES: 1048576
+      # CLIPWIRE_HISTORY_LEN: 50
+      # CLIPWIRE_TTL_HOURS: 24
+      # RUST_LOG: info
+    ports:
+      # relay по HTTP, наружу его выставляет nginx с TLS
+      - "127.0.0.1:3340:3340"
+      # прямые QUIC-соединения; если порт закрыт, всё пойдёт через relay
+      - "7842:7842/udp"
+    volumes:
+      - clipwire-data:/data
+
+volumes:
+  clipwire-data:

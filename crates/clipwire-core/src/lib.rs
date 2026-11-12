@@ -10,5 +10,5 @@ pub mod item;
 pub mod proto;
 
 pub use crypto::{GroupId, GroupKey, JoinSecret, SealedItem};
-pub use invite::Invite;
+pub use invite::{Invite, ServerInfo};
 pub use item::{Content, DeviceId, Item, ItemId};
