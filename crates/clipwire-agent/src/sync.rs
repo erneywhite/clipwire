@@ -187,6 +187,10 @@ impl Engine {
                 c = local.recv() => match c {
                     Some(c) => self.push(&mut send, c).await?,
                     None => {
+                        // Закрываем поток и ждём, пока сервер его дочитает: при
+                        // немедленном close QUIC выбросит ещё не доставленное.
+                        let _ = send.finish();
+                        let _ = tokio::time::timeout(Duration::from_secs(3), send.stopped()).await;
                         conn.close(0u32.into(), b"bye");
                         return Ok(());
                     }

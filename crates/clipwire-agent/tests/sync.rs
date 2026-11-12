@@ -176,3 +176,22 @@ async fn wrong_relay_token_is_reported_quickly() -> Result<()> {
     assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
     server.shutdown().await
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_then_shutdown_still_delivers() -> Result<()> {
+    // Режим `send`: отправить и сразу закрыть канал. Элемент не должен
+    // потеряться при закрытии соединения.
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key, None)?;
+    let mut b = Agent::spawn(&info, &key, None)?;
+    a.online().await?;
+    b.online().await?;
+    a.local
+        .send(Content::Text("последнее слово".into()))
+        .await?;
+    drop(a.local);
+    a.task.await??;
+    assert_eq!(b.incoming_text().await?, "последнее слово");
+    server.shutdown().await
+}

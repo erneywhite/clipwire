@@ -5,3 +5,6 @@ pub mod loopguard;
 pub mod secret;
 pub mod state;
 pub mod sync;
+
+#[cfg(windows)]
+pub mod platform;
