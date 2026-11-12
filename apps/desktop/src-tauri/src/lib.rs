@@ -3,6 +3,7 @@
 
 mod commands;
 mod popup;
+mod settings_window;
 mod tray;
 mod updates;
 
@@ -235,13 +236,17 @@ pub fn run() {
         }
     };
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Один экземпляр — только в релизе: dev-сборка должна запускаться рядом с
+    // установленной копией, иначе её не проверить, не закрывая рабочую программу.
+    // Второй запуск не плодит копию, а открывает настройки у первой.
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        show_settings(app);
+    }));
+    builder
         .manage(state)
         .manage(popup::PopupState::default())
-        // Второй запуск не плодит копию, а открывает настройки у первой.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_settings(app);
-        }))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -271,8 +276,8 @@ pub fn run() {
             popup::popup_hide,
             popup::popup_paste,
             popup::popup_paste_text,
-            popup::size_preview,
-            popup::size_preview_hide,
+            settings_window::size_preview,
+            settings_window::size_preview_hide,
             commands::history_update,
         ])
         .setup(|app| {
@@ -328,8 +333,9 @@ pub fn run() {
             WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
-                if let Some(p) = window.app_handle().get_webview_window("preview") {
-                    let _ = p.hide();
+                // Вместе с настройками прячется и пример окна вставки.
+                if window.label() == "settings" {
+                    settings_window::size_preview_hide(window.app_handle().clone());
                 }
             }
             // Окно вставки исчезает, как только уходит фокус: как меню.

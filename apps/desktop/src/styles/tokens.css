@@ -125,3 +125,20 @@
   --c-on-accent: #ffffff;
   --c-danger: #b3362e;
 }
+
+/* Цвета состояния — те же, что у провода на иконке в трее
+ * (apps/desktop/scripts/icons.mjs), чтобы индикатор читался одинаково. */
+:root[data-mode='dark'] {
+  --st-online: #3fbf7a;
+  --st-connecting: #f0b030;
+  --st-error: #e5484d;
+  --st-paused: #8a8f98;
+  --st-local: #4a9be0;
+}
+:root[data-mode='light'] {
+  --st-online: #1f9a5a;
+  --st-connecting: #c98a0c;
+  --st-error: #d0393e;
+  --st-paused: #7a7f88;
+  --st-local: #2f7fc8;
+}

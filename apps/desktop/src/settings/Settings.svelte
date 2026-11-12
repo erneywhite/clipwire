@@ -172,10 +172,11 @@
   // Экран в логических пикселях — для уменьшенной схемы «экран и окно на нём».
   const screenW = window.screen.width || 1920
   const screenH = window.screen.height || 1080
-  // Пример окна сбоку: размер меняется не чаще раза в кадр, в работе один запрос.
+  // Пример окна вставки рядом с настройками (отдельное окно, которое не
+  // забирает фокус). Размер меняется не чаще раза в кадр, в работе один запрос.
+  let previewOpen = false
   let pending: { w: number; h: number } | null = null
   let previewBusy = false
-  let shown = false
   async function flush() {
     if (previewBusy || !pending) return
     previewBusy = true
@@ -189,21 +190,39 @@
     }
   }
   function previewShow() {
-    shown = true
+    clearTimeout(hideTimer)
+    if (previewOpen) return
+    previewOpen = true
     pending = demoSize
     requestAnimationFrame(flush)
   }
   function previewResize(v: number) {
     demoSize = valueToSize(v)
-    if (!shown) return
+    if (!previewOpen) return
     pending = demoSize
     requestAnimationFrame(flush)
   }
+  // Прячем не мгновенно: через 250 мс проверяем, что курсор правда ушёл с блока.
+  let sizeCard: HTMLElement | undefined = $state()
+  let hideTimer: ReturnType<typeof setTimeout> | undefined
+  // Курсор ушёл — прячем, даже если ползунок в фокусе после перетаскивания.
+  // Фокус ушёл с ползунка — прячем, только если курсора над блоком нет.
   function previewHide() {
-    shown = false
-    pending = null
-    api.sizePreviewHide()
+    clearTimeout(hideTimer)
+    hideTimer = setTimeout(() => {
+      if (!previewOpen || sizeCard?.matches(':hover')) return
+      previewOpen = false
+      pending = null
+      api.sizePreviewHide()
+    }, 250)
   }
+  $effect(() => {
+    if (section !== 'keys' && previewOpen) {
+      previewOpen = false
+      pending = null
+      api.sizePreviewHide()
+    }
+  })
 
   function addApp() {
     const name = newApp.trim()
@@ -260,6 +279,8 @@
       applyTheme(v.theme, v.mode)
     })
     isEnabled().then((v) => (autostart = v)).catch(() => {})
+    // Страница могла перезагрузиться при открытом примере окна — спрятать его.
+    api.sizePreviewHide()
     // Сначала подписка на события, потом запрос статуса: иначе событие о старте
     // сервиса может прийти раньше подписки и потеряться.
     const unlisten = [
@@ -473,6 +494,7 @@
 
         <h2>Размер окна вставки</h2>
         <div
+          bind:this={sizeCard}
           class="card pad"
           role="group"
           aria-label="Размер окна вставки"
@@ -505,8 +527,8 @@
               <span class="cursor" aria-hidden="true"></span>
             </div>
             <p class="hint">
-              Пока курсор над этим блоком, рядом с настройками показан пример окна вставки выбранного
-              размера. Схема слева — ваш экран и окно на нём в настоящей пропорции.
+              Пока курсор над этим блоком, рядом с настройками показан пример окна вставки в настоящем
+              размере. Схема слева — ваш экран и окно на нём в той же пропорции.
             </p>
           </div>
         </div>
@@ -612,19 +634,30 @@
     height: 8px;
     border-radius: 50%;
     flex: none;
-    background: var(--c-muted);
+    background: var(--st-paused);
   }
   .status[data-kind='online'] .dot {
-    background: var(--c-ok);
+    background: var(--st-online);
   }
   .status[data-kind='local'] .dot {
-    background: var(--c-accent);
+    background: var(--st-local);
   }
+  .status[data-kind='paused'] .dot {
+    background: var(--st-paused);
+  }
+  .status[data-kind='offline'] .dot,
+  .status[data-kind='unconfigured'] .dot {
+    background: var(--st-error);
+  }
+  /* Подключение — жёлтый с лёгкой пульсацией, как провод в трее. */
   .status[data-kind='connecting'] .dot {
-    background: var(--c-accent);
+    background: var(--st-connecting);
+    animation: pulse 1.4s var(--ease-out) infinite alternate;
   }
-  .status[data-kind='offline'] .dot {
-    background: var(--c-danger);
+  @keyframes pulse {
+    to {
+      opacity: 0.4;
+    }
   }
   main {
     overflow-y: auto;

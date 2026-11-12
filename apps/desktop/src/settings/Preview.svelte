@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Отдельное окно-пример для превью размера: занимает всё окно, данные — примеры.
+  // Окно-пример для превью размера: окно вставки на примерах, во всё окно.
   import { onMount } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
   import { api, type Settings } from '../lib/api'
