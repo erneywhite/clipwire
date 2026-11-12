@@ -34,7 +34,11 @@ pub fn run() {
                 &[&settings, &PredefinedMenuItem::separator(app)?, &quit],
             )?;
             TrayIconBuilder::with_id("main")
-                .icon(app.default_window_icon().cloned().expect("иконка приложения"))
+                .icon(
+                    app.default_window_icon()
+                        .cloned()
+                        .expect("иконка приложения"),
+                )
                 .tooltip("Clipwire")
                 .menu(&menu)
                 .show_menu_on_left_click(false)

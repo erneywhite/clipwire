@@ -11,7 +11,7 @@ clipwire-agent — общий буфер обмена Clipwire
                               и напечатать код приглашения для остальных
   join <код приглашения>      подключить это устройство к группе
   invite                      снова напечатать код приглашения
-  run                         запустить синхронизацию с иконкой в трее (по умолчанию)
+  run                         синхронизировать буфер без интерфейса (до Ctrl+C)
   reset                       забыть группу и ключи на этом устройстве
 
 Отладка, без буфера и трея:
@@ -145,12 +145,29 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
     })
 }
 
-#[cfg(windows)]
+/// Синхронизация с буфером ОС без интерфейса, до Ctrl+C.
 fn run(state: AgentState, paths: Paths) -> Result<()> {
-    clipwire_agent::platform::run(state, paths)
-}
+    use clipwire_agent::service::{Service, UiEvent};
+    use clipwire_agent::sync::Status;
+    use std::sync::Arc;
 
-#[cfg(not(windows))]
-fn run(_state: AgentState, _paths: Paths) -> Result<()> {
-    bail!("клиент для этой ОС ещё не готов (этап 3)")
+    let rt = tokio::runtime::Runtime::new()?;
+    let service = Service::start(
+        rt.handle(),
+        state,
+        paths,
+        Arc::new(|e| match e {
+            UiEvent::Status(Status::Online) => eprintln!("на связи"),
+            UiEvent::Status(Status::Offline(r)) => eprintln!("нет связи: {r}"),
+            UiEvent::Status(Status::Connecting) => eprintln!("подключение…"),
+            UiEvent::Copied(_) => eprintln!("отправлено скопированное"),
+            UiEvent::Received(_) => eprintln!("получено с другого устройства"),
+        }),
+    )?;
+    eprintln!("синхронизация буфера запущена, Ctrl+C — выход");
+    rt.block_on(async {
+        let _ = tokio::signal::ctrl_c().await;
+        service.shutdown().await;
+    });
+    Ok(())
 }

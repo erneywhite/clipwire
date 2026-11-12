@@ -1,10 +1,9 @@
-//! Клиент Clipwire. Платформенный слой (буфер ОС, трей) — в `platform`,
-//! всё остальное общее для всех ОС.
+//! Клиент Clipwire: движок синхронизации, работа с буфером ОС и состояние.
+//! Используется приложением (Tauri) и консольным `clipwire-agent`.
 
+pub mod clipboard;
 pub mod loopguard;
 pub mod secret;
+pub mod service;
 pub mod state;
 pub mod sync;
-
-#[cfg(windows)]
-pub mod platform;
