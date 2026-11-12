@@ -68,6 +68,8 @@ pub struct Settings {
     pub sound_on_receive: bool,
     /// Загружать карточки ссылок (og:-теги) по пробелу.
     pub link_previews: bool,
+    /// Не показывать окна Clipwire при демонстрации и записи экрана.
+    pub hide_from_capture: bool,
     /// Не синхронизировать скопированное в этих программах (имя exe / bundle id).
     pub ignored_apps: Vec<String>,
 }
@@ -86,6 +88,7 @@ impl Default for Settings {
             popup_hotkey: "CommandOrControl+Shift+V".into(),
             sound_on_receive: false,
             link_previews: true,
+            hide_from_capture: false,
             ignored_apps: vec![
                 "KeePass.exe".into(),
                 "KeePassXC.exe".into(),

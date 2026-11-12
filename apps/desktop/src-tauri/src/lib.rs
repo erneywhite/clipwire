@@ -20,6 +20,8 @@ pub struct AppState {
     pub paths: Paths,
     pub settings: Mutex<Settings>,
     pub history: Arc<Mutex<History>>,
+    /// Список игнорируемых программ, общий с сервисом: меняется без перезапуска.
+    pub ignored_apps: Arc<Mutex<Vec<String>>>,
     pub service: Mutex<Option<Service>>,
 }
 
@@ -83,6 +85,7 @@ pub fn start_service(app: &AppHandle) -> anyhow::Result<bool> {
         Paths::resolve()?,
         device_name,
         state.history.clone(),
+        state.ignored_apps.clone(),
         std::sync::Arc::new(move |e| match e {
             UiEvent::Status(_) => publish_status(&handle),
             UiEvent::Copied(_) | UiEvent::Received(_) => {
@@ -124,6 +127,33 @@ fn spawn_pruner(app: AppHandle) {
     });
 }
 
+/// Остановить синхронизацию (если идёт) и запустить заново с текущими настройками.
+pub async fn restart_service(app: &AppHandle) -> anyhow::Result<bool> {
+    stop_service(app).await;
+    start_service(app)
+}
+
+pub async fn stop_service(app: &AppHandle) {
+    let service = app
+        .state::<AppState>()
+        .service
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(s) = service {
+        s.shutdown().await;
+    }
+}
+
+/// Скрывать окна при демонстрации экрана (WDA_EXCLUDEFROMCAPTURE на Windows).
+pub fn apply_capture_protection(app: &AppHandle, on: bool) {
+    for label in ["settings", "popup"] {
+        if let Some(w) = app.get_webview_window(label) {
+            let _ = w.set_content_protected(on);
+        }
+    }
+}
+
 pub fn show_settings(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show();
@@ -150,6 +180,7 @@ pub fn run() {
             show_settings(app);
         }))
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
@@ -169,6 +200,9 @@ pub fn run() {
             commands::history_clear,
             commands::get_settings,
             commands::save_settings,
+            commands::leave_group,
+            commands::device_info,
+            commands::copy_quietly,
             popup::popup_preview,
             popup::popup_hide,
             popup::popup_paste,
@@ -177,8 +211,11 @@ pub fn run() {
             let paths = Paths::resolve()?;
             let settings = Settings::load(&paths.dir);
             let history = History::open(&paths.dir)?;
+            let ignored = Arc::new(Mutex::new(settings.ignored_apps.clone()));
+            apply_capture_protection(app.handle(), settings.hide_from_capture);
             app.manage(AppState {
                 paths,
+                ignored_apps: ignored,
                 settings: Mutex::new(settings),
                 history: Arc::new(Mutex::new(history)),
                 service: Mutex::new(None),

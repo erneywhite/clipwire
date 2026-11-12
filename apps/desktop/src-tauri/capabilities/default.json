@@ -12,6 +12,10 @@
     "core:window:allow-set-position",
     "core:event:default",
     "updater:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://*" }, { "url": "http://*" }]
+    },
     "process:allow-restart",
     "autostart:allow-enable",
     "autostart:allow-disable",

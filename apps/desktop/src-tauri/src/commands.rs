@@ -215,13 +215,84 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
-pub fn save_settings(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    settings: Settings,
-) -> CmdResult<()> {
+pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> {
+    let state = app.state::<AppState>();
+    let old = state
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     settings.save(&state.paths.dir).map_err(err)?;
     *state.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings.clone();
+    *state.ignored_apps.lock().unwrap_or_else(|e| e.into_inner()) = settings.ignored_apps.clone();
+
+    if old.popup_hotkey != settings.popup_hotkey
+        && let Err(e) = crate::popup::register_hotkey(&app)
+    {
+        // Неудачное сочетание (занято другой программой) — откатываем на старое.
+        let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        s.popup_hotkey = old.popup_hotkey.clone();
+        let _ = s.save(&state.paths.dir);
+        drop(s);
+        let _ = crate::popup::register_hotkey(&app);
+        return Err(e);
+    }
+    if old.hide_from_capture != settings.hide_from_capture {
+        crate::apply_capture_protection(&app, settings.hide_from_capture);
+    }
+    if old.device_name != settings.device_name {
+        crate::restart_service(&app).await.map_err(err)?;
+    }
     let _ = app.emit("clipwire://settings-changed", &settings);
     Ok(())
+}
+
+/// Отключить устройство от группы: ключи удаляются, локальная история остаётся.
+#[tauri::command]
+pub async fn leave_group(app: AppHandle) -> CmdResult<()> {
+    crate::stop_service(&app).await;
+    app.state::<AppState>().paths.reset().map_err(err)?;
+    publish_status(&app);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceInfo {
+    pub version: String,
+    pub relay_url: Option<String>,
+    /// Короткий отпечаток устройства (первые байты endpoint ID).
+    pub device_id: Option<String>,
+}
+
+#[tauri::command]
+pub fn device_info(app: AppHandle) -> DeviceInfo {
+    let state = app.state::<AppState>();
+    let agent = state.paths.load().ok().flatten();
+    let device_id = state
+        .service
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|s| {
+            s.device().0[..5]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        });
+    DeviceInfo {
+        version: app.package_info().version.to_string(),
+        relay_url: agent.map(|a| a.invite.server.relay_url),
+        device_id,
+    }
+}
+
+/// Положить текст в буфер, не отправляя в синхронизацию (код приглашения и т. п.).
+#[tauri::command]
+pub fn copy_quietly(state: State<'_, AppState>, text: String) -> CmdResult<()> {
+    let svc = state.service.lock().unwrap_or_else(|e| e.into_inner());
+    match svc.as_ref() {
+        Some(s) => s.put_quietly(&text),
+        None => clipwire_agent::clipboard::write_text(&text),
+    }
+    .map_err(err)
 }

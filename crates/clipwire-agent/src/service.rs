@@ -46,6 +46,7 @@ impl Service {
         paths: Paths,
         device_name: String,
         history: Arc<Mutex<History>>,
+        ignored_apps: Arc<Mutex<Vec<String>>>,
         on_event: UiCallback,
     ) -> Result<Self> {
         let paused = Arc::new(AtomicBool::new(false));
@@ -129,8 +130,17 @@ impl Service {
         let watcher = {
             let (paused, guard, tx) = (paused.clone(), guard.clone(), local_tx.clone());
             let history = history.clone();
-            Watcher::start(move |content| {
-                if paused.load(Ordering::Relaxed) || !guard.should_send(&content) {
+            Watcher::start(move |content, owner| {
+                if paused.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(exe) = &owner
+                    && is_ignored(&ignored_apps.lock().unwrap_or_else(|e| e.into_inner()), exe)
+                {
+                    tracing::debug!(%exe, "скопировано в игнорируемой программе, пропускаю");
+                    return;
+                }
+                if !guard.should_send(&content) {
                     return;
                 }
                 if tx.try_send(content.clone()).is_err() {
@@ -197,5 +207,32 @@ fn record(history: &Mutex<History>, entry: Entry) {
     let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = h.add(entry) {
         tracing::warn!("не записалось в историю: {e:#}");
+    }
+}
+
+/// Сравнение без учёта регистра и расширения: «keepass», «KeePass.exe» — одно и то же.
+pub fn is_ignored(list: &[String], exe: &str) -> bool {
+    let norm = |s: &str| {
+        s.trim()
+            .trim_end_matches(".exe")
+            .trim_end_matches(".EXE")
+            .to_lowercase()
+    };
+    let exe = norm(exe);
+    list.iter().any(|x| norm(x) == exe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ignored;
+
+    #[test]
+    fn ignored_matching() {
+        let list = vec!["KeePass.exe".to_string(), "1password".to_string()];
+        assert!(is_ignored(&list, "keepass.exe"));
+        assert!(is_ignored(&list, "KEEPASS"));
+        assert!(is_ignored(&list, "1Password.exe"));
+        assert!(!is_ignored(&list, "KeePassXC.exe"));
+        assert!(!is_ignored(&[], "notepad.exe"));
     }
 }

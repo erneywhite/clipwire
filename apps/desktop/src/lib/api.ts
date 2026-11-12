@@ -17,7 +17,14 @@ export interface Settings {
   popup_hotkey: string
   sound_on_receive: boolean
   link_previews: boolean
+  hide_from_capture: boolean
   ignored_apps: string[]
+}
+
+export interface DeviceInfo {
+  version: string
+  relay_url: string | null
+  device_id: string | null
 }
 
 export interface Entry {
@@ -56,4 +63,7 @@ export const api = {
   paste: (id: string, intoActive?: boolean) => invoke<void>('popup_paste', { id, intoActive }),
   preview: (open: boolean) => invoke<'left' | 'right'>('popup_preview', { open }),
   hidePopup: () => invoke<void>('popup_hide'),
+  leaveGroup: () => invoke<void>('leave_group'),
+  deviceInfo: () => invoke<DeviceInfo>('device_info'),
+  copyQuietly: (text: string) => invoke<void>('copy_quietly', { text }),
 }

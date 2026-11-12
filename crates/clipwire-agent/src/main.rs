@@ -166,6 +166,7 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
         paths,
         settings.device_name,
         Arc::new(Mutex::new(history)),
+        Arc::new(Mutex::new(settings.ignored_apps)),
         Arc::new(|e| match e {
             UiEvent::Status(Status::Online) => eprintln!("на связи"),
             UiEvent::Status(Status::Offline(r)) => eprintln!("нет связи: {r}"),

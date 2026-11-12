@@ -48,7 +48,8 @@ mod win {
 
     const WM_STOP: u32 = WM_APP + 7;
 
-    type Callback = Box<dyn FnMut(Content)>;
+    /// Колбэк получает содержимое и имя exe программы-владельца буфера, если удалось узнать.
+    type Callback = Box<dyn FnMut(Content, Option<String>)>;
 
     struct Ctx {
         formats: ExclusionFormats,
@@ -63,7 +64,9 @@ mod win {
     }
 
     impl Watcher {
-        pub fn start(on_change: impl FnMut(Content) + Send + 'static) -> Result<Self> {
+        pub fn start(
+            on_change: impl FnMut(Content, Option<String>) + Send + 'static,
+        ) -> Result<Self> {
             let (tx, rx) = std_mpsc::channel::<Result<isize>>();
             let thread = std::thread::Builder::new()
                 .name("clipboard-watch".into())
@@ -126,7 +129,7 @@ mod win {
                     } else if let Some(text) = super::read_text()
                         && !text.is_empty()
                     {
-                        (ctx.on_change)(Content::Text(text));
+                        (ctx.on_change)(Content::Text(text), owner_exe());
                     }
                 }
                 LRESULT(0)
@@ -209,6 +212,40 @@ mod win {
         }
     }
 
+    /// Имя exe программы, которая положила данные в буфер (владелец буфера).
+    /// Не все программы назначают владельца — тогда `None`.
+    fn owner_exe() -> Option<String> {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::DataExchange::GetClipboardOwner;
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+        use windows::core::PWSTR;
+        unsafe {
+            let owner = GetClipboardOwner().ok()?;
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(owner, Some(&mut pid));
+            if pid == 0 {
+                return None;
+            }
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+            let mut buf = [0u16; 512];
+            let mut len = buf.len() as u32;
+            let res = QueryFullProcessImageNameW(
+                h,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            );
+            let _ = CloseHandle(h);
+            res.ok()?;
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            path.rsplit(['\\', '/']).next().map(str::to_string)
+        }
+    }
+
     fn read_dword(hwnd: HWND, format: u32) -> Option<u32> {
         unsafe {
             // Буфер может быть занят другой программой — несколько коротких попыток.
@@ -248,7 +285,9 @@ pub struct Watcher;
 
 #[cfg(not(windows))]
 impl Watcher {
-    pub fn start(_on_change: impl FnMut(clipwire_core::Content) + Send + 'static) -> Result<Self> {
+    pub fn start(
+        _on_change: impl FnMut(clipwire_core::Content, Option<String>) + Send + 'static,
+    ) -> Result<Self> {
         anyhow::bail!("слежение за буфером на этой ОС ещё не реализовано")
     }
 }
