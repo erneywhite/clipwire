@@ -210,6 +210,8 @@
     isEnabled().then((v) => (autostart = v)).catch(() => {})
     const unlisten = [
       listen<Status>('clipwire://status', (e) => (status = e.payload)),
+      // Фоновая проверка нашла обновление — сразу показать кнопку в «О программе».
+      listen('clipwire://update-available', () => checkUpdates()),
       listen<Settings>('clipwire://settings-changed', (e) => {
         s = e.payload
         applyTheme(e.payload.theme, e.payload.mode)

@@ -1,7 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Clipwire",
-  "version": "0.1.0",
   "identifier": "io.github.erneywhite.clipwire",
   "build": {
     "frontendDist": "../dist",

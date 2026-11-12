@@ -13,6 +13,7 @@ const TRAY_ID: &str = "main";
 pub struct TrayItems {
     status: MenuItem<Wry>,
     pause: CheckMenuItem<Wry>,
+    update: MenuItem<Wry>,
 }
 
 /// Иконка 32×32: залитый круг цвета состояния с мягким краем.
@@ -57,6 +58,8 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let status = MenuItem::with_id(app, "status", "Подключение…", false, None::<&str>)?;
     let pause = CheckMenuItem::with_id(app, "pause", "Пауза", true, false, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Настройки", true, None::<&str>)?;
+    // Появляется (становится активным), когда фоновая проверка нашла обновление.
+    let update = MenuItem::with_id(app, "update", "Обновлений нет", false, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
@@ -65,6 +68,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
             &PredefinedMenuItem::separator(app)?,
             &pause,
             &settings,
+            &update,
             &PredefinedMenuItem::separator(app)?,
             &quit,
         ],
@@ -88,6 +92,14 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
                 publish_status(app);
             }
             "settings" => show_settings(app),
+            "update" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = crate::updates::install(app).await {
+                        tracing::warn!("обновление не установилось: {e}");
+                    }
+                });
+            }
             "quit" => app.exit(0),
             _ => {}
         })
@@ -97,7 +109,11 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
             }
         })
         .build(app)?;
-    app.manage(TrayItems { status, pause });
+    app.manage(TrayItems {
+        status,
+        pause,
+        update,
+    });
     Ok(())
 }
 
@@ -113,5 +129,12 @@ pub fn show_status(app: &AppHandle, st: &StatusDto) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_icon(Some(dot(color)));
         let _ = tray.set_tooltip(Some(format!("Clipwire: {text}")));
+    }
+}
+
+pub fn show_update(app: &AppHandle, version: &str) {
+    if let Some(items) = app.try_state::<TrayItems>() {
+        let _ = items.update.set_text(format!("Обновить до {version}"));
+        let _ = items.update.set_enabled(true);
     }
 }

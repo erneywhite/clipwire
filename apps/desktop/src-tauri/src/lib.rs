@@ -4,6 +4,7 @@
 mod commands;
 mod popup;
 mod tray;
+mod updates;
 
 use std::sync::{Arc, Mutex};
 
@@ -222,6 +223,7 @@ pub fn run() {
             });
             app.manage(popup::PopupState::default());
             spawn_pruner(app.handle().clone());
+            updates::spawn(app.handle().clone());
             if let Err(e) = popup::register_hotkey(app.handle()) {
                 tracing::warn!("{e}");
             }
