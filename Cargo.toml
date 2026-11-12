@@ -6,3 +6,4 @@ members = ["crates/clipwire-core", "crates/clipwire-server"]
 version = "0.1.0"
 edition = "2024"
 authors = ["Erney White"]
+repository = "https://github.com/erneywhite/clipwire"

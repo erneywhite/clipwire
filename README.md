@@ -24,14 +24,24 @@
 Один контейнер. Наружу нужны HTTPS (nginx перед relay) и, по желанию, UDP-порт для прямых
 QUIC-соединений: без него всё работает через relay, только чуть медленнее.
 
-1. Скопировать репозиторий на сервер и поправить `CLIPWIRE_PUBLIC_URL` в
-   [deploy/docker-compose.yml](deploy/docker-compose.yml).
-2. Запустить: `docker compose up -d --build` в каталоге `deploy`.
-3. В aaPanel создать сайт на этот домен, выпустить SSL и вставить в конфиг сайта блок из
+Готовый образ собирает GitHub Actions: `ghcr.io/erneywhite/clipwire-server:latest`
+(последний `main`) и `:X.Y.Z` для релизов.
+
+**Через aaPanel или другую панель с Docker:**
+
+1. Docker → Compose: вставить [deploy/docker-compose.aapanel.yml](deploy/docker-compose.aapanel.yml),
+   заменить `CLIPWIRE_PUBLIC_URL` на свой домен и запустить.
+2. Создать обратный прокси на этот домен → `http://127.0.0.1:3340`, включить SSL и WebSocket.
+   Если в панели нет переключателя WebSocket, в конфиг сайта вставляется блок из
    [deploy/nginx-clipwire.conf](deploy/nginx-clipwire.conf).
-4. Открыть UDP 7842 в файрволе aaPanel (необязательно).
-5. Получить код сервера для первого устройства:
-   `docker compose exec clipwire clipwire-server info`. Он же печатается в лог при старте.
+3. Открыть UDP 7842 в файрволе (необязательно).
+4. Взять из лога контейнера строку `код сервера: cwserver1-…` — с ней подключается первое
+   устройство. То же печатает `clipwire-server info`.
+
+Обновление: скачать свежий образ (pull) и пересоздать контейнер.
+
+**Собрать образ самому:** `docker compose up -d --build` в каталоге `deploy`
+([deploy/docker-compose.yml](deploy/docker-compose.yml)).
 
 Ключ сервера, токен relay и база лежат в томе Docker `clipwire-data`. Если удалить ключ, у сервера
 сменится адрес, и устройства придётся подключать заново.

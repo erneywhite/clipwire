@@ -4,6 +4,7 @@ description = "Сервер Clipwire: почтовый ящик для заши�
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"

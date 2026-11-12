@@ -1,0 +1,27 @@
+# Compose для вставки в aaPanel → Docker → Compose (или любой другой хост).
+# Образ собирается в GitHub Actions, на сервере ничего не компилируется.
+# Обновление: pull образа и пересоздание контейнера (down/up в панели).
+#
+# Перед запуском поменяй CLIPWIRE_PUBLIC_URL на свой домен. На этот домен
+# в панели настраивается обратный прокси с SSL и WebSocket на http://127.0.0.1:3340.
+services:
+  clipwire:
+    image: ghcr.io/erneywhite/clipwire-server:latest
+    restart: unless-stopped
+    environment:
+      CLIPWIRE_PUBLIC_URL: https://clip.example.com
+      # Необязательные, значения по умолчанию:
+      # CLIPWIRE_MAX_ITEM_BYTES: 1048576
+      # CLIPWIRE_HISTORY_LEN: 50
+      # CLIPWIRE_TTL_HOURS: 24
+      # RUST_LOG: info
+    ports:
+      # relay по HTTP, только для локального прокси панели
+      - "127.0.0.1:3340:3340"
+      # прямые QUIC-соединения; если порт закрыт, всё пойдёт через relay
+      - "7842:7842/udp"
+    volumes:
+      - clipwire-data:/data
+
+volumes:
+  clipwire-data:

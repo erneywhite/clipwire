@@ -4,6 +4,7 @@ description = "Общая часть Clipwire: элементы буфера, ш
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 chacha20poly1305 = "0.11.0"
