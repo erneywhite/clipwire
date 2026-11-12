@@ -174,10 +174,33 @@ pub async fn stop_service(app: &AppHandle) {
 }
 
 /// Скрывать окна при демонстрации экрана (WDA_EXCLUDEFROMCAPTURE на Windows).
+///
+/// Спрятанное окно вставки не трогаем: на Windows этот вызов показывает окно,
+/// и оно всплывало пустым прямоугольником. Окну вставки защита выставляется
+/// в момент показа (`popup::show`).
 pub fn apply_capture_protection(app: &AppHandle, on: bool) {
     for label in ["settings", "popup"] {
-        if let Some(w) = app.get_webview_window(label) {
+        if let Some(w) = app.get_webview_window(label)
+            && (label == "settings" || w.is_visible().unwrap_or(false))
+        {
             let _ = w.set_content_protected(on);
+        }
+    }
+}
+
+/// Фон окон в цвет темы: виден, пока страница грузится и пока окно меняет размер.
+pub fn apply_window_background(app: &AppHandle, hex: &str) {
+    let h = hex.trim().trim_start_matches('#');
+    let Ok(v) = u32::from_str_radix(h, 16) else {
+        return;
+    };
+    if h.len() != 6 {
+        return;
+    }
+    let color = tauri::window::Color((v >> 16) as u8, (v >> 8) as u8, v as u8, 255);
+    for label in ["settings", "popup"] {
+        if let Some(w) = app.get_webview_window(label) {
+            let _ = w.set_background_color(Some(color));
         }
     }
 }
@@ -243,6 +266,7 @@ pub fn run() {
             commands::leave_group,
             commands::device_info,
             commands::copy_quietly,
+            commands::set_window_background,
             popup::popup_preview,
             popup::popup_hide,
             popup::popup_paste,
@@ -303,7 +327,13 @@ pub fn run() {
                 let _ = window.hide();
             }
             // Окно вставки исчезает, как только уходит фокус: как меню.
-            WindowEvent::Focused(false) if window.label() == "popup" => {
+            WindowEvent::Focused(false)
+                if window.label() == "popup"
+                    && !window
+                        .state::<popup::PopupState>()
+                        .demo
+                        .load(std::sync::atomic::Ordering::Relaxed) =>
+            {
                 tracing::debug!("окно вставки потеряло фокус, прячу");
                 let _ = window.hide();
             }

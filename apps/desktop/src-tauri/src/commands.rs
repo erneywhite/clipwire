@@ -317,3 +317,8 @@ pub fn history_update(
     let _ = app.emit("clipwire://history-changed", ());
     Ok(())
 }
+
+#[tauri::command]
+pub fn set_window_background(app: AppHandle, color: String) {
+    crate::apply_window_background(&app, &color);
+}

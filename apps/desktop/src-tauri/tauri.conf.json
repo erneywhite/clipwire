@@ -19,7 +19,8 @@
         "minWidth": 640,
         "minHeight": 460,
         "visible": false,
-        "center": true
+        "center": true,
+        "backgroundColor": "#1c1e22"
       },
       {
         "label": "popup",
@@ -33,7 +34,8 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "shadow": true,
-        "focus": false
+        "focus": false,
+        "backgroundColor": "#1c1e22"
       }
     ],
     "security": {

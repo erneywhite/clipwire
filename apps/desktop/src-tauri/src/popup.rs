@@ -20,6 +20,8 @@ pub struct PopupState {
     prev_window: Mutex<isize>,
     /// Где окно стоит без предпросмотра (физические пиксели) и куда раскрыт предпросмотр.
     base: Mutex<Option<Base>>,
+    /// Окно показано как превью размера из настроек: по потере фокуса не прятать.
+    pub demo: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +82,9 @@ pub fn hide(app: &AppHandle) {
 pub fn show(app: &AppHandle) {
     let Some(w) = window(app) else { return };
     let state = app.state::<PopupState>();
+    state
+        .demo
+        .store(false, std::sync::atomic::Ordering::Relaxed);
 
     #[cfg(windows)]
     {
@@ -146,6 +151,13 @@ pub fn show(app: &AppHandle) {
     });
     let _ = w.set_size(PhysicalSize::new(w_px as u32, h_px as u32));
     let _ = w.set_position(PhysicalPosition::new(x, y));
+    let protect = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .hide_from_capture;
+    let _ = w.set_content_protected(protect);
     let _ = w.show();
     let _ = w.set_focus();
     tracing::debug!(x, y, w = w_px, h = h_px, "окно вставки показано");
@@ -361,9 +373,19 @@ pub fn popup_demo(app: AppHandle, width: f64, height: f64) {
         (pos.x - gap - w).max(ax)
     };
     let y = pos.y.clamp(ay, (ay + ah - h).max(ay));
+    app.state::<PopupState>()
+        .demo
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = popup.set_size(PhysicalSize::new(w as u32, h as u32));
     let _ = popup.set_position(PhysicalPosition::new(x, y));
     if !popup.is_visible().unwrap_or(false) {
+        let protect = app
+            .state::<AppState>()
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hide_from_capture;
+        let _ = popup.set_content_protected(protect);
         let _ = popup.show();
         // Вернуть фокус настройкам: иначе ползунок отпустит мышь.
         let _ = settings.set_focus();
@@ -373,5 +395,8 @@ pub fn popup_demo(app: AppHandle, width: f64, height: f64) {
 
 #[tauri::command]
 pub fn popup_demo_end(app: AppHandle) {
+    app.state::<PopupState>()
+        .demo
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     hide(&app);
 }

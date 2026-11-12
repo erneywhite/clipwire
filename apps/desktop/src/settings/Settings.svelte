@@ -168,6 +168,46 @@
     return Math.round(((w - SIZE.w0) / (SIZE.w1 - SIZE.w0)) * 100)
   }
 
+  // Живое превью: показывается при наведении на блок, размер меняется не чаще
+  // одного раза за кадр, и в работе всегда только один запрос — последнее значение побеждает.
+  let demoSize = $state({ w: 0, h: 0 })
+  let demoPending: { w: number; h: number } | null = null
+  let demoBusy = false
+  let demoVisible = false
+
+  async function demoFlush() {
+    if (demoBusy || !demoPending) return
+    demoBusy = true
+    const next = demoPending
+    demoPending = null
+    try {
+      await api.popupDemo(next.w, next.h)
+    } finally {
+      demoBusy = false
+      if (demoPending) requestAnimationFrame(demoFlush)
+    }
+  }
+
+  function demoShow(w: number, h: number) {
+    demoVisible = true
+    demoSize = { w, h }
+    demoPending = { w, h }
+    requestAnimationFrame(demoFlush)
+  }
+
+  function demoResize(v: number) {
+    demoSize = valueToSize(v)
+    if (!demoVisible) return
+    demoPending = demoSize
+    requestAnimationFrame(demoFlush)
+  }
+
+  function demoHide() {
+    demoVisible = false
+    demoPending = null
+    api.popupDemoEnd()
+  }
+
   function addApp() {
     const name = newApp.trim()
     if (!s || !name || s.ignored_apps.some((a) => a.toLowerCase() === name.toLowerCase())) return
@@ -219,6 +259,7 @@
   onMount(() => {
     api.settings().then((v) => {
       s = v
+      demoSize = { w: v.popup_width, h: v.popup_height }
       applyTheme(v.theme, v.mode)
     })
     isEnabled().then((v) => (autostart = v)).catch(() => {})
@@ -434,26 +475,30 @@
         </div>
 
         <h2>Размер окна вставки</h2>
-        <div class="card pad">
+        <div
+          class="card pad"
+          role="group"
+          aria-label="Размер окна вставки"
+          onmouseenter={() => demoShow(s!.popup_width, s!.popup_height)}
+          onmouseleave={demoHide}
+        >
           <input
             type="range"
             min="0"
             max="100"
             step="1"
             value={sizeToValue(s.popup_width)}
-            oninput={(e) => {
-              const { w, h } = valueToSize(Number(e.currentTarget.value))
-              api.popupDemo(w, h)
-            }}
+            oninput={(e) => demoResize(Number(e.currentTarget.value))}
             onchange={(e) => {
               const { w, h } = valueToSize(Number(e.currentTarget.value))
               save({ popup_width: w, popup_height: h })
-              setTimeout(() => api.popupDemoEnd(), 1200)
             }}
+            onfocus={() => demoShow(s!.popup_width, s!.popup_height)}
+            onblur={demoHide}
             aria-label="Размер окна вставки"
           />
-          <div class="ticks"><span>Компактное</span><span>{s.popup_width} × {s.popup_height}</span><span>Просторное</span></div>
-          <p class="hint">Пока тянете ползунок, рядом показывается настоящее окно вставки этого размера.</p>
+          <div class="ticks"><span>Компактное</span><span>{demoSize.w} × {demoSize.h}</span><span>Просторное</span></div>
+          <p class="hint">Пока курсор над этим блоком, рядом показано настоящее окно вставки выбранного размера.</p>
         </div>
 
         <h2>В окне вставки</h2>

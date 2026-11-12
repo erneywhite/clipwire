@@ -167,9 +167,9 @@
       listen('clipwire://history-changed', () => load()),
       listen<Settings>('clipwire://settings-changed', (e) => applySettings(e.payload)),
       // Живое превью размера из настроек: ширина списка меняется вместе с окном.
+      // Живое превью размера: только ширина списка, без перезагрузки — это вызывается часто.
       listen<number>('popup://demo-size', (e) => {
         document.documentElement.style.setProperty('--popup-w', `${e.payload}px`)
-        load()
       }),
       listen('popup://opened', async () => {
         query = ''
