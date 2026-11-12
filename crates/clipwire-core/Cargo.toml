@@ -1,0 +1,17 @@
+[package]
+name = "clipwire-core"
+description = "Общая часть Clipwire: элементы буфера, шифрование, протокол"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+chacha20poly1305 = "0.11.0"
+data-encoding = "2.11.1"
+getrandom = "0.4"
+hkdf = "0.13.0"
+postcard = { version = "1.1.3", features = ["use-std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+uuid = { version = "1.29.2", features = ["v7", "serde"] }

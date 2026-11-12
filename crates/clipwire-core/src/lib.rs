@@ -1,0 +1,14 @@
+//! Общая часть Clipwire: модель элемента буфера, шифрование ключом группы,
+//! код приглашения и формат сообщений между агентом и сервером.
+//!
+//! Сетевого кода здесь нет: крейт не зависит от iroh и tokio, чтобы его можно
+//! было тестировать отдельно и переиспользовать в любом клиенте.
+
+pub mod crypto;
+pub mod invite;
+pub mod item;
+pub mod proto;
+
+pub use crypto::{GroupId, GroupKey, JoinSecret, SealedItem};
+pub use invite::Invite;
+pub use item::{Content, DeviceId, Item, ItemId};

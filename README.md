@@ -5,11 +5,24 @@
 
 ## Состояние
 
-Проект в самом начале, кода пока нет. Обзор готовых решений (CrossPaste, ClipCascade,
-UniClipboard и других) лежит в [docs/research.md](docs/research.md). Решили писать
-своё: удачные идеи у других берём, их код не копируем. Сейчас согласуем
-архитектуру: стек Rust + iroh, черновик — в [docs/architecture.md](docs/architecture.md).
-Бриф и план по этапам — в [CLAUDE.md](CLAUDE.md).
+Идёт этап 2: relay-сервер и Windows-клиент для текста, с E2E с самого начала.
+Стек — Rust + [iroh](https://github.com/n0-computer/iroh), архитектура описана в
+[docs/architecture.md](docs/architecture.md), обзор готовых решений — в
+[docs/research.md](docs/research.md). Бриф и план по этапам — в [CLAUDE.md](CLAUDE.md).
+
+Готово:
+- `crates/clipwire-core` — модель элемента буфера, шифрование ключом группы
+  (XChaCha20-Poly1305, ключи через HKDF-SHA256), код приглашения, формат сообщений.
+
+В работе: сервер (`clipwire-server`) и агент для Windows (`clipwire-agent`).
+
+## Сборка
+
+Нужен Rust stable (проверено на 1.100), на Windows ещё MSVC Build Tools.
+
+```
+cargo test
+```
 
 ## Автор
 
