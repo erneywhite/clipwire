@@ -162,7 +162,7 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let service = Service::start(
         rt.handle(),
-        state,
+        Some(state),
         paths,
         settings.device_name,
         Arc::new(Mutex::new(history)),

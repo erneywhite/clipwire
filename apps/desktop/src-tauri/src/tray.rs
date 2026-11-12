@@ -35,10 +35,12 @@ const GREEN: [u8; 3] = [0x2e, 0xa0, 0x6b];
 const AMBER: [u8; 3] = [0xe0, 0x9a, 0x1b];
 const RED: [u8; 3] = [0xc8, 0x3a, 0x3a];
 const GRAY: [u8; 3] = [0x8a, 0x8f, 0x98];
+const BLUE: [u8; 3] = [0x4a, 0x8f, 0xd6];
 
 fn describe(st: &StatusDto) -> (String, [u8; 3]) {
     match st {
-        StatusDto::Unconfigured => ("Устройство не подключено".into(), GRAY),
+        StatusDto::Unconfigured => ("Синхронизация не запустилась".into(), RED),
+        StatusDto::Local => ("Только это устройство".into(), BLUE),
         StatusDto::Connecting => ("Подключение…".into(), AMBER),
         StatusDto::Online => ("Синхронизация включена".into(), GREEN),
         StatusDto::Offline(e) => (format!("Нет связи: {}", short(e)), RED),

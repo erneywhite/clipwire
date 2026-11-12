@@ -58,7 +58,7 @@ fn ensure_unconfigured(app: &AppHandle) -> CmdResult<()> {
 
 /// Первое устройство: создать группу по коду сервера. Возвращает код приглашения.
 #[tauri::command]
-pub fn create_group(app: AppHandle, server_code: String) -> CmdResult<String> {
+pub async fn create_group(app: AppHandle, server_code: String) -> CmdResult<String> {
     let server = ServerInfo::decode(&server_code).map_err(err)?;
     ensure_unconfigured(&app)?;
     let agent = AgentState {
@@ -69,13 +69,13 @@ pub fn create_group(app: AppHandle, server_code: String) -> CmdResult<String> {
         device_key: random_key().map_err(err)?,
     };
     app.state::<AppState>().paths.save(&agent).map_err(err)?;
-    start_service(&app).map_err(err)?;
+    crate::restart_service(&app).await.map_err(err)?;
     Ok(agent.invite.encode())
 }
 
 /// Остальные устройства: войти по коду приглашения.
 #[tauri::command]
-pub fn join_group(app: AppHandle, invite_code: String) -> CmdResult<()> {
+pub async fn join_group(app: AppHandle, invite_code: String) -> CmdResult<()> {
     let invite = Invite::decode(&invite_code).map_err(err)?;
     ensure_unconfigured(&app)?;
     let agent = AgentState {
@@ -83,7 +83,7 @@ pub fn join_group(app: AppHandle, invite_code: String) -> CmdResult<()> {
         device_key: random_key().map_err(err)?,
     };
     app.state::<AppState>().paths.save(&agent).map_err(err)?;
-    start_service(&app).map_err(err)?;
+    crate::restart_service(&app).await.map_err(err)?;
     Ok(())
 }
 
@@ -252,6 +252,8 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
 pub async fn leave_group(app: AppHandle) -> CmdResult<()> {
     crate::stop_service(&app).await;
     app.state::<AppState>().paths.reset().map_err(err)?;
+    // Дальше работаем локально: история и окно вставки остаются.
+    start_service(&app).map_err(err)?;
     publish_status(&app);
     Ok(())
 }
@@ -295,4 +297,23 @@ pub fn copy_quietly(state: State<'_, AppState>, text: String) -> CmdResult<()> {
         None => clipwire_agent::clipboard::write_text(&text),
     }
     .map_err(err)
+}
+
+/// Сохранить правку текста элемента в истории.
+#[tauri::command]
+pub fn history_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    text: String,
+) -> CmdResult<()> {
+    let id = parse_id(&id)?;
+    state
+        .history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .update_text(id, text)
+        .map_err(err)?;
+    let _ = app.emit("clipwire://history-changed", ());
+    Ok(())
 }

@@ -36,6 +36,7 @@
   --font-mono: 'JetBrains Mono', ui-monospace, monospace;
 }
 :root[data-theme='graphite'][data-mode='dark'] {
+  --c-ok: #5fbf86;
   --c-bg: #1c1e22;
   --c-surface: #26292e;
   --c-hover: #2a2d33;
@@ -48,6 +49,7 @@
   --c-danger: #e0675f;
 }
 :root[data-theme='graphite'][data-mode='light'] {
+  --c-ok: #2b8a52;
   --c-bg: #f4f2ed;
   --c-surface: #ffffff;
   --c-hover: #ebe8e1;
@@ -66,6 +68,7 @@
   --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
 }
 :root[data-theme='paper'][data-mode='light'] {
+  --c-ok: #2f8550;
   --c-bg: #f3efe6;
   --c-surface: #fffdf7;
   --c-hover: #ebe5d8;
@@ -78,6 +81,7 @@
   --c-danger: #b3362e;
 }
 :root[data-theme='paper'][data-mode='dark'] {
+  --c-ok: #73c08f;
   --c-bg: #1e1c18;
   --c-surface: #28251f;
   --c-hover: #2e2a23;
@@ -96,6 +100,7 @@
   --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
 }
 :root[data-theme='signal'][data-mode='dark'] {
+  --c-ok: #46cfa3;
   --c-bg: #0f1517;
   --c-surface: #162024;
   --c-hover: #18252a;
@@ -108,6 +113,7 @@
   --c-danger: #e46c64;
 }
 :root[data-theme='signal'][data-mode='light'] {
+  --c-ok: #11805f;
   --c-bg: #eef4f3;
   --c-surface: #ffffff;
   --c-hover: #e2ecea;

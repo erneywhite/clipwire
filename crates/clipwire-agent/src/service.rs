@@ -34,6 +34,8 @@ pub struct Service {
     guard: Arc<LoopGuard>,
     device: DeviceId,
     invite: String,
+    /// Устройство в группе и синхронизируется (иначе работает только локально).
+    synced: bool,
     local_tx: Option<mpsc::Sender<Content>>,
     engine: Option<tokio::task::JoinHandle<Result<()>>>,
     _watcher: Watcher,
@@ -42,7 +44,7 @@ pub struct Service {
 impl Service {
     pub fn start(
         rt: &tokio::runtime::Handle,
-        state: AgentState,
+        state: Option<AgentState>,
         paths: Paths,
         device_name: String,
         history: Arc<Mutex<History>>,
@@ -52,7 +54,6 @@ impl Service {
         let paused = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(Status::Connecting));
         let guard = Arc::new(LoopGuard::default());
-        let invite = state.invite.encode();
 
         // Текущее содержимое буфера на старте не отправляем, но запоминаем,
         // чтобы повторное уведомление с ним же не ушло как новое.
@@ -60,17 +61,32 @@ impl Service {
             guard.wrote(&Content::Text(t));
         }
 
+        // Без группы (локальный режим) движка нет: только буфер и история.
+        let synced = state.is_some();
+        let invite = state
+            .as_ref()
+            .map(|s| s.invite.encode())
+            .unwrap_or_default();
         let (local_tx, local_rx) = mpsc::channel::<Content>(32);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
-        let engine = Engine::new(
-            state,
-            device_name.clone(),
-            paths.load_cursor(),
-            event_tx,
-            Arc::new(|| {}),
-        );
-        let device = engine.device();
-        let engine = rt.spawn(engine.run(local_rx));
+        let (device, engine) = match state {
+            Some(state) => {
+                let engine = Engine::new(
+                    state,
+                    device_name.clone(),
+                    paths.load_cursor(),
+                    event_tx,
+                    Arc::new(|| {}),
+                );
+                let device = engine.device();
+                (device, Some(rt.spawn(engine.run(local_rx))))
+            }
+            None => {
+                drop(event_tx);
+                (DeviceId([0; 32]), None)
+            }
+        };
+        let local_tx = synced.then_some(local_tx);
 
         // События движка.
         {
@@ -143,7 +159,9 @@ impl Service {
                 if !guard.should_send(&content) {
                     return;
                 }
-                if tx.try_send(content.clone()).is_err() {
+                if let Some(tx) = &tx
+                    && tx.try_send(content.clone()).is_err()
+                {
                     tracing::warn!("очередь отправки переполнена, копирование пропущено");
                 }
                 record(&history, local_entry(device, &device_name, content.clone()));
@@ -157,8 +175,9 @@ impl Service {
             guard,
             device,
             invite,
-            local_tx: Some(local_tx),
-            engine: Some(engine),
+            synced,
+            local_tx,
+            engine,
             _watcher: watcher,
         })
     }
@@ -174,6 +193,10 @@ impl Service {
             .clone()
     }
 
+    pub fn synced(&self) -> bool {
+        self.synced
+    }
+
     pub fn paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
     }
@@ -182,7 +205,7 @@ impl Service {
         self.paused.store(p, Ordering::Relaxed);
     }
 
-    /// Код приглашения (в нём ключ группы).
+    /// Код приглашения (в нём ключ группы). Пустой в локальном режиме.
     pub fn invite_code(&self) -> &str {
         &self.invite
     }

@@ -184,8 +184,7 @@ pub fn popup_hide(app: AppHandle) {
     hide(&app);
 }
 
-/// Положить элемент в буфер и, если включено, вставить в окно, которое было
-/// активным до показа.
+/// Вставить элемент истории по id.
 #[tauri::command]
 pub async fn popup_paste(
     app: AppHandle,
@@ -196,8 +195,8 @@ pub async fn popup_paste(
         .parse()
         .map(clipwire_core::ItemId)
         .map_err(|_| "Неверный id элемента".to_string())?;
-    let state = app.state::<AppState>();
     let text = {
+        let state = app.state::<AppState>();
         let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
         match h.get(id).map(|e| &e.content) {
             Some(clipwire_core::Content::Text(t)) => t.clone(),
@@ -206,6 +205,23 @@ pub async fn popup_paste(
             None => return Err("Элемента уже нет в истории".into()),
         }
     };
+    paste_text(&app, &text, into_active).await
+}
+
+/// Вставить произвольный текст: изменённый в предпросмотре вариант.
+#[tauri::command]
+pub async fn popup_paste_text(
+    app: AppHandle,
+    text: String,
+    into_active: Option<bool>,
+) -> Result<(), String> {
+    paste_text(&app, &text, into_active).await
+}
+
+/// Положить текст в буфер и, если включено, вставить в окно, которое было
+/// активным до показа.
+async fn paste_text(app: &AppHandle, text: &str, into_active: Option<bool>) -> Result<(), String> {
+    let state = app.state::<AppState>();
     let paste = into_active.unwrap_or_else(|| {
         state
             .settings
@@ -218,11 +234,12 @@ pub async fn popup_paste(
     {
         let svc = state.service.lock().unwrap_or_else(|e| e.into_inner());
         match svc.as_ref() {
-            Some(s) => s.put_quietly(&text),
-            None => clipwire_agent::clipboard::write_text(&text),
+            Some(s) => s.put_quietly(text),
+            None => clipwire_agent::clipboard::write_text(text),
         }
         .map_err(|e| format!("{e:#}"))?;
     }
+
     // Порядок важен: вернуть фокус прежнему окну, пока окно вставки ещё
     // активно. Если сначала спрятать окно, Windows отдаст фокус кому-то ещё,
     // и SetForegroundWindow из фонового процесса молча откажет.
@@ -235,7 +252,7 @@ pub async fn popup_paste(
             .unwrap_or_else(|e| e.into_inner());
         win::focus(prev)
     };
-    hide(&app);
+    hide(app);
     #[cfg(windows)]
     if focused {
         // Окну нужно мгновение, чтобы принять фокус, иначе Ctrl+V уйдёт в никуда.
@@ -304,4 +321,57 @@ mod win {
         ];
         unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     }
+}
+
+/// Показать окно вставки рядом с окном настроек в заданном размере — живое
+/// превью для ползунка размера. Фокус не забирает, поэтому по потере фокуса
+/// не прячется; прячет `popup_demo_end`.
+#[tauri::command]
+pub fn popup_demo(app: AppHandle, width: f64, height: f64) {
+    let (Some(popup), Some(settings)) = (window(&app), app.get_webview_window("settings")) else {
+        return;
+    };
+    let Ok(pos) = settings.outer_position() else {
+        return;
+    };
+    let Ok(size) = settings.outer_size() else {
+        return;
+    };
+    let monitor = settings.current_monitor().ok().flatten();
+    let scale = monitor.as_ref().map(|m| m.scale_factor()).unwrap_or(1.0);
+    let (w, h) = ((width * scale) as i32, (height * scale) as i32);
+    let gap = (GAP * 2.0 * scale) as i32;
+    let (ax, ay, aw, ah) = monitor
+        .as_ref()
+        .map(|m| {
+            let a = m.work_area();
+            (
+                a.position.x,
+                a.position.y,
+                a.size.width as i32,
+                a.size.height as i32,
+            )
+        })
+        .unwrap_or((0, 0, i32::MAX / 2, i32::MAX / 2));
+    // Справа от настроек, если влезает, иначе слева.
+    let right = pos.x + size.width as i32 + gap;
+    let x = if right + w <= ax + aw {
+        right
+    } else {
+        (pos.x - gap - w).max(ax)
+    };
+    let y = pos.y.clamp(ay, (ay + ah - h).max(ay));
+    let _ = popup.set_size(PhysicalSize::new(w as u32, h as u32));
+    let _ = popup.set_position(PhysicalPosition::new(x, y));
+    if !popup.is_visible().unwrap_or(false) {
+        let _ = popup.show();
+        // Вернуть фокус настройкам: иначе ползунок отпустит мышь.
+        let _ = settings.set_focus();
+    }
+    let _ = app.emit_to("popup", "popup://demo-size", width);
+}
+
+#[tauri::command]
+pub fn popup_demo_end(app: AppHandle) {
+    hide(&app);
 }

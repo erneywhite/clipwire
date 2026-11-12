@@ -24,14 +24,18 @@ pub struct AppState {
     /// Список игнорируемых программ, общий с сервисом: меняется без перезапуска.
     pub ignored_apps: Arc<Mutex<Vec<String>>>,
     pub service: Mutex<Option<Service>>,
+    /// Сервис уже пытались запустить. До этого статус — «подключение», а не ошибка.
+    pub service_attempted: std::sync::atomic::AtomicBool,
 }
 
 /// Статус для интерфейса.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "detail", rename_all = "lowercase")]
 pub enum StatusDto {
-    /// Устройство ещё не в группе.
+    /// Синхронизация не запустилась совсем (ошибка).
     Unconfigured,
+    /// Без группы: история и окно вставки работают только на этом устройстве.
+    Local,
     Connecting,
     Online,
     Offline(String),
@@ -42,6 +46,9 @@ impl StatusDto {
     pub fn from_service(s: &Service) -> Self {
         if s.paused() {
             return Self::Paused;
+        }
+        if !s.synced() {
+            return Self::Local;
         }
         match s.status() {
             Status::Connecting => Self::Connecting,
@@ -54,10 +61,16 @@ impl StatusDto {
 pub fn current_status(app: &AppHandle) -> StatusDto {
     let state = app.state::<AppState>();
     let guard = state.service.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .as_ref()
-        .map(StatusDto::from_service)
-        .unwrap_or(StatusDto::Unconfigured)
+    match guard.as_ref() {
+        Some(s) => StatusDto::from_service(s),
+        None if !state
+            .service_attempted
+            .load(std::sync::atomic::Ordering::Relaxed) =>
+        {
+            StatusDto::Connecting
+        }
+        None => StatusDto::Unconfigured,
+    }
 }
 
 /// Сообщить трею и окнам, что статус поменялся.
@@ -67,12 +80,12 @@ pub fn publish_status(app: &AppHandle) {
     let _ = app.emit("clipwire://status", &st);
 }
 
-/// Запустить синхронизацию, если устройство уже в группе.
+/// Запустить сервис: с синхронизацией, если устройство в группе, иначе локально.
+/// Возвращает `true`, если устройство в группе.
 pub fn start_service(app: &AppHandle) -> anyhow::Result<bool> {
     let state = app.state::<AppState>();
-    let Some(agent) = state.paths.load()? else {
-        return Ok(false);
-    };
+    let agent = state.paths.load()?;
+    let configured = agent.is_some();
     let handle = app.clone();
     let device_name = state
         .settings
@@ -96,7 +109,21 @@ pub fn start_service(app: &AppHandle) -> anyhow::Result<bool> {
     )?;
     *state.service.lock().unwrap_or_else(|e| e.into_inner()) = Some(service);
     publish_status(app);
-    Ok(true)
+    Ok(configured)
+}
+
+fn load_state() -> anyhow::Result<AppState> {
+    let paths = Paths::resolve()?;
+    let settings = Settings::load(&paths.dir);
+    let history = History::open(&paths.dir)?;
+    Ok(AppState {
+        ignored_apps: Arc::new(Mutex::new(settings.ignored_apps.clone())),
+        settings: Mutex::new(settings),
+        history: Arc::new(Mutex::new(history)),
+        service: Mutex::new(None),
+        service_attempted: Default::default(),
+        paths,
+    })
 }
 
 /// Раз в час и на старте удаляет историю старше срока хранения.
@@ -175,7 +202,19 @@ pub fn run() {
         )
         .init();
 
+    // Состояние создаётся до приложения: окна грузятся параллельно с setup и
+    // сразу спрашивают статус и настройки, состояние к этому моменту уже должно быть.
+    let state = match load_state() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("не удалось открыть данные Clipwire: {e:#}");
+            panic!("не удалось открыть данные Clipwire: {e:#}");
+        }
+    };
+
     tauri::Builder::default()
+        .manage(state)
+        .manage(popup::PopupState::default())
         // Второй запуск не плодит копию, а открывает настройки у первой.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_settings(app);
@@ -207,21 +246,29 @@ pub fn run() {
             popup::popup_preview,
             popup::popup_hide,
             popup::popup_paste,
+            popup::popup_paste_text,
+            popup::popup_demo,
+            popup::popup_demo_end,
+            commands::history_update,
         ])
         .setup(|app| {
-            let paths = Paths::resolve()?;
-            let settings = Settings::load(&paths.dir);
-            let history = History::open(&paths.dir)?;
-            let ignored = Arc::new(Mutex::new(settings.ignored_apps.clone()));
-            apply_capture_protection(app.handle(), settings.hide_from_capture);
-            app.manage(AppState {
-                paths,
-                ignored_apps: ignored,
-                settings: Mutex::new(settings),
-                history: Arc::new(Mutex::new(history)),
-                service: Mutex::new(None),
-            });
-            app.manage(popup::PopupState::default());
+            let hide_from_capture = app
+                .state::<AppState>()
+                .settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .hide_from_capture;
+            // Окно вставки создаётся вместе с приложением, но показываться должно
+            // только по горячей клавише. Прячем явно: на некоторых сборках WebView2
+            // скрытое окно без рамки всплывало пустым белым прямоугольником.
+            if let Some(p) = app.get_webview_window("popup") {
+                let _ = p.hide();
+            }
+            // Защиту от захвата трогаем, только если она включена: вызов на
+            // скрытом окне может его показать.
+            if hide_from_capture {
+                apply_capture_protection(app.handle(), true);
+            }
             spawn_pruner(app.handle().clone());
             updates::spawn(app.handle().clone());
             if let Err(e) = popup::register_hotkey(app.handle()) {
@@ -229,7 +276,11 @@ pub fn run() {
             }
             tray::build(app.handle())?;
 
-            let configured = match start_service(app.handle()) {
+            let started = start_service(app.handle());
+            app.state::<AppState>()
+                .service_attempted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let configured = match started {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("синхронизация не запустилась: {e:#}");

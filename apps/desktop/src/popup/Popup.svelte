@@ -10,6 +10,10 @@
   let items = $state<Entry[]>([])
   let sel = $state(0)
   let preview = $state<{ entry: Entry; side: 'left' | 'right' } | null>(null)
+  // Текст в предпросмотре можно поправить перед вставкой.
+  let draft = $state('')
+  let editor: HTMLTextAreaElement | undefined = $state()
+  const edited = $derived(preview !== null && draft !== preview.entry.text)
   let error = $state('')
   let input: HTMLInputElement | undefined = $state()
   let listEl: HTMLUListElement | undefined = $state()
@@ -40,9 +44,23 @@
 
   async function paste(entry: Entry | undefined, intoActive?: boolean) {
     if (!entry) return
+    // Если это элемент из предпросмотра и его поправили — вставляем изменённый текст.
+    const text = preview && preview.entry.id === entry.id && edited ? draft : null
     await closePreview()
     try {
-      await api.paste(entry.id, intoActive)
+      if (text !== null) await api.pasteText(text, intoActive)
+      else await api.paste(entry.id, intoActive)
+    } catch (e) {
+      error = String(e)
+    }
+  }
+
+  async function saveDraft() {
+    if (!preview || !edited) return
+    try {
+      await api.update(preview.entry.id, draft)
+      preview = { ...preview, entry: await api.get(preview.entry.id) }
+      await load()
     } catch (e) {
       error = String(e)
     }
@@ -53,6 +71,7 @@
     const entry = await api.get(current.id)
     const side = preview ? preview.side : await api.preview(true)
     preview = { entry, side }
+    draft = entry.text
   }
 
   async function closePreview() {
@@ -74,6 +93,22 @@
   }
 
   async function onKey(e: KeyboardEvent) {
+    // В редакторе предпросмотра клавиши работают как в обычном поле ввода,
+    // кроме двух: Ctrl+Enter вставляет изменённый текст, Esc возвращает к списку.
+    if (e.target === editor) {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault()
+        paste(preview?.entry)
+      } else if (e.key === 'Escape') {
+        e.preventDefault()
+        editor?.blur()
+        input?.focus()
+      } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyS') {
+        e.preventDefault()
+        saveDraft()
+      }
+      return
+    }
     switch (e.key) {
       case 'ArrowDown':
         e.preventDefault()
@@ -131,6 +166,11 @@
     const unlisten = [
       listen('clipwire://history-changed', () => load()),
       listen<Settings>('clipwire://settings-changed', (e) => applySettings(e.payload)),
+      // Живое превью размера из настроек: ширина списка меняется вместе с окном.
+      listen<number>('popup://demo-size', (e) => {
+        document.documentElement.style.setProperty('--popup-w', `${e.payload}px`)
+        load()
+      }),
       listen('popup://opened', async () => {
         query = ''
         sel = 0
@@ -228,19 +268,33 @@
   {#if preview}
     <section class="preview-pane" aria-label="Предпросмотр">
       {#if isUrl(preview.entry.text)}
-        <p class="url">{preview.entry.text}</p>
-        <p class="note">Предпросмотр ссылок появится в следующей версии</p>
-      {:else}
-        <pre class:mono={looksLikeCode(preview.entry.text)}>{preview.entry.text}</pre>
+        <p class="note">Карточки ссылок появятся в следующей версии</p>
       {/if}
+      <textarea
+        bind:this={editor}
+        bind:value={draft}
+        class="editor"
+        class:mono={looksLikeCode(draft)}
+        spellcheck="false"
+        aria-label="Текст элемента, можно поправить перед вставкой"
+      ></textarea>
       <div class="preview-meta">
-        {preview.entry.local ? 'Это устройство' : preview.entry.device_name} · {ago(preview.entry.seen_ms)} · {sizeLabel(preview.entry.chars, preview.entry.lines)}
+        {#if edited}
+          изменено · Ctrl+Enter вставить · Ctrl+S сохранить
+        {:else}
+          {preview.entry.local ? 'Это устройство' : preview.entry.device_name} · {ago(preview.entry.seen_ms)} · {sizeLabel(preview.entry.chars, preview.entry.lines)}
+        {/if}
       </div>
       <div class="actions">
         <button class="primary" onclick={() => paste(preview?.entry)}>Вставить</button>
-        <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
-          {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
-        </button>
+        {#if edited}
+          <button onclick={saveDraft}>Сохранить в истории</button>
+          <button onclick={() => preview && (draft = preview.entry.text)}>Отменить правку</button>
+        {:else}
+          <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
+            {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
+          </button>
+        {/if}
       </div>
     </section>
   {/if}
@@ -371,7 +425,7 @@
     white-space: pre-line;
   }
   .text.mono,
-  pre.mono {
+  .editor.mono {
     font-family: var(--font-mono);
     font-size: var(--text-s);
   }
@@ -443,25 +497,34 @@
     border-left: 0;
     border-right: 1px solid var(--c-border);
   }
-  pre {
+  .editor {
     flex: 1;
     margin: 0;
+    resize: none;
+    border: 1px solid transparent;
+    border-radius: var(--radius-m);
+    background: transparent;
+    padding: var(--space-2);
     overflow: auto;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     font-family: var(--font-ui);
     font-size: var(--text-m);
+    line-height: 1.45;
+    color: var(--c-text);
+    outline: none;
   }
-  .url {
-    margin: 0;
-    overflow-wrap: anywhere;
-    color: var(--c-accent);
+  .editor:hover {
+    border-color: var(--c-border);
+  }
+  .editor:focus {
+    border-color: var(--c-accent);
+    background: var(--c-bg);
   }
   .note {
     margin: 0;
     color: var(--c-muted);
     font-size: var(--text-s);
-    flex: 1;
   }
   .actions {
     display: flex;

@@ -41,6 +41,7 @@ export interface Entry {
 
 export type Status =
   | { kind: 'unconfigured' }
+  | { kind: 'local' }
   | { kind: 'connecting' }
   | { kind: 'online' }
   | { kind: 'offline'; detail: string }
@@ -61,8 +62,12 @@ export const api = {
   remove: (id: string) => invoke<void>('history_delete', { id }),
   clear: (keepPinned: boolean) => invoke<void>('history_clear', { keepPinned }),
   paste: (id: string, intoActive?: boolean) => invoke<void>('popup_paste', { id, intoActive }),
+  pasteText: (text: string, intoActive?: boolean) => invoke<void>('popup_paste_text', { text, intoActive }),
+  update: (id: string, text: string) => invoke<void>('history_update', { id, text }),
   preview: (open: boolean) => invoke<'left' | 'right'>('popup_preview', { open }),
   hidePopup: () => invoke<void>('popup_hide'),
+  popupDemo: (width: number, height: number) => invoke<void>('popup_demo', { width, height }),
+  popupDemoEnd: () => invoke<void>('popup_demo_end'),
   leaveGroup: () => invoke<void>('leave_group'),
   deviceInfo: () => invoke<DeviceInfo>('device_info'),
   copyQuietly: (text: string) => invoke<void>('copy_quietly', { text }),

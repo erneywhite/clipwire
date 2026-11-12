@@ -203,6 +203,28 @@ impl History {
         self.write(&e)
     }
 
+    /// Заменить текст элемента (правка в предпросмотре). Если такой текст уже
+    /// есть в истории отдельным элементом, тот удаляется, чтобы не было дублей.
+    pub fn update_text(&mut self, id: ItemId, text: String) -> Result<()> {
+        let content = Content::Text(text);
+        let hash = content.hash();
+        if let Some(&other) = self.by_hash.get(&hash)
+            && other != id
+        {
+            self.delete(other)?;
+        }
+        let Some(e) = self.entries.iter_mut().find(|e| e.id == id) else {
+            bail!("элемента уже нет в истории");
+        };
+        let old = e.content.hash();
+        e.content = content;
+        let e = e.clone();
+        self.write(&e)?;
+        self.by_hash.remove(&old);
+        self.by_hash.insert(hash, id);
+        Ok(())
+    }
+
     pub fn delete(&mut self, id: ItemId) -> Result<()> {
         self.conn.execute(
             "DELETE FROM entries WHERE id = ?1",
@@ -343,6 +365,19 @@ mod tests {
         assert!(h.list("", true, 10)[0].pinned);
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn update_text_replaces_and_dedups() {
+        let mut h = History::in_memory();
+        let a = text(&mut h, "черновик", 1);
+        text(&mut h, "итог", 2);
+        h.update_text(a, "итог".into()).unwrap();
+        assert_eq!(texts(h.list("", false, 10)), ["итог"]);
+        assert!(h.get(a).is_some());
+        // Повторное копирование того же текста поднимает отредактированный элемент.
+        text(&mut h, "итог", 3);
+        assert_eq!(h.len(), 1);
     }
 
     #[test]

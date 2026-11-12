@@ -59,7 +59,7 @@
   let updateState = $state<'idle' | 'checking' | 'none' | 'available' | 'installing' | 'error'>('idle')
   let updateError = $state('')
 
-  const configured = $derived(status.kind !== 'unconfigured')
+  const configured = $derived(status.kind !== 'unconfigured' && status.kind !== 'local')
 
   function flash(msg: string) {
     notice = msg
@@ -155,6 +155,19 @@
     }
   }
 
+  // Размер окна вставки одним числом: ширина и высота растут вместе.
+  const SIZE = { w0: 320, w1: 560, h0: 400, h1: 760 }
+  function valueToSize(v: number) {
+    const t = v / 100
+    return {
+      w: Math.round((SIZE.w0 + (SIZE.w1 - SIZE.w0) * t) / 10) * 10,
+      h: Math.round((SIZE.h0 + (SIZE.h1 - SIZE.h0) * t) / 10) * 10,
+    }
+  }
+  function sizeToValue(w: number) {
+    return Math.round(((w - SIZE.w0) / (SIZE.w1 - SIZE.w0)) * 100)
+  }
+
   function addApp() {
     const name = newApp.trim()
     if (!s || !name || s.ignored_apps.some((a) => a.toLowerCase() === name.toLowerCase())) return
@@ -196,8 +209,10 @@
         return 'На паузе'
       case 'offline':
         return `Нет связи: ${st.detail}`
+      case 'local':
+        return 'Только это устройство'
       case 'unconfigured':
-        return 'Устройство не подключено'
+        return 'Синхронизация не запустилась'
     }
   }
 
@@ -206,8 +221,9 @@
       s = v
       applyTheme(v.theme, v.mode)
     })
-    refresh()
     isEnabled().then((v) => (autostart = v)).catch(() => {})
+    // Сначала подписка на события, потом запрос статуса: иначе событие о старте
+    // сервиса может прийти раньше подписки и потеряться.
     const unlisten = [
       listen<Status>('clipwire://status', (e) => (status = e.payload)),
       // Фоновая проверка нашла обновление — сразу показать кнопку в «О программе».
@@ -217,6 +233,7 @@
         applyTheme(e.payload.theme, e.payload.mode)
       }),
     ]
+    Promise.all(unlisten).then(refresh)
     return () => unlisten.forEach((p) => p.then((f) => f()))
   })
 </script>
@@ -303,7 +320,11 @@
       {:else if section === 'sync'}
         <h1>Синхронизация</h1>
         {#if !configured}
-          <p class="lead">Устройство ещё не в группе. Группу создаёт первое устройство, остальные подключаются по коду приглашения.</p>
+          <p class="lead">
+            Сейчас Clipwire работает только на этом устройстве: история и окно вставки есть, синхронизации нет.
+            Чтобы буфер был общим с другими компьютерами, подключите сервер. Группу создаёт первое устройство,
+            остальные подключаются по коду приглашения.
+          </p>
           <div class="card pad">
             <h2 class="in-card">Это первое устройство</h2>
             <p class="hint">Код сервера печатает сервер Clipwire при запуске, строка начинается с <code>cwserver1-</code>.</p>
@@ -321,7 +342,7 @@
             <div class="card pad accent">
               <h2 class="in-card">Группа создана</h2>
               <p class="hint">Этот код вставьте на остальных устройствах. В нём ключ шифрования группы: передавайте его только себе.</p>
-              <code class="code">{createdInvite}</code>
+              <code class="code selectable">{createdInvite}</code>
               <button onclick={() => copy(createdInvite)}>Скопировать код</button>
             </div>
           {/if}
@@ -343,7 +364,7 @@
           <div class="card pad">
             <p class="hint">Код приглашения содержит ключ шифрования группы. Кто его увидел, тот может читать ваш буфер.</p>
             {#if invite}
-              <code class="code">{invite}</code>
+              <code class="code selectable">{invite}</code>
               <div class="buttons">
                 <button onclick={() => copy(invite)}>Скопировать код</button>
                 <button onclick={() => (invite = '')}>Скрыть</button>
@@ -413,15 +434,26 @@
         </div>
 
         <h2>Размер окна вставки</h2>
-        <div class="card pad two">
-          <label class="field">
-            <span>Ширина, px</span>
-            <input type="number" min="300" max="720" step="10" value={s.popup_width} onchange={(e) => save({ popup_width: Math.min(720, Math.max(300, Number(e.currentTarget.value))) })} />
-          </label>
-          <label class="field">
-            <span>Высота, px</span>
-            <input type="number" min="320" max="900" step="10" value={s.popup_height} onchange={(e) => save({ popup_height: Math.min(900, Math.max(320, Number(e.currentTarget.value))) })} />
-          </label>
+        <div class="card pad">
+          <input
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            value={sizeToValue(s.popup_width)}
+            oninput={(e) => {
+              const { w, h } = valueToSize(Number(e.currentTarget.value))
+              api.popupDemo(w, h)
+            }}
+            onchange={(e) => {
+              const { w, h } = valueToSize(Number(e.currentTarget.value))
+              save({ popup_width: w, popup_height: h })
+              setTimeout(() => api.popupDemoEnd(), 1200)
+            }}
+            aria-label="Размер окна вставки"
+          />
+          <div class="ticks"><span>Компактное</span><span>{s.popup_width} × {s.popup_height}</span><span>Просторное</span></div>
+          <p class="hint">Пока тянете ползунок, рядом показывается настоящее окно вставки этого размера.</p>
         </div>
 
         <h2>В окне вставки</h2>
@@ -528,6 +560,12 @@
     background: var(--c-muted);
   }
   .status[data-kind='online'] .dot {
+    background: var(--c-ok);
+  }
+  .status[data-kind='local'] .dot {
+    background: var(--c-accent);
+  }
+  .status[data-kind='connecting'] .dot {
     background: var(--c-accent);
   }
   .status[data-kind='offline'] .dot {
@@ -580,9 +618,6 @@
   }
   .card.accent {
     border-color: var(--c-accent);
-  }
-  .card.two {
-    flex-direction: row;
   }
   .hint {
     font-size: var(--text-s);
