@@ -20,7 +20,9 @@
         "minHeight": 460,
         "visible": false,
         "center": true,
-        "backgroundColor": "#1c1e22"
+        "backgroundColor": "#1c1e22",
+        "decorations": false,
+        "shadow": true
       },
       {
         "label": "popup",
@@ -79,7 +81,14 @@
         "languages": [
           "Russian",
           "English"
-        ]
+        ],
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "headerImage": "installer/header.bmp",
+        "uninstallerHeaderImage": "installer/header.bmp",
+        "sidebarImage": "installer/sidebar.bmp",
+        "startMenuFolder": "Clipwire",
+        "displayLanguageSelector": false
       }
     },
     "createUpdaterArtifacts": true

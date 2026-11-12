@@ -13,6 +13,8 @@
 @import '@fontsource/jetbrains-mono/400.css';
 
 :root {
+  /* Фирменный янтарный провод знака — одинаковый во всех темах. */
+  --c-brand-wire: #e2a63b;
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;

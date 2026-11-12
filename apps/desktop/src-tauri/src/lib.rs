@@ -278,6 +278,7 @@ pub fn run() {
             popup::popup_paste_text,
             settings_window::size_preview,
             settings_window::size_preview_hide,
+            settings_window::settings_toggle_maximize,
             commands::history_update,
         ])
         .setup(|app| {

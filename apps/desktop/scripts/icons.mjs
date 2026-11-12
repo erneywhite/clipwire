@@ -49,4 +49,42 @@ for (const [panel, { sheets, wire }] of Object.entries(panels)) {
     }
   }
 }
-console.log(`иконка приложения: icons-src/icon-1024.png; иконок трея: ${n}`)
+// Картинки установщика NSIS: он понимает только BMP (24 бита, без сжатия).
+function bmp(rgba, w, h) {
+  const row = Math.ceil((w * 3) / 4) * 4
+  const size = 54 + row * h
+  const b = Buffer.alloc(size)
+  b.write('BM', 0)
+  b.writeUInt32LE(size, 2)
+  b.writeUInt32LE(54, 10)
+  b.writeUInt32LE(40, 14)
+  b.writeInt32LE(w, 18)
+  b.writeInt32LE(h, 22) // положительная высота — строки снизу вверх
+  b.writeUInt16LE(1, 26)
+  b.writeUInt16LE(24, 28)
+  b.writeUInt32LE(row * h, 34)
+  b.writeInt32LE(2835, 38) // 72 dpi
+  b.writeInt32LE(2835, 42)
+  for (let y = 0; y < h; y++) {
+    const off = 54 + (h - 1 - y) * row
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4
+      const a = rgba[i + 3] / 255 // фон у картинок непрозрачный, но на всякий случай — на белое
+      const mix = (c) => Math.round(c * a + 255 * (1 - a))
+      b[off + x * 3] = mix(rgba[i + 2])
+      b[off + x * 3 + 1] = mix(rgba[i + 1])
+      b[off + x * 3 + 2] = mix(rgba[i])
+    }
+  }
+  return b
+}
+const nsisOut = join(here, '../src-tauri/installer')
+mkdirSync(nsisOut, { recursive: true })
+for (const [name, file] of [['sidebar', 'installer-sidebar.svg'], ['header', 'installer-header.svg']]) {
+  // В двойном разрешении: NSIS вписывает картинку в свою область, и на экранах
+  // с масштабом больше 100% уменьшенная картинка чётче растянутой.
+  const img = new Resvg(readFileSync(join(brand, file), 'utf8'), { fitTo: { mode: 'zoom', value: 2 } }).render()
+  writeFileSync(join(nsisOut, `${name}.bmp`), bmp(img.pixels, img.width, img.height))
+}
+
+console.log(`иконка приложения: icons-src/icon-1024.png; иконок трея: ${n}; картинки установщика: src-tauri/installer`)

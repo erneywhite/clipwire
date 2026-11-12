@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="164" height="314" viewBox="0 0 164 314">
+  <!-- Картинка слева в установщике: знак и провод, который тянется вниз. -->
+  <rect width="164" height="314" fill="#1c1e22"/>
+  <g transform="translate(11.6 34) scale(0.55)">
+    <path d="M58 28 H118 L146 56 V148 Q146 166 128 166 H58 Q40 166 40 148 V46 Q40 28 58 28 Z" fill="#1c1e22" stroke="#e9e6df" stroke-width="14" stroke-linejoin="round"/>
+    <path d="M118 28 V56 H146 Z" fill="#e9e6df" stroke="#e9e6df" stroke-width="14" stroke-linejoin="round"/>
+    <path d="M128 90 H188 L216 118 V210 Q216 228 198 228 H128 Q110 228 110 210 V108 Q110 90 128 90 Z" fill="#1c1e22" stroke="#e9e6df" stroke-width="14" stroke-linejoin="round"/>
+    <path d="M188 90 V118 H216 Z" fill="#e9e6df" stroke="#e9e6df" stroke-width="14" stroke-linejoin="round"/>
+    <path d="M72 66 V112 Q72 130 90 130 H146 Q164 130 164 148 V320" fill="none" stroke="#e2a63b" stroke-width="15" stroke-linecap="round"/>
+    <circle cx="72" cy="64" r="14" fill="#e2a63b"/>
+  </g>
+  <!-- Провод выходит из знака и спускается к нижнему краю. -->
+  <path d="M101.8 210 V246 Q101.8 262 85.8 262 H62 Q46 262 46 278 V314" fill="none" stroke="#e2a63b" stroke-width="8.25" stroke-linecap="round"/>
+</svg>

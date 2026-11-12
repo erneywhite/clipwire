@@ -9,6 +9,7 @@
   import { applyTheme } from '../lib/theme'
   import { fromEvent, label as hotkeyLabel } from '../lib/hotkey'
   import Toggle from './Toggle.svelte'
+  import TitleBar from './TitleBar.svelte'
 
   type Section = 'general' | 'sync' | 'privacy' | 'keys' | 'about'
   const sections: { id: Section; title: string; icon: string }[] = [
@@ -300,6 +301,8 @@
 <svelte:window onkeydown={recordKey} />
 
 {#if s}
+  <div class="window">
+  <TitleBar />
   <div class="layout">
     <nav aria-label="Разделы настроек">
       {#each sections as sec (sec.id)}
@@ -565,13 +568,20 @@
       {/if}
     </main>
   </div>
+  </div>
 {/if}
 
 <style>
+  .window {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
   .layout {
+    flex: 1;
+    min-height: 0;
     display: grid;
     grid-template-columns: 200px minmax(0, 1fr);
-    height: 100vh;
   }
   nav {
     display: flex;
@@ -829,6 +839,12 @@
   .theme.on {
     border-color: var(--c-accent);
     color: var(--c-text);
+  }
+  /* Одна рамка: кольцо фокуса только с клавиатуры, и оно заменяет рамку, а не добавляется. */
+  .theme:focus-visible {
+    outline: none;
+    border-color: var(--c-accent);
+    box-shadow: 0 0 0 1px var(--c-accent);
   }
   .swatch {
     width: 100%;
