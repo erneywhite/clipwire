@@ -27,9 +27,9 @@ QUIC-соединений: без него всё работает через re
 Готовый образ собирает GitHub Actions: `ghcr.io/erneywhite/clipwire-server:latest`
 (последний `main`) и `:X.Y.Z` для релизов.
 
-**Через aaPanel или другую панель с Docker:**
+**Через панель управления с Docker (или просто `docker compose`):**
 
-1. Docker → Compose: вставить [deploy/docker-compose.aapanel.yml](deploy/docker-compose.aapanel.yml),
+1. Docker → Compose: вставить [deploy/docker-compose.image.yml](deploy/docker-compose.image.yml),
    заменить `CLIPWIRE_PUBLIC_URL` на свой домен и запустить.
 2. Создать обратный прокси на этот домен → `http://127.0.0.1:3340`, включить SSL и WebSocket.
    Если в панели нет переключателя WebSocket, в конфиг сайта вставляется блок из

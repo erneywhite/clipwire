@@ -1,4 +1,4 @@
-# Сервер Clipwire для aaPanel или любого хоста с Docker.
+# Сервер Clipwire со сборкой образа на месте. Готовый образ — docker-compose.image.yml.
 # Перед запуском поменяй CLIPWIRE_PUBLIC_URL на свой домен.
 services:
   clipwire:
