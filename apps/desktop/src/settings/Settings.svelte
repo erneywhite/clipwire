@@ -9,7 +9,6 @@
   import { applyTheme } from '../lib/theme'
   import { fromEvent, label as hotkeyLabel } from '../lib/hotkey'
   import Toggle from './Toggle.svelte'
-  import PopupMock from './PopupMock.svelte'
 
   type Section = 'general' | 'sync' | 'privacy' | 'keys' | 'about'
   const sections: { id: Section; title: string; icon: string }[] = [
@@ -173,8 +172,38 @@
   // Экран в логических пикселях — для уменьшенной схемы «экран и окно на нём».
   const screenW = window.screen.width || 1920
   const screenH = window.screen.height || 1080
-  // Превью окна вписывается в 300 px по высоте, крупнее не помещается в настройки.
-  const mockScale = $derived(Math.min(1, 300 / Math.max(1, demoSize.h)))
+  // Пример окна сбоку: размер меняется не чаще раза в кадр, в работе один запрос.
+  let pending: { w: number; h: number } | null = null
+  let previewBusy = false
+  let shown = false
+  async function flush() {
+    if (previewBusy || !pending) return
+    previewBusy = true
+    const next = pending
+    pending = null
+    try {
+      await api.sizePreview(next.w, next.h)
+    } finally {
+      previewBusy = false
+      if (pending) requestAnimationFrame(flush)
+    }
+  }
+  function previewShow() {
+    shown = true
+    pending = demoSize
+    requestAnimationFrame(flush)
+  }
+  function previewResize(v: number) {
+    demoSize = valueToSize(v)
+    if (!shown) return
+    pending = demoSize
+    requestAnimationFrame(flush)
+  }
+  function previewHide() {
+    shown = false
+    pending = null
+    api.sizePreviewHide()
+  }
 
   function addApp() {
     const name = newApp.trim()
@@ -443,18 +472,26 @@
         </div>
 
         <h2>Размер окна вставки</h2>
-        <div class="card pad">
+        <div
+          class="card pad"
+          role="group"
+          aria-label="Размер окна вставки"
+          onmouseenter={() => previewShow()}
+          onmouseleave={() => previewHide()}
+        >
           <input
             type="range"
             min="0"
             max="100"
             step="1"
             value={sizeToValue(s.popup_width)}
-            oninput={(e) => (demoSize = valueToSize(Number(e.currentTarget.value)))}
+            oninput={(e) => previewResize(Number(e.currentTarget.value))}
             onchange={(e) => {
               const { w, h } = valueToSize(Number(e.currentTarget.value))
               save({ popup_width: w, popup_height: h })
             }}
+            onfocus={() => previewShow()}
+            onblur={() => previewHide()}
             aria-label="Размер окна вставки"
           />
           <div class="ticks"><span>Компактное</span><span>{demoSize.w} × {demoSize.h}</span><span>Просторное</span></div>
@@ -467,15 +504,11 @@
               ></div>
               <span class="cursor" aria-hidden="true"></span>
             </div>
-            <div class="mock-wrap" style:height="{demoSize.h * mockScale}px" style:width="{demoSize.w * mockScale}px">
-              <div class="mock" style:transform="scale({mockScale})">
-                <PopupMock width={demoSize.w} height={demoSize.h} />
-              </div>
-            </div>
+            <p class="hint">
+              Пока курсор над этим блоком, рядом с настройками показан пример окна вставки выбранного
+              размера. Схема слева — ваш экран и окно на нём в настоящей пропорции.
+            </p>
           </div>
-          <p class="hint">
-            Слева — ваш экран и окно вставки в настоящей пропорции. Справа — как оно выглядит{mockScale < 1 ? `, в масштабе ${Math.round(mockScale * 100)}%` : ''}.
-          </p>
         </div>
 
         <h2>В окне вставки</h2>
@@ -825,7 +858,7 @@
   }
   .screen {
     position: relative;
-    flex: 0 0 150px;
+    flex: 0 0 170px;
     border: 1px solid var(--c-border);
     border-radius: var(--radius-s);
     background: var(--c-bg);
@@ -847,13 +880,7 @@
     border-left: 4px solid var(--c-text);
     border-bottom: 4px solid transparent;
   }
-  .mock-wrap {
-    flex: none;
-    overflow: hidden;
-  }
-  .mock {
-    transform-origin: 0 0;
-  }
+
   .apps {
     list-style: none;
     margin: 0;

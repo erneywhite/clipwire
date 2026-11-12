@@ -1,10 +1,11 @@
 <script lang="ts">
-  // Окно вставки на примерах — для превью размера в настройках. Живёт внутри
-  // окна настроек: никакого второго окна, фокус и курсор никуда не уходят.
+  // Окно вставки на примерах — для превью размера в настройках. Показывается
+  // в отдельном окне без фокуса рядом с настройками.
   import EntryRow from '../lib/EntryRow.svelte'
   import type { Entry } from '../lib/api'
 
-  let { width, height }: { width: number; height: number } = $props()
+  // fill — занять всё окно (отдельное окно-превью); иначе заданный размер.
+  let { width = 0, height = 0, fill = false }: { width?: number; height?: number; fill?: boolean } = $props()
 
   const now = Date.now()
   const min = 60_000
@@ -20,7 +21,7 @@
   ]
 </script>
 
-<div class="frame" style:width="{width}px" style:height="{height}px" aria-hidden="true">
+<div class="frame" style:width={fill ? '100vw' : `${width}px`} style:height={fill ? '100vh' : `${height}px`} aria-hidden="true">
   <div class="search">
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4.5 4.5" /></svg>
     <span>Найти в буфере</span>

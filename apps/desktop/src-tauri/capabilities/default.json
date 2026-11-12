@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Права окон настроек и вставки",
-  "windows": ["settings", "popup"],
+  "windows": ["settings", "popup", "preview"],
   "permissions": [
     "core:default",
     "core:window:allow-hide",

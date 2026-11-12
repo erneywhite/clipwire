@@ -198,7 +198,7 @@ pub fn apply_window_background(app: &AppHandle, hex: &str) {
         return;
     }
     let color = tauri::window::Color((v >> 16) as u8, (v >> 8) as u8, v as u8, 255);
-    for label in ["settings", "popup"] {
+    for label in ["settings", "popup", "preview"] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.set_background_color(Some(color));
         }
@@ -271,6 +271,8 @@ pub fn run() {
             popup::popup_hide,
             popup::popup_paste,
             popup::popup_paste_text,
+            popup::size_preview,
+            popup::size_preview_hide,
             commands::history_update,
         ])
         .setup(|app| {
@@ -283,8 +285,10 @@ pub fn run() {
             // Окно вставки создаётся вместе с приложением, но показываться должно
             // только по горячей клавише. Прячем явно: на некоторых сборках WebView2
             // скрытое окно без рамки всплывало пустым белым прямоугольником.
-            if let Some(p) = app.get_webview_window("popup") {
-                let _ = p.hide();
+            for label in ["popup", "preview"] {
+                if let Some(p) = app.get_webview_window(label) {
+                    let _ = p.hide();
+                }
             }
             // Защиту от захвата трогаем, только если она включена: вызов на
             // скрытом окне может его показать.
@@ -297,6 +301,7 @@ pub fn run() {
                 tracing::warn!("{e}");
             }
             tray::build(app.handle())?;
+            tray::spawn_animator(app.handle().clone());
 
             let started = start_service(app.handle());
             app.state::<AppState>()
@@ -323,6 +328,9 @@ pub fn run() {
             WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
+                if let Some(p) = window.app_handle().get_webview_window("preview") {
+                    let _ = p.hide();
+                }
             }
             // Окно вставки исчезает, как только уходит фокус: как меню.
             WindowEvent::Focused(false) if window.label() == "popup" => {

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Значок трея. SHEETS — цвет листов (под тему панели задач), WIRE — цвет провода (состояние). -->
+  <defs>
+    <mask id="cut">
+      <rect width="256" height="256" fill="#fff"/>
+      <path d="M122 78 H192 L234 120 V212 Q234 240 206 240 H122 Q94 240 94 212 V106 Q94 78 122 78 Z" fill="#000"/>
+    </mask>
+  </defs>
+  <g fill="none" stroke="SHEETS" stroke-width="22" stroke-linejoin="round">
+    <g mask="url(#cut)">
+      <path d="M52 18 H114 L148 52 V150 Q148 172 126 172 H52 Q30 172 30 150 V40 Q30 18 52 18 Z"/>
+      <path d="M114 18 V52 H148 Z" fill="SHEETS"/>
+    </g>
+    <path d="M130 88 H192 L226 122 V214 Q226 236 204 236 H130 Q108 236 108 214 V110 Q108 88 130 88 Z"/>
+    <path d="M192 88 V122 H226 Z" fill="SHEETS"/>
+  </g>
+  <path d="M66 60 V108 Q66 130 88 130 H144 Q166 130 166 152 V176" fill="none" stroke="WIRE" stroke-width="24" stroke-linecap="round"/>
+  <circle cx="66" cy="58" r="21" fill="WIRE"/>
+  <circle cx="166" cy="180" r="21" fill="WIRE"/>
+</svg>

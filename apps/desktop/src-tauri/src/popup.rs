@@ -329,3 +329,55 @@ mod win {
         unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     }
 }
+
+/// Пример окна вставки рядом с настройками — превью размера. Отдельное окно
+/// с примерами, которое не может получить фокус (`focusable: false`): окно
+/// настроек остаётся активным, курсор над ним не «теряется», ничего не мигает.
+#[tauri::command]
+pub fn size_preview(app: AppHandle, width: f64, height: f64) {
+    let (Some(preview), Some(settings)) = (
+        app.get_webview_window("preview"),
+        app.get_webview_window("settings"),
+    ) else {
+        return;
+    };
+    let (Ok(pos), Ok(size)) = (settings.outer_position(), settings.outer_size()) else {
+        return;
+    };
+    let monitor = settings.current_monitor().ok().flatten();
+    let scale = monitor.as_ref().map(|m| m.scale_factor()).unwrap_or(1.0);
+    let (w, h) = ((width * scale) as i32, (height * scale) as i32);
+    let gap = (GAP * 2.0 * scale) as i32;
+    let (ax, ay, aw, ah) = monitor
+        .as_ref()
+        .map(|m| {
+            let a = m.work_area();
+            (
+                a.position.x,
+                a.position.y,
+                a.size.width as i32,
+                a.size.height as i32,
+            )
+        })
+        .unwrap_or((0, 0, i32::MAX / 2, i32::MAX / 2));
+    // Справа от настроек, если влезает, иначе слева.
+    let right = pos.x + size.width as i32 + gap;
+    let x = if right + w <= ax + aw {
+        right
+    } else {
+        (pos.x - gap - w).max(ax)
+    };
+    let y = pos.y.clamp(ay, (ay + ah - h).max(ay));
+    let _ = preview.set_size(PhysicalSize::new(w as u32, h as u32));
+    let _ = preview.set_position(PhysicalPosition::new(x, y));
+    if !preview.is_visible().unwrap_or(false) {
+        let _ = preview.show();
+    }
+}
+
+#[tauri::command]
+pub fn size_preview_hide(app: AppHandle) {
+    if let Some(p) = app.get_webview_window("preview") {
+        let _ = p.hide();
+    }
+}

@@ -16,3 +16,6 @@ Thumbs.db
 
 # Личные заметки для Claude Code
 CLAUDE.local.md
+
+# Промежуточный PNG для `tauri icon`, пересоздаётся scripts/icons.mjs
+apps/desktop/icons-src/

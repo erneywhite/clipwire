@@ -1,3 +1,5 @@
+<img src="docs/brand/clipwire-icon.svg" width="96" alt="">
+
 # Clipwire
 
 Общий буфер обмена для Windows, Linux и macOS: копируешь на одной машине, вставляешь на другой.
