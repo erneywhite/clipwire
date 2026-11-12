@@ -149,9 +149,11 @@ mod tests {
     #[test]
     fn save_load_roundtrip() {
         let dir = std::env::temp_dir().join(format!("clipwire-settings-{}", uuid::Uuid::now_v7()));
-        let mut s = Settings::default();
-        s.device_name = "Тест".into();
-        s.mode = Mode::Dark;
+        let s = Settings {
+            device_name: "Тест".into(),
+            mode: Mode::Dark,
+            ..Default::default()
+        };
         s.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), s);
         let _ = std::fs::remove_dir_all(dir);
