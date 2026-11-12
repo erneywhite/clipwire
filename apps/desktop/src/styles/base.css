@@ -1,12 +1,48 @@
-:root {
-  color-scheme: light dark;
-  font-family: system-ui, sans-serif;
-}
-html, body {
+@import './tokens.css';
+
+html,
+body {
   margin: 0;
   height: 100%;
   overflow-x: clip;
+  background: var(--c-bg);
+  color: var(--c-text);
+  font-family: var(--font-ui);
+  font-size: var(--text-m);
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
 }
+
 #app {
   height: 100%;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 1px;
+}
+
+::selection {
+  background: var(--c-accent);
+  color: var(--c-on-accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0ms !important;
+    animation-duration: 0ms !important;
+  }
 }

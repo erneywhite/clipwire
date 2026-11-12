@@ -1,0 +1,121 @@
+/* Токены оформления. Три темы × светлый и тёмный режим.
+ * На <html> ставятся data-theme (graphite | paper | signal) и data-mode
+ * (light | dark, уже вычисленный из «как в системе»). Компоненты используют
+ * только эти переменные, никаких цветов по месту. */
+
+@import '@fontsource/onest/400.css';
+@import '@fontsource/onest/500.css';
+@import '@fontsource/golos-text/400.css';
+@import '@fontsource/golos-text/500.css';
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/jetbrains-mono/400.css';
+
+:root {
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --radius-s: 6px;
+  --radius-m: 8px;
+  --radius-l: 12px;
+  --text-xs: 11px;
+  --text-s: 12px;
+  --text-m: 13px;
+  --text-l: 15px;
+  --text-xl: 18px;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-fast: 120ms;
+}
+
+/* ── Графит: тёмная утилита, янтарный акцент ── */
+:root[data-theme='graphite'] {
+  --font-ui: 'Onest', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+:root[data-theme='graphite'][data-mode='dark'] {
+  --c-bg: #1c1e22;
+  --c-surface: #26292e;
+  --c-hover: #2a2d33;
+  --c-sel: #2f2c24;
+  --c-border: #34373d;
+  --c-text: #e9e6df;
+  --c-muted: #9a978f;
+  --c-accent: #e2a63b;
+  --c-on-accent: #1c1e22;
+  --c-danger: #e0675f;
+}
+:root[data-theme='graphite'][data-mode='light'] {
+  --c-bg: #f4f2ed;
+  --c-surface: #ffffff;
+  --c-hover: #ebe8e1;
+  --c-sel: #f7ead2;
+  --c-border: #dcd8ce;
+  --c-text: #1d1f23;
+  --c-muted: #6b675f;
+  --c-accent: #a8700f;
+  --c-on-accent: #ffffff;
+  --c-danger: #b3362e;
+}
+
+/* ── Бумага: тёплая бумага, чернильный синий ── */
+:root[data-theme='paper'] {
+  --font-ui: 'Golos Text', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+}
+:root[data-theme='paper'][data-mode='light'] {
+  --c-bg: #f3efe6;
+  --c-surface: #fffdf7;
+  --c-hover: #ebe5d8;
+  --c-sel: #fffdf7;
+  --c-border: #d9d3c5;
+  --c-text: #22252b;
+  --c-muted: #6f6a5c;
+  --c-accent: #2d55c8;
+  --c-on-accent: #ffffff;
+  --c-danger: #b3362e;
+}
+:root[data-theme='paper'][data-mode='dark'] {
+  --c-bg: #1e1c18;
+  --c-surface: #28251f;
+  --c-hover: #2e2a23;
+  --c-sel: #262a35;
+  --c-border: #3a352c;
+  --c-text: #ece6d8;
+  --c-muted: #a39b89;
+  --c-accent: #8aa6f2;
+  --c-on-accent: #14161c;
+  --c-danger: #e0756d;
+}
+
+/* ── Сигнал: холодный, мятный акцент ── */
+:root[data-theme='signal'] {
+  --font-ui: 'IBM Plex Sans', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+}
+:root[data-theme='signal'][data-mode='dark'] {
+  --c-bg: #0f1517;
+  --c-surface: #162024;
+  --c-hover: #18252a;
+  --c-sel: #123029;
+  --c-border: #23302f;
+  --c-text: #dce8e6;
+  --c-muted: #7e928f;
+  --c-accent: #46cfa3;
+  --c-on-accent: #0b1513;
+  --c-danger: #e46c64;
+}
+:root[data-theme='signal'][data-mode='light'] {
+  --c-bg: #eef4f3;
+  --c-surface: #ffffff;
+  --c-hover: #e2ecea;
+  --c-sel: #dcf1ea;
+  --c-border: #cfdcd9;
+  --c-text: #10201d;
+  --c-muted: #566a66;
+  --c-accent: #11805f;
+  --c-on-accent: #ffffff;
+  --c-danger: #b3362e;
+}

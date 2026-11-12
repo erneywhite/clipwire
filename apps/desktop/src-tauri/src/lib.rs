@@ -2,6 +2,7 @@
 //! синхронизации из `clipwire-agent`.
 
 mod commands;
+mod popup;
 mod tray;
 
 use std::sync::{Arc, Mutex};
@@ -149,6 +150,7 @@ pub fn run() {
             show_settings(app);
         }))
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -167,6 +169,9 @@ pub fn run() {
             commands::history_clear,
             commands::get_settings,
             commands::save_settings,
+            popup::popup_preview,
+            popup::popup_hide,
+            popup::popup_paste,
         ])
         .setup(|app| {
             let paths = Paths::resolve()?;
@@ -178,7 +183,11 @@ pub fn run() {
                 history: Arc::new(Mutex::new(history)),
                 service: Mutex::new(None),
             });
+            app.manage(popup::PopupState::default());
             spawn_pruner(app.handle().clone());
+            if let Err(e) = popup::register_hotkey(app.handle()) {
+                tracing::warn!("{e}");
+            }
             tray::build(app.handle())?;
 
             let configured = match start_service(app.handle()) {
@@ -197,12 +206,18 @@ pub fn run() {
             }
             Ok(())
         })
-        .on_window_event(|window, event| {
+        .on_window_event(|window, event| match event {
             // Закрытие окна прячет его: приложение живёт в трее до «Выход».
-            if let WindowEvent::CloseRequested { api, .. } = event {
+            WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            // Окно вставки исчезает, как только уходит фокус: как меню.
+            WindowEvent::Focused(false) if window.label() == "popup" => {
+                tracing::debug!("окно вставки потеряло фокус, прячу");
+                let _ = window.hide();
+            }
+            _ => {}
         })
         .build(tauri::generate_context!())
         .expect("приложение не собралось")
