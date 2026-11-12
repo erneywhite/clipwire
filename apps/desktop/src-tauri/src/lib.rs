@@ -271,8 +271,6 @@ pub fn run() {
             popup::popup_hide,
             popup::popup_paste,
             popup::popup_paste_text,
-            popup::popup_demo,
-            popup::popup_demo_end,
             commands::history_update,
         ])
         .setup(|app| {
@@ -327,13 +325,7 @@ pub fn run() {
                 let _ = window.hide();
             }
             // Окно вставки исчезает, как только уходит фокус: как меню.
-            WindowEvent::Focused(false)
-                if window.label() == "popup"
-                    && !window
-                        .state::<popup::PopupState>()
-                        .demo
-                        .load(std::sync::atomic::Ordering::Relaxed) =>
-            {
+            WindowEvent::Focused(false) if window.label() == "popup" => {
                 tracing::debug!("окно вставки потеряло фокус, прячу");
                 let _ = window.hide();
             }

@@ -4,6 +4,7 @@
   import { api, type Entry, type Settings } from '../lib/api'
   import { applyTheme } from '../lib/theme'
   import { ago, isUrl, looksLikeCode, sizeLabel } from '../lib/format'
+  import EntryRow from '../lib/EntryRow.svelte'
 
   let query = $state('')
   let tab = $state<'all' | 'pinned'>('all')
@@ -167,10 +168,6 @@
       listen('clipwire://history-changed', () => load()),
       listen<Settings>('clipwire://settings-changed', (e) => applySettings(e.payload)),
       // Живое превью размера из настроек: ширина списка меняется вместе с окном.
-      // Живое превью размера: только ширина списка, без перезагрузки — это вызывается часто.
-      listen<number>('popup://demo-size', (e) => {
-        document.documentElement.style.setProperty('--popup-w', `${e.payload}px`)
-      }),
       listen('popup://opened', async () => {
         query = ''
         sel = 0
@@ -226,33 +223,7 @@
     {:else}
       <ul class="list" bind:this={listEl} role="listbox" aria-label="История буфера">
         {#each items as item, i (item.id)}
-          <li
-            data-i={i}
-            role="option"
-            aria-selected={i === sel}
-            class:sel={i === sel}
-            onclick={() => (sel = i)}
-            ondblclick={() => paste(item)}
-            onkeydown={() => {}}
-          >
-            <span class="glyph" aria-hidden="true">
-              {#if isUrl(item.text)}
-                <svg viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1" /><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" /></svg>
-              {:else if looksLikeCode(item.text)}
-                <svg viewBox="0 0 24 24"><path d="m8 8-4 4 4 4M16 8l4 4-4 4" /></svg>
-              {:else}
-                <svg viewBox="0 0 24 24"><path d="M5 7h14M5 12h14M5 17h9" /></svg>
-              {/if}
-            </span>
-            <span class="body">
-              <span class="text" class:mono={looksLikeCode(item.text)}>{item.text}</span>
-              <span class="meta">
-                {item.local ? 'Это устройство' : item.device_name || 'Другое устройство'} · {ago(item.seen_ms)} · {sizeLabel(item.chars, item.lines)}
-              </span>
-            </span>
-            {#if i < 9}<kbd class="num">{i + 1}</kbd>{/if}
-            {#if item.pinned}<span class="pin" aria-label="Закреплено">●</span>{/if}
-          </li>
+          <EntryRow {item} index={i} selected={i === sel} onselect={() => (sel = i)} onpaste={() => paste(item)} />
         {/each}
       </ul>
     {/if}
@@ -379,57 +350,6 @@
     overflow-y: auto;
     flex: 1;
   }
-  .list li {
-    display: grid;
-    grid-template-columns: 22px minmax(0, 1fr) auto;
-    gap: var(--space-2);
-    align-items: start;
-    padding: 7px var(--space-2);
-    border-radius: var(--radius-m);
-    cursor: default;
-    position: relative;
-  }
-  .list li:hover {
-    background: var(--c-hover);
-  }
-  .list li.sel {
-    background: var(--c-sel);
-    box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--c-accent) 55%, transparent);
-  }
-  .glyph svg {
-    width: 18px;
-    height: 18px;
-    margin-top: 1px;
-    fill: none;
-    stroke: var(--c-muted);
-    stroke-width: 1.8;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-  }
-  .sel .glyph svg {
-    stroke: var(--c-accent);
-  }
-  .body {
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-  .text {
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-    overflow-wrap: anywhere;
-    white-space: pre-line;
-  }
-  .text.mono,
-  .editor.mono {
-    font-family: var(--font-mono);
-    font-size: var(--text-s);
-  }
-  .meta,
   .preview-meta {
     font-family: var(--font-mono);
     font-size: var(--text-xs);
@@ -438,23 +358,9 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .num {
+  .editor.mono {
     font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    color: var(--c-muted);
-    opacity: 0;
-    margin-top: 2px;
-  }
-  .list li.sel .num,
-  .list li:hover .num {
-    opacity: 1;
-  }
-  .pin {
-    position: absolute;
-    left: 4px;
-    top: 6px;
-    font-size: 7px;
-    color: var(--c-accent);
+    font-size: var(--text-s);
   }
   .empty {
     flex: 1;

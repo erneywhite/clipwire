@@ -29,7 +29,7 @@ export interface DeviceInfo {
 
 export interface Entry {
   id: string
-  kind: 'text' | 'other'
+  kind: 'text' | 'image' | 'other'
   text: string
   chars: number
   lines: number
@@ -66,8 +66,6 @@ export const api = {
   update: (id: string, text: string) => invoke<void>('history_update', { id, text }),
   preview: (open: boolean) => invoke<'left' | 'right'>('popup_preview', { open }),
   hidePopup: () => invoke<void>('popup_hide'),
-  popupDemo: (width: number, height: number) => invoke<void>('popup_demo', { width, height }),
-  popupDemoEnd: () => invoke<void>('popup_demo_end'),
   leaveGroup: () => invoke<void>('leave_group'),
   deviceInfo: () => invoke<DeviceInfo>('device_info'),
   copyQuietly: (text: string) => invoke<void>('copy_quietly', { text }),

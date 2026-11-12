@@ -9,6 +9,7 @@
   import { applyTheme } from '../lib/theme'
   import { fromEvent, label as hotkeyLabel } from '../lib/hotkey'
   import Toggle from './Toggle.svelte'
+  import PopupMock from './PopupMock.svelte'
 
   type Section = 'general' | 'sync' | 'privacy' | 'keys' | 'about'
   const sections: { id: Section; title: string; icon: string }[] = [
@@ -168,45 +169,12 @@
     return Math.round(((w - SIZE.w0) / (SIZE.w1 - SIZE.w0)) * 100)
   }
 
-  // Живое превью: показывается при наведении на блок, размер меняется не чаще
-  // одного раза за кадр, и в работе всегда только один запрос — последнее значение побеждает.
   let demoSize = $state({ w: 0, h: 0 })
-  let demoPending: { w: number; h: number } | null = null
-  let demoBusy = false
-  let demoVisible = false
-
-  async function demoFlush() {
-    if (demoBusy || !demoPending) return
-    demoBusy = true
-    const next = demoPending
-    demoPending = null
-    try {
-      await api.popupDemo(next.w, next.h)
-    } finally {
-      demoBusy = false
-      if (demoPending) requestAnimationFrame(demoFlush)
-    }
-  }
-
-  function demoShow(w: number, h: number) {
-    demoVisible = true
-    demoSize = { w, h }
-    demoPending = { w, h }
-    requestAnimationFrame(demoFlush)
-  }
-
-  function demoResize(v: number) {
-    demoSize = valueToSize(v)
-    if (!demoVisible) return
-    demoPending = demoSize
-    requestAnimationFrame(demoFlush)
-  }
-
-  function demoHide() {
-    demoVisible = false
-    demoPending = null
-    api.popupDemoEnd()
-  }
+  // Экран в логических пикселях — для уменьшенной схемы «экран и окно на нём».
+  const screenW = window.screen.width || 1920
+  const screenH = window.screen.height || 1080
+  // Превью окна вписывается в 300 px по высоте, крупнее не помещается в настройки.
+  const mockScale = $derived(Math.min(1, 300 / Math.max(1, demoSize.h)))
 
   function addApp() {
     const name = newApp.trim()
@@ -475,30 +443,39 @@
         </div>
 
         <h2>Размер окна вставки</h2>
-        <div
-          class="card pad"
-          role="group"
-          aria-label="Размер окна вставки"
-          onmouseenter={() => demoShow(s!.popup_width, s!.popup_height)}
-          onmouseleave={demoHide}
-        >
+        <div class="card pad">
           <input
             type="range"
             min="0"
             max="100"
             step="1"
             value={sizeToValue(s.popup_width)}
-            oninput={(e) => demoResize(Number(e.currentTarget.value))}
+            oninput={(e) => (demoSize = valueToSize(Number(e.currentTarget.value)))}
             onchange={(e) => {
               const { w, h } = valueToSize(Number(e.currentTarget.value))
               save({ popup_width: w, popup_height: h })
             }}
-            onfocus={() => demoShow(s!.popup_width, s!.popup_height)}
-            onblur={demoHide}
             aria-label="Размер окна вставки"
           />
           <div class="ticks"><span>Компактное</span><span>{demoSize.w} × {demoSize.h}</span><span>Просторное</span></div>
-          <p class="hint">Пока курсор над этим блоком, рядом показано настоящее окно вставки выбранного размера.</p>
+          <div class="size-preview">
+            <div class="screen" style:aspect-ratio="{screenW} / {screenH}" title="Ваш экран в масштабе">
+              <div
+                class="screen-popup"
+                style:width="{(demoSize.w / screenW) * 100}%"
+                style:height="{(demoSize.h / screenH) * 100}%"
+              ></div>
+              <span class="cursor" aria-hidden="true"></span>
+            </div>
+            <div class="mock-wrap" style:height="{demoSize.h * mockScale}px" style:width="{demoSize.w * mockScale}px">
+              <div class="mock" style:transform="scale({mockScale})">
+                <PopupMock width={demoSize.w} height={demoSize.h} />
+              </div>
+            </div>
+          </div>
+          <p class="hint">
+            Слева — ваш экран и окно вставки в настоящей пропорции. Справа — как оно выглядит{mockScale < 1 ? `, в масштабе ${Math.round(mockScale * 100)}%` : ''}.
+          </p>
         </div>
 
         <h2>В окне вставки</h2>
@@ -840,6 +817,42 @@
   }
   .ticks .on {
     color: var(--c-text);
+  }
+  .size-preview {
+    display: flex;
+    gap: var(--space-4);
+    align-items: flex-start;
+  }
+  .screen {
+    position: relative;
+    flex: 0 0 150px;
+    border: 1px solid var(--c-border);
+    border-radius: var(--radius-s);
+    background: var(--c-bg);
+  }
+  .screen-popup {
+    position: absolute;
+    left: 40%;
+    top: 30%;
+    border-radius: 2px;
+    background: color-mix(in oklch, var(--c-accent) 30%, transparent);
+    border: 1px solid var(--c-accent);
+  }
+  .cursor {
+    position: absolute;
+    left: calc(40% - 4px);
+    top: calc(30% - 4px);
+    width: 0;
+    height: 0;
+    border-left: 4px solid var(--c-text);
+    border-bottom: 4px solid transparent;
+  }
+  .mock-wrap {
+    flex: none;
+    overflow: hidden;
+  }
+  .mock {
+    transform-origin: 0 0;
   }
   .apps {
     list-style: none;

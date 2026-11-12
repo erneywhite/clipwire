@@ -20,8 +20,6 @@ pub struct PopupState {
     prev_window: Mutex<isize>,
     /// Где окно стоит без предпросмотра (физические пиксели) и куда раскрыт предпросмотр.
     base: Mutex<Option<Base>>,
-    /// Окно показано как превью размера из настроек: по потере фокуса не прятать.
-    pub demo: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -82,9 +80,6 @@ pub fn hide(app: &AppHandle) {
 pub fn show(app: &AppHandle) {
     let Some(w) = window(app) else { return };
     let state = app.state::<PopupState>();
-    state
-        .demo
-        .store(false, std::sync::atomic::Ordering::Relaxed);
 
     #[cfg(windows)]
     {
@@ -333,70 +328,4 @@ mod win {
         ];
         unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     }
-}
-
-/// Показать окно вставки рядом с окном настроек в заданном размере — живое
-/// превью для ползунка размера. Фокус не забирает, поэтому по потере фокуса
-/// не прячется; прячет `popup_demo_end`.
-#[tauri::command]
-pub fn popup_demo(app: AppHandle, width: f64, height: f64) {
-    let (Some(popup), Some(settings)) = (window(&app), app.get_webview_window("settings")) else {
-        return;
-    };
-    let Ok(pos) = settings.outer_position() else {
-        return;
-    };
-    let Ok(size) = settings.outer_size() else {
-        return;
-    };
-    let monitor = settings.current_monitor().ok().flatten();
-    let scale = monitor.as_ref().map(|m| m.scale_factor()).unwrap_or(1.0);
-    let (w, h) = ((width * scale) as i32, (height * scale) as i32);
-    let gap = (GAP * 2.0 * scale) as i32;
-    let (ax, ay, aw, ah) = monitor
-        .as_ref()
-        .map(|m| {
-            let a = m.work_area();
-            (
-                a.position.x,
-                a.position.y,
-                a.size.width as i32,
-                a.size.height as i32,
-            )
-        })
-        .unwrap_or((0, 0, i32::MAX / 2, i32::MAX / 2));
-    // Справа от настроек, если влезает, иначе слева.
-    let right = pos.x + size.width as i32 + gap;
-    let x = if right + w <= ax + aw {
-        right
-    } else {
-        (pos.x - gap - w).max(ax)
-    };
-    let y = pos.y.clamp(ay, (ay + ah - h).max(ay));
-    app.state::<PopupState>()
-        .demo
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = popup.set_size(PhysicalSize::new(w as u32, h as u32));
-    let _ = popup.set_position(PhysicalPosition::new(x, y));
-    if !popup.is_visible().unwrap_or(false) {
-        let protect = app
-            .state::<AppState>()
-            .settings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .hide_from_capture;
-        let _ = popup.set_content_protected(protect);
-        let _ = popup.show();
-        // Вернуть фокус настройкам: иначе ползунок отпустит мышь.
-        let _ = settings.set_focus();
-    }
-    let _ = app.emit_to("popup", "popup://demo-size", width);
-}
-
-#[tauri::command]
-pub fn popup_demo_end(app: AppHandle) {
-    app.state::<PopupState>()
-        .demo
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    hide(&app);
 }
