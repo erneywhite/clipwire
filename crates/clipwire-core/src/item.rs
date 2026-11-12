@@ -15,6 +15,23 @@ impl ItemId {
         Self(Uuid::now_v7())
     }
 
+    /// Id с заданным временем: для элементов истории, скопированных раньше,
+    /// чтобы на сервере и у других устройств они встали на своё место по времени.
+    pub fn at_ms(ms: u64) -> Self {
+        let ts = uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            ms / 1000,
+            ((ms % 1000) * 1_000_000) as u32,
+        );
+        Self(Uuid::new_v7(ts))
+    }
+
+    /// Время из UUID v7, мс Unix.
+    pub fn ms(&self) -> Option<u64> {
+        let (s, ns) = self.0.get_timestamp()?.to_unix();
+        Some(s * 1000 + u64::from(ns) / 1_000_000)
+    }
+
     pub fn as_bytes(&self) -> &[u8; 16] {
         self.0.as_bytes()
     }
@@ -122,6 +139,18 @@ impl Item {
         self.device_name = name.into();
         self
     }
+
+    /// Элемент, скопированный раньше (`ms` — когда), например из локальной
+    /// истории при подключении к группе.
+    pub fn backdated(origin: DeviceId, content: Content, ms: u64) -> Self {
+        Self {
+            id: ItemId::at_ms(ms),
+            origin,
+            device_name: String::new(),
+            created_at_ms: ms,
+            content,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -133,6 +162,15 @@ mod tests {
         let a = ItemId::new();
         let b = ItemId::new();
         assert!(a < b);
+    }
+
+    #[test]
+    fn backdated_ids_keep_time_and_order() {
+        let ms = 1_763_000_000_123;
+        let old = ItemId::at_ms(ms);
+        assert_eq!(old.ms(), Some(ms));
+        assert!(old < ItemId::new());
+        assert!(ItemId::at_ms(ms - 1) < old);
     }
 
     #[test]

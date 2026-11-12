@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{ALPN, ClientMsg, ServerMsg};
-use clipwire_core::{Content, DeviceId, GroupKey, Item, ServerInfo};
+use clipwire_core::{Content, DeviceId, GroupKey, Item, SealedItem, ServerInfo};
 use clipwire_server::Config;
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
@@ -49,7 +49,8 @@ impl Client {
         })
     }
 
-    async fn join(&mut self, key: &GroupKey) -> Result<ServerMsg> {
+    /// Войти и дочитать историю группы.
+    async fn join(&mut self, key: &GroupKey) -> Result<Vec<(SealedItem, bool)>> {
         write_msg(
             &mut self.send,
             &ClientMsg::Join {
@@ -58,7 +59,18 @@ impl Client {
             },
         )
         .await?;
-        self.next().await
+        match self.next().await? {
+            ServerMsg::Joined => {}
+            other => anyhow::bail!("ждали Joined, пришло {other:?}"),
+        }
+        let mut history = Vec::new();
+        loop {
+            match self.next().await? {
+                ServerMsg::History { item, backfill } => history.push((item, backfill)),
+                ServerMsg::HistoryEnd => return Ok(history),
+                other => anyhow::bail!("ждали историю, пришло {other:?}"),
+            }
+        }
     }
 
     async fn next(&mut self) -> Result<ServerMsg> {
@@ -104,8 +116,8 @@ async fn sync_between_devices() -> Result<()> {
 
     let mut a = Client::connect(&info, &relay, "test-token").await?;
     let mut b = Client::connect(&info, &relay, "test-token").await?;
-    assert_eq!(a.join(&key).await?, ServerMsg::Joined { history: vec![] });
-    assert_eq!(b.join(&key).await?, ServerMsg::Joined { history: vec![] });
+    assert!(a.join(&key).await?.is_empty());
+    assert!(b.join(&key).await?.is_empty());
 
     // A копирует — B получает и расшифровывает.
     let sent = a.push_text(&key, "пароль от wifi").await?;
@@ -124,15 +136,26 @@ async fn sync_between_devices() -> Result<()> {
         .is_err()
     );
 
-    // Устройство, подключившееся позже, получает историю.
-    let mut c = Client::connect(&info, &relay, "test-token").await?;
-    match c.join(&key).await? {
-        ServerMsg::Joined { history } => {
-            assert_eq!(history.len(), 1);
-            assert_eq!(key.open(&history[0])?, sent);
-        }
-        other => panic!("ждали Joined, пришло {other:?}"),
+    // Старый элемент из локальной истории A: B получает его как Backfill.
+    let old = Item::backdated(
+        a.device,
+        Content::Text("скопировано без группы".into()),
+        1_000,
+    );
+    write_msg(&mut a.send, &ClientMsg::Backfill(key.seal(&old)?)).await?;
+    match b.next().await? {
+        ServerMsg::Backfill(sealed) => assert_eq!(key.open(&sealed)?, old),
+        other => panic!("ждали Backfill, пришло {other:?}"),
     }
+
+    // Устройство, подключившееся позже, получает историю по времени и с пометками.
+    let mut c = Client::connect(&info, &relay, "test-token").await?;
+    let history = c.join(&key).await?;
+    assert_eq!(history.len(), 2);
+    assert_eq!(key.open(&history[0].0)?, old);
+    assert!(history[0].1);
+    assert_eq!(key.open(&history[1].0)?, sent);
+    assert!(!history[1].1);
 
     // Чужой секрет к существующей группе не пускают.
     let mut evil = Client::connect(&info, &relay, "test-token").await?;

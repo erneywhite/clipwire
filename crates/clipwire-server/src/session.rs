@@ -1,4 +1,4 @@
-//! Обработка одного подключения агента по ALPN `clipwire/1`.
+//! Обработка одного подключения агента по ALPN `clipwire/2`.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{ClientMsg, ServerMsg};
-use clipwire_core::{DeviceId, GroupId};
+use clipwire_core::{DeviceId, GroupId, SealedItem};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::sync::mpsc;
@@ -91,8 +91,13 @@ async fn serve(shared: &Shared, conn: &Connection) -> Result<()> {
         outcome => tracing::info!(group = %short(&group), ?outcome, "вход в группу"),
     }
 
+    // История по одному элементу: картинки вместе не влезут в один кадр.
     let history = shared.store.history(&group, shared.not_before_ms())?;
-    write_msg(&mut send, &ServerMsg::Joined { history }).await?;
+    write_msg(&mut send, &ServerMsg::Joined).await?;
+    for (item, backfill) in history {
+        write_msg(&mut send, &ServerMsg::History { item, backfill }).await?;
+    }
+    write_msg(&mut send, &ServerMsg::HistoryEnd).await?;
 
     let (tx, mut rx) = mpsc::channel(QUEUE);
     let reg = shared.hub.register(group, tx);
@@ -102,21 +107,8 @@ async fn serve(shared: &Shared, conn: &Connection) -> Result<()> {
             msg = read_msg::<_, ClientMsg>(&mut recv) => {
                 match msg? {
                     None => return Ok(()),
-                    Some(ClientMsg::Push(item)) => {
-                        if item.origin != device {
-                            bail!("origin элемента не совпадает с устройством");
-                        }
-                        if item.ciphertext.len() > shared.limits.max_item_bytes {
-                            // Не рвём соединение: агент мог просто скопировать большой текст.
-                            tracing::warn!(len = item.ciphertext.len(), "элемент больше лимита, отброшен");
-                            continue;
-                        }
-                        let fresh = shared.store.push(&group, &item, now_ms(), shared.limits.history_len)?;
-                        if fresh {
-                            let n = shared.hub.broadcast(&group, reg.id, &ServerMsg::Deliver(item));
-                            tracing::debug!(receivers = n, "элемент разослан");
-                        }
-                    }
+                    Some(ClientMsg::Push(item)) => accept(shared, &group, device, reg.id, item, false)?,
+                    Some(ClientMsg::Backfill(item)) => accept(shared, &group, device, reg.id, item, true)?,
                     Some(ClientMsg::Join { .. }) => bail!("повторный Join"),
                 }
             }
@@ -127,6 +119,41 @@ async fn serve(shared: &Shared, conn: &Connection) -> Result<()> {
             }
         }
     }
+}
+
+/// Принять элемент от устройства: сохранить и разослать остальным в группе.
+fn accept(
+    shared: &Shared,
+    group: &GroupId,
+    device: DeviceId,
+    conn_id: u64,
+    item: SealedItem,
+    backfill: bool,
+) -> Result<()> {
+    if item.origin != device {
+        bail!("origin элемента не совпадает с устройством");
+    }
+    if item.ciphertext.len() > shared.limits.max_item_bytes {
+        // Не рвём соединение: агент мог просто скопировать большой текст.
+        tracing::warn!(
+            len = item.ciphertext.len(),
+            "элемент больше лимита, отброшен"
+        );
+        return Ok(());
+    }
+    let fresh = shared
+        .store
+        .push(group, &item, now_ms(), shared.limits.history_len, backfill)?;
+    if fresh {
+        let msg = if backfill {
+            ServerMsg::Backfill(item)
+        } else {
+            ServerMsg::Deliver(item)
+        };
+        let n = shared.hub.broadcast(group, conn_id, &msg);
+        tracing::debug!(receivers = n, backfill, "элемент разослан");
+    }
+    Ok(())
 }
 
 /// Отправляет ошибку и закрывает поток. Если сразу вернуться из обработчика,

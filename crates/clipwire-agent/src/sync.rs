@@ -35,6 +35,9 @@ pub enum Event {
     Status(Status),
     /// Элемент с другого устройства, его надо положить в буфер.
     Incoming(Item),
+    /// Элементы только для истории, в буфер не класть: пропущенное, пока
+    /// устройство было не на связи, и чужая локальная история.
+    History(Vec<Item>),
     /// Агент увидел элемент с этим id; сохранить, чтобы после перезапуска не
     /// применять старое повторно.
     Cursor(ItemId),
@@ -54,6 +57,9 @@ pub struct Engine {
     /// Сессия успела войти в группу. После такого обрыва переподключаемся
     /// быстро, а не с накопленной паузой.
     went_online: bool,
+    /// Локальная история, которую надо отправить в группу (устройство только
+    /// что подключилось): содержимое и когда скопировано, от старых к новым.
+    backfill: Vec<(Content, u64)>,
 }
 
 impl Engine {
@@ -73,7 +79,14 @@ impl Engine {
             events,
             notify,
             went_online: false,
+            backfill: Vec::new(),
         }
+    }
+
+    /// Отправить в группу эту локальную историю после входа.
+    pub fn with_backfill(mut self, items: Vec<(Content, u64)>) -> Self {
+        self.backfill = items;
+        self
     }
 
     pub fn device(&self) -> DeviceId {
@@ -173,11 +186,27 @@ impl Engine {
             .await
             .context("сервер не ответил на вход")??
         {
-            Some(ServerMsg::Joined { history }) => self.apply_history(history),
+            Some(ServerMsg::Joined) => {}
             Some(ServerMsg::Error(e)) => bail!("сервер отказал: {e}"),
             Some(other) => bail!("неожиданный ответ сервера: {other:?}"),
             None => bail!("сервер закрыл соединение"),
         }
+        // История идёт по элементу; таймаут на каждый, а не на всю: с
+        // картинками она может качаться дольше CONNECT_TIMEOUT.
+        let mut history = Vec::new();
+        loop {
+            match tokio::time::timeout(CONNECT_TIMEOUT, read_msg(&mut recv))
+                .await
+                .context("сервер не дослал историю")??
+            {
+                Some(ServerMsg::History { item, backfill }) => history.push((item, backfill)),
+                Some(ServerMsg::HistoryEnd) => break,
+                Some(ServerMsg::Error(e)) => bail!("сервер: {e}"),
+                Some(other) => bail!("неожиданное сообщение в истории: {other:?}"),
+                None => bail!("сервер закрыл соединение"),
+            }
+        }
+        self.apply_history(history);
         self.went_online = true;
         self.emit(Event::Status(Status::Online));
         tracing::info!("на связи с сервером");
@@ -185,6 +214,7 @@ impl Engine {
         if let Some(c) = pending.take() {
             self.push(&mut send, c).await?;
         }
+        self.send_backfill(&mut send).await?;
 
         loop {
             tokio::select! {
@@ -209,6 +239,15 @@ impl Engine {
                             Err(e) => tracing::warn!("элемент не расшифровался, пропускаю: {e}"),
                         }
                     }
+                    Some(ServerMsg::Backfill(sealed)) => {
+                        if sealed.origin == self.device {
+                            continue;
+                        }
+                        match key.open(&sealed) {
+                            Ok(item) => self.emit(Event::History(vec![item])),
+                            Err(e) => tracing::warn!("элемент не расшифровался, пропускаю: {e}"),
+                        }
+                    }
                     Some(ServerMsg::Error(e)) => bail!("сервер: {e}"),
                     Some(other) => tracing::debug!("пропускаю {other:?}"),
                     None => bail!("сервер закрыл соединение"),
@@ -217,28 +256,55 @@ impl Engine {
         }
     }
 
-    /// Из истории применяем только самый свежий чужой элемент, который ещё не
-    /// видели. При первом запуске (курсора нет) ничего не применяем, только
-    /// запоминаем позицию — иначе установка агента перезатёрла бы буфер.
-    fn apply_history(&mut self, history: Vec<clipwire_core::SealedItem>) {
-        let Some(last) = history.last() else { return };
-        let Some(cursor) = self.cursor else {
-            self.set_cursor(last.id);
-            return;
-        };
-        let newest = history
-            .iter()
-            .rev()
-            .find(|s| s.id > cursor && s.origin != self.device);
-        if let Some(sealed) = newest {
-            match self.state.invite.group_key.open(sealed) {
-                Ok(item) => self.accept(item),
+    /// История группы при входе. В буфер идёт только самый свежий чужой
+    /// элемент, которого ещё не видели, и только если курсор уже есть: при
+    /// первом входе буфер не перезатираем. Остальное новое — в историю.
+    fn apply_history(&mut self, history: Vec<(clipwire_core::SealedItem, bool)>) {
+        let plan = plan_history(&history, self.cursor, self.device);
+        let key = self.state.invite.group_key.clone();
+        let mut items = Vec::new();
+        let mut current = None;
+        for (i, (sealed, _)) in history.iter().enumerate() {
+            if !plan.history.contains(&i) && plan.current != Some(i) {
+                continue;
+            }
+            match key.open(sealed) {
+                Ok(item) if plan.current == Some(i) => current = Some(item),
+                Ok(item) => items.push(item),
                 Err(e) => tracing::warn!("элемент из истории не расшифровался: {e}"),
             }
         }
-        if last.id > cursor {
-            self.set_cursor(last.id);
+        if !items.is_empty() {
+            self.emit(Event::History(items));
         }
+        if let Some(item) = current {
+            self.accept(item);
+        }
+        if let Some(max) = history.iter().map(|(s, _)| s.id).max() {
+            self.set_cursor(max);
+        }
+    }
+
+    /// Отправить локальную историю в группу. Отправленное убирается из очереди
+    /// сразу, так что после обрыва досылается только остаток.
+    async fn send_backfill(&mut self, send: &mut iroh::endpoint::SendStream) -> Result<()> {
+        if self.backfill.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            n = self.backfill.len(),
+            "отправляю локальную историю в группу"
+        );
+        while let Some((content, ms)) = self.backfill.first().cloned() {
+            if content.len() <= MAX_ITEM_BYTES {
+                let item = Item::backdated(self.device, content, ms)
+                    .with_device_name(self.device_name.clone());
+                let sealed = self.state.invite.group_key.seal(&item)?;
+                write_msg(send, &ClientMsg::Backfill(sealed)).await?;
+            }
+            self.backfill.remove(0);
+        }
+        Ok(())
     }
 
     fn accept(&mut self, item: Item) {
@@ -268,6 +334,41 @@ impl Engine {
     }
 }
 
+/// Что сделать с историей группы при входе: индексы элементов для истории и
+/// индекс элемента для буфера.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HistoryPlan {
+    history: Vec<usize>,
+    current: Option<usize>,
+}
+
+fn plan_history(
+    history: &[(clipwire_core::SealedItem, bool)],
+    cursor: Option<ItemId>,
+    me: DeviceId,
+) -> HistoryPlan {
+    let mut plan = HistoryPlan::default();
+    // В буфер — самый свежий обычный элемент новее курсора (не первый вход).
+    if let Some(c) = cursor {
+        plan.current = history
+            .iter()
+            .rposition(|(s, backfill)| !backfill && s.id > c && s.origin != me);
+    }
+    for (i, (s, backfill)) in history.iter().enumerate() {
+        if s.origin == me || plan.current == Some(i) {
+            continue;
+        }
+        // Обычные элементы не новее курсора уже были у нас. Чужую локальную
+        // историю берём всегда: её id старые, курсор про неё ничего не говорит,
+        // а повтор отсеет история по содержимому.
+        let seen = !backfill && cursor.is_some_and(|c| s.id <= c);
+        if !seen {
+            plan.history.push(i);
+        }
+    }
+    plan
+}
+
 /// Ждёт, пока relay откажет в доступе, и возвращает причину.
 async fn relay_denied(ep: &Endpoint) -> String {
     let mut w = ep.home_relay_status();
@@ -293,4 +394,57 @@ fn relay_hint(ep: &Endpoint) -> String {
         .iter()
         .find_map(|s| s.last_error().map(|e| format!(" (relay: {e})")))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clipwire_core::{GroupKey, SealedItem};
+
+    fn sealed(origin: u8, ms: u64) -> SealedItem {
+        GroupKey([1; 32])
+            .seal(&Item::backdated(
+                DeviceId([origin; 32]),
+                Content::Text(ms.to_string()),
+                ms,
+            ))
+            .unwrap()
+    }
+
+    #[test]
+    fn first_join_takes_everything_into_history_but_not_clipboard() {
+        let h = vec![
+            (sealed(2, 10), false),
+            (sealed(2, 20), true),
+            (sealed(1, 30), false),
+        ];
+        let plan = plan_history(&h, None, DeviceId([1; 32]));
+        assert_eq!(
+            plan,
+            HistoryPlan {
+                history: vec![0, 1],
+                current: None
+            }
+        );
+    }
+
+    #[test]
+    fn rejoin_applies_newest_unseen_and_keeps_backfill() {
+        let h = vec![
+            (sealed(2, 10), false), // уже видели
+            (sealed(3, 15), true),  // чужая локальная история — старая, но берём
+            (sealed(2, 30), false), // пропущено
+            (sealed(2, 40), false), // самое свежее — в буфер
+            (sealed(3, 50), true),  // локальная история в буфер не идёт
+        ];
+        let cursor = Some(h[0].0.id);
+        let plan = plan_history(&h, cursor, DeviceId([1; 32]));
+        assert_eq!(
+            plan,
+            HistoryPlan {
+                history: vec![1, 2, 4],
+                current: Some(3)
+            }
+        );
+    }
 }

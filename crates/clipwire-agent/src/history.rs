@@ -231,6 +231,26 @@ impl History {
         Ok(())
     }
 
+    /// Влить элемент из чужой истории: если такое содержимое уже есть, ничего
+    /// не меняется; иначе запись встаёт на своё место по времени, а не наверх.
+    /// Возвращает `true`, если добавилось.
+    pub fn merge(&mut self, entry: Entry) -> Result<bool> {
+        let hash = entry.content.hash();
+        if self.by_hash.contains_key(&hash) || self.get(entry.id).is_some() {
+            return Ok(false);
+        }
+        self.write(&entry)?;
+        self.store_thumb(&entry);
+        self.by_hash.insert(hash, entry.id);
+        let pos = self
+            .entries
+            .iter()
+            .position(|e| e.seen_ms < entry.seen_ms)
+            .unwrap_or(self.entries.len());
+        self.entries.insert(pos, entry);
+        Ok(true)
+    }
+
     pub fn get(&self, id: ItemId) -> Option<&Entry> {
         self.entries.iter().find(|e| e.id == id)
     }
@@ -387,6 +407,23 @@ mod tests {
         text(&mut h, "a", 3);
         assert_eq!(texts(h.list("", false, 10)), ["a", "b"]);
         assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn merge_places_by_time_and_skips_known_content() {
+        let mut h = History::in_memory();
+        text(&mut h, "старое", 10);
+        text(&mut h, "новое", 30);
+        let mut e = local_entry(DeviceId([2; 32]), "Mac", Content::Text("с мака".into()));
+        e.seen_ms = 20;
+        e.local = false;
+        assert!(h.merge(e).unwrap());
+        assert_eq!(texts(h.list("", false, 10)), ["новое", "с мака", "старое"]);
+        // То же содержимое не дублируется и не поднимается.
+        let mut dup = local_entry(DeviceId([2; 32]), "Mac", Content::Text("старое".into()));
+        dup.seen_ms = 99;
+        assert!(!h.merge(dup).unwrap());
+        assert_eq!(texts(h.list("", false, 10)), ["новое", "с мака", "старое"]);
     }
 
     #[test]

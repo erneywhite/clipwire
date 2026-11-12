@@ -65,6 +65,15 @@ impl Store {
                  PRIMARY KEY (group_id, item_id)
              );",
         )?;
+        // Пометка «из локальной истории» появилась в протоколе clipwire/2.
+        let has_backfill: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('items') WHERE name = 'backfill'")?
+            .exists([])?;
+        if !has_backfill {
+            conn.execute_batch(
+                "ALTER TABLE items ADD COLUMN backfill INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -115,26 +124,28 @@ impl Store {
 
     /// Сохраняет элемент и обрезает историю группы до `keep` последних.
     /// Повторная отправка того же `id` игнорируется. Возвращает `false`, если
-    /// элемент уже был.
+    /// элемент уже был. `backfill` — элемент из локальной истории устройства.
     pub fn push(
         &self,
         group: &GroupId,
         item: &SealedItem,
         now_ms: i64,
         keep: usize,
+        backfill: bool,
     ) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO items (group_id, item_id, origin, nonce, ciphertext, received_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR IGNORE INTO items (group_id, item_id, origin, nonce, ciphertext, received_ms, backfill)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 &group.0[..],
                 &item.id.as_bytes()[..],
                 &item.origin.0[..],
                 &item.nonce[..],
                 &item.ciphertext,
-                now_ms
+                now_ms,
+                backfill
             ],
         )?;
         // UUID v7 в виде BLOB сортируется по времени, поэтому старые элементы
@@ -150,10 +161,11 @@ impl Store {
     }
 
     /// История группы от старых к новым, без просроченных элементов.
-    pub fn history(&self, group: &GroupId, not_before_ms: i64) -> Result<Vec<SealedItem>> {
+    /// Второе в паре — элемент из локальной истории (`backfill`).
+    pub fn history(&self, group: &GroupId, not_before_ms: i64) -> Result<Vec<(SealedItem, bool)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT item_id, origin, nonce, ciphertext FROM items
+            "SELECT item_id, origin, nonce, ciphertext, backfill FROM items
              WHERE group_id = ?1 AND received_ms >= ?2 ORDER BY item_id ASC",
         )?;
         let rows = stmt.query_map(params![&group.0[..], not_before_ms], |r| {
@@ -162,17 +174,21 @@ impl Store {
                 r.get::<_, Vec<u8>>(1)?,
                 r.get::<_, Vec<u8>>(2)?,
                 r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, bool>(4)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, origin, nonce, ciphertext) = row?;
-            out.push(SealedItem {
-                id: ItemId(Uuid::from_slice(&id).context("битый item_id в базе")?),
-                origin: DeviceId(origin.try_into().ok().context("битый origin в базе")?),
-                nonce: nonce.try_into().ok().context("битый nonce в базе")?,
-                ciphertext,
-            });
+            let (id, origin, nonce, ciphertext, backfill) = row?;
+            out.push((
+                SealedItem {
+                    id: ItemId(Uuid::from_slice(&id).context("битый item_id в базе")?),
+                    origin: DeviceId(origin.try_into().ok().context("битый origin в базе")?),
+                    nonce: nonce.try_into().ok().context("битый nonce в базе")?,
+                    ciphertext,
+                },
+                backfill,
+            ));
         }
         Ok(out)
     }
@@ -247,10 +263,15 @@ mod tests {
             .unwrap();
         let items: Vec<_> = (0..5).map(|i| sealed(&key, &format!("t{i}"))).collect();
         for it in &items {
-            assert!(s.push(&g, it, 10, 3).unwrap());
+            assert!(s.push(&g, it, 10, 3, false).unwrap());
         }
-        assert!(!s.push(&g, &items[4], 10, 3).unwrap());
-        let h = s.history(&g, 0).unwrap();
+        assert!(!s.push(&g, &items[4], 10, 3, false).unwrap());
+        let h: Vec<_> = s
+            .history(&g, 0)
+            .unwrap()
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(h, items[2..].to_vec());
     }
 
@@ -263,11 +284,11 @@ mod tests {
             .unwrap();
         let old = sealed(&key, "old");
         let new = sealed(&key, "new");
-        s.push(&g, &old, 100, 50).unwrap();
-        s.push(&g, &new, 200, 50).unwrap();
-        assert_eq!(s.history(&g, 150).unwrap(), vec![new.clone()]);
+        s.push(&g, &old, 100, 50, false).unwrap();
+        s.push(&g, &new, 200, 50, true).unwrap();
+        assert_eq!(s.history(&g, 150).unwrap(), vec![(new.clone(), true)]);
         assert_eq!(s.purge_expired(150).unwrap(), 1);
-        assert_eq!(s.history(&g, 0).unwrap(), vec![new]);
+        assert_eq!(s.history(&g, 0).unwrap(), vec![(new, true)]);
     }
 
     #[test]
@@ -278,7 +299,8 @@ mod tests {
             .unwrap();
         s.join(&b.group_id(), &b.join_secret(), &DeviceId([5; 32]), 0)
             .unwrap();
-        s.push(&a.group_id(), &sealed(&a, "a"), 1, 50).unwrap();
+        s.push(&a.group_id(), &sealed(&a, "a"), 1, 50, false)
+            .unwrap();
         assert!(s.history(&b.group_id(), 0).unwrap().is_empty());
     }
 }

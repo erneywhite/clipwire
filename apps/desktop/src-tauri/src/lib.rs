@@ -84,6 +84,12 @@ pub fn publish_status(app: &AppHandle) {
 /// Запустить сервис: с синхронизацией, если устройство в группе, иначе локально.
 /// Возвращает `true`, если устройство в группе.
 pub fn start_service(app: &AppHandle) -> anyhow::Result<bool> {
+    start_service_with(app, false)
+}
+
+/// `backfill` — устройство только что вошло в группу: отправить туда историю,
+/// накопленную в локальном режиме.
+fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
     let state = app.state::<AppState>();
     let agent = state.paths.load()?;
     let configured = agent.is_some();
@@ -97,13 +103,14 @@ pub fn start_service(app: &AppHandle) -> anyhow::Result<bool> {
     let service = Service::start(
         tauri::async_runtime::handle().inner(),
         agent,
+        backfill,
         Paths::resolve()?,
         device_name,
         state.history.clone(),
         state.ignored_apps.clone(),
         std::sync::Arc::new(move |e| match e {
             UiEvent::Status(_) => publish_status(&handle),
-            UiEvent::Copied(_) | UiEvent::Received(_) => {
+            UiEvent::Copied(_) | UiEvent::Received(_) | UiEvent::HistoryMerged(_) => {
                 let _ = handle.emit("clipwire://history-changed", ());
             }
         }),
@@ -160,6 +167,12 @@ fn spawn_pruner(app: AppHandle) {
 pub async fn restart_service(app: &AppHandle) -> anyhow::Result<bool> {
     stop_service(app).await;
     start_service(app)
+}
+
+/// Перезапуск после входа в группу: локальная история уходит в группу.
+pub async fn restart_service_joined(app: &AppHandle) -> anyhow::Result<bool> {
+    stop_service(app).await;
+    start_service_with(app, true)
 }
 
 pub async fn stop_service(app: &AppHandle) {

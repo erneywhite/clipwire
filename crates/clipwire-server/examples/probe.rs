@@ -75,8 +75,13 @@ async fn main() -> Result<()> {
     for (name, c) in [("A", &mut a), ("B", &mut b)] {
         write_msg(&mut c.send, &join).await?;
         match next(c).await? {
-            ServerMsg::Joined { .. } => println!("{name} вошёл в группу"),
+            ServerMsg::Joined => println!("{name} вошёл в группу"),
             other => bail!("{name}: ждали Joined, пришло {other:?}"),
+        }
+        // Группа новая, история пустая: сразу HistoryEnd.
+        match next(c).await? {
+            ServerMsg::HistoryEnd => {}
+            other => bail!("{name}: ждали HistoryEnd, пришло {other:?}"),
         }
     }
 

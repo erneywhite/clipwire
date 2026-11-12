@@ -138,6 +138,9 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
                     Content::Text(t) => println!("{t}"),
                     other => println!("{other:?}"),
                 },
+                Event::History(items) => {
+                    eprintln!("в истории группы новых элементов: {}", items.len())
+                }
                 Event::Cursor(_) => {}
             }
         }
@@ -163,6 +166,7 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
     let service = Service::start(
         rt.handle(),
         Some(state),
+        false,
         paths,
         settings.device_name,
         Arc::new(Mutex::new(history)),
@@ -173,6 +177,7 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
             UiEvent::Status(Status::Connecting) => eprintln!("подключение…"),
             UiEvent::Copied(_) => eprintln!("отправлено скопированное"),
             UiEvent::Received(_) => eprintln!("получено с другого устройства"),
+            UiEvent::HistoryMerged(n) => eprintln!("в историю добавлено с других устройств: {n}"),
         }),
     )?;
     eprintln!("синхронизация буфера запущена, Ctrl+C — выход");

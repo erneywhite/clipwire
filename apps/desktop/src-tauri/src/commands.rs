@@ -69,7 +69,7 @@ pub async fn create_group(app: AppHandle, server_code: String) -> CmdResult<Stri
         device_key: random_key().map_err(err)?,
     };
     app.state::<AppState>().paths.save(&agent).map_err(err)?;
-    crate::restart_service(&app).await.map_err(err)?;
+    crate::restart_service_joined(&app).await.map_err(err)?;
     Ok(agent.invite.encode())
 }
 
@@ -83,7 +83,7 @@ pub async fn join_group(app: AppHandle, invite_code: String) -> CmdResult<()> {
         device_key: random_key().map_err(err)?,
     };
     app.state::<AppState>().paths.save(&agent).map_err(err)?;
-    crate::restart_service(&app).await.map_err(err)?;
+    crate::restart_service_joined(&app).await.map_err(err)?;
     Ok(())
 }
 

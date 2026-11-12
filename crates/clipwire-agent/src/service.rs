@@ -24,9 +24,15 @@ pub enum UiEvent {
     Copied(Content),
     /// Пришло с другого устройства.
     Received(Item),
+    /// В историю влились элементы с других устройств (без записи в буфер).
+    HistoryMerged(usize),
 }
 
 pub type UiCallback = Arc<dyn Fn(UiEvent) + Send + Sync>;
+
+/// Сколько последних локальных элементов отправлять в группу при подключении.
+/// Сервер по умолчанию хранит 50, больше всё равно отсечётся.
+pub const BACKFILL_MAX: usize = 50;
 
 pub struct Service {
     paused: Arc<AtomicBool>,
@@ -42,9 +48,13 @@ pub struct Service {
 }
 
 impl Service {
+    /// `backfill` — устройство только что вошло в группу: отправить туда
+    /// локальную историю, накопленную без группы.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         rt: &tokio::runtime::Handle,
         state: Option<AgentState>,
+        backfill: bool,
         paths: Paths,
         device_name: String,
         history: Arc<Mutex<History>>,
@@ -71,13 +81,19 @@ impl Service {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
         let (device, engine) = match state {
             Some(state) => {
+                let local_history = if backfill {
+                    local_backfill(&history.lock().unwrap_or_else(|e| e.into_inner()))
+                } else {
+                    Vec::new()
+                };
                 let engine = Engine::new(
                     state,
                     device_name.clone(),
                     paths.load_cursor(),
                     event_tx,
                     Arc::new(|| {}),
-                );
+                )
+                .with_backfill(local_history);
                 let device = engine.device();
                 (device, Some(rt.spawn(engine.run(local_rx))))
             }
@@ -133,6 +149,30 @@ impl Service {
                                 },
                             );
                             on_event(UiEvent::Received(item));
+                        }
+                        Event::History(items) => {
+                            let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut added = 0;
+                            for item in items {
+                                let entry = Entry {
+                                    id: item.id,
+                                    origin: item.origin,
+                                    device_name: item.device_name,
+                                    local: false,
+                                    content: item.content,
+                                    seen_ms: item.created_at_ms as i64,
+                                    pinned: false,
+                                };
+                                match h.merge(entry) {
+                                    Ok(true) => added += 1,
+                                    Ok(false) => {}
+                                    Err(e) => tracing::warn!("не записалось в историю: {e:#}"),
+                                }
+                            }
+                            drop(h);
+                            if added > 0 {
+                                on_event(UiEvent::HistoryMerged(added));
+                            }
                         }
                     }
                 }
@@ -226,6 +266,19 @@ impl Service {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(3), e).await;
         }
     }
+}
+
+/// Последние локальные элементы, от старых к новым, для отправки в группу.
+fn local_backfill(h: &History) -> Vec<(Content, u64)> {
+    let mut out: Vec<(Content, u64)> = h
+        .list("", false, usize::MAX)
+        .into_iter()
+        .filter(|e| e.local)
+        .take(BACKFILL_MAX)
+        .map(|e| (e.content.clone(), e.seen_ms.max(0) as u64))
+        .collect();
+    out.reverse();
+    out
 }
 
 fn record(history: &Mutex<History>, entry: Entry) {

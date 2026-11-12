@@ -50,7 +50,35 @@ async fn run() -> Result<()> {
         "сервер запущен"
     );
     tracing::info!("код сервера: {}", running.info.encode());
-    tokio::signal::ctrl_c().await?;
+    stop_signal().await?;
     tracing::info!("остановка");
-    running.shutdown().await
+    // Не даём корректной остановке тянуться дольше, чем Docker ждёт до SIGKILL.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), running.shutdown()).await {
+        Ok(res) => res,
+        Err(_) => {
+            tracing::warn!("остановка затянулась, выхожу");
+            Ok(())
+        }
+    }
+}
+
+/// Ctrl+C в консоли или SIGTERM от Docker. В контейнере сервер работает как
+/// PID 1, а такому процессу ядро без обработчика SIGTERM не доставляет:
+/// `docker stop` ждал 10 секунд и убивал контейнер с кодом 137.
+async fn stop_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r?,
+            _ = term.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(())
+    }
 }

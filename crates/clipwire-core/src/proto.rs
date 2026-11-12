@@ -3,15 +3,17 @@
 //! Агент открывает одно двунаправленное QUIC-соединение с ALPN [`ALPN`].
 //! Сообщения идут кадрами: 4 байта длины (big-endian) + postcard.
 //!
-//! Порядок: агент шлёт `Join`, сервер отвечает `Joined` с историей группы,
-//! дальше обе стороны шлют сообщения когда угодно.
+//! Порядок: агент шлёт `Join`, сервер отвечает `Joined`, затем историю группы
+//! по одному элементу (`History`) и `HistoryEnd`. Дальше обе стороны шлют
+//! сообщения когда угодно. История идёт отдельными кадрами, потому что в ней
+//! бывают картинки: одним кадром она легко перерастает [`MAX_FRAME`].
 
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{GroupId, JoinSecret, SealedItem};
 
 /// ALPN протокола. Меняем номер при несовместимых изменениях формата.
-pub const ALPN: &[u8] = b"clipwire/1";
+pub const ALPN: &[u8] = b"clipwire/2";
 
 /// Предел одного кадра. Сервер может выставить свой лимит на элемент
 /// меньше, этот нужен, чтобы не выделять память под мусорную длину.
@@ -25,16 +27,26 @@ pub enum ClientMsg {
         group_id: GroupId,
         join_secret: JoinSecret,
     },
-    /// Новый элемент с этого устройства.
+    /// Новый элемент с этого устройства: попадает в буфер остальных.
     Push(SealedItem),
+    /// Старый элемент из локальной истории (устройство работало без группы
+    /// и подключилось). Остальные кладут его только в историю, буфер не трогают.
+    Backfill(SealedItem),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMsg {
-    /// Вход принят. История от старых элементов к новым.
-    Joined { history: Vec<SealedItem> },
+    /// Вход принят. Следом идут `History` и `HistoryEnd`.
+    Joined,
+    /// Элемент истории группы, от старых к новым. `backfill` — элемент пришёл
+    /// из чьей-то локальной истории, в буфер его применять не надо.
+    History { item: SealedItem, backfill: bool },
+    /// История передана целиком.
+    HistoryEnd,
     /// Элемент с другого устройства группы.
     Deliver(SealedItem),
+    /// Старый элемент из истории другого устройства — только в историю.
+    Backfill(SealedItem),
     /// Ошибка. После неё сервер закрывает соединение.
     Error(String),
 }
@@ -132,14 +144,12 @@ pub mod io {
             write_msg(&mut a, &ServerMsg::Error("x".into()))
                 .await
                 .unwrap();
-            write_msg(&mut a, &ServerMsg::Joined { history: vec![] })
-                .await
-                .unwrap();
+            write_msg(&mut a, &ServerMsg::Joined).await.unwrap();
             drop(a);
             let m1: ServerMsg = read_msg(&mut b).await.unwrap().unwrap();
             let m2: ServerMsg = read_msg(&mut b).await.unwrap().unwrap();
             assert_eq!(m1, ServerMsg::Error("x".into()));
-            assert_eq!(m2, ServerMsg::Joined { history: vec![] });
+            assert_eq!(m2, ServerMsg::Joined);
             assert!(read_msg::<_, ServerMsg>(&mut b).await.unwrap().is_none());
         }
     }
