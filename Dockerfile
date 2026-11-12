@@ -4,6 +4,9 @@ FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# Приложение — член workspace, без его манифеста cargo не соберёт даже сервер.
+# Компилируется только clipwire-server, зависимости приложения не качаются.
+COPY apps/desktop/src-tauri ./apps/desktop/src-tauri
 RUN cargo build --release --locked -p clipwire-server \
  && cp target/release/clipwire-server /clipwire-server  && mkdir /data
 

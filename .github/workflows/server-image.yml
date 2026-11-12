@@ -9,6 +9,7 @@ on:
     tags: ["v*"]
     paths:
       - "crates/**"
+      - "apps/desktop/src-tauri/Cargo.toml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile"
