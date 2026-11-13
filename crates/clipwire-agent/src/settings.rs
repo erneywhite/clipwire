@@ -72,6 +72,9 @@ pub struct Settings {
     pub hide_from_capture: bool,
     /// Не синхронизировать скопированное в этих программах (имя exe / bundle id).
     pub ignored_apps: Vec<String>,
+    /// Файлы до этого размера (МБ) при копировании в группе загружаются на
+    /// сервер; 0 — не загружать, файлы остаются только ссылкой на источник.
+    pub file_upload_limit_mb: u64,
 }
 
 impl Default for Settings {
@@ -95,6 +98,7 @@ impl Default for Settings {
                 "1Password.exe".into(),
                 "Bitwarden.exe".into(),
             ],
+            file_upload_limit_mb: 100,
         }
     }
 }
@@ -147,6 +151,10 @@ mod tests {
         assert_eq!(s.retention, Retention::Week);
         assert_eq!(s.popup_width, 380);
         assert!(s.paste_into_active);
+        // Старый файл без поля про файлы — значение по умолчанию.
+        assert_eq!(s.file_upload_limit_mb, 100);
+        let s: Settings = serde_json::from_str(r#"{"file_upload_limit_mb":0}"#).unwrap();
+        assert_eq!(s.file_upload_limit_mb, 0);
     }
 
     #[test]

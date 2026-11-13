@@ -13,6 +13,7 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey, Watcher};
 use tokio::sync::mpsc;
 
+use crate::blobs::Blobs;
 use crate::state::AgentState;
 
 /// Больше этого не отправляем: сервер по умолчанию принимает до 8 МиБ
@@ -60,6 +61,18 @@ pub struct Engine {
     /// Локальная история, которую надо отправить в группу (устройство только
     /// что подключилось): содержимое и когда скопировано, от старых к новым.
     backfill: Vec<(Content, u64)>,
+    /// Передача файлов: загрузчик живёт здесь, соединение отдаётся ему на
+    /// время сессии.
+    blobs: Option<Arc<Blobs>>,
+}
+
+/// Останавливает задачу, когда выходит из области видимости.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Engine {
@@ -80,7 +93,14 @@ impl Engine {
             notify,
             went_online: false,
             backfill: Vec::new(),
+            blobs: None,
         }
+    }
+
+    /// Загружать файлы из очереди и давать соединение для скачивания.
+    pub fn with_blobs(mut self, blobs: Arc<Blobs>) -> Self {
+        self.blobs = Some(blobs);
+        self
     }
 
     /// Отправить в группу эту локальную историю после входа.
@@ -114,6 +134,11 @@ impl Engine {
             .await
             .context("не поднялся iroh-эндпоинт")?;
         let addr = EndpointAddr::new(PublicKey::from_bytes(&server.server_id)?).with_relay_url(url);
+        // Загрузчик ждёт соединения сам и останавливается вместе с движком.
+        let _uploader = self
+            .blobs
+            .clone()
+            .map(|b| AbortOnDrop(tokio::spawn(b.run_uploads())));
 
         let mut pending: Option<Content> = None;
         let mut backoff = Duration::from_secs(1);
@@ -207,6 +232,8 @@ impl Engine {
             }
         }
         self.apply_history(history);
+        // Файлы ходят по своим потокам этого же соединения, пока сессия жива.
+        let _files = self.blobs.as_ref().map(|b| b.attach(conn.clone()));
         self.went_online = true;
         self.emit(Event::Status(Status::Online));
         tracing::info!("на связи с сервером");

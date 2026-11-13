@@ -169,23 +169,36 @@ impl History {
     fn store_thumb(&mut self, e: &Entry) {
         let made = match &e.content {
             Content::Image { png, .. } => crate::image::thumbnail(png),
-            // Один файл-картинка: миниатюра из файла.
-            Content::Files(f) if f.len() == 1 && f[0].width > 0 => {
+            // Свой файл-картинка: миниатюра из файла. У чужого путь с другого
+            // устройства, его миниатюра делается после скачивания (`file_thumb`).
+            Content::Files(f) if e.local && f.len() == 1 && f[0].width > 0 => {
                 crate::image::thumbnail_file(std::path::Path::new(&f[0].path))
             }
             _ => return,
         };
+        self.save_thumb(e.id, made);
+    }
+
+    /// Миниатюра записи из скачанного файла-картинки, если её ещё нет.
+    pub fn file_thumb(&mut self, id: ItemId, path: &Path) {
+        if self.thumbs.contains_key(&id) || self.get(id).is_none() {
+            return;
+        }
+        self.save_thumb(id, crate::image::thumbnail_file(path));
+    }
+
+    fn save_thumb(&mut self, id: ItemId, made: Result<Vec<u8>>) {
         let res = made.and_then(|t| {
             let (nonce, data) = self.seal_blob(&t)?;
             self.conn.execute(
                 "UPDATE entries SET thumb_nonce = ?1, thumb = ?2 WHERE id = ?3",
-                params![&nonce[..], data, &e.id.as_bytes()[..]],
+                params![&nonce[..], data, &id.as_bytes()[..]],
             )?;
             Ok(t)
         });
         match res {
             Ok(t) => {
-                self.thumbs.insert(e.id, t);
+                self.thumbs.insert(id, t);
             }
             Err(err) => tracing::warn!("миниатюра не сделалась: {err:#}"),
         }
@@ -227,7 +240,9 @@ impl History {
             existing.device_name = std::mem::take(&mut entry.device_name);
             // Тот же текст скопирован уже с форматированием — берём его. Обратно
             // (вставка без форматирования) форматирование у записи не отнимаем.
-            if matches!(entry.content, Content::Rich { .. }) {
+            // Файлы берём новые: у них могли смениться `blob` (файл изменился
+            // или запись пришла с другого устройства с теми же путями).
+            if matches!(entry.content, Content::Rich { .. } | Content::Files(_)) {
                 existing.content = entry.content;
             }
             self.write(&existing)?;
@@ -259,6 +274,12 @@ impl History {
             .unwrap_or(self.entries.len());
         self.entries.insert(pos, entry);
         Ok(true)
+    }
+
+    /// Запись с тем же содержимым (по хэшу), если есть.
+    pub fn find(&self, content: &Content) -> Option<&Entry> {
+        let id = *self.by_hash.get(&content.hash())?;
+        self.get(id)
     }
 
     pub fn get(&self, id: ItemId) -> Option<&Entry> {

@@ -211,15 +211,29 @@ pub async fn popup_paste(
         .parse()
         .map(clipwire_core::ItemId)
         .map_err(|_| "Неверный id элемента".to_string())?;
-    let content = {
+    let entry = {
         let state = app.state::<AppState>();
         let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
         match h.get(id) {
-            Some(e) => e.content.clone(),
+            Some(e) => e.clone(),
             None => return Err("Элемента уже нет в истории".into()),
         }
     };
-    let content = if plain { content.plain() } else { content };
+    // Файлы с другого устройства: скачать и положить в буфер пути из кэша.
+    // В группу повторно не отправляем — это та же запись, она есть у всех.
+    if !entry.local && matches!(entry.content, clipwire_core::Content::Files(_)) {
+        let paste = into_active.unwrap_or_else(|| paste_into_active(&app));
+        let files = crate::files::fetch_for_paste(&app, &entry).await?;
+        put_quietly(&app, &clipwire_core::Content::Files(files))?;
+        crate::files::bump(&app, &entry);
+        return_and_paste(&app, "popup", paste).await;
+        return Ok(());
+    }
+    let content = if plain {
+        entry.content.plain()
+    } else {
+        entry.content
+    };
     paste_content(&app, content, into_active).await
 }
 
@@ -263,6 +277,17 @@ pub fn copy(app: &AppHandle, content: clipwire_core::Content) -> Result<(), Stri
         Some(s) => s.copy(content),
         // Сервис ещё не поднялся: хотя бы в буфер.
         None => clipwire_agent::clipboard::write(&content),
+    }
+    .map_err(|e| format!("{e:#}"))
+}
+
+/// Положить в буфер без отправки в группу и без записи в историю.
+fn put_quietly(app: &AppHandle, content: &clipwire_core::Content) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let svc = state.service.lock().unwrap_or_else(|e| e.into_inner());
+    match svc.as_ref() {
+        Some(s) => s.put_content_quietly(content),
+        None => clipwire_agent::clipboard::write(content),
     }
     .map_err(|e| format!("{e:#}"))
 }
