@@ -2,11 +2,11 @@
 // (Node 23.6+ сам убирает типы). Тестового фреймворка у фронтенда нет,
 // поэтому простые проверки с исключением.
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
-import type { Transfer } from './api'
+import type { FileInfo, Transfer } from './api'
 
 // Node требует расширение в пути, а TypeScript без allowImportingTsExtensions его
 // не пропускает: путь собирается строкой, тип берётся отдельно.
-const { entryProgress, percentOf, progressLabel } = (await import('./transfer' + '.ts')) as typeof import('./transfer')
+const { canDownload, entryProgress, isGone, onlyThere, percentOf, progressLabel } = (await import('./transfer' + '.ts')) as typeof import('./transfer')
 
 function check(cond: boolean, msg: string) {
   if (!cond) throw new Error(`не прошло: ${msg}`)
@@ -64,6 +64,29 @@ check(entryProgress([{ blob: 'a' }], { a: t('a', { state: 'done', done: 100 }) }
 {
   const p = entryProgress([{ blob: 'a' }], { a: t('a', { direction: 'down', state: 'failed', error: null }) })
   check(p !== null && progressLabel(p) === 'не скачано: неизвестная ошибка', 'ошибка без текста')
+}
+
+{
+  // Какие файлы можно скачать, какие пропали насовсем.
+  const f = (over: Partial<FileInfo>): FileInfo => ({
+    name: 'a.txt',
+    path: 'C:\\a.txt',
+    size: 3,
+    is_dir: false,
+    exists: false,
+    blob: 'b'.repeat(32),
+    local_path: null,
+    remote: false,
+    ...over,
+  })
+  check(canDownload(f({ remote: true })), 'чужой файл с сервера можно скачать')
+  check(canDownload(f({})), 'свой пропавший файл с копией на сервере можно скачать')
+  check(!isGone(f({})), 'свой пропавший с копией на сервере — не пропал')
+  check(!canDownload(f({ exists: true, local_path: 'C:\\a.txt' })), 'файл на месте качать не надо')
+  check(!canDownload(f({ is_dir: true })), 'папку не скачать')
+  check(isGone(f({ blob: null })), 'свой пропавший без копии — пропал')
+  check(!isGone(f({ blob: null, remote: true })), 'чужой без копии не «пропал», он только там')
+  check(onlyThere(f({ blob: null, remote: true })), 'чужой без копии — есть только на источнике')
 }
 
 console.log('transfer: все проверки прошли')

@@ -63,12 +63,20 @@ export function isHere(f: FileInfo): boolean {
   return f.local_path !== null && f.exists
 }
 
-/** Файл с другого устройства, который можно скачать с сервера. */
+/**
+ * Файла нет на этом компьютере, но его можно скачать с сервера: файл с
+ * другого устройства или свой, который переместили или удалили.
+ */
 export function canDownload(f: FileInfo): boolean {
-  return f.remote && !f.is_dir && f.blob !== null && !isHere(f)
+  return !f.is_dir && f.blob !== null && !isHere(f)
 }
 
 /** Файл с другого устройства, которого нет на сервере: папка или файл крупнее порога. */
 export function onlyThere(f: FileInfo): boolean {
   return f.remote && !isHere(f) && f.blob === null
+}
+
+/** Свой файл пропал с места, и копии на сервере нет: вставить нечего. */
+export function isGone(f: FileInfo): boolean {
+  return !f.remote && !isHere(f) && !canDownload(f)
 }

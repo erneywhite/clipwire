@@ -4,7 +4,8 @@
   import { api, type Entry, type Settings, type Transfer } from '../lib/api'
   import { applyTheme } from '../lib/theme'
   import { ago, bytesLabel, filesMeta, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
-  import { canDownload, entryProgress, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
+  import { canDownload, entryProgress, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
+  import { getCurrentWindow } from '@tauri-apps/api/window'
   import EntryRow from '../lib/EntryRow.svelte'
   import LinkCard from './LinkCard.svelte'
   import FilePreview from './FilePreview.svelte'
@@ -32,6 +33,11 @@
   // Запись, файлы которой сейчас качаются перед вставкой или по кнопке «Скачать».
   let fetching = $state<string | null>(null)
   let pasting = $state(false)
+  // Сколько раз окно показывали. Скачивание перед вставкой может идти долго:
+  // если за это время окно открыли заново, начатая вставка уже не нужна.
+  let shown = 0
+  // Текущая ошибка — от неудачного load(): её снимает следующий удачный.
+  let loadFailed = false
 
   /** Имя устройства, откуда пришла запись. */
   function deviceOf(e: Entry): string {
@@ -46,19 +52,34 @@
   /** Скачать файлы записи. true — всё скачалось. */
   async function download(entry: Entry): Promise<boolean> {
     if (fetching) return false
+    const session = shown
     fetching = entry.id
     error = ''
+    let failure = ''
     try {
       await api.filesDownload(entry.id)
-      return true
     } catch (e) {
-      error = String(e)
-      return false
-    } finally {
-      fetching = null
-      // Пути в кэше появились — обновить строку и предпросмотр.
-      await load()
-      await refreshPreview()
+      failure = String(e)
+    }
+    // Окно открыли заново — там уже своё состояние, его не трогаем.
+    if (session !== shown) return false
+    fetching = null
+    // Пути в кэше появились — обновить строку и предпросмотр. Ошибку ставим
+    // после: обновление списка её не стирает, но и не должно её опередить.
+    await load()
+    await refreshPreview()
+    if (failure && session === shown) error = failure
+    return !failure
+  }
+
+  /** Окно на экране и в фокусе: пользователь всё ещё ждёт вставку. */
+  async function stillShown(): Promise<boolean> {
+    try {
+      const w = getCurrentWindow()
+      return (await w.isVisible()) && (await w.isFocused())
+    } catch {
+      // Не узнали — решит Rust, он проверяет то же самое перед Ctrl+V.
+      return true
     }
   }
 
@@ -83,14 +104,28 @@
     }
   }
 
+  // Чужую ошибку (скачивания, вставки) load() не стирает: её сбрасывают явные
+  // действия — новый запрос, смена вкладки, новое открытие окна, новая вставка.
   async function load() {
     try {
       items = await api.list(query, tab === 'pinned')
       if (sel >= items.length) sel = Math.max(0, items.length - 1)
-      error = ''
+      if (loadFailed) {
+        loadFailed = false
+        error = ''
+      }
     } catch (e) {
       error = String(e)
+      loadFailed = true
     }
+  }
+
+  /** Явная смена списка: новый запрос или вкладка. Старая ошибка уже ни к чему. */
+  function reload() {
+    sel = 0
+    error = ''
+    loadFailed = false
+    load()
   }
 
   async function scrollToSel() {
@@ -116,10 +151,17 @@
         error = fetching === entry.id ? 'Файлы ещё скачиваются' : 'Сначала дождитесь, пока скачаются файлы другой записи'
         return
       }
+      const session = shown
       pasting = true
       const ok = await download(entry)
+      // Пока качалось, окно открыли заново (там уже сброшено своё состояние)
+      // или спрятали: Ctrl+V ушёл бы туда, где пользователь уже работает.
+      // Файлы остаются в кэше, вставить можно ещё раз.
+      if (session !== shown) return
       pasting = false
-      if (!ok) return
+      if (!ok || !(await stillShown()) || session !== shown) return
+    } else {
+      error = ''
     }
     // Если это элемент из предпросмотра и его поправили — вставляем изменённый текст.
     const text = preview && preview.entry.id === entry.id && edited ? draft : null
@@ -225,8 +267,7 @@
       case 'Tab':
         e.preventDefault()
         tab = tab === 'all' ? 'pinned' : 'all'
-        sel = 0
-        load()
+        reload()
         return
       case ' ':
         // Пробел открывает предпросмотр, пока строка поиска пустая; иначе это пробел в запросе.
@@ -267,10 +308,16 @@
       listen<Settings>('clipwire://settings-changed', (e) => applySettings(e.payload)),
       // Живое превью размера из настроек: ширина списка меняется вместе с окном.
       listen('popup://opened', async () => {
+        // Новый показ: начатые в прошлый раз скачивание и вставка сюда уже не
+        // относятся (скачивание дойдёт в фоне, но вставлять не станет).
+        shown++
+        pasting = false
+        fetching = null
         query = ''
         sel = 0
         preview = null
         error = ''
+        loadFailed = false
         await load()
         await tick()
         // Окно не пересоздаётся, а прокрутка остаётся с прошлого раза: без этого
@@ -299,10 +346,7 @@
       <input
         bind:this={input}
         bind:value={query}
-        oninput={() => {
-          sel = 0
-          load()
-        }}
+        oninput={reload}
         placeholder="Найти в буфере"
         spellcheck="false"
         aria-label="Поиск по истории"
@@ -310,8 +354,8 @@
     </label>
 
     <div class="tabs" role="tablist">
-      <button role="tab" aria-selected={tab === 'all'} onclick={() => { tab = 'all'; sel = 0; load() }}>История</button>
-      <button role="tab" aria-selected={tab === 'pinned'} onclick={() => { tab = 'pinned'; sel = 0; load() }}>Закреплённое</button>
+      <button role="tab" aria-selected={tab === 'all'} onclick={() => { tab = 'all'; reload() }}>История</button>
+      <button role="tab" aria-selected={tab === 'pinned'} onclick={() => { tab = 'pinned'; reload() }}>Закреплённое</button>
     </div>
 
     {#if error}
@@ -381,14 +425,14 @@
           <ul class="file-list">
             {#each entry.files as f (f.path)}
               {@const fp = entryProgress([f], transfers)}
-              <li class:gone={!f.remote && !f.exists}>
+              <li class:gone={isGone(f)}>
                 <span class="fname">{f.name}</span>
                 <span class="fmeta">
-                  {f.is_dir ? 'папка' : bytesLabel(f.size)}{#if !f.remote && !f.exists}
+                  {f.is_dir ? 'папка' : bytesLabel(f.size)}{#if isGone(f)}
                     · файла нет на месте{:else if onlyThere(f)}
                     · есть только на устройстве «{device}»{:else if fp}
                     · {progressLabel(fp)}{:else if canDownload(f)}
-                    · не скачан{/if}
+                    · {f.remote ? 'не скачан' : 'нет на месте, копия на сервере'}{/if}
                 </span>
                 {#if isHere(f)}
                   <span class="fpath">{f.local_path}</span>

@@ -134,7 +134,10 @@ pub struct FileDto {
     pub remote: bool,
 }
 
-/// Где файл записи лежит на этом компьютере, если лежит.
+/// Где файл записи лежит на этом компьютере, если лежит. У своей записи —
+/// исходный путь, а если файл с тех пор переместили или удалили — копия,
+/// скачанная с сервера в кэш. У чужой — только кэш: её исходный путь с
+/// другого устройства, здесь по нему может лежать совсем другой файл.
 pub fn local_file(
     local: bool,
     f: &clipwire_core::FileRef,
@@ -142,10 +145,11 @@ pub fn local_file(
 ) -> Option<std::path::PathBuf> {
     if local {
         let p = std::path::PathBuf::from(&f.path);
-        p.exists().then_some(p)
-    } else {
-        clipwire_agent::blobs::cached_file(files_dir, f)
+        if p.exists() {
+            return Some(p);
+        }
     }
+    clipwire_agent::blobs::cached_file(files_dir, f)
 }
 
 fn file_dto(local: bool, f: &clipwire_core::FileRef, files_dir: &std::path::Path) -> FileDto {

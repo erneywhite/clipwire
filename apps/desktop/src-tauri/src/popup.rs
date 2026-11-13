@@ -219,11 +219,21 @@ pub async fn popup_paste(
             None => return Err("Элемента уже нет в истории".into()),
         }
     };
-    // Файлы с другого устройства: скачать и положить в буфер пути из кэша.
-    // В группу повторно не отправляем — это та же запись, она есть у всех.
-    if !entry.local && matches!(entry.content, clipwire_core::Content::Files(_)) {
+    // Файлы с другого устройства или свои, пропавшие с места: скачать и
+    // положить в буфер пути из кэша. В группу повторно не отправляем — это та
+    // же запись, она есть у всех.
+    if matches!(entry.content, clipwire_core::Content::Files(_))
+        && (!entry.local || !crate::files::all_here(&app, &entry))
+    {
         let paste = into_active.unwrap_or_else(|| paste_into_active(&app));
         let files = crate::files::fetch_for_paste(&app, &entry).await?;
+        // Скачивание могло идти долго: пользователь мог закрыть окно и уйти
+        // работать в другую программу. Тогда Ctrl+V туда нельзя, а буфер не
+        // трогаем: файлы уже в кэше, вставить их можно ещё раз из окна.
+        if !still_open(&app) {
+            tracing::info!("окно вставки закрыли, пока шло скачивание: файлы только в кэше");
+            return Ok(());
+        }
         put_quietly(&app, &clipwire_core::Content::Files(files))?;
         crate::files::bump(&app, &entry);
         return_and_paste(&app, "popup", paste).await;
@@ -235,6 +245,17 @@ pub async fn popup_paste(
         entry.content
     };
     paste_content(&app, content, into_active).await
+}
+
+/// Окно вставки всё ещё на экране и в фокусе: пользователь ждёт вставку.
+fn still_open(app: &AppHandle) -> bool {
+    window(app).is_some_and(|w| ready_to_paste(w.is_visible().ok(), w.is_focused().ok()))
+}
+
+/// Вставлять, только если окно точно видно и в фокусе. Не узнали — не вставляем:
+/// лишний Ctrl+V в чужое окно хуже, чем вставка, которую придётся повторить.
+fn ready_to_paste(visible: Option<bool>, focused: Option<bool>) -> bool {
+    visible == Some(true) && focused == Some(true)
 }
 
 /// Вставить произвольный текст: изменённый в предпросмотре вариант.
@@ -376,5 +397,21 @@ mod win {
             key(VK_CONTROL, true),
         ];
         unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ready_to_paste;
+
+    #[test]
+    fn pastes_only_into_open_focused_popup() {
+        assert!(ready_to_paste(Some(true), Some(true)));
+        // Окно спрятали или фокус ушёл в другую программу — Ctrl+V не жмём.
+        assert!(!ready_to_paste(Some(false), Some(true)));
+        assert!(!ready_to_paste(Some(true), Some(false)));
+        // Система не ответила — тоже не жмём.
+        assert!(!ready_to_paste(None, Some(true)));
+        assert!(!ready_to_paste(Some(true), None));
     }
 }

@@ -1,9 +1,10 @@
 <script lang="ts">
   // Предпросмотр одного файла: начало текста, PDF во встроенном просмотрщике
   // WebView, видео и аудио с плеером. Файл читается через asset-протокол, доступ
-  // к нему Rust открывает только на время просмотра.
+  // к нему Rust открывает только для файлов из истории и с подходящей сигнатурой.
   // Файл с другого устройства показывается так же, когда скачан (по пути в
-  // кэше); пока не скачан — карточка с кнопкой «Скачать».
+  // кэше); пока не скачан — карточка с кнопкой «Скачать». Так же и свой файл,
+  // который пропал с места, но есть на сервере.
   import { convertFileSrc } from '@tauri-apps/api/core'
   import { api, type FileInfo, type FilePreview } from '../lib/api'
   import { bytesLabel } from '../lib/format'
@@ -77,11 +78,15 @@
 
 <!-- Свой плеер на каждый файл: при переключении старый останавливается. -->
 {#key path}
-{#if file.remote && !here}
+{#if !here && (file.remote || canDownload(file))}
   <div class="box muted">
     <span class="name">{file.name}</span>
     {#if canDownload(file)}
-      <span>Файл на устройстве «{device}» · {bytesLabel(file.size)}</span>
+      {#if file.remote}
+        <span>Файл на устройстве «{device}» · {bytesLabel(file.size)}</span>
+      {:else}
+        <span>Файла нет на месте, копия есть на сервере · {bytesLabel(file.size)}</span>
+      {/if}
       {#if progress}
         <span class="bar" class:failed={!!progress.error} aria-hidden="true">
           <span style:width="{progress.percent}%"></span>

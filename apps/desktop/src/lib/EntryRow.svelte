@@ -3,7 +3,7 @@
   // чтобы превью выглядело ровно как настоящее окно.
   import type { Entry } from './api'
   import { ago, bytesLabel, filesLabel, filesMeta, isUrl, looksLikeCode, sizeLabel } from './format'
-  import { entryProgress, progressLabel, type TransferMap } from './transfer'
+  import { entryProgress, isGone, progressLabel, type TransferMap } from './transfer'
 
   let {
     item,
@@ -33,8 +33,9 @@
   )
   const folder = $derived(item.files.length > 0 && item.files.every((f) => f.is_dir))
   const progress = $derived(kind === 'files' ? entryProgress(item.files, transfers) : null)
-  // Файл с другого устройства, которого ещё нет здесь, не «пропал»: его можно скачать.
-  const gone = $derived(item.files.some((f) => !f.remote && !f.exists))
+  // Файл, которого нет здесь, но который есть на сервере, не «пропал»: его можно
+  // скачать. Пропал только свой файл без копии на сервере.
+  const gone = $derived(item.files.some(isGone))
   const meta = $derived(
     [
       item.local ? 'Это устройство' : item.device_name || 'Другое устройство',

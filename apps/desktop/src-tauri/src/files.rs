@@ -2,8 +2,10 @@
 //!
 //! Предпросмотр: текст читаем сами (начало файла), PDF, видео и аудио
 //! показывает WebView через asset-протокол. Доступ к файлу через протокол
-//! открывается только на время просмотра и только для файлов из истории: своих
-//! по исходному пути, чужих — по пути в кэше скачанного.
+//! открывается только для файлов из истории: своих по исходному пути (или по
+//! копии в кэше, если исходный пропал), чужих — по пути в кэше скачанного.
+//! Тип для протокола определяется по содержимому, поэтому как PDF или медиа
+//! файл открывается только с подходящей сигнатурой в начале.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -44,8 +46,15 @@ pub fn file_preview(app: AppHandle, path: String) -> Result<FilePreview, String>
         return Ok(NONE);
     }
     let kind = media_kind(&path);
-    if kind != "none" {
+    // Сверяем начало файла с типом: asset-протокол сам смотрит в содержимое, и
+    // HTML с расширением .pdf открылся бы в iframe как страница со скриптами.
+    // Не совпало — показываем как обычный файл (текстом, если это текст).
+    if kind != "none" && head(p).is_some_and(|h| signature_matches(kind, &h)) {
         // WebView читает файл сам, кусками: видео любого размера не грузится целиком.
+        // shortcut: разрешение в scope не отзывается (в tauri 2 нет удаления из
+        // allowed, а forbid_file запрещает навсегда), файл доступен протоколу до
+        // перезапуска. Переделать на свой протокол с проверкой текущего файла,
+        // если в окнах появится сторонний контент.
         app.asset_protocol_scope()
             .allow_file(p)
             .map_err(|e| format!("Файл не открылся для просмотра: {e}"))?;
@@ -75,12 +84,10 @@ fn entry_has_path(e: &Entry, files_dir: &Path, path: &Path) -> bool {
         return false;
     };
     files.iter().any(|f| {
-        if e.local {
-            Path::new(&f.path) == path
-        } else {
-            f.blob
+        // Свой исходный путь подходит; кэш — у любой записи: туда пишем только мы.
+        (e.local && Path::new(&f.path) == path)
+            || f.blob
                 .is_some_and(|b| cache_path(files_dir, b, &f.name) == path)
-        }
     })
 }
 
@@ -103,8 +110,79 @@ fn only_on_source(e: &Entry, files: &[&FileRef]) -> String {
     )
 }
 
-/// Скачать в кэш файлы записи с другого устройства (уже скачанные берутся
-/// из кэша). Возвращает пути на этом компьютере в том же порядке.
+/// Текст ошибки про свои файлы, которых нет ни на месте, ни на сервере.
+fn gone_here(files: &[&FileRef]) -> String {
+    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    format!(
+        "Файла нет на месте, его переместили или удалили: {}",
+        names.join(", ")
+    )
+}
+
+/// Откуда взять файл записи на этом компьютере.
+#[derive(Debug, PartialEq, Eq)]
+enum Source {
+    /// Уже здесь: исходный путь своей записи или кэш.
+    Here(PathBuf),
+    /// Скачать с сервера в кэш.
+    Fetch,
+    /// Взять неоткуда: папка или файл без копии на сервере.
+    Missing,
+}
+
+fn plan(e: &Entry, files: &[FileRef], files_dir: &Path) -> Vec<Source> {
+    files
+        .iter()
+        .map(
+            |f| match crate::commands::local_file(e.local, f, files_dir) {
+                Some(p) => Source::Here(p),
+                None if f.blob.is_some() && !f.is_dir => Source::Fetch,
+                None => Source::Missing,
+            },
+        )
+        .collect()
+}
+
+/// Файлы, которые надо скачать, в том же порядке.
+fn to_fetch(files: &[FileRef], plan: &[Source]) -> Vec<FileRef> {
+    files
+        .iter()
+        .zip(plan)
+        .filter(|(_, s)| **s == Source::Fetch)
+        .map(|(f, _)| f.clone())
+        .collect()
+}
+
+/// Ошибка про файлы, которые взять неоткуда, или `None`, если таких нет.
+fn missing_error(e: &Entry, files: &[FileRef], plan: &[Source]) -> Option<String> {
+    let missing: Vec<&FileRef> = files
+        .iter()
+        .zip(plan)
+        .filter(|(_, s)| **s == Source::Missing)
+        .map(|(f, _)| f)
+        .collect();
+    if missing.is_empty() {
+        None
+    } else if e.local {
+        Some(gone_here(&missing))
+    } else {
+        Some(only_on_source(e, &missing))
+    }
+}
+
+/// Все файлы записи лежат на этом компьютере, качать ничего не надо.
+pub fn all_here(app: &AppHandle, e: &Entry) -> bool {
+    let Content::Files(files) = &e.content else {
+        return true;
+    };
+    let dir = files_dir(&app.state::<AppState>().paths.dir);
+    plan(e, files, &dir)
+        .iter()
+        .all(|s| matches!(s, Source::Here(_)))
+}
+
+/// Скачать в кэш файлы записи (уже скачанные берутся из кэша). Возвращает
+/// пути на этом компьютере в том же порядке.
 async fn download(app: &AppHandle, e: &Entry, files: &[FileRef]) -> Result<Vec<PathBuf>, String> {
     let blobs = {
         let state = app.state::<AppState>();
@@ -116,7 +194,9 @@ async fn download(app: &AppHandle, e: &Entry, files: &[FileRef]) -> Result<Vec<P
     // Даже при ошибке часть файлов могла скачаться — окну стоит перечитать.
     let _ = app.emit("clipwire://history-changed", ());
     let paths = res.map_err(|e| format!("{e:#}"))?;
-    if let ([f], [p]) = (files, paths.as_slice())
+    // Миниатюра нужна только записи из одного файла-картинки.
+    if let (Content::Files(all), [f], [p]) = (&e.content, files, paths.as_slice())
+        && all.len() == 1
         && f.width > 0
     {
         let state = app.state::<AppState>();
@@ -126,26 +206,40 @@ async fn download(app: &AppHandle, e: &Entry, files: &[FileRef]) -> Result<Vec<P
     Ok(paths)
 }
 
-/// Файлы записи с другого устройства для вставки: всё скачивается, в
-/// `FileRef.path` — пути из кэша. Если хоть один файл не получить (нет на
-/// сервере, не скачался) — ошибка и ничего не возвращается.
+/// Файлы записи для вставки: чего нет на этом компьютере, скачивается в
+/// кэш; в `FileRef.path` — пути здесь. Касается и чужих записей, и своих, у
+/// которых файл переместили или удалили, а копия есть на сервере. Если хоть
+/// один файл не получить (нет на сервере, не скачался) — ошибка и ничего не
+/// возвращается.
 pub async fn fetch_for_paste(app: &AppHandle, e: &Entry) -> Result<Vec<FileRef>, String> {
     let Content::Files(files) = &e.content else {
         return Err("В записи нет файлов".into());
     };
-    let missing: Vec<&FileRef> = files.iter().filter(|f| f.blob.is_none()).collect();
-    if !missing.is_empty() {
-        return Err(only_on_source(e, &missing));
+    let dir = files_dir(&app.state::<AppState>().paths.dir);
+    let plan = plan(e, files, &dir);
+    if let Some(err) = missing_error(e, files, &plan) {
+        return Err(err);
     }
-    let paths = download(app, e, files).await?;
-    Ok(files
-        .iter()
-        .zip(paths)
-        .map(|(f, p)| FileRef {
+    let need = to_fetch(files, &plan);
+    let mut fetched = if need.is_empty() {
+        Vec::new()
+    } else {
+        download(app, e, &need).await?
+    }
+    .into_iter();
+    let mut out = Vec::with_capacity(files.len());
+    for (f, s) in files.iter().zip(plan) {
+        let p = match s {
+            Source::Here(p) => p,
+            Source::Fetch => fetched.next().ok_or("Файл не скачался")?,
+            Source::Missing => return Err(only_on_source(e, &[f])),
+        };
+        out.push(FileRef {
             path: p.to_string_lossy().into_owned(),
             ..f.clone()
-        })
-        .collect())
+        });
+    }
+    Ok(out)
 }
 
 /// Поднять запись наверх истории, как после копирования.
@@ -164,27 +258,26 @@ pub fn bump(app: &AppHandle, e: &Entry) {
     let _ = app.emit("clipwire://history-changed", ());
 }
 
-/// Скачать файлы записи с другого устройства без вставки. Прогресс идёт
-/// событиями `clipwire://transfer`.
+/// Скачать без вставки файлы записи, которых нет на этом компьютере: чужие и
+/// свои пропавшие, если копия есть на сервере. Прогресс идёт событиями
+/// `clipwire://transfer`. Что можно, скачивается, даже если часть файлов взять
+/// неоткуда; про них — ошибка после скачивания.
 #[tauri::command]
 pub async fn files_download(app: AppHandle, id: String) -> Result<(), String> {
     let e = entry(&app, &id)?;
     let Content::Files(files) = &e.content else {
         return Err("В записи нет файлов".into());
     };
-    if e.local {
-        return Ok(());
+    let dir = files_dir(&app.state::<AppState>().paths.dir);
+    let plan = plan(&e, files, &dir);
+    let need = to_fetch(files, &plan);
+    if !need.is_empty() {
+        download(&app, &e, &need).await?;
     }
-    let (with, without): (Vec<&FileRef>, Vec<&FileRef>) =
-        files.iter().partition(|f| f.blob.is_some());
-    if !with.is_empty() {
-        let with: Vec<FileRef> = with.into_iter().cloned().collect();
-        download(&app, &e, &with).await?;
+    match missing_error(&e, files, &plan) {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
-    if !without.is_empty() {
-        return Err(only_on_source(&e, &without));
-    }
-    Ok(())
 }
 
 /// Текущие передачи файлов — начальное состояние окна.
@@ -209,6 +302,48 @@ pub fn media_kind(name: &str) -> &'static str {
         "mp4" | "m4v" | "webm" | "mov" | "ogv" => "video",
         "mp3" | "m4a" | "aac" | "wav" | "ogg" | "oga" | "opus" | "flac" => "audio",
         _ => "none",
+    }
+}
+
+/// Сколько байт начала файла смотреть для сигнатуры.
+const HEAD: usize = 16;
+
+fn head(p: &Path) -> Option<Vec<u8>> {
+    let mut buf = Vec::with_capacity(HEAD);
+    std::fs::File::open(p)
+        .ok()?
+        .take(HEAD as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(buf)
+}
+
+/// Начало файла похоже на заявленный тип: PDF начинается с `%PDF-`, у видео и
+/// аудио — свои метки контейнера. Защита от подмены: HTML и прочее под чужим
+/// расширением не должно уйти в WebView как PDF или медиа.
+pub fn signature_matches(kind: &str, h: &[u8]) -> bool {
+    // ISO BMFF (mp4, m4v, m4a, mov): размер блока, затем его тип. Старые
+    // файлы QuickTime начинаются не с ftyp, а сразу с moov, mdat и т. п.
+    let bmff = h.len() >= 8
+        && matches!(
+            &h[4..8],
+            b"ftyp" | b"moov" | b"mdat" | b"wide" | b"free" | b"skip" | b"pnot"
+        );
+    let ogg = h.starts_with(b"OggS");
+    match kind {
+        "pdf" => h.starts_with(b"%PDF-"),
+        "video" => bmff || ogg || h.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]),
+        "audio" => {
+            // Кадр MP3 или ADTS (AAC) без заголовка: 11 единичных бит синхронизации.
+            let sync = h.len() >= 2 && h[0] == 0xFF && h[1] & 0xE0 == 0xE0;
+            bmff || ogg
+                || sync
+                || h.starts_with(b"ID3")
+                || h.starts_with(b"fLaC")
+                || h.starts_with(b"ADIF")
+                || (h.len() >= 12 && h.starts_with(b"RIFF") && &h[8..12] == b"WAVE")
+        }
+        _ => false,
     }
 }
 
@@ -278,7 +413,8 @@ mod tests {
         let cached = cache_path(dir, blob, &f.name);
         let own = entry_with(true, f.clone());
         assert!(entry_has_path(&own, dir, Path::new(&f.path)));
-        assert!(!entry_has_path(&own, dir, &cached));
+        // Свой файл пропал с места — показываем копию из кэша.
+        assert!(entry_has_path(&own, dir, &cached));
         let remote = entry_with(false, f.clone());
         assert!(entry_has_path(&remote, dir, &cached));
         assert!(entry_has_path(
@@ -290,6 +426,129 @@ mod tests {
         assert!(!entry_has_path(&remote, dir, Path::new(&f.path)));
         let msg = only_on_source(&remote, &[&f]);
         assert_eq!(msg, "Есть только на устройстве «Ноутбук»: отчёт.txt");
+    }
+
+    /// Временная папка теста, удаляется в конце.
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(tag: &str) -> Tmp {
+            let p = std::env::temp_dir().join(format!(
+                "clipwire-desktop-{tag}-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Tmp(p)
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn file(name: &str, path: &Path, blob: Option<BlobId>, is_dir: bool) -> FileRef {
+        FileRef {
+            name: name.into(),
+            path: path.to_string_lossy().into_owned(),
+            size: 3,
+            is_dir,
+            width: 0,
+            height: 0,
+            modified_ms: 1,
+            blob,
+        }
+    }
+
+    #[test]
+    fn own_moved_file_comes_from_cache_or_server() {
+        let tmp = Tmp::new("plan");
+        let dir = tmp.0.join("files");
+        let here = tmp.0.join("здесь.txt");
+        std::fs::write(&here, b"abc").unwrap();
+        let gone_blob = BlobId([1; 16]);
+        let cached_blob = BlobId([2; 16]);
+        let cached = cache_path(&dir, cached_blob, "в кэше.txt");
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, b"abc").unwrap();
+
+        let files = vec![
+            file("здесь.txt", &here, Some(BlobId([3; 16])), false),
+            file(
+                "пропал.txt",
+                &tmp.0.join("пропал.txt"),
+                Some(gone_blob),
+                false,
+            ),
+            file(
+                "в кэше.txt",
+                &tmp.0.join("в кэше.txt"),
+                Some(cached_blob),
+                false,
+            ),
+        ];
+        let mut own = entry_with(true, files[0].clone());
+        own.content = Content::Files(files.clone());
+        let p = plan(&own, &files, &dir);
+        assert_eq!(
+            p,
+            vec![
+                Source::Here(here.clone()),
+                Source::Fetch,
+                Source::Here(cached.clone())
+            ]
+        );
+        assert_eq!(missing_error(&own, &files, &p), None);
+        let need = to_fetch(&files, &p);
+        assert_eq!(need.len(), 1);
+        assert_eq!(need[0].name, "пропал.txt");
+        // local_file для своей записи тоже находит копию в кэше.
+        assert_eq!(
+            crate::commands::local_file(true, &files[2], &dir),
+            Some(cached.clone())
+        );
+
+        // Пропавший файл без копии на сервере и папка — понятная ошибка.
+        let lost = vec![
+            file("пропал.txt", &tmp.0.join("пропал.txt"), None, false),
+            file("Папка", &tmp.0.join("Папка"), Some(gone_blob), true),
+        ];
+        let p = plan(&own, &lost, &dir);
+        assert_eq!(p, vec![Source::Missing, Source::Missing]);
+        assert_eq!(
+            missing_error(&own, &lost, &p).as_deref(),
+            Some("Файла нет на месте, его переместили или удалили: пропал.txt, Папка")
+        );
+
+        // Чужая запись: исходный путь не в счёт, даже если по нему что-то есть.
+        let remote = entry_with(false, files[0].clone());
+        assert_eq!(plan(&remote, &files[..1], &dir), vec![Source::Fetch]);
+        let p = plan(&remote, &lost[..1], &dir);
+        assert_eq!(
+            missing_error(&remote, &lost[..1], &p).as_deref(),
+            Some("Есть только на устройстве «Ноутбук»: пропал.txt")
+        );
+    }
+
+    #[test]
+    fn media_needs_matching_signature() {
+        assert!(signature_matches("pdf", b"%PDF-1.7\n"));
+        // HTML под видом PDF в WebView не уходит.
+        assert!(!signature_matches("pdf", b"<html><script>"));
+        assert!(!signature_matches("pdf", b""));
+        assert!(signature_matches("video", b"\0\0\0\x20ftypisom"));
+        assert!(signature_matches("video", &[0x1A, 0x45, 0xDF, 0xA3, 0x01]));
+        assert!(signature_matches("video", b"OggS\0\x02"));
+        assert!(!signature_matches("video", b"<!doctype html>"));
+        assert!(signature_matches("audio", b"ID3\x04\0"));
+        assert!(signature_matches("audio", &[0xFF, 0xFB, 0x90, 0x00]));
+        assert!(signature_matches("audio", b"fLaC\0\0\0\x22"));
+        assert!(signature_matches("audio", b"RIFF\x24\0\0\0WAVEfmt "));
+        assert!(!signature_matches("audio", b"RIFF\x24\0\0\0AVI LIST"));
+        assert!(!signature_matches("audio", b"<svg onload=x>"));
+        assert!(!signature_matches("none", b"%PDF-1.7"));
     }
 
     #[test]
