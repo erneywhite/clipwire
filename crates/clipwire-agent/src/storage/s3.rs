@@ -393,7 +393,13 @@ impl ObjectStore for S3Store {
         Box::pin(async move {
             check_name(name)?;
             let (status, headers, body) = self
-                .send(Method::HEAD, Some(&self.key(name)), &[], Vec::new(), SMALL_BODY)
+                .send(
+                    Method::HEAD,
+                    Some(&self.key(name)),
+                    &[],
+                    Vec::new(),
+                    SMALL_BODY,
+                )
                 .await?;
             match status {
                 s if s.is_success() => Ok(Some(ObjectInfo {
@@ -478,9 +484,7 @@ impl ObjectStore for S3Store {
                 match next {
                     // Повтор токена — список по кругу.
                     Some(t) if !seen_tokens.insert(t.clone()) => {
-                        return Err(StoreError::Corrupt(
-                            "список объектов пошёл по кругу".into(),
-                        ));
+                        return Err(StoreError::Corrupt("список объектов пошёл по кругу".into()));
                     }
                     Some(t) => token = Some(t),
                     None => return Ok(out),

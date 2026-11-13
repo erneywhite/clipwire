@@ -3,7 +3,7 @@
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
 import type { SavedSecrets, StorageForm } from './api'
 
-const { copyForm, hostChanged, hostId, isDirty, isLocalHost, keepsSecret, keyProblem, probeKey, ttlOptions, validate } =
+const { copyForm, hostChanged, hostId, hostKeyChanged, isDirty, isLocalHost, keepsSecret, keyProblem, probeKey, ttlOptions, validate } =
   (await import('./storage' + '.ts')) as typeof import('./storage')
 
 function check(cond: boolean, msg: string) {
@@ -81,6 +81,22 @@ sftp.sftp.private_key = KEY
 check(!validate(sftp, form(), none).private_key, 'ключ OpenSSH годится')
 check(keyProblem('PuTTY-User-Key-File-3: ssh-ed25519\n').includes('PuTTY'), 'ключ PuTTY')
 check(keyProblem('-----BEGIN RSA PRIVATE KEY-----\nxx') === '', 'старый формат RSA тоже')
+
+// Сохранённый пароль SFTP не уходит серверу с другим ключом.
+const savedSftp = form({ kind: 'sftp' })
+Object.assign(savedSftp.sftp, { host: 'nas.local', user: 'clip', host_key_sha256: 'SHA256:abc' })
+const hasPw = { ...none, sftp_password: true }
+const re = copyForm(savedSftp)
+check(keepsSecret(re, savedSftp, hasPw), 'тот же сервер и ключ — пароль сохранён')
+re.sftp.host_key_sha256 = 'sha256:abc=='
+check(keepsSecret(re, savedSftp, hasPw) && !hostKeyChanged(re, savedSftp), 'другое написание отпечатка не в счёт')
+re.sftp.host_key_sha256 = ''
+check(keepsSecret(re, savedSftp, hasPw), 'сброшенный отпечаток: запрос без входа, пароль можно не вводить')
+re.sftp.host_key_sha256 = 'SHA256:evil'
+check(hostKeyChanged(re, savedSftp) && !keepsSecret(re, savedSftp, hasPw), 'другой ключ сервера — пароль заново')
+check(validate(re, savedSftp, hasPw).password.includes('Ключ сервера изменился'), 'подсказка про смену ключа')
+re.sftp.password = 'новый'
+check(!validate(re, savedSftp, hasPw).password, 'новый пароль введён')
 
 // Отпечаток ключа хоста: смена хоста или порта сбрасывает подтверждение.
 const confirmed = hostId({ host: 'NAS.local ', port: 22 })

@@ -581,7 +581,10 @@ async fn file_roundtrip_overwrite_list_and_cleanup() {
     // meta пишется дважды (начало и конец): второй раз — поверх
     // существующего файла, чего SFTP v3 сам не умеет.
     external::upload(&store, &key, &job, |_| {}).await.unwrap();
-    let meta = external::get_meta(&store, &key, blob).await.unwrap().unwrap();
+    let meta = external::get_meta(&store, &key, blob)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(meta.complete);
     let names: Vec<String> = store
         .list(&group_dir(&g))
@@ -609,7 +612,10 @@ async fn file_roundtrip_overwrite_list_and_cleanup() {
 
     // Чистка по сроку удаляет файлы и пустые папки.
     let later = clipwire_agent::history::now_ms() as u64 + 48 * 3600 * 1000;
-    assert_eq!(external::cleanup_at(&store, &g, 24, later).await.unwrap(), 1);
+    assert_eq!(
+        external::cleanup_at(&store, &g, 24, later).await.unwrap(),
+        1
+    );
     let fs = s.fs.lock().unwrap();
     assert!(fs.files.is_empty());
     assert!(

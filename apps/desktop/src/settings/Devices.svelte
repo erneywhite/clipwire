@@ -2,7 +2,7 @@
   // Устройства группы: список, удаление устройства и смена ключа группы.
   import { onMount } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
-  import { api, type GroupDevice, type GroupRekeyed, type RekeyResult, type Status } from '../lib/api'
+  import { api, type GroupDevice, type GroupRekeyed, type RekeyResult, type Status, type StorageKind } from '../lib/api'
   import { ago, plural } from '../lib/format'
   import { CHECKING, confirmText, deviceTitle, seenLabel } from '../lib/devices'
 
@@ -20,8 +20,25 @@
   let copied = $state(false)
   /** Ответ на смену ключа потерялся, ждём, что скажет сервер при повторном входе. */
   let checking = $state(false)
+  /** Вид хранилища файлов группы: у внешнего доступы остаются у исключённого. */
+  let storageKind = $state<StorageKind | null>(null)
 
-  const explain = $derived(confirming === null ? [] : confirmText(list, confirming || null, fmt))
+  const explain = $derived(confirming === null ? [] : confirmText(list, confirming || null, fmt, storageKind))
+
+  async function loadStorage() {
+    try {
+      storageKind = (await api.storageGet()).form.kind
+    } catch {
+      storageKind = null
+    }
+  }
+
+  /** Спросить подтверждение удаления: вид хранилища к этому моменту мог смениться. */
+  function askRemove(id: string) {
+    confirming = id
+    result = null
+    loadStorage()
+  }
 
   async function load() {
     try {
@@ -106,7 +123,7 @@
         <span class="meta mono">{d.os ?? 'нет карточки'} · {d.fingerprint} · {seenLabel(d, fmt)}</span>
       </div>
       {#if !d.me}
-        <button class="danger" disabled={busy} onclick={() => ((confirming = d.id), (result = null))}>Удалить</button>
+        <button class="danger" disabled={busy} onclick={() => askRemove(d.id)}>Удалить</button>
       {/if}
     </div>
   {/each}

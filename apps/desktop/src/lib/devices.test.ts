@@ -38,6 +38,14 @@ check(remove.some((s) => s.startsWith('1 устройство получит')),
 check(remove.some((s) => s.includes('dddd')), 'предупреждение про устройство без карточки')
 check(remove.at(-1)!.includes('Код приглашения сменится'), 'про код приглашения')
 
+// Внешнее хранилище: доступы к нему остаются у исключённого.
+check(!remove.some((s) => s.includes('хранилищу файлов')), 'хранилище не известно — без предупреждения')
+check(!confirmText(list, 'cccc', fmt, 'server').some((s) => s.includes('хранилищу файлов')), 'сервер Clipwire — доступов нет')
+const s3 = confirmText(list, 'cccc', fmt, 's3')
+check(s3[1].startsWith('Внимание') && s3[1].includes('ключ S3'), 'S3: сменить ключ, сразу после строки про удаляемое')
+check(confirmText(list, 'cccc', fmt, 'sftp').some((s) => s.includes('пароль или ключ SSH')), 'SFTP: сменить пароль или ключ')
+check(!confirmText(list, null, fmt, 's3').some((s) => s.includes('хранилищу файлов')), 'смена ключа без удаления — без предупреждения')
+
 const rekey = confirmText([me, work, phone], null, fmt)
 check(!rekey.some((s) => s.includes('потеряет доступ')), 'без удаления никто не теряет доступ')
 check(rekey.some((s) => s.startsWith('2 устройства получат')), 'двое получат ключ')

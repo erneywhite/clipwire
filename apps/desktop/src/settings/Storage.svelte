@@ -8,6 +8,7 @@
     copyForm,
     hostChanged,
     hostId,
+    hostKeyChanged,
     isDirty,
     isHttp,
     keepsSecret,
@@ -58,6 +59,8 @@
   const probeFresh = $derived(!!form && probedFor === probeKey(form))
   const probeOk = $derived(probeFresh && probe?.status === 'ok')
   const needsKeyConfirm = $derived(form?.kind === 'sftp' && !form.sftp.host_key_sha256)
+  /** Подтверждён другой ключ сервера: сохранённый пароль или ключ ему не отправляются. */
+  const rekeyedHost = $derived(!!form && !!savedForm && hostKeyChanged(form, savedForm))
 
   function apply(s: StorageState) {
     stored = s
@@ -109,13 +112,17 @@
     }
   }
 
-  /** «Отпечаток совпадает»: запомнить его и сразу проверить вход и запись. */
+  /**
+   * «Отпечаток совпадает»: запомнить его и сразу проверить вход и запись.
+   * Если подтверждён не тот ключ, что сохранён, сохранённый пароль или ключ
+   * не подставляется: проверка ждёт, пока его введут заново.
+   */
   function confirmKey() {
     if (!form || !offeredKey) return
     form.sftp.host_key_sha256 = offeredKey
     keyFor = hostId(form.sftp)
     offeredKey = ''
-    runProbe()
+    if (valid) runProbe()
   }
 
   /** Сервер сменил ключ: забыть старый отпечаток и показать новый на подтверждение. */
@@ -307,6 +314,7 @@
             />
             <button type="button" class="eye" onclick={() => (showPassword = !showPassword)} aria-pressed={showPassword}>{showPassword ? 'Скрыть' : 'Показать'}</button>
           </span>
+          {#if errors.password && rekeyedHost}<span class="bad">{errors.password}</span>{/if}
         </label>
       {:else}
         <label class="field">
@@ -318,7 +326,7 @@
             spellcheck="false"
             autocomplete="off"
           ></textarea>
-          {#if errors.private_key && form.sftp.private_key.trim()}<span class="bad">{errors.private_key}</span>{/if}
+          {#if errors.private_key && (form.sftp.private_key.trim() || rekeyedHost)}<span class="bad">{errors.private_key}</span>{/if}
         </label>
         <div class="buttons">
           <button type="button" onclick={() => keyFile?.click()}>Выбрать файл ключа…</button>
@@ -372,6 +380,15 @@
       </p>
     {/if}
 
+    {#if stored.access_exposed && form.kind !== 'server'}
+      <p class="hint warn" role="alert">
+        Из группы исключили устройство, у которого остались эти доступы к хранилищу файлов.
+        {stored.form.kind === 'sftp'
+          ? 'Смените пароль или ключ SSH на сервере и сохраните новые здесь.'
+          : 'Смените ключ S3 у поставщика хранилища и сохраните новый здесь.'}
+        Пока доступы прежние, исключённое устройство может удалять и портить файлы группы в хранилище, хотя прочитать их не может.
+      </p>
+    {/if}
     {#if stored.error && !dirty}
       <p class="error" role="alert">Сохранённое хранилище не открывается: {stored.error}. Файлы пока идут через сервер Clipwire.</p>
     {/if}
@@ -393,8 +410,9 @@
         <div class="error" role="alert">
           <p>Сервер прислал другой ключ: <code class="selectable">{probe.got}</code>, а подтверждён <code class="selectable">{probe.expected}</code>.</p>
           <p class="hint">
-            Если ключ сервера правда меняли (переустановка, новый сервер), сбросьте отпечаток и подтвердите новый. Если
-            нет, ничего не меняйте: соединение мог перехватить кто-то посередине.
+            Смена ключа сервера может значить, что соединение перехватили. Если ключ правда меняли (переустановка,
+            новый сервер), сбросьте отпечаток и подтвердите новый, а потом введите пароль или ключ заново: сохранённый
+            серверу с другим ключом не отправляется. Если не меняли, ничего не трогайте.
           </p>
           <button class="danger" onclick={resetKey}>Сбросить отпечаток</button>
         </div>

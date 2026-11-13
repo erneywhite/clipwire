@@ -50,10 +50,29 @@ export function isHttp(endpoint: string): boolean {
   return endpoint.trim().toLowerCase().startsWith('http://')
 }
 
+/** Отпечаток ключа хоста к виду `SHA256:<base64 без =>` (так же, как движок). */
+export function normFingerprint(s: string): string {
+  const t = s.trim()
+  const body = t.startsWith('SHA256:') || t.startsWith('sha256:') ? t.slice(7) : t
+  return `SHA256:${body.replace(/=+$/, '')}`
+}
+
+/**
+ * Тот же сервер SFTP, но подтверждён другой ключ сервера. Сохранённый пароль
+ * или ключ ему не отправляются: смена ключа сервера может значить перехват.
+ * Пустой отпечаток в форме — только запрос отпечатка, без входа.
+ */
+export function hostKeyChanged(form: StorageForm, saved: StorageForm): boolean {
+  if (form.kind !== 'sftp' || saved.kind !== 'sftp') return false
+  const a = form.sftp.host_key_sha256
+  return !!a.trim() && normFingerprint(a) !== normFingerprint(saved.sftp.host_key_sha256)
+}
+
 /**
  * Сохранённый секрет остаётся, если поле пустое и хранилище то же: адрес и ключ
- * доступа (S3) или хост, порт и пользователь (SFTP) не менялись. Так же решает
- * приложение (`storage.rs`), здесь — чтобы сразу подсказать.
+ * доступа (S3) или хост, порт, пользователь и подтверждённый ключ сервера
+ * (SFTP) не менялись. Так же решает приложение (`storage.rs`), здесь — чтобы
+ * сразу подсказать.
  */
 export function keepsSecret(form: StorageForm, saved: StorageForm, has: SavedSecrets): boolean {
   if (form.kind !== saved.kind) return false
@@ -65,6 +84,7 @@ export function keepsSecret(form: StorageForm, saved: StorageForm, has: SavedSec
     const a = form.sftp
     const b = saved.sftp
     if (a.host.trim() !== b.host.trim() || a.port !== b.port || a.user.trim() !== b.user.trim() || a.auth !== b.auth) return false
+    if (hostKeyChanged(form, saved)) return false
     return a.auth === 'password' ? has.sftp_password : has.sftp_key
   }
   return false
@@ -105,10 +125,12 @@ export function validate(form: StorageForm, saved: StorageForm, has: SavedSecret
     else if (/[\s/@]/.test(f.host.trim())) e.host = 'Только имя или адрес сервера, без пользователя и пути'
     if (!Number.isInteger(f.port) || f.port < 1 || f.port > 65535) e.port = 'Порт — число от 1 до 65535'
     if (!f.user.trim()) e.user = 'Укажите пользователя'
+    const rekeyed = hostKeyChanged(form, saved)
     if (f.auth === 'password') {
-      if (!f.password && !keep) e.password = 'Введите пароль'
+      if (!f.password && !keep) e.password = rekeyed ? 'Ключ сервера изменился: введите пароль заново' : 'Введите пароль'
     } else {
-      const problem = f.private_key.trim() ? keyProblem(f.private_key) : keep ? '' : 'Вставьте закрытый ключ или выберите файл'
+      const missing = rekeyed ? 'Ключ сервера изменился: вставьте закрытый ключ заново' : 'Вставьте закрытый ключ или выберите файл'
+      const problem = f.private_key.trim() ? keyProblem(f.private_key) : keep ? '' : missing
       if (problem) e.private_key = problem
     }
   }

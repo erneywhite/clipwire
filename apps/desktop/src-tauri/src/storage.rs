@@ -4,14 +4,18 @@
 //! Секреты (секретный ключ S3, пароль SFTP, закрытый ключ и пароль к нему) в
 //! окно не уходят: форма получает пустые поля и признак «сохранён». Пустое
 //! поле при сохранении или проверке значит «оставить сохранённый», но только
-//! если не сменились адрес и ключ доступа (S3) или сервер, порт и
-//! пользователь (SFTP): иначе сохранённый секрет ушёл бы чужому серверу.
+//! если не сменились адрес и ключ доступа (S3) или сервер, порт,
+//! пользователь и подтверждённый отпечаток ключа сервера (SFTP): иначе
+//! сохранённый секрет ушёл бы чужому серверу. Сменившийся ключ сервера может
+//! значить перехват соединения, и после «Сбросить отпечаток» пароль или ключ
+//! вводятся заново.
 
 use std::sync::Mutex;
 
 use clipwire_agent::group_config::StorageController;
 use clipwire_agent::storage::StoreError;
 use clipwire_agent::storage::external::Probe;
+use clipwire_agent::storage::sftp::normalize_fingerprint;
 use clipwire_core::storage::{GroupConfig, S3Config, SftpAuth, SftpConfig, StorageConfig};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -108,6 +112,9 @@ pub struct StorageDto {
     pub insecure_http: bool,
     /// Последнее предупреждение за этот запуск.
     pub warning: Option<Warning>,
+    /// Доступы к хранилищу были у исключённого из группы устройства: их надо
+    /// сменить у поставщика и сохранить заново.
+    pub access_exposed: bool,
 }
 
 /// Итог «Проверить подключение».
@@ -277,19 +284,33 @@ fn from_form(form: &StorageForm, current: &StorageConfig) -> CmdResult<StorageCo
             }
             let host = f.host.trim().to_string();
             let user = f.user.trim().to_string();
+            // Пустой отпечаток в форме — только запрос отпечатка, без входа:
+            // секрет при этом не отправляется, а сохранить без отпечатка
+            // нельзя. Другой отпечаток — другой сервер, секрет заново.
+            let form_key = f.host_key_sha256.trim();
             let same = match current {
                 StorageConfig::Sftp(c)
-                    if c.host.trim() == host && c.port == f.port && c.user.trim() == user =>
+                    if c.host.trim() == host
+                        && c.port == f.port
+                        && c.user.trim() == user
+                        && (form_key.is_empty()
+                            || normalize_fingerprint(form_key)
+                                == normalize_fingerprint(&c.host_key_sha256)) =>
                 {
                     Some(&c.auth)
                 }
                 _ => None,
             };
+            let changed_key = matches!(current, StorageConfig::Sftp(c)
+                if c.host.trim() == host && c.port == f.port && c.user.trim() == user)
+                && same.is_none();
             let auth = match f.auth.as_str() {
                 "password" => SftpAuth::Password(if !f.password.is_empty() {
                     f.password.clone()
                 } else if let Some(SftpAuth::Password(p)) = same {
                     p.clone()
+                } else if changed_key {
+                    return Err("Ключ сервера изменился: введите пароль заново".into());
                 } else {
                     return Err("Введите пароль".into());
                 }),
@@ -309,6 +330,8 @@ fn from_form(form: &StorageForm, current: &StorageConfig) -> CmdResult<StorageCo
                             private_key: private_key.clone(),
                             passphrase: new_pass.or_else(|| passphrase.clone()),
                         }
+                    } else if changed_key {
+                        return Err("Ключ сервера изменился: вставьте закрытый ключ заново".into());
                     } else {
                         return Err("Вставьте закрытый ключ или выберите файл".into());
                     }
@@ -337,6 +360,7 @@ fn dto(ctl: &StorageController, app: &AppHandle) -> StorageDto {
         version: view.version,
         error: view.error,
         insecure_http: view.insecure_http,
+        access_exposed: view.access_exposed,
         warning: app
             .state::<LastWarning>()
             .0
@@ -420,6 +444,7 @@ mod tests {
             version: 3,
             storage,
             file_ttl_hours: 48,
+            access_exposed: false,
         }
     }
 
@@ -486,6 +511,39 @@ mod tests {
         assert!(from_form(&form, &saved).is_err());
         assert_eq!(clean_path("clip/"), "clip");
         assert_eq!(clean_prefix(" /a/b/ "), "a/b");
+    }
+
+    #[test]
+    fn saved_secret_not_sent_to_server_with_other_host_key() {
+        let saved = sftp_saved(SftpAuth::Password("пароль".into()));
+        let (mut form, _) = to_form(&cfg(saved.clone()));
+        // Тот же отпечаток в другом написании — тот же сервер.
+        form.sftp.host_key_sha256 = "sha256:abc==".into();
+        assert!(from_form(&form, &saved).is_ok());
+        // «Сбросить отпечаток»: запрос отпечатка без входа, секрет можно.
+        form.sftp.host_key_sha256 = String::new();
+        assert!(from_form(&form, &saved).is_ok());
+        // Подтвердили другой отпечаток — сохранённый пароль туда не уходит.
+        form.sftp.host_key_sha256 = "SHA256:evil".into();
+        let e = from_form(&form, &saved).unwrap_err();
+        assert!(e.contains("Ключ сервера изменился"), "{e}");
+        form.sftp.password = "новый".into();
+        match from_form(&form, &saved).unwrap() {
+            StorageConfig::Sftp(c) => {
+                assert!(matches!(c.auth, SftpAuth::Password(p) if p == "новый"));
+                assert_eq!(c.host_key_sha256, "SHA256:evil");
+            }
+            _ => unreachable!(),
+        }
+        // Вход по ключу — так же.
+        let saved = sftp_saved(SftpAuth::Key {
+            private_key: "KEY".into(),
+            passphrase: None,
+        });
+        let (mut form, _) = to_form(&cfg(saved.clone()));
+        assert!(from_form(&form, &saved).is_ok());
+        form.sftp.host_key_sha256 = "SHA256:evil".into();
+        assert!(from_form(&form, &saved).is_err());
     }
 
     #[test]

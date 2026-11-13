@@ -1,5 +1,5 @@
 // Подписи и тексты подтверждений для раздела «Устройства группы».
-import type { GroupDevice } from './api'
+import type { GroupDevice, StorageKind } from './api'
 import type * as format from './format'
 
 /** Функции из `format.ts`. Передаются параметром, чтобы модуль запускался в
@@ -33,14 +33,30 @@ export function leftOut(list: GroupDevice[], removeId: string | null): GroupDevi
   return list.filter((d) => !d.me && !d.known && d.id !== removeId)
 }
 
-/** Объяснение перед подтверждением: что будет с удаляемым и с остальными. */
-export function confirmText(list: GroupDevice[], removeId: string | null, { plural }: Fmt): string[] {
+/** Предупреждение про доступы к внешнему хранилищу у исключаемого устройства. */
+export function exposedAccessText(kind: StorageKind | null): string {
+  if (kind === 's3') {
+    return 'Внимание: у исключённого устройства остались доступы к хранилищу файлов. Смените ключ S3 у поставщика хранилища и сохраните новый в настройках «Хранилище файлов».'
+  }
+  if (kind === 'sftp') {
+    return 'Внимание: у исключённого устройства остались доступы к хранилищу файлов. Смените пароль или ключ SSH на сервере и сохраните новые в настройках «Хранилище файлов».'
+  }
+  return ''
+}
+
+/**
+ * Объяснение перед подтверждением: что будет с удаляемым и с остальными.
+ * `storage` — вид хранилища файлов группы (`null` — не знаем).
+ */
+export function confirmText(list: GroupDevice[], removeId: string | null, { plural }: Fmt, storage: StorageKind | null = null): string[] {
   const out: string[] = []
   const target = list.find((d) => d.id === removeId)
   if (target) {
     out.push(
       `«${deviceTitle(target)}» потеряет доступ к группе: не получит новые элементы и файлы и не сможет вернуться по старому коду приглашения. То, что уже есть на нём, останется.`,
     )
+    const exposed = exposedAccessText(storage)
+    if (exposed) out.push(exposed)
   }
   const others = list.filter((d) => !d.me && d.known && d.id !== removeId)
   if (others.length > 0) {

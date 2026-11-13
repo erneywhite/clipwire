@@ -430,10 +430,17 @@ pub async fn probe_store(store: &dyn ObjectStore, group: &GroupId) -> Result<(),
 /// взять его время изменения и удалить. Время изменения остальных объектов
 /// ставят те же часы, поэтому сбитые часы устройства на чистку не влияют.
 /// `None` — хранилище время не сообщает.
-pub async fn store_clock(store: &dyn ObjectStore, group: &GroupId) -> Result<Option<u64>, StoreError> {
+pub async fn store_clock(
+    store: &dyn ObjectStore,
+    group: &GroupId,
+) -> Result<Option<u64>, StoreError> {
     let mut rnd = [0u8; 16];
     getrandom::fill(&mut rnd).map_err(|e| StoreError::Other(e.to_string()))?;
-    let name = format!("{}/probe-clock-{}", group_dir(group), super::sigv4::hex(&rnd));
+    let name = format!(
+        "{}/probe-clock-{}",
+        group_dir(group),
+        super::sigv4::hex(&rnd)
+    );
     store.put(&name, b"clipwire clock".to_vec()).await?;
     let info = store.head(&name).await;
     let deleted = store.delete(&name).await;
@@ -788,11 +795,7 @@ mod tests {
         fn put<'a>(&'a self, name: &'a str, data: Vec<u8>) -> StoreFuture<'a, ()> {
             self.inner.put(name, data)
         }
-        fn get<'a>(
-            &'a self,
-            name: &'a str,
-            max: u64,
-        ) -> StoreFuture<'a, Option<Vec<u8>>> {
+        fn get<'a>(&'a self, name: &'a str, max: u64) -> StoreFuture<'a, Option<Vec<u8>>> {
             Box::pin(async move {
                 if self.hide_parts && !name.ends_with("/meta") {
                     return Ok(None);
@@ -868,7 +871,9 @@ mod tests {
         let src = dir.join("src.bin");
         std::fs::write(&src, vec![7u8; 100]).unwrap();
         let inner = DirStore::new(dir.join("store"));
-        upload(&inner, &key, &job(&src, blob), |_| {}).await.unwrap();
+        upload(&inner, &key, &job(&src, blob), |_| {})
+            .await
+            .unwrap();
         let store = Quirky {
             inner,
             shift_ms: 0,
@@ -881,7 +886,15 @@ mod tests {
         };
         let res = tokio::time::timeout(
             Duration::from_secs(10),
-            download(&store, &key, blob, 100, &dir.join("o").join("f"), waits, |_| {}),
+            download(
+                &store,
+                &key,
+                blob,
+                100,
+                &dir.join("o").join("f"),
+                waits,
+                |_| {},
+            ),
         )
         .await
         .expect("скачивание должно сдаться, а не крутиться вечно");
@@ -916,15 +929,37 @@ mod tests {
             Err(StoreError::Corrupt(_))
         ));
         // Загрузка такой meta не верит: части грузятся, meta заводится своя.
-        upload(&store, &key, &job(&src, blob), |_| {}).await.unwrap();
+        upload(&store, &key, &job(&src, blob), |_| {})
+            .await
+            .unwrap();
         for i in 0..2 {
-            assert!(store.head(&chunk_object(&g, blob, i)).await.unwrap().is_some());
+            assert!(
+                store
+                    .head(&chunk_object(&g, blob, i))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
         }
-        assert!(get_meta(&store, &key, blob).await.unwrap().unwrap().complete);
+        assert!(
+            get_meta(&store, &key, blob)
+                .await
+                .unwrap()
+                .unwrap()
+                .complete
+        );
         // Своя meta с complete, но без последней части — тоже не «готово».
         store.delete(&chunk_object(&g, blob, 1)).await.unwrap();
-        upload(&store, &key, &job(&src, blob), |_| {}).await.unwrap();
-        assert!(store.head(&chunk_object(&g, blob, 1)).await.unwrap().is_some());
+        upload(&store, &key, &job(&src, blob), |_| {})
+            .await
+            .unwrap();
+        assert!(
+            store
+                .head(&chunk_object(&g, blob, 1))
+                .await
+                .unwrap()
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -935,11 +970,7 @@ mod tests {
             fn put<'a>(&'a self, _: &'a str, _: Vec<u8>) -> StoreFuture<'a, ()> {
                 Box::pin(async { Err(StoreError::Network("нет".into())) })
             }
-            fn get<'a>(
-                &'a self,
-                _: &'a str,
-                _: u64,
-            ) -> StoreFuture<'a, Option<Vec<u8>>> {
+            fn get<'a>(&'a self, _: &'a str, _: u64) -> StoreFuture<'a, Option<Vec<u8>>> {
                 Box::pin(async { Err(StoreError::Network("нет".into())) })
             }
             fn head<'a>(&'a self, _: &'a str) -> StoreFuture<'a, Option<ObjectInfo>> {

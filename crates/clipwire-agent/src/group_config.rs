@@ -621,10 +621,14 @@ mod tests {
         assert!(st.seal_for_rekey(&new, true).is_none(), "настроек нет");
         assert!(st.apply(s3(10)));
         // Без исключения — как есть.
-        let same = new.open_config(&st.seal_for_rekey(&new, false).unwrap()).unwrap();
+        let same = new
+            .open_config(&st.seal_for_rekey(&new, false).unwrap())
+            .unwrap();
         assert_eq!(same, s3(10));
         // С исключением — пометка и новая версия, доступы те же.
-        let marked = new.open_config(&st.seal_for_rekey(&new, true).unwrap()).unwrap();
+        let marked = new
+            .open_config(&st.seal_for_rekey(&new, true).unwrap())
+            .unwrap();
         assert!(marked.access_exposed && marked.version > 10);
         assert_eq!(marked.storage, s3(10).storage);
         assert!(StorageView::of(&marked, None).access_exposed);
@@ -634,7 +638,9 @@ mod tests {
             version: 3,
             ..GroupConfig::default()
         }));
-        let c = new.open_config(&server.seal_for_rekey(&new, true).unwrap()).unwrap();
+        let c = new
+            .open_config(&server.seal_for_rekey(&new, true).unwrap())
+            .unwrap();
         assert!(!c.access_exposed && c.version == 3);
         let _ = std::fs::remove_dir_all(&d);
     }

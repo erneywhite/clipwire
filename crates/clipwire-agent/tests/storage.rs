@@ -438,7 +438,10 @@ async fn dead_external_store_on_both_sides_falls_back_quickly() -> Result<()> {
         .send(Content::Files(vec![f.clone()]).into())
         .await?;
     let item = b.incoming().await?;
-    assert_eq!(places(&item.ext), vec![(f.blob.unwrap(), BlobPlace::Server)]);
+    assert_eq!(
+        places(&item.ext),
+        vec![(f.blob.unwrap(), BlobPlace::Server)]
+    );
     let Content::Files(files) = &item.content else {
         unreachable!()
     };
