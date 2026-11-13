@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clipwire_core::proto::io::{IoError, read_msg, read_msg_limited, write_msg};
 use clipwire_core::proto::{ClientMsg, ServerMsg};
+use clipwire_core::storage::MAX_CONFIG_BYTES;
 use clipwire_core::{DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -304,10 +305,24 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                             write_msg(&mut send, &reply).await?;
                         }
                     }
-                    // shortcut: заглушка до реализации хранения настроек группы (волна 3).
-                    Some(ClientMsg::SetGroupConfig(_)) => {}
+                    Some(ClientMsg::SetGroupConfig(config)) => {
+                        if config.len() > MAX_CONFIG_BYTES {
+                            refuse(&mut send, "настройки группы слишком большие").await;
+                            bail!("настройки группы {} байт", config.len());
+                        }
+                        if shared.store.set_group_config(&group, &config, now_ms())? {
+                            let n = shared.hub.broadcast_config(
+                                &group,
+                                reg.id,
+                                &ServerMsg::GroupConfig(Some(config)),
+                            );
+                            tracing::info!(group = %short(&group), receivers = n, "настройки группы сохранены");
+                        }
+                    }
                     Some(ClientMsg::GetGroupConfig) => {
-                        write_msg(&mut send, &ServerMsg::GroupConfig(None)).await?;
+                        reg.subscribe_config();
+                        let config = shared.store.group_config(&group)?;
+                        write_msg(&mut send, &ServerMsg::GroupConfig(config)).await?;
                     }
                     Some(ClientMsg::ListDevices) => {
                         write_msg(&mut send, &crate::devices::list_devices(shared, &group)?).await?;

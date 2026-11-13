@@ -14,6 +14,7 @@ use clipwire_core::{BlobId, DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+mod config;
 mod devices;
 pub use devices::{RekeyLimits, RekeyOutcome, Rotation};
 
@@ -167,6 +168,7 @@ impl Store {
             conn.execute_batch("ALTER TABLE blobs ADD COLUMN origin BLOB;")?;
         }
         devices::migrate(&conn)?;
+        config::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

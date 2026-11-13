@@ -3,7 +3,8 @@
 //! Карточка — зашифрованный ключом группы блоб, сервер хранит последнюю на
 //! каждое устройство группы. Смена ключа переводит группу в режим «ключ
 //! сменён»: в `groups` появляются `rotated_to` и `rotated_ms`, пакеты нового
-//! ключа лежат в `rekeys` по устройствам, элементы и файлы группы удаляются.
+//! ключа лежат в `rekeys` по устройствам, элементы, файлы и настройки группы
+//! удаляются.
 //! Через `rotated_keep` (30 дней) пакеты, карточки и устройства удаляются, а
 //! строка группы остаётся навсегда надгробием (`tombstone_ms`): иначе вход
 //! старым ключом с токеном сервера создал бы группу с тем же id заново.
@@ -225,7 +226,7 @@ impl Store {
                 blobs.push(BlobId(b?.try_into().ok().context("битый blob_id в базе")?));
             }
         }
-        for table in ["items", "blobs", "cards"] {
+        for table in ["items", "blobs", "cards", "group_config"] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE group_id = ?1"),
                 params![&group.0[..]],
@@ -253,7 +254,14 @@ impl Store {
                 .collect::<rusqlite::Result<_>>()?
         };
         for g in &groups {
-            for table in ["rekeys", "cards", "devices", "items", "blobs"] {
+            for table in [
+                "rekeys",
+                "cards",
+                "devices",
+                "items",
+                "blobs",
+                "group_config",
+            ] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE group_id = ?1"),
                     params![g],

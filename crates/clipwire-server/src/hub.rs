@@ -3,7 +3,7 @@
 //! кто на связи (`ListDevices`), и закрыть соединения при смене ключа.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clipwire_core::proto::ServerMsg;
@@ -20,6 +20,9 @@ struct Member {
     device: DeviceId,
     tx: mpsc::Sender<ServerMsg>,
     kick: Arc<Notify>,
+    /// Соединение спрашивало `GetGroupConfig` и получает новые настройки.
+    /// Клиенты 0.1.0 этого сообщения не знают, им `GroupConfig` слать нельзя.
+    config_sub: Arc<AtomicBool>,
 }
 
 type Groups = HashMap<GroupId, HashMap<u64, Member>>;
@@ -39,6 +42,14 @@ pub struct Registration<'a> {
     /// так что сигнал не теряется, даже если соединение в этот момент занято,
     /// и не зависит от очереди сообщений.
     pub kick: Arc<Notify>,
+    config_sub: Arc<AtomicBool>,
+}
+
+impl Registration<'_> {
+    /// Подписать соединение на настройки группы (`GetGroupConfig`).
+    pub fn subscribe_config(&self) {
+        self.config_sub.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Drop for Registration<'_> {
@@ -68,12 +79,14 @@ impl Hub {
     ) -> Registration<'_> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let kick = Arc::new(Notify::new());
+        let config_sub = Arc::new(AtomicBool::new(false));
         self.lock().entry(group).or_default().insert(
             id,
             Member {
                 device,
                 tx,
                 kick: kick.clone(),
+                config_sub: config_sub.clone(),
             },
         );
         Registration {
@@ -81,6 +94,7 @@ impl Hub {
             group,
             id,
             kick,
+            config_sub,
         }
     }
 
@@ -118,13 +132,23 @@ impl Hub {
     /// Рассылает сообщение всем соединениям группы, кроме `except`.
     /// Возвращает число получателей.
     pub fn broadcast(&self, group: &GroupId, except: u64, msg: &ServerMsg) -> usize {
+        self.send_to(group, except, msg, false)
+    }
+
+    /// То же, но только соединениям, подписанным на настройки группы
+    /// ([`Registration::subscribe_config`]).
+    pub fn broadcast_config(&self, group: &GroupId, except: u64, msg: &ServerMsg) -> usize {
+        self.send_to(group, except, msg, true)
+    }
+
+    fn send_to(&self, group: &GroupId, except: u64, msg: &ServerMsg, config_only: bool) -> usize {
         let groups = self.lock();
         let Some(members) = groups.get(group) else {
             return 0;
         };
         let mut sent = 0;
         for (&id, m) in members {
-            if id == except {
+            if id == except || (config_only && !m.config_sub.load(Ordering::Relaxed)) {
                 continue;
             }
             match m.tx.try_send(msg.clone()) {
@@ -158,6 +182,26 @@ mod tests {
         assert!(rc.try_recv().is_err());
         assert_eq!(hub.online_devices(&g1), HashSet::from([da, db]));
         assert_eq!(hub.online_devices(&GroupId([9; 32])), HashSet::new());
+    }
+
+    #[test]
+    fn config_goes_only_to_subscribers() {
+        let hub = Hub::default();
+        let g = GroupId([1; 32]);
+        let (ta, mut ra) = mpsc::channel(4);
+        let (tb, mut rb) = mpsc::channel(4);
+        let (tc, mut rc) = mpsc::channel(4);
+        let a = hub.register(g, DeviceId([1; 32]), ta);
+        let b = hub.register(g, DeviceId([2; 32]), tb);
+        let _old = hub.register(g, DeviceId([3; 32]), tc);
+        a.subscribe_config();
+        b.subscribe_config();
+        let msg = ServerMsg::GroupConfig(Some(vec![1]));
+        // Отправитель и неподписанный (клиент 0.1.0) не получают.
+        assert_eq!(hub.broadcast_config(&g, a.id, &msg), 1);
+        assert!(ra.try_recv().is_err());
+        assert_eq!(rb.try_recv().unwrap(), msg);
+        assert!(rc.try_recv().is_err());
     }
 
     #[tokio::test]
