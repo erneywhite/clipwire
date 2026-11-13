@@ -163,9 +163,23 @@ impl Client {
 }
 
 async fn joined(dev: &Dev, info: &ServerInfo, relay: &str, key: &GroupKey) -> Result<Client> {
-    let mut c = Client::connect(dev, info, relay).await?;
-    c.join(key).await?;
-    Ok(c)
+    // Сервер освобождает место соединения, когда его сессия закончилась, а
+    // клиент узнаёт об отказе раньше. Новое соединение сразу после отказа может
+    // упереться в предел соединений устройства: подождать и повторить.
+    let started = std::time::Instant::now();
+    loop {
+        let mut c = Client::connect(dev, info, relay).await?;
+        match c.join(key).await {
+            Ok(_) => return Ok(c),
+            Err(e)
+                if e.to_string().contains("слишком много соединений") && started.elapsed() < T =>
+            {
+                c.conn.close(0u32.into(), b"retry");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 async fn start_server() -> Result<(clipwire_server::Running, String, PathBuf)> {
