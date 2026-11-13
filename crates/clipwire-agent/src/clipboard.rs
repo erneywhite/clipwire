@@ -121,6 +121,97 @@ fn read_consistent<T>(mut seq: impl FnMut() -> u32, mut read: impl FnMut() -> T)
     None
 }
 
+/// Что брать из буфера Windows по набору форматов в нём.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// Список путей `CF_HDROP` (Проводник).
+    Files,
+    /// Картинка, хотя рядом лежит и обещание файла `FileGroupDescriptorW`:
+    /// так копирует картинку Firefox и Thunderbird. Человек копировал
+    /// изображение, и вставлять его надо как изображение.
+    Image,
+    /// Виртуальные файлы без пути на диске (вложения и письма Outlook).
+    Virtual,
+    /// Текст с форматированием или картинка, по обычным правилам.
+    Other,
+}
+
+/// Порядок разбора буфера. `avail` — есть ли формат с таким номером,
+/// `descriptor` и `png` — номера зарегистрированных форматов
+/// `FileGroupDescriptorW` и `PNG` (0 — не зарегистрировались).
+///
+/// Виртуальные файлы проверяются раньше текста: Outlook при копировании
+/// письма из списка кладёт рядом текст с отправителем и темой, а при
+/// копировании вложения — его имя. Картинки у Outlook рядом с описанием
+/// файлов нет, поэтому вложение и письмо остаются файлами.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pick(avail: impl Fn(u32) -> bool, descriptor: u32, png: u32) -> Pick {
+    const CF_HDROP: u32 = 15;
+    const CF_DIB: u32 = 8;
+    const CF_DIBV5: u32 = 17;
+    if avail(CF_HDROP) {
+        return Pick::Files;
+    }
+    if descriptor == 0 || !avail(descriptor) {
+        return Pick::Other;
+    }
+    let image = avail(CF_DIB) || avail(CF_DIBV5) || (png != 0 && avail(png));
+    if image { Pick::Image } else { Pick::Virtual }
+}
+
+/// Очерёдность чтений виртуальных файлов в потоке слежения: какой буфер
+/// уже забран и какой ждёт, пока закончится прошлое чтение. Номера — версии
+/// буфера (`GetClipboardSequenceNumber`).
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Default)]
+struct VirtualQueue {
+    /// Буфер, который уже забран или забирается: повторное уведомление о
+    /// нём файлы не дублирует.
+    taken: u32,
+    /// Буфер с виртуальными файлами, пришедший во время чтения прошлого.
+    pending: Option<u32>,
+}
+
+/// Что делать, когда чтение закончилось.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+struct VirtualDone {
+    /// Отдать забранные файлы дальше (в историю и группу).
+    deliver: bool,
+    /// Перечитать буфер: в нём всё ещё то, что ждало очереди.
+    reread: bool,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl VirtualQueue {
+    /// Читать ли буфер `seq`.
+    fn wants(&self, seq: u32) -> bool {
+        seq != self.taken
+    }
+
+    /// Чтение буфера `seq` началось.
+    fn started(&mut self, seq: u32) {
+        self.taken = seq;
+        self.pending = None;
+    }
+
+    /// Буфер `seq` не начали читать: идёт прошлое чтение.
+    fn busy(&mut self, seq: u32) {
+        self.pending = Some(seq);
+    }
+
+    /// Чтение буфера `seq` закончилось, сейчас в буфере версия `now`.
+    /// Если буфер с тех пор сменился, новое содержимое уже ушло (или уйдёт)
+    /// своим путём, и старые файлы поверх него ставить нельзя.
+    fn finished(&mut self, seq: u32, now: u32) -> VirtualDone {
+        VirtualDone {
+            deliver: seq == now,
+            reread: self.pending.take() == Some(now),
+        }
+    }
+}
+
 /// Каталог забранных «виртуальных» файлов (вложения Outlook и т. п.):
 /// `<state dir>/virtual`.
 pub fn virtual_dir(state_dir: &std::path::Path) -> std::path::PathBuf {
@@ -216,8 +307,9 @@ mod win {
     /// буфера, если удалось узнать.
     type Callback = Box<dyn FnMut(Content, Option<String>)>;
 
-    /// Результат чтения виртуальных файлов: пути верхнего уровня и владелец.
-    type VirtualResult = (Result<Vec<std::path::PathBuf>>, Option<String>);
+    /// Результат чтения виртуальных файлов: забранное, владелец и номер
+    /// версии буфера, который читался.
+    type VirtualResult = (Result<crate::virtual_files::Captured>, Option<String>, u32);
 
     struct Ctx {
         formats: ExclusionFormats,
@@ -227,9 +319,8 @@ mod win {
         virt_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
         virt_tx: std_mpsc::Sender<VirtualResult>,
         virt_rx: std_mpsc::Receiver<VirtualResult>,
-        /// Номер версии буфера, виртуальные файлы которой уже забраны или
-        /// забираются: повторное уведомление о том же буфере их не дублирует.
-        virt_seq: u32,
+        /// Какой буфер с виртуальными файлами забран и какой ждёт очереди.
+        virt: super::VirtualQueue,
     }
 
     /// Следит за буфером, пока жив. Колбэк вызывается в потоке слежения на
@@ -256,7 +347,7 @@ mod win {
                         virt_busy: Default::default(),
                         virt_tx,
                         virt_rx,
-                        virt_seq: 0,
+                        virt: Default::default(),
                     });
                     let hwnd = match create_window(ctx) {
                         Ok(h) => h,
@@ -341,16 +432,31 @@ mod win {
                 let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Ctx;
                 // SAFETY: как в WM_TIMER.
                 if let Some(ctx) = unsafe { ptr.as_mut() } {
-                    while let Ok((res, owner)) = ctx.virt_rx.try_recv() {
+                    while let Ok((res, owner, seq)) = ctx.virt_rx.try_recv() {
+                        let now = unsafe { GetClipboardSequenceNumber() };
+                        let done = ctx.virt.finished(seq, now);
                         match res {
-                            Ok(paths) => {
+                            Ok(got) if done.deliver => {
                                 let files: Vec<_> =
-                                    paths.iter().map(|p| super::local_file_ref(p)).collect();
+                                    got.tops.iter().map(|p| super::local_file_ref(p)).collect();
                                 (ctx.on_change)(Content::Files(files), owner);
+                            }
+                            Ok(got) => {
+                                // Пока файлы читались, скопировали другое: оно
+                                // уже ушло, и старые файлы его бы перекрыли.
+                                tracing::info!(
+                                    "виртуальные файлы пропущены: буфер сменился, пока они читались"
+                                );
+                                got.discard();
                             }
                             Err(e) => {
                                 tracing::info!("виртуальные файлы из буфера пропущены: {e:#}")
                             }
+                        }
+                        if done.reread {
+                            // Ждавший очереди буфер всё ещё на месте: прочитать
+                            // его обычным путём, с проверкой меток и владельца.
+                            unsafe { SetTimer(Some(hwnd), READ_TIMER, READ_DELAY_MS, None) };
                         }
                     }
                 }
@@ -382,13 +488,25 @@ mod win {
         if ctx.formats.excluded(hwnd) {
             return Snapshot::Excluded;
         }
-        let content = if let Some(files) = read_files() {
+        // Порядок форматов и почему он такой — в `super::pick`.
+        let pick = super::pick(
+            raw_available,
+            crate::virtual_files::descriptor_format(),
+            png_format(),
+        );
+        let content = if pick == super::Pick::Files
+            && let Some(files) = read_files()
+        {
             // Проводник кладёт файлы списком путей (CF_HDROP).
             Content::Files(files)
-        } else if raw_available(crate::virtual_files::descriptor_format()) {
-            // Outlook и другие источники без файлов на диске. Проверяем
-            // раньше текста: рядом с вложением бывает его имя текстом.
+        } else if pick == super::Pick::Virtual {
+            // Outlook и другие источники без файлов на диске.
             return Snapshot::Virtual(owner_exe());
+        } else if pick == super::Pick::Image
+            && let Some(img) = super::read_image()
+        {
+            // Картинка вместе с обещанием файла (Firefox, Thunderbird).
+            img
         } else if let Some(text) = super::read_text()
             && !text.is_empty()
         {
@@ -413,11 +531,16 @@ mod win {
         format != 0 && unsafe { IsClipboardFormatAvailable(format) }.is_ok()
     }
 
+    /// Номер формата `PNG` (так кладут картинки браузеры и редакторы).
+    fn png_format() -> u32 {
+        unsafe { RegisterClipboardFormatW(w!("PNG")) }
+    }
+
     /// Начать чтение виртуальных файлов в отдельном потоке. Результат придёт
     /// сообщением WM_VIRTUAL_DONE в поток слежения, и колбэк вызовется там.
     fn start_virtual(ctx: &mut Ctx, hwnd: HWND, owner: Option<String>) {
         let seq = unsafe { GetClipboardSequenceNumber() };
-        if seq == ctx.virt_seq {
+        if !ctx.virt.wants(seq) {
             tracing::debug!("виртуальные файлы этого буфера уже забраны");
             return;
         }
@@ -431,8 +554,9 @@ mod win {
             &ctx.virt_busy,
             ctx.opts.virtual_dir.clone(),
             max_bytes,
+            seq,
             move |res| {
-                if tx.send((res, owner)).is_ok() {
+                if tx.send((res, owner, seq)).is_ok() {
                     let hwnd = HWND(hwnd_raw as *mut _);
                     let _ =
                         unsafe { PostMessageW(Some(hwnd), WM_VIRTUAL_DONE, WPARAM(0), LPARAM(0)) };
@@ -440,9 +564,12 @@ mod win {
             },
         );
         if started {
-            ctx.virt_seq = seq;
+            ctx.virt.started(seq);
         } else {
-            tracing::info!("виртуальные файлы пропущены: прошлое чтение ещё не закончилось");
+            // Прочитаем, когда закончится прошлое (если буфер к тому времени
+            // не сменится): см. WM_VIRTUAL_DONE.
+            tracing::debug!("виртуальные файлы ждут: прошлое чтение ещё не закончилось");
+            ctx.virt.busy(seq);
         }
     }
 
@@ -754,5 +881,95 @@ mod tests {
             || reads.set(reads.get() + 1),
         );
         assert_eq!((got, reads.get()), (None, 3));
+    }
+
+    /// Номера форматов для проверки порядка: как в Windows, кроме
+    /// зарегистрированных — у них номера условные.
+    const HDROP: u32 = 15;
+    const TEXT: u32 = 13;
+    const DIB: u32 = 8;
+    const DIBV5: u32 = 17;
+    const DESC: u32 = 0xC0A0;
+    const CONTENTS: u32 = 0xC0A1;
+    const HTML: u32 = 0xC0A2;
+    const PNG: u32 = 0xC0A3;
+
+    fn pick_of(formats: &[u32]) -> Pick {
+        pick(|f| formats.contains(&f), DESC, PNG)
+    }
+
+    #[test]
+    fn image_with_file_promise_stays_image() {
+        // Firefox «Копировать изображение»: картинка, HTML и обещание файла.
+        assert_eq!(pick_of(&[DESC, CONTENTS, DIBV5, HTML]), Pick::Image);
+        assert_eq!(pick_of(&[DESC, CONTENTS, DIB]), Pick::Image);
+        assert_eq!(pick_of(&[DESC, CONTENTS, PNG, TEXT]), Pick::Image);
+        // Вложение и письмо Outlook: описание, содержимое, рядом текст.
+        assert_eq!(pick_of(&[DESC, CONTENTS]), Pick::Virtual);
+        assert_eq!(pick_of(&[DESC, CONTENTS, TEXT]), Pick::Virtual);
+        // Проводник кладёт и пути, и описание: берём пути.
+        assert_eq!(pick_of(&[HDROP, DESC, CONTENTS, DIB]), Pick::Files);
+        // Без описания — обычные правила текста и картинки.
+        assert_eq!(pick_of(&[TEXT, DIB, HTML]), Pick::Other);
+        assert_eq!(pick_of(&[DIB]), Pick::Other);
+        // Формат не зарегистрировался (0) — описания будто нет.
+        assert_eq!(pick(|_| true, 0, 0), Pick::Files);
+        assert_eq!(pick(|f| f != HDROP, 0, 0), Pick::Other);
+    }
+
+    #[test]
+    fn late_virtual_result_does_not_override_newer_copy() {
+        let mut q = VirtualQueue::default();
+        assert!(q.wants(10));
+        q.started(10);
+        assert!(!q.wants(10));
+        // Буфер не менялся — файлы отдаём.
+        let d = q.finished(10, 10);
+        assert_eq!(
+            d,
+            VirtualDone {
+                deliver: true,
+                reread: false
+            }
+        );
+
+        // Пока читались файлы, скопировали текст (11): файлы не отдаём,
+        // перечитывать нечего.
+        q.started(20);
+        assert_eq!(
+            q.finished(20, 21),
+            VirtualDone {
+                deliver: false,
+                reread: false
+            }
+        );
+    }
+
+    #[test]
+    fn virtual_copy_during_read_is_read_afterwards() {
+        let mut q = VirtualQueue::default();
+        q.started(1);
+        // Второе вложение скопировано, пока читалось первое.
+        assert!(q.wants(2));
+        q.busy(2);
+        let d = q.finished(1, 2);
+        assert!(!d.deliver);
+        assert!(d.reread, "ждавший буфер должен перечитаться");
+        // Перечитали и начали.
+        assert!(q.wants(2));
+        q.started(2);
+        assert!(!q.finished(2, 2).reread);
+
+        // Ждавший буфер сменился ещё раз (текст) — не перечитываем: текст
+        // ушёл своим путём.
+        q.started(5);
+        q.busy(6);
+        assert_eq!(
+            q.finished(5, 7),
+            VirtualDone {
+                deliver: false,
+                reread: false
+            }
+        );
     }
 }

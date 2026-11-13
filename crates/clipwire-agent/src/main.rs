@@ -188,6 +188,11 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
         &history.blobs(),
         &Default::default(),
     );
+    clipwire_agent::cache::prune_virtual(
+        &clipwire_agent::clipboard::virtual_dir(&paths.dir),
+        &history.file_paths(),
+        clipwire_agent::cache::VIRTUAL_GRACE,
+    );
     let rt = tokio::runtime::Runtime::new()?;
     let service = Service::start(
         rt.handle(),
