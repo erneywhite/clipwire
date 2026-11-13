@@ -247,12 +247,13 @@ async fn begin(
         shared.not_before_ms(),
         limits.blob_quota,
         limits.blob_total_quota,
+        limits.max_reserves,
     )?;
     let (have, fresh) = match begin {
         BlobBegin::Created => (0, true),
         BlobBegin::Existing { have } => (have, false),
         BlobBegin::SizeMismatch => return Err(BlobFail::SizeMismatch.into()),
-        BlobBegin::QuotaExceeded | BlobBegin::ServerFull => {
+        BlobBegin::QuotaExceeded | BlobBegin::ServerFull | BlobBegin::TooManyReserves => {
             return Err(BlobFail::QuotaExceeded.into());
         }
     };
@@ -303,6 +304,29 @@ async fn abort(
     }
     write_msg(send, &BlobReply::Aborted).await?;
     Ok(())
+}
+
+/// Чистка брошенных резервов: файлы, по которым за `reserve_ttl` не пришло ни
+/// одной части. Иначе `Reserve` без загрузки держал бы квоту группы до общего
+/// срока (сутки). Удаление — как у `Abort`, под замком записи: если за это
+/// время началась загрузка, у неё замок, и после него у файла уже есть части,
+/// тогда его не трогаем. Ждущие `Get` получают `Cancelled`.
+/// Возвращает, сколько резервов удалено.
+pub async fn purge_stale_reserves(shared: &Shared) -> anyhow::Result<usize> {
+    let older_than = now_ms() - shared.limits.reserve_ttl.as_millis() as i64;
+    let stale = shared.store.stale_reserves(older_than)?;
+    let mut removed = 0;
+    for (group, blob) in &stale {
+        let live = shared.blobs.live(group, blob, 0);
+        let _writer = live.writer.lock().await;
+        if !shared.store.delete_stale_reserve(group, blob, older_than)? {
+            continue;
+        }
+        shared.blobs.remove(group, blob);
+        live.state.send_modify(|p| p.cancelled = true);
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// Чистка по сроку: строки удаляются в базе, файлы — под замком записи.

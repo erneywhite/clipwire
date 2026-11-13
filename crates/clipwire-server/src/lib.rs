@@ -23,11 +23,12 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey};
 
 use blobs::Blobs;
-pub use config::Config;
-use session::{ClipwireProtocol, Limits, Shared};
+pub use config::{Config, Guards};
+use session::{ClipwireProtocol, DeviceSlots, Limits, Shared};
 use store::Store;
 
-/// Как часто чистить просроченные элементы и файлы.
+/// Как часто чистить просроченные элементы и файлы. Если срок резерва
+/// короче, чистка идёт чаще, чтобы брошенный резерв не жил вдвое дольше.
 const PURGE_EVERY: Duration = Duration::from_secs(600);
 
 /// Запущенный сервер. Работает, пока жив объект или до `shutdown`.
@@ -134,7 +135,13 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Запустить сервер с пределами по умолчанию ([`Guards::default`]).
 pub async fn start(config: &Config) -> Result<Running> {
+    start_with(config, &Guards::default()).await
+}
+
+/// Запустить сервер со своими пределами против злоупотреблений.
+pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
     let identity = Identity::load_or_create(&config.data_dir, config.relay_token.as_deref())?;
     let info = identity.server_info(&config.public_url);
 
@@ -167,22 +174,19 @@ pub async fn start(config: &Config) -> Result<Running> {
         store,
         hub: Default::default(),
         blobs: Blobs::new(config.data_dir.join("blobs")),
-        limits: Limits {
-            max_item_bytes: config.max_item_bytes,
-            history_len: config.history_len,
-            ttl: config.ttl,
-            max_file_bytes: config.max_file_bytes,
-            blob_quota: config.blob_quota,
-            blob_total_quota: config.blob_total_quota,
-            blob_stall: config.blob_stall,
-        },
+        limits: Limits::new(config, guards),
         streams: Default::default(),
+        token: identity.relay_token.clone(),
+        devices: DeviceSlots::default(),
     });
+    let purge_every = PURGE_EVERY
+        .min(guards.reserve_ttl)
+        .max(Duration::from_secs(1));
 
     let purge = {
         let shared = shared.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(PURGE_EVERY);
+            let mut tick = tokio::time::interval(purge_every);
             loop {
                 tick.tick().await;
                 match shared.store.purge_expired(shared.not_before_ms()) {
@@ -194,6 +198,11 @@ pub async fn start(config: &Config) -> Result<Running> {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("удалено просроченных файлов: {n}"),
                     Err(e) => tracing::warn!("очистка файлов не удалась: {e:#}"),
+                }
+                match transfer::purge_stale_reserves(&shared).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("удалено брошенных резервов: {n}"),
+                    Err(e) => tracing::warn!("очистка резервов не удалась: {e:#}"),
                 }
             }
         })

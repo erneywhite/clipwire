@@ -14,7 +14,7 @@ use clipwire_core::proto::{
     ALPN, BlobChunk, BlobFail, BlobReply, BlobRequest, ClientMsg, ServerMsg,
 };
 use clipwire_core::{BlobId, Content, DeviceId, GroupKey, Item, SealedItem, ServerInfo};
-use clipwire_server::Config;
+use clipwire_server::{Config, Guards};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
 
@@ -30,13 +30,13 @@ struct Client {
 
 impl Client {
     async fn connect(info: &ServerInfo, relay_url: &str, token: &str) -> Result<Self> {
+        let ep = endpoint(relay_url, token).await?;
+        Self::connect_on(ep, info, relay_url).await
+    }
+
+    /// Новое соединение с уже готового эндпоинта: то же устройство.
+    async fn connect_on(ep: Endpoint, info: &ServerInfo, relay_url: &str) -> Result<Self> {
         let url: RelayUrl = relay_url.parse()?;
-        let ep = Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Custom(
-                RelayMap::from_iter([url.clone()]).with_auth_token(token.to_string()),
-            ))
-            .bind()
-            .await?;
         let addr = EndpointAddr::new(PublicKey::from_bytes(&info.server_id)?).with_relay_url(url);
         let conn = tokio::time::timeout(T, ep.connect(addr, ALPN))
             .await
@@ -52,16 +52,28 @@ impl Client {
         })
     }
 
-    /// Войти и дочитать историю группы.
+    /// Войти с токеном сервера (группа создастся, если её нет) и дочитать
+    /// историю группы.
     async fn join(&mut self, key: &GroupKey) -> Result<Vec<(SealedItem, bool)>> {
-        write_msg(
-            &mut self.send,
-            &ClientMsg::Join {
-                group_id: key.group_id(),
-                join_secret: key.join_secret(),
-            },
-        )
-        .await?;
+        self.join_msg(&ClientMsg::JoinWithToken {
+            group_id: key.group_id(),
+            join_secret: key.join_secret(),
+            token: "test-token".into(),
+        })
+        .await
+    }
+
+    /// Войти обычным `Join`, без токена: только в существующую группу.
+    async fn join_plain(&mut self, key: &GroupKey) -> Result<Vec<(SealedItem, bool)>> {
+        self.join_msg(&ClientMsg::Join {
+            group_id: key.group_id(),
+            join_secret: key.join_secret(),
+        })
+        .await
+    }
+
+    async fn join_msg(&mut self, msg: &ClientMsg) -> Result<Vec<(SealedItem, bool)>> {
+        write_msg(&mut self.send, msg).await?;
         match self.next().await? {
             ServerMsg::Joined => {}
             other => anyhow::bail!("ждали Joined, пришло {other:?}"),
@@ -90,12 +102,29 @@ impl Client {
     }
 }
 
+async fn endpoint(relay_url: &str, token: &str) -> Result<Endpoint> {
+    let url: RelayUrl = relay_url.parse()?;
+    Ok(Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Custom(
+            RelayMap::from_iter([url]).with_auth_token(token.to_string()),
+        ))
+        .bind()
+        .await?)
+}
+
 async fn start_server() -> Result<(clipwire_server::Running, String)> {
     start_server_with(|_| {}).await
 }
 
 async fn start_server_with(
     tune: impl FnOnce(&mut Config),
+) -> Result<(clipwire_server::Running, String)> {
+    start_server_guarded(tune, Guards::default()).await
+}
+
+async fn start_server_guarded(
+    tune: impl FnOnce(&mut Config),
+    guards: Guards,
 ) -> Result<(clipwire_server::Running, String)> {
     let dir = std::env::temp_dir().join(format!("clipwire-e2e-{}", uuid::Uuid::now_v7()));
     let mut config = Config {
@@ -114,7 +143,7 @@ async fn start_server_with(
         blob_stall: Duration::from_secs(10),
     };
     tune(&mut config);
-    let server = clipwire_server::start(&config).await?;
+    let server = clipwire_server::start_with(&config, &guards).await?;
     tokio::time::timeout(T, server.endpoint().online())
         .await
         .context("сервер не подключился к своему relay")?;
@@ -834,5 +863,271 @@ async fn file_waiting_gets_do_not_block_other_streams() -> Result<()> {
         }
         assert_eq!(read_chunks(&mut g, &k1, blob, size, 0).await?, data);
     }
+    server.shutdown().await
+}
+
+// ---------- защита от злоупотреблений ----------
+
+/// Отправить первое сообщение и дождаться отказа: текст ошибки.
+async fn join_error(c: &mut Client, msg: &ClientMsg) -> Result<String> {
+    write_msg(&mut c.send, msg).await?;
+    match c.next().await? {
+        ServerMsg::Error(e) => Ok(e),
+        other => anyhow::bail!("ждали Error, пришло {other:?}"),
+    }
+}
+
+fn join_with_token(key: &GroupKey, token: &str) -> ClientMsg {
+    ClientMsg::JoinWithToken {
+        group_id: key.group_id(),
+        join_secret: key.join_secret(),
+        token: token.into(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_group_needs_server_token() -> Result<()> {
+    let (server, relay) = start_server().await?;
+    let info = server.info.clone();
+    let key = GroupKey::generate()?;
+    let plain = ClientMsg::Join {
+        group_id: key.group_id(),
+        join_secret: key.join_secret(),
+    };
+
+    // Без токена группа не создаётся.
+    let mut c = Client::connect(&info, &relay, "test-token").await?;
+    let e = join_error(&mut c, &plain).await?;
+    assert!(e.contains("группы нет"), "{e}");
+
+    // С неверным токеном тоже.
+    let mut c = Client::connect(&info, &relay, "test-token").await?;
+    let e = join_error(&mut c, &join_with_token(&key, "wrong-token")).await?;
+    assert!(e.contains("код сервера"), "{e}");
+
+    // С верным токеном создаётся, дальше пускает и обычный Join.
+    let mut a = Client::connect(&info, &relay, "test-token").await?;
+    assert!(a.join(&key).await?.is_empty());
+    let mut b = Client::connect(&info, &relay, "test-token").await?;
+    assert!(b.join_plain(&key).await?.is_empty());
+    let sent = a.push_text(&key, "привет").await?;
+    match b.next().await? {
+        ServerMsg::Deliver(s) => assert_eq!(key.open(&s)?, sent),
+        other => anyhow::bail!("ждали Deliver, пришло {other:?}"),
+    }
+
+    // Чужой секрет к существующей группе не пускает и с токеном.
+    let mut evil = Client::connect(&info, &relay, "test-token").await?;
+    let mut wrong = join_with_token(&key, "test-token");
+    if let ClientMsg::JoinWithToken { join_secret, .. } = &mut wrong {
+        *join_secret = GroupKey::generate()?.join_secret();
+    }
+    let e = join_error(&mut evil, &wrong).await?;
+    assert!(e.contains("секрет"), "{e}");
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn max_groups_limits_new_groups() -> Result<()> {
+    let guards = Guards {
+        max_groups: 2,
+        ..Guards::default()
+    };
+    let (server, relay) = start_server_guarded(|_| {}, guards).await?;
+    let keys = [
+        GroupKey::generate()?,
+        GroupKey::generate()?,
+        GroupKey::generate()?,
+    ];
+    joined(&server.info, &relay, &keys[0]).await?;
+    joined(&server.info, &relay, &keys[1]).await?;
+    let mut c = Client::connect(&server.info, &relay, "test-token").await?;
+    let e = join_error(&mut c, &join_with_token(&keys[2], "test-token")).await?;
+    assert!(e.contains("предельное число групп"), "{e}");
+    // В существующие группы входить можно.
+    joined(&server.info, &relay, &keys[0]).await?;
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_first_frame_is_rejected() -> Result<()> {
+    let (server, relay) = start_server().await?;
+    let key = GroupKey::generate()?;
+
+    // Длинный токен: кадр больше 512 байт.
+    let mut c = Client::connect(&server.info, &relay, "test-token").await?;
+    let e = join_error(&mut c, &join_with_token(&key, &"x".repeat(1000))).await?;
+    assert!(e.contains("слишком большое"), "{e}");
+
+    // Префикс длины 16 МиБ без тела: отказ сразу, тело сервер не ждёт.
+    let mut c = Client::connect(&server.info, &relay, "test-token").await?;
+    c.send
+        .write_all(&(16u32 * 1024 * 1024).to_be_bytes())
+        .await?;
+    match c.next().await? {
+        ServerMsg::Error(e) => assert!(e.contains("слишком большое"), "{e}"),
+        other => anyhow::bail!("ждали Error, пришло {other:?}"),
+    }
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_over_16_mib_is_sent_item_by_item() -> Result<()> {
+    let (server, relay) = start_server_with(|c| c.max_item_bytes = 7 * 1024 * 1024).await?;
+    let info = server.info.clone();
+    let key = GroupKey::generate()?;
+    let mut a = joined(&info, &relay, &key).await?;
+    let mut b = joined(&info, &relay, &key).await?;
+    // Три элемента по 6 МиБ: вместе больше предела одного кадра (16 МиБ).
+    let big = "ж".repeat(3 * 1024 * 1024);
+    let mut sent = Vec::new();
+    for i in 0..3 {
+        sent.push(a.push_text(&key, &format!("{i}{big}")).await?);
+    }
+    // B получил все три: значит, сервер их сохранил.
+    for want in &sent {
+        match b.next().await? {
+            ServerMsg::Deliver(s) => assert_eq!(&key.open(&s)?, want),
+            other => anyhow::bail!("ждали Deliver, пришло {other:?}"),
+        }
+    }
+    let mut c = Client::connect(&info, &relay, "test-token").await?;
+    let history = c.join_plain(&key).await?;
+    assert_eq!(history.len(), 3);
+    for ((item, _), want) in history.iter().zip(&sent) {
+        assert_eq!(&key.open(item)?, want);
+    }
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn item_from_the_future_is_dropped() -> Result<()> {
+    let (server, relay) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = joined(&server.info, &relay, &key).await?;
+    let mut b = joined(&server.info, &relay, &key).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64;
+    let future = Item::backdated(
+        a.device,
+        Content::Text("из будущего".into()),
+        now + 3_600_000,
+    );
+    write_msg(&mut a.send, &ClientMsg::Push(key.seal(&future)?)).await?;
+    write_msg(&mut a.send, &ClientMsg::Backfill(key.seal(&future)?)).await?;
+    // Соединение не рвётся, следующий нормальный элемент доходит первым.
+    let normal = a.push_text(&key, "сейчас").await?;
+    match b.next().await? {
+        ServerMsg::Deliver(s) => assert_eq!(key.open(&s)?, normal),
+        other => anyhow::bail!("ждали Deliver, пришло {other:?}"),
+    }
+    // В истории его тоже нет.
+    let mut c = Client::connect(&server.info, &relay, "test-token").await?;
+    let history = c.join_plain(&key).await?;
+    assert_eq!(history.len(), 1);
+    assert_eq!(key.open(&history[0].0)?, normal);
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_reserve_frees_quota() -> Result<()> {
+    let guards = Guards {
+        reserve_ttl: Duration::from_secs(1),
+        ..Guards::default()
+    };
+    let (server, relay) =
+        start_server_guarded(|c| c.blob_quota = sealed_size(1000), guards).await?;
+    let key = GroupKey::generate()?;
+    let a = joined(&server.info, &relay, &key).await?;
+    let reserve = |blob| BlobRequest::Reserve { blob, size: 1000 };
+    let first = BlobId::random()?;
+    let mut r = BlobStream::open(&a.conn, reserve(first)).await?;
+    assert_eq!(r.reply().await?, BlobReply::Reserved);
+
+    // Квота занята резервом без единой части.
+    let second = BlobId::random()?;
+    let mut r = BlobStream::open(&a.conn, reserve(second)).await?;
+    assert_eq!(expect_fail(&mut r).await?, BlobFail::QuotaExceeded);
+
+    // Через срок резерва чистка его убирает, и место освобождается.
+    let started = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut r = BlobStream::open(&a.conn, reserve(second)).await?;
+        match r.reply().await? {
+            BlobReply::Reserved => break,
+            BlobReply::Error(BlobFail::QuotaExceeded) if started.elapsed() < T => {}
+            other => anyhow::bail!("ждали Reserved, пришло {other:?}"),
+        }
+    }
+    let mut g = BlobStream::open(
+        &a.conn,
+        BlobRequest::Get {
+            blob: first,
+            from: 0,
+        },
+    )
+    .await?;
+    assert_eq!(expect_fail(&mut g).await?, BlobFail::NotFound);
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reserves_per_group_are_limited() -> Result<()> {
+    let guards = Guards {
+        max_reserves: 2,
+        ..Guards::default()
+    };
+    let (server, relay) = start_server_guarded(|_| {}, guards).await?;
+    let key = GroupKey::generate()?;
+    let a = joined(&server.info, &relay, &key).await?;
+    for _ in 0..2 {
+        let blob = BlobId::random()?;
+        let mut r = BlobStream::open(&a.conn, BlobRequest::Reserve { blob, size: 10 }).await?;
+        assert_eq!(r.reply().await?, BlobReply::Reserved);
+    }
+    let blob = BlobId::random()?;
+    let mut r = BlobStream::open(&a.conn, BlobRequest::Reserve { blob, size: 10 }).await?;
+    assert_eq!(expect_fail(&mut r).await?, BlobFail::QuotaExceeded);
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_per_device_are_limited() -> Result<()> {
+    let guards = Guards {
+        max_device_conns: 2,
+        ..Guards::default()
+    };
+    let (server, relay) = start_server_guarded(|_| {}, guards).await?;
+    let info = server.info.clone();
+    let key = GroupKey::generate()?;
+    let ep = endpoint(&relay, "test-token").await?;
+    let mut c1 = Client::connect_on(ep.clone(), &info, &relay).await?;
+    c1.join(&key).await?;
+    let mut c2 = Client::connect_on(ep.clone(), &info, &relay).await?;
+    c2.join(&key).await?;
+
+    let mut c3 = Client::connect_on(ep.clone(), &info, &relay).await?;
+    let e = join_error(&mut c3, &join_with_token(&key, "test-token")).await?;
+    assert!(e.contains("слишком много соединений"), "{e}");
+
+    // Другого устройства это не касается.
+    joined(&info, &relay, &key).await?;
+
+    // Закрыли одно соединение — место вернулось.
+    c1.conn.close(0u32.into(), b"bye");
+    drop(c1);
+    let started = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut c = Client::connect_on(ep.clone(), &info, &relay).await?;
+        match c.join(&key).await {
+            Ok(_) => break,
+            Err(_) if started.elapsed() < T => {}
+            Err(e) => return Err(e),
+        }
+    }
+    drop(c2);
     server.shutdown().await
 }
