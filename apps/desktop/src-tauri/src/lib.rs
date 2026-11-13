@@ -8,12 +8,12 @@ mod editor;
 mod files;
 mod link;
 mod popup;
+mod send_to;
 mod settings_window;
 mod sound;
 mod storage;
 mod tray;
 mod updates;
-mod send_to;
 mod winv;
 
 use std::sync::{Arc, Mutex};

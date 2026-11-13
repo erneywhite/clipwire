@@ -57,7 +57,11 @@ mod imp {
                 ki: KEYBDINPUT {
                     wVk: vk,
                     wScan: 0,
-                    dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                    dwFlags: if up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    },
                     time: 0,
                     dwExtraInfo: 0,
                 },
@@ -200,8 +204,16 @@ mod tests {
     #[test]
     fn leaves_other_keys_and_combinations() {
         let s = AtomicBool::new(false);
-        assert_eq!(decide(V, true, false, false, &s), (false, false), "просто V");
-        assert_eq!(decide(V, true, true, true, &s), (false, false), "Ctrl+Win+V и т. п.");
+        assert_eq!(
+            decide(V, true, false, false, &s),
+            (false, false),
+            "просто V"
+        );
+        assert_eq!(
+            decide(V, true, true, true, &s),
+            (false, false),
+            "Ctrl+Win+V и т. п."
+        );
         assert_eq!(decide(0x45, true, true, false, &s), (false, false), "Win+E");
         assert_eq!(decide(V, false, false, false, &s), (false, false));
     }

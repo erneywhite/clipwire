@@ -345,12 +345,16 @@ pub struct SyncTimes {
 
 impl SyncTimes {
     pub fn mark_sent(&self) {
-        self.sent_ms
-            .store(crate::history::now_ms(), std::sync::atomic::Ordering::Relaxed);
+        self.sent_ms.store(
+            crate::history::now_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     pub fn mark_received(&self) {
-        self.received_ms
-            .store(crate::history::now_ms(), std::sync::atomic::Ordering::Relaxed);
+        self.received_ms.store(
+            crate::history::now_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 

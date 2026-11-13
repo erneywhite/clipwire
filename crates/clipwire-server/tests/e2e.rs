@@ -1203,7 +1203,11 @@ async fn new_alpn_and_group_stats() -> Result<()> {
     let ep = endpoint(&relay, "test-token").await?;
     let opts = iroh::endpoint::ConnectOptions::new().with_additional_alpns(vec![ALPN.to_vec()]);
     let conn = tokio::time::timeout(T, async {
-        anyhow::Ok(ep.connect_with_opts(addr.clone(), ALPN_4, opts).await?.await?)
+        anyhow::Ok(
+            ep.connect_with_opts(addr.clone(), ALPN_4, opts)
+                .await?
+                .await?,
+        )
     })
     .await??;
     assert_eq!(conn.alpn(), ALPN_4);

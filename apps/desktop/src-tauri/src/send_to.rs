@@ -86,7 +86,10 @@ fn flush(app: &AppHandle) {
         .unwrap_or_else(|e| e.into_inner())
         .is_some();
     if !ready {
-        let tries = app.state::<SendQueue>().waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tries = app
+            .state::<SendQueue>()
+            .waits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if tries < 20 {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -96,7 +99,9 @@ fn flush(app: &AppHandle) {
             return;
         }
     }
-    app.state::<SendQueue>().waits.store(0, std::sync::atomic::Ordering::Relaxed);
+    app.state::<SendQueue>()
+        .waits
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     let paths = std::mem::take(
         &mut *app
             .state::<SendQueue>()
@@ -166,7 +171,8 @@ mod reg {
 
     fn set(key: HKEY, name: Option<&str>, value: &str) -> windows::core::Result<()> {
         let wide: Vec<u16> = value.encode_utf16().chain([0]).collect();
-        let bytes = unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
         let name = name.map(HSTRING::from);
         let name = name.as_ref().map_or(PCWSTR::null(), |n| PCWSTR(n.as_ptr()));
         unsafe { RegSetValueExW(key, name, None, REG_SZ, Some(bytes)) }.ok()
