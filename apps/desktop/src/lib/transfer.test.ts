@@ -6,7 +6,7 @@ import type { FileInfo, Transfer } from './api'
 
 // Node требует расширение в пути, а TypeScript без allowImportingTsExtensions его
 // не пропускает: путь собирается строкой, тип берётся отдельно.
-const { canDownload, entryProgress, isGone, onlyThere, percentOf, progressLabel } = (await import('./transfer' + '.ts')) as typeof import('./transfer')
+const { allUploaded, canDownload, entryProgress, isGone, onlyThere, percentOf, progressLabel } = (await import('./transfer' + '.ts')) as typeof import('./transfer')
 
 function check(cond: boolean, msg: string) {
   if (!cond) throw new Error(`не прошло: ${msg}`)
@@ -87,6 +87,17 @@ check(entryProgress([{ blob: 'a' }], { a: t('a', { state: 'done', done: 100 }) }
   check(isGone(f({ blob: null })), 'свой пропавший без копии — пропал')
   check(!isGone(f({ blob: null, remote: true })), 'чужой без копии не «пропал», он только там')
   check(onlyThere(f({ blob: null, remote: true })), 'чужой без копии — есть только на источнике')
+}
+
+{
+  const up = (state: 'active' | 'done' | 'failed', direction: 'up' | 'down' = 'up') =>
+    ({ blob: 'b', direction, done: 1, total: 1, state, error: null })
+  const one = [{ blob: 'b' }]
+  check(allUploaded(one, { b: up('done') }), 'отправленный файл — на сервере')
+  check(!allUploaded(one, { b: up('active') }), 'идущая отправка — ещё не на сервере')
+  check(!allUploaded(one, {}), 'без сведений об отправке — не утверждаем')
+  check(!allUploaded(one, { b: up('done', 'down') }), 'скачанный файл — не «на сервере»')
+  check(!allUploaded([{ blob: 'b' }, { blob: 'c' }], { b: up('done'), c: { ...up('failed'), blob: 'c' } }), 'один не ушёл — не все на сервере')
 }
 
 console.log('transfer: все проверки прошли')

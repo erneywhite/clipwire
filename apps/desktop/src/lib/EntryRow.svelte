@@ -3,7 +3,7 @@
   // чтобы превью выглядело ровно как настоящее окно.
   import type { Entry } from './api'
   import { ago, bytesLabel, filesLabel, filesMeta, isUrl, looksLikeCode, sizeLabel } from './format'
-  import { entryProgress, isGone, progressLabel, type TransferMap } from './transfer'
+  import { allUploaded, entryProgress, isGone, progressLabel, type TransferMap } from './transfer'
 
   let {
     item,
@@ -47,6 +47,7 @@
           : sizeLabel(item.chars, item.lines),
       ...(item.rich ? [item.rich] : []),
       ...(progress ? [progressLabel(progress)] : []),
+      ...(!progress && kind === 'files' && allUploaded(item.files, transfers) ? ['↑ на сервере'] : []),
     ].join(' · '),
   )
 </script>

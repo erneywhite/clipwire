@@ -119,8 +119,9 @@ export const api = {
   pin: (id: string, pinned: boolean) => invoke<void>('history_pin', { id, pinned }),
   remove: (id: string) => invoke<void>('history_delete', { id }),
   clear: (keepPinned: boolean) => invoke<void>('history_clear', { keepPinned }),
-  paste: (id: string, intoActive?: boolean, plain?: boolean) =>
-    invoke<void>('popup_paste', { id, intoActive, plain }),
+  /** `files` — номера файлов записи, если вставить нужно только часть. */
+  paste: (id: string, intoActive?: boolean, plain?: boolean, files?: number[]) =>
+    invoke<void>('popup_paste', { id, intoActive, plain, files }),
   pasteText: (text: string, intoActive?: boolean) => invoke<void>('popup_paste_text', { text, intoActive }),
   update: (id: string, text: string) => invoke<void>('history_update', { id, text }),
   preview: (open: boolean) => invoke<'left' | 'right'>('popup_preview', { open }),

@@ -192,13 +192,15 @@ pub fn popup_hide(app: AppHandle) {
 }
 
 /// Вставить элемент истории по id. `plain` — без форматирования (Shift+Enter);
-/// не задано — как в настройке «всегда без форматирования».
+/// не задано — как в настройке «всегда без форматирования». `files` — номера
+/// файлов записи, если вставить нужно только часть.
 #[tauri::command]
 pub async fn popup_paste(
     app: AppHandle,
     id: String,
     into_active: Option<bool>,
     plain: Option<bool>,
+    files: Option<Vec<usize>>,
 ) -> Result<(), String> {
     let plain = plain.unwrap_or_else(|| {
         app.state::<AppState>()
@@ -219,6 +221,7 @@ pub async fn popup_paste(
             None => return Err("Элемента уже нет в истории".into()),
         }
     };
+    let (entry, partial) = select_files(entry, files.as_deref())?;
     // Файлы: в буфер всегда идут пути на этом компьютере, чего здесь нет —
     // скачивается в кэш. Если хоть один путь не исходный (чужая запись или
     // свой файл пропал с места и взят из кэша), кладём тихо и поднимаем
@@ -227,7 +230,9 @@ pub async fn popup_paste(
     if let clipwire_core::Content::Files(orig) = &entry.content {
         let paste = into_active.unwrap_or_else(|| paste_into_active(&app));
         let files = crate::files::fetch_for_paste(&app, &entry).await?;
-        if entry.local && !crate::files::paths_replaced(orig, &files) {
+        // Часть записи тоже кладём тихо: иначе подмножество стало бы новой
+        // записью в истории и ушло бы в группу с новыми файлами.
+        if entry.local && !partial && !crate::files::paths_replaced(orig, &files) {
             // Свои файлы на месте — как обычное копирование.
             return paste_content(&app, entry.content, Some(paste)).await;
         }
@@ -249,6 +254,32 @@ pub async fn popup_paste(
         entry.content
     };
     paste_content(&app, content, into_active).await
+}
+
+/// Оставить в записи с файлами только выбранные (по номерам, в исходном
+/// порядке). Второе значение — выбрана часть, а не все файлы.
+fn select_files(
+    mut entry: clipwire_agent::history::Entry,
+    only: Option<&[usize]>,
+) -> Result<(clipwire_agent::history::Entry, bool), String> {
+    let (clipwire_core::Content::Files(all), Some(only)) = (&mut entry.content, only) else {
+        return Ok((entry, false));
+    };
+    if only.is_empty() {
+        return Err("Не выбрано ни одного файла".into());
+    }
+    if let Some(&bad) = only.iter().find(|&&i| i >= all.len()) {
+        return Err(format!("В записи нет файла №{}", bad + 1));
+    }
+    let total = all.len();
+    let mut i = 0;
+    all.retain(|_| {
+        let keep = only.contains(&i);
+        i += 1;
+        keep
+    });
+    let partial = all.len() < total;
+    Ok((entry, partial))
 }
 
 /// Окно вставки всё ещё на экране и в фокусе: пользователь ждёт вставку.
@@ -406,7 +437,51 @@ mod win {
 
 #[cfg(test)]
 mod tests {
-    use super::ready_to_paste;
+    use super::{ready_to_paste, select_files};
+    use clipwire_agent::history::local_entry;
+    use clipwire_core::{Content, DeviceId, FileRef};
+
+    fn files(names: &[&str]) -> clipwire_agent::history::Entry {
+        let f = |n: &&str| FileRef {
+            name: n.to_string(),
+            path: format!("C:\\{n}"),
+            size: 1,
+            is_dir: false,
+            width: 0,
+            height: 0,
+            modified_ms: 0,
+            blob: None,
+        };
+        local_entry(
+            DeviceId([1; 32]),
+            "ПК",
+            Content::Files(names.iter().map(f).collect()),
+        )
+    }
+
+    fn names(e: &clipwire_agent::history::Entry) -> Vec<String> {
+        match &e.content {
+            Content::Files(f) => f.iter().map(|f| f.name.clone()).collect(),
+            _ => vec![],
+        }
+    }
+
+    #[test]
+    fn picks_selected_files_in_original_order() {
+        let (e, partial) = select_files(files(&["a", "b", "c"]), Some(&[2, 0])).unwrap();
+        assert_eq!(names(&e), ["a", "c"]);
+        assert!(partial);
+        let (e, partial) = select_files(files(&["a", "b"]), Some(&[0, 1])).unwrap();
+        assert_eq!(names(&e), ["a", "b"]);
+        assert!(!partial);
+        let (_, partial) = select_files(files(&["a"]), None).unwrap();
+        assert!(!partial);
+        assert!(select_files(files(&["a"]), Some(&[])).is_err());
+        assert!(select_files(files(&["a"]), Some(&[1])).is_err());
+        // Не файлы — выбор не применяется.
+        let text = local_entry(DeviceId([1; 32]), "ПК", Content::Text("x".into()));
+        assert!(!select_files(text, Some(&[0])).unwrap().1);
+    }
 
     #[test]
     fn pastes_only_into_open_focused_popup() {

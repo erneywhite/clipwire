@@ -140,12 +140,28 @@
     if (preview) openPreview()
   }
 
-  async function paste(entry: Entry | undefined, intoActive?: boolean, plain?: boolean) {
+  // Какие файлы записи вставлять: null — все. Сбрасывается при открытии предпросмотра.
+  let picked = $state<number[] | null>(null)
+
+  function togglePick(i: number, total: number) {
+    const cur = picked ?? Array.from({ length: total }, (_, k) => k)
+    const next = cur.includes(i) ? cur.filter((k) => k !== i) : [...cur, i].sort((a, b) => a - b)
+    picked = next.length === total ? null : next
+  }
+
+  /** Вставить только отмеченные файлы записи. */
+  function pastePicked(entry: Entry) {
+    if (picked && picked.length === 0) return
+    paste(entry, undefined, undefined, picked ?? undefined)
+  }
+
+  async function paste(entry: Entry | undefined, intoActive?: boolean, plain?: boolean, only?: number[]) {
     if (!entry || pasting) return
     // Файлы с другого устройства сначала скачиваются: окно остаётся открытым и
     // показывает прогресс. popup_paste скачал бы и сам, но тогда до конца
     // загрузки не видно, что происходит, а ошибка приходит уже после закрытия.
-    if (needsDownload(entry)) {
+    // Часть файлов Rust скачает сам: заранее качать все незачем.
+    if (!only && needsDownload(entry)) {
       // shortcut: одно скачивание за раз, второе не встаёт в очередь; переделать, если будут жалобы.
       if (fetching) {
         error = fetching === entry.id ? 'Файлы ещё скачиваются' : 'Сначала дождитесь, пока скачаются файлы другой записи'
@@ -168,7 +184,7 @@
     await closePreview()
     try {
       if (text !== null) await api.pasteText(text, intoActive)
-      else await api.paste(entry.id, intoActive, plain)
+      else await api.paste(entry.id, intoActive, plain, only)
     } catch (e) {
       error = String(e)
     }
@@ -189,6 +205,7 @@
     if (!current) return
     const entry = await api.get(current.id)
     const side = preview ? preview.side : await api.preview(true)
+    if (preview?.entry.id !== entry.id) picked = null
     preview = { entry, side }
     draft = entry.text
     richView = true
@@ -257,7 +274,9 @@
       case 'Enter':
         // Shift+Enter — без форматирования.
         e.preventDefault()
-        paste(current, undefined, e.shiftKey ? true : undefined)
+        // В предпросмотре файлов отмечена часть — вставляем только её.
+        if (picked && current && preview?.entry.id === current.id) pastePicked(current)
+        else paste(current, undefined, e.shiftKey ? true : undefined)
         return
       case 'Escape':
         e.preventDefault()
@@ -423,10 +442,18 @@
           <FilePreview file={entry.files[0]} {device} {transfers} ondownload={() => download(entry)} />
         {:else}
           <ul class="file-list">
-            {#each entry.files as f (f.path)}
+            {#each entry.files as f, i (f.path)}
               {@const fp = entryProgress([f], transfers)}
-              <li class:gone={isGone(f)}>
-                <span class="fname">{f.name}</span>
+              <li class:gone={isGone(f)} class:off={picked !== null && !picked.includes(i)}>
+                <label class="fname">
+                  <input
+                    type="checkbox"
+                    checked={picked === null || picked.includes(i)}
+                    onchange={() => togglePick(i, entry.files.length)}
+                    aria-label="Вставить «{f.name}»"
+                  />
+                  <span>{f.name}</span>
+                </label>
                 <span class="fmeta">
                   {f.is_dir ? 'папка' : bytesLabel(f.size)}{#if isGone(f)}
                     · файла нет на месте{:else if onlyThere(f)}
@@ -447,9 +474,11 @@
             · есть только на устройстве «{device}»{/if}
         </div>
         <div class="actions">
-          <button class="primary" disabled={pasting} onclick={() => paste(entry)}>
+          <button class="primary" disabled={pasting || picked?.length === 0} onclick={() => pastePicked(entry)}>
             {#if pasting && fetching === entry.id}
               Скачивается{progress && !progress.error ? ` ${progress.percent}%` : '…'}
+            {:else if picked}
+              Вставить выбранные ({picked.length})
             {:else}
               Вставить
             {/if}
@@ -741,6 +770,25 @@
   .fpath {
     grid-column: 1 / -1;
     overflow-wrap: anywhere;
+  }
+  .fname {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .fname span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .fname input {
+    flex: none;
+    margin: 0;
+    accent-color: var(--c-accent);
+  }
+  .file-list li.off {
+    opacity: 0.55;
   }
   .file-list li.gone .fname {
     text-decoration: line-through;
