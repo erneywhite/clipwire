@@ -2,11 +2,13 @@
 //! элементов буфера. Содержимое сервер не видит, ключ группы есть только на
 //! устройствах.
 
+mod blobs;
 pub mod config;
 mod hub;
 mod relay;
 mod session;
 mod store;
+mod transfer;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -20,11 +22,12 @@ use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey};
 
+use blobs::Blobs;
 pub use config::Config;
 use session::{ClipwireProtocol, Limits, Shared};
 use store::Store;
 
-/// Как часто чистить просроченные элементы.
+/// Как часто чистить просроченные элементы и файлы.
 const PURGE_EVERY: Duration = Duration::from_secs(600);
 
 /// Запущенный сервер. Работает, пока жив объект или до `shutdown`.
@@ -163,10 +166,14 @@ pub async fn start(config: &Config) -> Result<Running> {
     let shared = Arc::new(Shared {
         store,
         hub: Default::default(),
+        blobs: Blobs::new(config.data_dir.join("blobs")),
         limits: Limits {
             max_item_bytes: config.max_item_bytes,
             history_len: config.history_len,
             ttl: config.ttl,
+            max_file_bytes: config.max_file_bytes,
+            blob_quota: config.blob_quota,
+            blob_stall: config.blob_stall,
         },
     });
 
@@ -180,6 +187,17 @@ pub async fn start(config: &Config) -> Result<Running> {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("удалено просроченных элементов: {n}"),
                     Err(e) => tracing::warn!("очистка истории не удалась: {e:#}"),
+                }
+                match shared.store.purge_expired_blobs(shared.not_before_ms()) {
+                    Ok(gone) => {
+                        for (group, blob) in &gone {
+                            shared.blobs.remove(group, blob);
+                        }
+                        if !gone.is_empty() {
+                            tracing::info!("удалено просроченных файлов: {}", gone.len());
+                        }
+                    }
+                    Err(e) => tracing::warn!("очистка файлов не удалась: {e:#}"),
                 }
             }
         })

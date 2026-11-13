@@ -1,4 +1,4 @@
-//! Обработка одного подключения агента по ALPN `clipwire/2`.
+//! Обработка одного подключения агента по ALPN `clipwire/3`.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,7 +10,9 @@ use clipwire_core::{DeviceId, GroupId, SealedItem};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
+use crate::blobs::Blobs;
 use crate::hub::{Hub, QUEUE};
 use crate::store::{JoinOutcome, Store};
 
@@ -21,11 +23,15 @@ pub struct Limits {
     pub max_item_bytes: usize,
     pub history_len: usize,
     pub ttl: Duration,
+    pub max_file_bytes: u64,
+    pub blob_quota: u64,
+    pub blob_stall: Duration,
 }
 
 pub struct Shared {
     pub store: Store,
     pub hub: Hub,
+    pub blobs: Blobs,
     pub limits: Limits,
 }
 
@@ -62,7 +68,7 @@ impl ProtocolHandler for ClipwireProtocol {
     }
 }
 
-async fn serve(shared: &Shared, conn: &Connection) -> Result<()> {
+async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
     let device = DeviceId(*conn.remote_id().as_bytes());
     let (mut send, mut recv) = tokio::time::timeout(JOIN_TIMEOUT, conn.accept_bi())
         .await
@@ -101,6 +107,15 @@ async fn serve(shared: &Shared, conn: &Connection) -> Result<()> {
 
     let (tx, mut rx) = mpsc::channel(QUEUE);
     let reg = shared.hub.register(group, tx);
+
+    // Файлы идут отдельными потоками того же соединения. Задача живёт, пока
+    // жив основной поток: JoinSet снимает её при выходе из функции.
+    let mut streams = JoinSet::new();
+    streams.spawn(crate::transfer::serve_streams(
+        shared.clone(),
+        conn.clone(),
+        group,
+    ));
 
     loop {
         tokio::select! {

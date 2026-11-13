@@ -29,8 +29,14 @@ pub struct Config {
     pub max_item_bytes: usize,
     /// Сколько последних элементов хранить на группу.
     pub history_len: usize,
-    /// Сколько хранить элемент.
+    /// Сколько хранить элемент. Файлы живут столько же от момента создания.
     pub ttl: Duration,
+    /// Предел размера одного файла (открытый текст).
+    pub max_file_bytes: u64,
+    /// Сколько места под файлы на группу, считается по зашифрованному размеру.
+    pub blob_quota: u64,
+    /// Сколько ждать следующей части файла, прежде чем сдаться.
+    pub blob_stall: Duration,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -61,6 +67,10 @@ impl Config {
         let self_relay_url = var("CLIPWIRE_SELF_RELAY_URL")
             .unwrap_or_else(|| format!("http://127.0.0.1:{}", relay_bind.port()));
         let ttl_hours: u64 = parse("CLIPWIRE_TTL_HOURS", 24)?;
+        let stall_secs: u64 = parse("CLIPWIRE_BLOB_STALL_SECS", 120)?;
+        if stall_secs == 0 {
+            bail!("CLIPWIRE_BLOB_STALL_SECS должен быть больше нуля");
+        }
         Ok(Self {
             data_dir: var("CLIPWIRE_DATA_DIR")
                 .unwrap_or_else(|| "data".into())
@@ -73,6 +83,9 @@ impl Config {
             max_item_bytes: parse("CLIPWIRE_MAX_ITEM_BYTES", 8 * 1024 * 1024)?,
             history_len: parse("CLIPWIRE_HISTORY_LEN", 50)?,
             ttl: Duration::from_secs(ttl_hours * 3600),
+            max_file_bytes: parse("CLIPWIRE_MAX_FILE_BYTES", 100 * 1024 * 1024)?,
+            blob_quota: parse("CLIPWIRE_BLOB_QUOTA", 2 * 1024 * 1024 * 1024)?,
+            blob_stall: Duration::from_secs(stall_secs),
         })
     }
 }
