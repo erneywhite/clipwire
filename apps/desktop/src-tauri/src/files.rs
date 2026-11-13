@@ -470,6 +470,7 @@ mod tests {
             content: Content::Files(vec![f]),
             seen_ms: 0,
             pinned: false,
+            ext: Vec::new(),
         }
     }
 

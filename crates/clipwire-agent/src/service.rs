@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use clipwire_core::{BlobId, Content, DeviceId, FileRef, Item};
+use clipwire_core::{BlobId, Content, DeviceId, FileRef, Item, SourceApp};
 use tokio::sync::mpsc;
 
 use crate::blobs::{Blobs, Transfer};
@@ -31,6 +31,10 @@ pub enum UiEvent {
     /// Прогресс загрузки или скачивания файла (не чаще раза в 200 мс на файл
     /// плюс финальное).
     Transfer(Transfer),
+    /// В истории появилась новая запись: своё копирование или пришедшее с
+    /// другого устройства. Повтор того, что уже есть в истории (вставка из
+    /// истории, то же содержимое ещё раз), новой записью не считается.
+    NewEntry,
 }
 
 pub type UiCallback = Arc<dyn Fn(UiEvent) + Send + Sync>;
@@ -83,7 +87,8 @@ impl Copier {
     // shortcut: элемент с папкой встаёт в историю, когда готов архив, а не
     // в момент копирования; скопированное за это время может оказаться ниже.
     // Если станет заметно — заводить запись сразу и обновлять её по id.
-    fn dispatch(&self, content: Content, send: bool) {
+    /// `source` — приложение, из которого скопировано.
+    fn dispatch(&self, content: Content, send: bool, source: Option<SourceApp>) {
         if self.is_cancelled() {
             return;
         }
@@ -94,7 +99,7 @@ impl Copier {
             let me = self.clone();
             self.rt.spawn_blocking(move || {
                 if let Some(content) = me.prepare(content, limit) {
-                    me.finish(content, true);
+                    me.finish(content, true, source);
                 }
             });
             return;
@@ -107,7 +112,7 @@ impl Copier {
         } else {
             content
         };
-        self.finish(content, send);
+        self.finish(content, send, source);
     }
 
     fn is_cancelled(&self) -> bool {
@@ -133,7 +138,7 @@ impl Copier {
         Some(p.content)
     }
 
-    fn finish(&self, content: Content, send: bool) {
+    fn finish(&self, content: Content, send: bool, source: Option<SourceApp>) {
         if send {
             let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
             // Отмена проверяется под тем же замком, которым её берёт `cancel`:
@@ -152,11 +157,15 @@ impl Copier {
         } else if self.is_cancelled() {
             return;
         }
-        record(
-            &self.history,
-            local_entry(self.device, &self.device_name, content.clone()),
-        );
+        let mut entry = local_entry(self.device, &self.device_name, content.clone());
+        if let Some(app) = &source {
+            entry.set_source_app(app);
+        }
+        let new = record(&self.history, entry);
         (self.on_event)(UiEvent::Copied(content));
+        if new {
+            (self.on_event)(UiEvent::NewEntry);
+        }
     }
 }
 
@@ -284,7 +293,7 @@ impl Service {
                                     tracing::warn!("{e:#}");
                                 }
                             }
-                            record(
+                            let new = record(
                                 &history,
                                 Entry {
                                     id: item.id,
@@ -294,9 +303,15 @@ impl Service {
                                     content: item.content.clone(),
                                     seen_ms: now_ms(),
                                     pinned: false,
+                                    // Приложение-источник и прочие сведения
+                                    // приходят внутри элемента.
+                                    ext: item.ext.clone(),
                                 },
                             );
                             on_event(UiEvent::Received(item));
+                            if new {
+                                on_event(UiEvent::NewEntry);
+                            }
                         }
                         Event::History(items) => {
                             let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
@@ -310,6 +325,7 @@ impl Service {
                                     content: item.content,
                                     seen_ms: item.created_at_ms as i64,
                                     pinned: false,
+                                    ext: item.ext,
                                 };
                                 match h.merge(entry) {
                                     Ok(true) => added += 1,
@@ -334,7 +350,9 @@ impl Service {
                 if paused.load(Ordering::Relaxed) {
                     return;
                 }
-                if let Some(exe) = &owner
+                // `owner` — полный путь exe программы-владельца буфера.
+                let exe = owner.as_deref().and_then(crate::source_app::file_name);
+                if let Some(exe) = &exe
                     && is_ignored(&ignored_apps.lock().unwrap_or_else(|e| e.into_inner()), exe)
                 {
                     tracing::debug!(%exe, "скопировано в игнорируемой программе, пропускаю");
@@ -343,9 +361,10 @@ impl Service {
                 if !guard.should_send(&content) {
                     return;
                 }
+                let source = owner.as_deref().and_then(crate::source_app::lookup);
                 // Загрузки в очередь ставит движок, когда элемент на самом деле
                 // уходит в группу (см. `Engine::push`).
-                copier.dispatch(content, true);
+                copier.dispatch(content, true, source);
             })?
         };
 
@@ -414,7 +433,7 @@ impl Service {
         self.guard.wrote(&content);
         clipboard::write(&content)?;
         if let Some(c) = &self.copier {
-            c.dispatch(content, !self.paused());
+            c.dispatch(content, !self.paused(), None);
         }
         Ok(())
     }
@@ -616,11 +635,13 @@ fn discard_outbox(blobs: Option<&Blobs>, content: &Content) {
     }
 }
 
-fn record(history: &Mutex<History>, entry: Entry) {
+/// Записать в историю. `true` — появилась новая запись.
+fn record(history: &Mutex<History>, entry: Entry) -> bool {
     let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(e) = h.add(entry) {
+    h.add(entry).unwrap_or_else(|e| {
         tracing::warn!("не записалось в историю: {e:#}");
-    }
+        false
+    })
 }
 
 /// Сравнение без учёта регистра и расширения: «keepass», «KeePass.exe» — одно и то же.
@@ -799,25 +820,71 @@ mod tests {
             history: history.clone(),
             device: DeviceId([1; 32]),
             device_name: "тест".into(),
-            on_event: Arc::new(move |_| {
-                seen.fetch_add(1, Ordering::SeqCst);
+            on_event: Arc::new(move |e| {
+                if matches!(e, UiEvent::Copied(_)) {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
             }),
             blobs: None,
             limit_mb: Arc::new(AtomicU64::new(1)),
             rt: tokio::runtime::Handle::current(),
         };
-        c.finish(Content::Text("до".into()), true);
+        c.finish(Content::Text("до".into()), true, None);
         assert_eq!(rx.recv().await, Some(Content::Text("до".into())));
         // Копия как у фоновой задачи с папкой.
         let late = c.clone();
         c.cancel();
         assert_eq!(rx.recv().await, None, "канал закрыт, хотя копия жива");
-        late.finish(Content::Text("после".into()), true);
-        late.dispatch(Content::Text("ещё".into()), false);
+        late.finish(Content::Text("после".into()), true, None);
+        late.dispatch(Content::Text("ещё".into()), false, None);
         let h = history.lock().unwrap();
         assert_eq!(h.len(), 1);
         assert!(h.find(&Content::Text("после".into())).is_none());
         assert_eq!(events.load(Ordering::SeqCst), 1);
+        drop(h);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Новая запись в истории даёт событие для звука, повтор того же
+    /// содержимого (вставка из истории, второе копирование) — нет.
+    #[tokio::test]
+    async fn only_new_entries_signal_sound() {
+        let d = tmp("sound");
+        let history = Arc::new(Mutex::new(History::open(&d).unwrap()));
+        let (copied, new) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let (c2, n2) = (copied.clone(), new.clone());
+        let c = Copier {
+            tx: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            history: history.clone(),
+            device: DeviceId([1; 32]),
+            device_name: "тест".into(),
+            on_event: Arc::new(move |e| match e {
+                UiEvent::Copied(_) => {
+                    c2.fetch_add(1, Ordering::SeqCst);
+                }
+                UiEvent::NewEntry => {
+                    n2.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }),
+            blobs: None,
+            limit_mb: Arc::new(AtomicU64::new(1)),
+            rt: tokio::runtime::Handle::current(),
+        };
+        let app = SourceApp {
+            name: "Блокнот".into(),
+            exe: "notepad.exe".into(),
+            icon_png: Vec::new(),
+        };
+        c.dispatch(Content::Text("раз".into()), false, Some(app.clone()));
+        c.dispatch(Content::Text("раз".into()), false, None);
+        c.dispatch(Content::Text("два".into()), false, None);
+        assert_eq!(copied.load(Ordering::SeqCst), 3);
+        assert_eq!(new.load(Ordering::SeqCst), 2, "повтор звука не даёт");
+        let h = history.lock().unwrap();
+        let e = h.find(&Content::Text("раз".into())).unwrap();
+        assert_eq!(e.source_app(), Some(app), "источник записан в историю");
         drop(h);
         let _ = std::fs::remove_dir_all(d);
     }

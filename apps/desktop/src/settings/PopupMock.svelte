@@ -10,7 +10,7 @@
 
   const now = Date.now()
   const min = 60_000
-  const base = { local: true, pinned: false, device_name: '', lines: 1, width: 0, height: 0, bytes: 0, thumb: null, image: null, rich: null, html: null, files: [] }
+  const base = { local: true, pinned: false, device_name: '', lines: 1, width: 0, height: 0, bytes: 0, thumb: null, image: null, rich: null, html: null, files: [], source_app: null }
   // Образец картинки: схематичный скриншот окна (16:9), чтобы превью показывало
   // настоящую высоту строки с картинкой.
   const sampleShot =
@@ -29,7 +29,7 @@
       </svg>`,
     )
   // Образец файла с другого устройства: идёт скачивание, видна полоса прогресса.
-  const sampleFile = { name: 'Отчёт за ноябрь.pdf', path: '/Users/me/Отчёт за ноябрь.pdf', size: 2_400_000, is_dir: false, exists: false, blob: '0'.repeat(32), p2p: false, blob_size: 2_400_000, local_path: null, remote: true }
+  const sampleFile = { name: 'Отчёт за ноябрь.pdf', path: '/Users/me/Отчёт за ноябрь.pdf', size: 2_400_000, is_dir: false, exists: false, blob: '0'.repeat(32), p2p: false, blob_size: 2_400_000, local_path: null, remote: true, uploaded: false }
   const sampleTransfers: TransferMap = {
     [sampleFile.blob]: { blob: sampleFile.blob, direction: 'down', done: 1_100_000, total: 2_400_000, state: 'active', error: null },
   }
@@ -37,7 +37,7 @@
     { ...base, id: '1', kind: 'image', text: '', chars: 0, seen_ms: now - 1 * min, local: false, device_name: 'MacBook', width: 1920, height: 1080, bytes: 348_000, thumb: sampleShot },
     { ...base, id: '2', kind: 'text', text: 'https://github.com/erneywhite/clipwire', chars: 38, seen_ms: now - 4 * min },
     { ...base, id: 'f', kind: 'files', text: '', chars: 0, seen_ms: now - 6 * min, local: false, device_name: 'MacBook', bytes: sampleFile.size, files: [sampleFile] },
-    { ...base, id: '3', kind: 'text', text: 'docker compose pull && docker compose up -d', chars: 43, seen_ms: now - 9 * min },
+    { ...base, id: '3', kind: 'text', text: 'docker compose pull && docker compose up -d', chars: 43, seen_ms: now - 9 * min, source_app: { name: 'Терминал', icon: null } },
     { ...base, id: '4', kind: 'text', text: 'Созвон завтра в 10:00, ссылку пришлю утром', chars: 42, seen_ms: now - 25 * min, local: false, device_name: 'MacBook', pinned: true },
     { ...base, id: '5', kind: 'text', text: 'Ответ клиенту: заказ отправлен, номер для отслеживания пришлю отдельным письмом сегодня вечером', chars: 96, lines: 1, seen_ms: now - 50 * min },
     { ...base, id: '6', kind: 'text', text: 'SELECT id, name\nFROM devices\nWHERE last_seen > now() - interval 1 day;', chars: 70, lines: 3, seen_ms: now - 80 * min },

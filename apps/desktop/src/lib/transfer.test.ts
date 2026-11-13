@@ -79,6 +79,7 @@ check(entryProgress([{ blob: 'a' }], { a: t('a', { state: 'done', done: 100 }) }
     blob_size: 3,
     local_path: null,
     remote: false,
+    uploaded: false,
     ...over,
   })
   check(canDownload(f({ remote: true })), 'чужой файл с сервера можно скачать')
@@ -108,12 +109,25 @@ check(entryProgress([{ blob: 'a' }], { a: t('a', { state: 'done', done: 100 }) }
 {
   const up = (state: 'active' | 'done' | 'failed', direction: 'up' | 'down' = 'up') =>
     ({ blob: 'b', direction, done: 1, total: 1, state, error: null })
-  const one = [{ blob: 'b' }]
+  const one = [{ blob: 'b', uploaded: false }]
   check(allUploaded(one, { b: up('done') }), 'отправленный файл — на сервере')
   check(!allUploaded(one, { b: up('active') }), 'идущая отправка — ещё не на сервере')
   check(!allUploaded(one, {}), 'без сведений об отправке — не утверждаем')
   check(!allUploaded(one, { b: up('done', 'down') }), 'скачанный файл — не «на сервере»')
-  check(!allUploaded([{ blob: 'b' }, { blob: 'c' }], { b: up('done'), c: { ...up('failed'), blob: 'c' } }), 'один не ушёл — не все на сервере')
+  check(!allUploaded([{ blob: 'b', uploaded: false }, { blob: 'c', uploaded: false }], { b: up('done'), c: { ...up('failed'), blob: 'c' } }), 'один не ушёл — не все на сервере')
+
+  // После перезапуска событий нет, но журнал загрузок помнит.
+  check(allUploaded([{ blob: 'b', uploaded: true }], {}), 'загружено до перезапуска — на сервере')
+  check(allUploaded([{ blob: 'b', uploaded: true }, { blob: null, uploaded: false }], {}), 'папка без передачи не мешает')
+  check(!allUploaded([{ blob: null, uploaded: false }], {}), 'нечего отправлять — пометки нет')
+  check(
+    !allUploaded([{ blob: 'b', uploaded: true }, { blob: 'c', uploaded: false }], { c: { ...up('active'), blob: 'c' } }),
+    'второй файл ещё идёт — не все на сервере',
+  )
+  check(
+    allUploaded([{ blob: 'b', uploaded: true }, { blob: 'c', uploaded: false }], { c: { ...up('done'), blob: 'c' } }),
+    'один из журнала, второй из события — все на сервере',
+  )
 }
 
 console.log('transfer: все проверки прошли')

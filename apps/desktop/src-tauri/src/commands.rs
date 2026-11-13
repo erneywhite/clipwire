@@ -114,6 +114,15 @@ pub struct EntryDto {
     pub html: Option<String>,
     /// Скопированные файлы и папки.
     pub files: Vec<FileDto>,
+    /// Приложение, из которого скопировано; `None` — неизвестно.
+    pub source_app: Option<SourceAppDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceAppDto {
+    pub name: String,
+    /// Иконка 32×32 — data URL PNG; `None`, если достать не удалось.
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +146,24 @@ pub struct FileDto {
     pub local_path: Option<String>,
     /// Запись с другого устройства.
     pub remote: bool,
+    /// Файл этого устройства уже на сервере: загрузка закончилась за
+    /// последние сутки, в том числе до перезапуска.
+    pub uploaded: bool,
+}
+
+/// Загружен ли файл на сервер (по журналу загрузок). В локальном режиме — нет.
+pub type UploadedFn<'a> = &'a dyn Fn(clipwire_core::BlobId) -> bool;
+
+/// Журнал загрузок текущего сервиса. Берётся до замка истории, чтобы не
+/// держать оба замка сразу.
+fn uploaded_check(state: &AppState) -> impl Fn(clipwire_core::BlobId) -> bool + use<> {
+    let blobs = state
+        .service
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|s| s.blobs());
+    move |b| blobs.as_ref().is_some_and(|x| x.is_uploaded(b))
 }
 
 /// Где файл записи лежит на этом компьютере, если лежит. У своей записи —
@@ -157,7 +184,12 @@ pub fn local_file(
     clipwire_agent::blobs::cached_file(files_dir, f)
 }
 
-fn file_dto(local: bool, f: &clipwire_core::FileRef, files_dir: &std::path::Path) -> FileDto {
+fn file_dto(
+    local: bool,
+    f: &clipwire_core::FileRef,
+    files_dir: &std::path::Path,
+    uploaded: UploadedFn<'_>,
+) -> FileDto {
     let local_path = local_file(local, f, files_dir);
     FileDto {
         name: f.name.clone(),
@@ -170,6 +202,7 @@ fn file_dto(local: bool, f: &clipwire_core::FileRef, files_dir: &std::path::Path
         blob_size: f.blob_size,
         local_path: local_path.map(|p| p.to_string_lossy().into_owned()),
         remote: !local,
+        uploaded: f.blob.is_some_and(uploaded),
     }
 }
 
@@ -196,7 +229,13 @@ fn png_url(png: &[u8]) -> String {
     )
 }
 
-fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool, files_dir: &std::path::Path) -> EntryDto {
+fn to_dto(
+    e: &Entry,
+    thumb: Option<&[u8]>,
+    full: bool,
+    files_dir: &std::path::Path,
+    uploaded: UploadedFn<'_>,
+) -> EntryDto {
     let (kind, text, width, height, image) = match &e.content {
         Content::Text(t) | Content::Rich { text: t, .. } => ("text", t.as_str(), 0, 0, None),
         Content::Image { width, height, png } => ("image", "", *width, *height, Some(png)),
@@ -212,7 +251,10 @@ fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool, files_dir: &std::path::Pa
         _ => ("other", "", 0, 0, None),
     };
     let files: Vec<FileDto> = match &e.content {
-        Content::Files(f) => f.iter().map(|f| file_dto(e.local, f, files_dir)).collect(),
+        Content::Files(f) => f
+            .iter()
+            .map(|f| file_dto(e.local, f, files_dir, uploaded))
+            .collect(),
         _ => Vec::new(),
     };
     let (rich, html) = match &e.content {
@@ -254,6 +296,10 @@ fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool, files_dir: &std::path::Pa
         rich,
         html,
         files,
+        source_app: e.source_app().map(|a| SourceAppDto {
+            icon: (!a.icon_png.is_empty()).then(|| png_url(&a.icon_png)),
+            name: a.name,
+        }),
     }
 }
 
@@ -271,10 +317,11 @@ pub fn history_list(
     limit: usize,
 ) -> Vec<EntryDto> {
     let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
+    let uploaded = uploaded_check(&state);
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
     h.list(&query, pinned_only, limit.min(500))
         .into_iter()
-        .map(|e| to_dto(e, h.thumb(e.id), false, &files_dir))
+        .map(|e| to_dto(e, h.thumb(e.id), false, &files_dir, &uploaded))
         .collect()
 }
 
@@ -282,9 +329,10 @@ pub fn history_list(
 pub fn history_get(state: State<'_, AppState>, id: String) -> CmdResult<EntryDto> {
     let id = parse_id(&id)?;
     let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
+    let uploaded = uploaded_check(&state);
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
     h.get(id)
-        .map(|e| to_dto(e, h.thumb(e.id), true, &files_dir))
+        .map(|e| to_dto(e, h.thumb(e.id), true, &files_dir, &uploaded))
         .ok_or_else(|| "Элемента уже нет в истории".into())
 }
 
@@ -315,6 +363,7 @@ pub fn history_delete(app: AppHandle, state: State<'_, AppState>, id: String) ->
         .unwrap_or_else(|e| e.into_inner())
         .delete(id)
         .map_err(err)?;
+    crate::cache::prune_later(&app);
     let _ = app.emit("clipwire://history-changed", ());
     Ok(())
 }
@@ -331,6 +380,7 @@ pub fn history_clear(
         .unwrap_or_else(|e| e.into_inner())
         .clear(keep_pinned)
         .map_err(err)?;
+    crate::cache::prune_later(&app);
     let _ = app.emit("clipwire://history-changed", ());
     Ok(())
 }

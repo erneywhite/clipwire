@@ -12,7 +12,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use clipwire_core::{Content, DeviceId, ItemId};
+use clipwire_core::item::ext;
+use clipwire_core::{Content, DeviceId, Ext, ExtList, ItemId, SourceApp};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -30,6 +31,67 @@ pub struct Entry {
     /// Когда элемент последний раз появился в буфере (мс Unix).
     pub seen_ms: i64,
     pub pinned: bool,
+    /// Дополнительные сведения по меткам, как у `Item` (приложение-источник).
+    pub ext: Vec<Ext>,
+}
+
+impl ExtList for Entry {
+    fn ext_list(&self) -> &[Ext] {
+        &self.ext
+    }
+    fn ext_list_mut(&mut self) -> &mut Vec<Ext> {
+        &mut self.ext
+    }
+}
+
+impl Entry {
+    /// Приложение, из которого скопировано, если известно.
+    pub fn source_app(&self) -> Option<SourceApp> {
+        self.ext_get(ext::SOURCE_APP)
+    }
+
+    pub fn set_source_app(&mut self, app: &SourceApp) {
+        self.ext_set(ext::SOURCE_APP, app);
+    }
+
+    /// Только имя приложения-источника: для поиска не нужно разбирать иконку.
+    fn source_name(&self) -> Option<String> {
+        #[derive(Deserialize)]
+        struct NameOnly {
+            name: String,
+        }
+        let e = self.ext.iter().find(|e| e.tag == ext::SOURCE_APP)?;
+        postcard::take_from_bytes::<NameOnly>(&e.data)
+            .ok()
+            .map(|(n, _)| n.name)
+    }
+}
+
+/// `Entry` до появления `ext`.
+#[derive(Deserialize)]
+struct EntryV3 {
+    id: ItemId,
+    origin: DeviceId,
+    device_name: String,
+    local: bool,
+    content: Content,
+    seen_ms: i64,
+    pinned: bool,
+}
+
+impl From<EntryV3> for Entry {
+    fn from(e: EntryV3) -> Self {
+        Entry {
+            id: e.id,
+            origin: e.origin,
+            device_name: e.device_name,
+            local: e.local,
+            content: e.content,
+            seen_ms: e.seen_ms,
+            pinned: e.pinned,
+            ext: Vec::new(),
+        }
+    }
 }
 
 /// `Entry` с содержимым прошлой версии (см. `clipwire_core::item::legacy`).
@@ -54,6 +116,7 @@ impl From<EntryV2> for Entry {
             content: e.content.into(),
             seen_ms: e.seen_ms,
             pinned: e.pinned,
+            ext: Vec::new(),
         }
     }
 }
@@ -169,14 +232,17 @@ impl History {
 
     fn decrypt(&self, nonce: &[u8], data: &[u8]) -> Result<Entry> {
         let plain = self.open_blob(nonce, data)?;
-        // Запись прошлой версии читается по-старому и переводится. Новый вид
-        // принимаем, только если он съел все байты: запись старого формата с
-        // несколькими файлами иначе могла бы разобраться со сдвинутыми полями.
+        // Запись прошлой версии читается по-старому и переводится. Каждый вид
+        // принимаем, только если он съел все байты: запись старого формата
+        // иначе могла бы разобраться со сдвинутыми полями.
         let err = match postcard::take_from_bytes::<Entry>(&plain) {
             Ok((e, [])) => return Ok(e),
             Ok(_) => postcard::Error::DeserializeBadEncoding,
             Err(e) => e,
         };
+        if let Ok((e, [])) = postcard::take_from_bytes::<EntryV3>(&plain) {
+            return Ok(e.into());
+        }
         match postcard::take_from_bytes::<EntryV2>(&plain) {
             Ok((e, [])) => Ok(e.into()),
             _ => Err(err.into()),
@@ -266,7 +332,9 @@ impl History {
 
     /// Добавить элемент. То же содержимое не дублируется: существующая запись
     /// поднимается наверх с новым временем (закрепление сохраняется).
-    pub fn add(&mut self, mut entry: Entry) -> Result<()> {
+    /// Возвращает `true`, если появилась новая запись, и `false`, если
+    /// поднялась существующая.
+    pub fn add(&mut self, mut entry: Entry) -> Result<bool> {
         let hash = entry.content.hash();
         if let Some(&old) = self.by_hash.get(&hash)
             && let Some(pos) = self.entries.iter().position(|e| e.id == old)
@@ -283,15 +351,21 @@ impl History {
             if matches!(entry.content, Content::Rich { .. } | Content::Files(_)) {
                 existing.content = entry.content;
             }
+            // Сведения нового копирования (другое приложение-источник)
+            // заменяют старые по метке; чего в новом нет, остаётся.
+            for x in entry.ext {
+                existing.ext.retain(|e| e.tag != x.tag);
+                existing.ext.push(x);
+            }
             self.write(&existing)?;
             self.entries.insert(0, existing);
-            return Ok(());
+            return Ok(false);
         }
         self.write(&entry)?;
         self.store_thumb(&entry);
         self.by_hash.insert(hash, entry.id);
         self.entries.insert(0, entry);
-        Ok(())
+        Ok(true)
     }
 
     /// Влить элемент из чужой истории: если такое содержимое уже есть, ничего
@@ -368,6 +442,8 @@ impl History {
                         _ => false,
                     }
                     || e.device_name.to_lowercase().contains(&q)
+                    || e.source_name()
+                        .is_some_and(|n| n.to_lowercase().contains(&q))
             })
             .take(limit)
             .collect()
@@ -452,6 +528,11 @@ impl History {
         self.entries.len()
     }
 
+    /// Блобы файлов всех записей: скачанное по ним в кэше ещё нужно.
+    pub fn blobs(&self) -> std::collections::HashSet<clipwire_core::BlobId> {
+        referenced_blobs(&self.entries)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -467,7 +548,22 @@ pub fn local_entry(device: DeviceId, device_name: &str, content: Content) -> Ent
         content,
         seen_ms: now_ms(),
         pinned: false,
+        ext: Vec::new(),
     }
+}
+
+/// Блобы файлов, на которые ссылаются записи (для чистки кэша скачанного).
+pub fn referenced_blobs<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
+) -> std::collections::HashSet<clipwire_core::BlobId> {
+    entries
+        .into_iter()
+        .filter_map(|e| match &e.content {
+            Content::Files(f) => Some(f.iter().filter_map(|f| f.blob)),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 #[cfg(test)]
@@ -648,6 +744,86 @@ mod tests {
             }
             other => panic!("ждали файлы, пришло {other:?}"),
         }
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn entry_without_ext_is_read() {
+        // Запись до появления `ext`: те же поля, кроме последнего.
+        #[derive(Serialize)]
+        struct EntryV3Out {
+            id: ItemId,
+            origin: DeviceId,
+            device_name: String,
+            local: bool,
+            content: Content,
+            seen_ms: i64,
+            pinned: bool,
+        }
+        let old = EntryV3Out {
+            id: ItemId::new(),
+            origin: DeviceId([3; 32]),
+            device_name: "Mac".into(),
+            local: false,
+            content: Content::Text("старая запись".into()),
+            seen_ms: 77,
+            pinned: true,
+        };
+        let h = History::in_memory();
+        let (nonce, data) = h.seal_blob(&postcard::to_stdvec(&old).unwrap()).unwrap();
+        let e = h.decrypt(&nonce, &data).expect("старая запись прочиталась");
+        assert_eq!(e.id, old.id);
+        assert_eq!(e.content, Content::Text("старая запись".into()));
+        assert!(e.pinned && e.ext.is_empty() && e.source_app().is_none());
+
+        // Новая запись с ext читается как новая, а не как старая с хвостом.
+        let mut new = local_entry(DeviceId([1; 32]), "ПК", Content::Text("новая".into()));
+        new.set_source_app(&app("Блокнот"));
+        let (nonce, data) = h.seal_blob(&postcard::to_stdvec(&new).unwrap()).unwrap();
+        assert_eq!(h.decrypt(&nonce, &data).unwrap(), new);
+    }
+
+    fn app(name: &str) -> SourceApp {
+        SourceApp {
+            name: name.into(),
+            exe: format!("{name}.exe"),
+            icon_png: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn source_app_is_kept_found_and_replaced() {
+        let dir = std::env::temp_dir().join(format!("clipwire-src-{}", Uuid::now_v7()));
+        {
+            let mut h = History::open(&dir).unwrap();
+            let mut e = local_entry(DeviceId([1; 32]), "ПК", Content::Text("абв".into()));
+            e.set_source_app(&app("Telegram"));
+            assert!(h.add(e).unwrap(), "новая запись");
+            text(&mut h, "другое", 5);
+            assert_eq!(texts(h.list("telegr", false, 10)), ["абв"]);
+            assert!(h.list("notepad", false, 10).is_empty());
+
+            // Повтор того же содержимого — не новая запись; без источника
+            // старый источник остаётся.
+            let again = local_entry(DeviceId([1; 32]), "ПК", Content::Text("абв".into()));
+            assert!(!h.add(again).unwrap());
+            assert_eq!(h.len(), 2);
+            assert_eq!(
+                h.list("абв", false, 1)[0].source_app(),
+                Some(app("Telegram"))
+            );
+
+            // Скопировали то же из другой программы — источник новый.
+            let mut other = local_entry(DeviceId([1; 32]), "ПК", Content::Text("абв".into()));
+            other.set_source_app(&app("Блокнот"));
+            assert!(!h.add(other).unwrap());
+        }
+        let h = History::open(&dir).unwrap();
+        let e = h.list("блокн", false, 10);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].source_app(), Some(app("Блокнот")));
+        assert!(h.list("telegram", false, 10).is_empty());
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
     }

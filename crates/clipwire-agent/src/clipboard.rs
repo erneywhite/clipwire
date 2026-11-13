@@ -196,7 +196,8 @@ mod win {
     const READ_TIMER: usize = 1;
     const READ_DELAY_MS: u32 = 60;
 
-    /// Колбэк получает содержимое и имя exe программы-владельца буфера, если удалось узнать.
+    /// Колбэк получает содержимое и полный путь exe программы-владельца
+    /// буфера, если удалось узнать.
     type Callback = Box<dyn FnMut(Content, Option<String>)>;
 
     struct Ctx {
@@ -311,7 +312,7 @@ mod win {
 
     /// Что лежит в буфере.
     enum Snapshot {
-        /// Содержимое и exe владельца буфера.
+        /// Содержимое и путь exe владельца буфера.
         Content(Content, Option<String>),
         /// Помечено как приватное (или метку не удалось прочитать).
         Excluded,
@@ -551,7 +552,7 @@ mod win {
         }
     }
 
-    /// Имя exe программы, которая положила данные в буфер (владелец буфера).
+    /// Полный путь exe программы, которая положила данные в буфер (владелец буфера).
     /// Не все программы назначают владельца — тогда `None`.
     fn owner_exe() -> Option<String> {
         use windows::Win32::Foundation::CloseHandle;
@@ -580,8 +581,7 @@ mod win {
             );
             let _ = CloseHandle(h);
             res.ok()?;
-            let path = String::from_utf16_lossy(&buf[..len as usize]);
-            path.rsplit(['\\', '/']).next().map(str::to_string)
+            Some(String::from_utf16_lossy(&buf[..len as usize]))
         }
     }
 

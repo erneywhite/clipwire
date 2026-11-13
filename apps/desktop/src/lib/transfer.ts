@@ -55,11 +55,18 @@ export function entryProgress(files: Pick<FileInfo, 'blob'>[], transfers: Transf
 /**
  * Все файлы записи, которые отправлялись, уже на сервере. Полоса прогресса
  * видна только пока файл идёт, а это секунды: без этой пометки открывший окно
- * позже не узнает, ушёл ли файл. Знаем только про передачи этого запуска.
+ * позже не узнает, ушёл ли файл. Сведения двух видов: события передач этого
+ * запуска и поле uploaded (журнал загрузок за сутки, переживает перезапуск).
  */
-export function allUploaded(files: Pick<FileInfo, 'blob'>[], transfers: TransferMap): boolean {
-  const list = files.flatMap((f) => (f.blob && transfers[f.blob] ? [transfers[f.blob]] : []))
-  return list.length > 0 && list.every((t) => t.direction === 'up' && t.state === 'done')
+export function allUploaded(files: Pick<FileInfo, 'blob' | 'uploaded'>[], transfers: TransferMap): boolean {
+  const sent = files.filter((f) => f.blob && (f.uploaded || transfers[f.blob]))
+  return (
+    sent.length > 0 &&
+    sent.every((f) => {
+      const t = transfers[f.blob!]
+      return f.uploaded || (t.direction === 'up' && t.state === 'done')
+    })
+  )
 }
 
 /** Подпись для меты строки: «↑ 45%», «↓ 12%», «не отправлено: причина». */

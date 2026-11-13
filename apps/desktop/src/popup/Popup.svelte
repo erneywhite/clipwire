@@ -7,6 +7,7 @@
   import { canDownload, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import EntryRow from '../lib/EntryRow.svelte'
+  import AppTag from '../lib/AppTag.svelte'
   import LinkCard from './LinkCard.svelte'
   import FilePreview from './FilePreview.svelte'
   import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -431,7 +432,7 @@
           {/if}
         </div>
         <div class="preview-meta">
-          {preview.entry.local ? 'Это устройство' : preview.entry.device_name} · {ago(preview.entry.seen_ms)} · {preview.entry.width}×{preview.entry.height} · {bytesLabel(preview.entry.bytes)}
+          {deviceOf(preview.entry)}{#if preview.entry.source_app}&nbsp;· <AppTag app={preview.entry.source_app} />{/if} · {ago(preview.entry.seen_ms)} · {preview.entry.width}×{preview.entry.height} · {bytesLabel(preview.entry.bytes)}
         </div>
         <div class="actions">
           <button class="primary" onclick={() => paste(preview?.entry)}>Вставить</button>
@@ -536,7 +537,7 @@
         {#if edited}
           изменено · Ctrl+Enter вставить · Ctrl+S сохранить
         {:else}
-          {preview.entry.local ? 'Это устройство' : preview.entry.device_name} · {ago(preview.entry.seen_ms)} · {sizeLabel(preview.entry.chars, preview.entry.lines)}{preview.entry.rich ? ` · ${preview.entry.rich}` : ''}
+          {deviceOf(preview.entry)}{#if preview.entry.source_app}&nbsp;· <AppTag app={preview.entry.source_app} />{/if} · {ago(preview.entry.seen_ms)} · {sizeLabel(preview.entry.chars, preview.entry.lines)}{preview.entry.rich ? ` · ${preview.entry.rich}` : ''}
         {/if}
       </div>
       <div class="actions">
