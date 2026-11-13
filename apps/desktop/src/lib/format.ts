@@ -34,7 +34,8 @@ export function sizeLabel(chars: number, lines: number): string {
 export function bytesLabel(n: number): string {
   if (n < 1024) return `${n} Б`
   if (n < 1024 * 1024) return `${Math.round(n / 1024)} КБ`
-  return `${(n / 1024 / 1024).toFixed(1).replace('.', ',')} МБ`
+  if (n < 1024 ** 3) return `${(n / 1024 / 1024).toFixed(1).replace('.', ',')} МБ`
+  return `${(n / 1024 ** 3).toFixed(1).replace('.', ',')} ГБ`
 }
 
 /** Подпись для набора файлов: «Отчёт.pdf», «3 файла: a.pdf, b.png, c.txt». */
