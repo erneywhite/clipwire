@@ -2,31 +2,103 @@
 //! `Join`. Один поток — один файл, первым кадром `BlobRequest`. Порядок кадров
 //! описан в `docs/files-transfer.md`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use clipwire_core::blob::{CHUNK, OVERHEAD, chunk_count};
 use clipwire_core::proto::io::{IoError, read_msg_limited, write_msg};
 use clipwire_core::proto::{BlobChunk, BlobFail, BlobReply, BlobRequest};
 use clipwire_core::{BlobId, GroupId};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::blobs::{Blobs, Live, Progress, sealed_chunk_len};
 use crate::session::{Shared, now_ms};
 use crate::store::BlobBegin;
 
-/// Сколько потоков файлов одного соединения обслуживаются одновременно.
-/// Остальные ждут: сервер просто не принимает следующий поток, пока не
-/// освободится место.
+/// Сколько потоков одного соединения могут ждать первого кадра (и
+/// обслуживать короткие `Reserve` и `Abort`). Пока все заняты, сервер не
+/// принимает следующий поток этого соединения.
+pub const MAX_OPENING: usize = 32;
+/// Сколько `Put` и `Get` одного соединения обслуживаются одновременно.
 pub const MAX_STREAMS: usize = 8;
-/// Сколько потоков файлов сервер обслуживает одновременно на все соединения.
-/// Принятый сверх этого поток ждёт свободного места.
+/// Сколько `Put` (и отдельно `Get`) сервер обслуживает одновременно на все
+/// соединения. Пулы раздельные: ждущие частей `Get` не должны занимать места,
+/// нужные загрузке, которой они ждут.
 pub const MAX_SERVER_STREAMS: usize = 64;
+/// Сколько `Put` (и отдельно `Get`) одной группы обслуживаются одновременно:
+/// одна группа не занимает весь серверный пул.
+pub const MAX_GROUP_STREAMS: usize = 16;
+/// Сколько ждать первого кадра потока.
+pub const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// Предел первого кадра потока: в запросе только id файла и пара чисел.
 pub const MAX_REQUEST_FRAME: usize = 256;
 /// Предел кадра с частью файла: сама часть и запас на разметку postcard.
 pub const MAX_CHUNK_FRAME: usize = CHUNK + OVERHEAD + 64;
+
+/// Вид долгого потока: у каждого свои пулы.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Kind {
+    Put,
+    Get,
+}
+
+/// Серверные пределы долгих потоков: пулы на сервер и на группу, отдельно
+/// для `Put` и `Get`.
+pub struct StreamLimits {
+    put: Arc<Semaphore>,
+    get: Arc<Semaphore>,
+    /// Пулы групп. Слабые ссылки: пул живёт, пока его держит или ждёт хоть
+    /// один поток группы.
+    groups: Mutex<HashMap<(GroupId, Kind), Weak<Semaphore>>>,
+}
+
+impl Default for StreamLimits {
+    fn default() -> Self {
+        Self {
+            put: Arc::new(Semaphore::new(MAX_SERVER_STREAMS)),
+            get: Arc::new(Semaphore::new(MAX_SERVER_STREAMS)),
+            groups: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl StreamLimits {
+    fn group(&self, group: GroupId, kind: Kind) -> Arc<Semaphore> {
+        let mut map = self.groups.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = map.get(&(group, kind)).and_then(Weak::upgrade) {
+            return s;
+        }
+        map.retain(|_, w| w.strong_count() > 0);
+        let s = Arc::new(Semaphore::new(MAX_GROUP_STREAMS));
+        map.insert((group, kind), Arc::downgrade(&s));
+        s
+    }
+
+    /// Пропуска долгого потока: соединения, группы и сервера. Берутся всегда
+    /// в этом порядке, поэтому друг друга не запирают.
+    async fn acquire(
+        &self,
+        conn: &Arc<Semaphore>,
+        group: GroupId,
+        kind: Kind,
+    ) -> [OwnedSemaphorePermit; 3] {
+        let server = match kind {
+            Kind::Put => &self.put,
+            Kind::Get => &self.get,
+        };
+        let c = take(conn.clone()).await;
+        let g = take(self.group(group, kind)).await;
+        let s = take(server.clone()).await;
+        [c, g, s]
+    }
+}
+
+async fn take(s: Arc<Semaphore>) -> OwnedSemaphorePermit {
+    s.acquire_owned().await.expect("семафор никто не закрывает")
+}
 
 /// Почему поток файла закончился неудачно.
 enum Fail {
@@ -59,27 +131,25 @@ impl From<IoError> for Fail {
 
 /// Принимает потоки файлов, пока живо соединение. Задачи потоков живут в
 /// `JoinSet` и снимаются вместе с этой функцией, когда закрывается основной поток.
+///
+/// Пропуск `opening` берётся до `accept_bi` и держится до первого кадра (у
+/// `Reserve` и `Abort` — до конца, они короткие): так соединение не может
+/// плодить потоки без запроса. `Put` и `Get` отдают его после первого кадра и
+/// ждут своих пропусков; сколько их может ждать, ограничивает сам QUIC
+/// (предел одновременных потоков соединения).
 pub async fn serve_streams(shared: Arc<Shared>, conn: Connection, group: GroupId) {
-    let permits = Arc::new(Semaphore::new(MAX_STREAMS));
+    let opening = Arc::new(Semaphore::new(MAX_OPENING));
+    let streams = Arc::new(Semaphore::new(MAX_STREAMS));
     let mut tasks = JoinSet::new();
     loop {
-        let permit = permits
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("семафор никто не закрывает");
+        let permit = take(opening.clone()).await;
         while tasks.try_join_next().is_some() {}
         let Ok((send, recv)) = conn.accept_bi().await else {
             return;
         };
-        let shared = shared.clone();
+        let (shared, streams) = (shared.clone(), streams.clone());
         tasks.spawn(async move {
-            let _permit = permit;
-            // Общий предел сервера: поток ждёт здесь, пока не освободится место.
-            let Ok(_server_permit) = shared.streams.clone().acquire_owned().await else {
-                return;
-            };
-            serve_stream(&shared, &group, send, recv).await;
+            serve_stream(&shared, &group, &streams, permit, send, recv).await;
         });
     }
 }
@@ -87,18 +157,30 @@ pub async fn serve_streams(shared: Arc<Shared>, conn: Connection, group: GroupId
 async fn serve_stream(
     shared: &Shared,
     group: &GroupId,
+    conn_streams: &Arc<Semaphore>,
+    opening: OwnedSemaphorePermit,
     mut send: SendStream,
     mut recv: RecvStream,
 ) {
     let first = read_msg_limited(&mut recv, MAX_REQUEST_FRAME);
-    let res = match tokio::time::timeout(shared.limits.blob_stall, first).await {
+    let res = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, first).await {
         Err(_) => Err(Fail::Reply(BlobFail::Stalled)),
         Ok(Err(e)) => Err(e.into()),
         Ok(Ok(None)) => return,
         Ok(Ok(Some(BlobRequest::Put { blob, size }))) => {
+            drop(opening);
+            let _permits = shared
+                .streams
+                .acquire(conn_streams, *group, Kind::Put)
+                .await;
             put(shared, group, &mut send, &mut recv, blob, size).await
         }
         Ok(Ok(Some(BlobRequest::Get { blob, from }))) => {
+            drop(opening);
+            let _permits = shared
+                .streams
+                .acquire(conn_streams, *group, Kind::Get)
+                .await;
             get(shared, group, &mut send, blob, from).await
         }
         Ok(Ok(Some(BlobRequest::Reserve { blob, size }))) => {

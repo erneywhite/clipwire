@@ -23,6 +23,11 @@ pub const MAX_ITEM_BYTES: usize = 7 * 1024 * 1024 + 512 * 1024;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Сколько попыток подряд отправить элемент с файлами, чей резерв не доходит
+/// до сервера. На последней файлы, резерв которых снова не дошёл, уходят без
+/// `blob` («есть только на устройстве»), чтобы один элемент не держал всю
+/// синхронизацию в цикле переподключений.
+pub const MAX_RESERVE_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -64,6 +69,14 @@ pub struct Engine {
     /// Передача файлов: загрузчик живёт здесь, соединение отдаётся ему на
     /// время сессии.
     blobs: Option<Arc<Blobs>>,
+    /// Последнее копирование, которое ещё не ушло в группу: скопировано без
+    /// связи или отправка оборвалась. Уходит первым после входа.
+    pending: Option<Content>,
+    /// У `pending` могли остаться резервы на сервере (отправка уже
+    /// начиналась): если его вытеснит новое копирование, резервы отменяются.
+    pending_reserved: bool,
+    /// Сколько раз подряд резерв файлов `pending` не дошёл до сервера.
+    reserve_failures: u32,
 }
 
 impl Engine {
@@ -85,6 +98,9 @@ impl Engine {
             went_online: false,
             backfill: Vec::new(),
             blobs: None,
+            pending: None,
+            pending_reserved: false,
+            reserve_failures: 0,
         }
     }
 
@@ -146,14 +162,10 @@ impl Engine {
             .context("не поднялся iroh-эндпоинт")?;
         let addr = EndpointAddr::new(PublicKey::from_bytes(&server.server_id)?).with_relay_url(url);
 
-        let mut pending: Option<Content> = None;
         let mut backoff = Duration::from_secs(1);
         loop {
             self.emit(Event::Status(Status::Connecting));
-            match self
-                .session(&ep, addr.clone(), &mut local, &mut pending)
-                .await
-            {
+            match self.session(&ep, addr.clone(), &mut local).await {
                 // Сессия кончается без ошибки, только когда закрыт канал локальных изменений.
                 Ok(()) => {
                     ep.close().await;
@@ -175,7 +187,7 @@ impl Engine {
                 tokio::select! {
                     _ = &mut sleep => break,
                     c = local.recv() => match c {
-                        Some(c) => pending = Some(c),
+                        Some(c) => self.replace_pending(c),
                         None => { ep.close().await; return Ok(()); }
                     },
                 }
@@ -189,7 +201,6 @@ impl Engine {
         ep: &Endpoint,
         addr: EndpointAddr,
         local: &mut mpsc::Receiver<Content>,
-        pending: &mut Option<Content>,
     ) -> Result<()> {
         // Пока идёт подключение, следим за relay: если он отказал по токену,
         // ждать таймаута бессмысленно, iroh будет повторять с тем же токеном вечно.
@@ -244,7 +255,7 @@ impl Engine {
         self.emit(Event::Status(Status::Online));
         tracing::info!("на связи с сервером");
 
-        if let Some(c) = pending.take() {
+        if let Some(c) = self.pending.take() {
             self.push(&conn, &mut send, c).await?;
         }
         self.send_backfill(&mut send).await?;
@@ -354,6 +365,31 @@ impl Engine {
         }
     }
 
+    /// Новое копирование, пока нет связи, вытесняет неотправленное. Если
+    /// отправка вытесненного уже начиналась, его резервы на сервере
+    /// отменяются при следующем соединении.
+    fn replace_pending(&mut self, c: Content) {
+        if let Some(old) = self.pending.replace(c)
+            && std::mem::take(&mut self.pending_reserved)
+            && let (Some(b), Content::Files(files)) = (&self.blobs, &old)
+        {
+            b.abort_later(files.iter().filter_map(|f| f.blob));
+        }
+        self.reserve_failures = 0;
+    }
+
+    /// Вернуть неотправленный элемент в очередь движка: он уйдёт первым
+    /// после переподключения (если его не вытеснит новое копирование).
+    fn restore_pending(&mut self, c: Content) {
+        if self.pending.is_none() {
+            self.pending = Some(c);
+            self.pending_reserved = true;
+        }
+    }
+
+    /// Отправить элемент. Если отправка сорвалась (резерв файлов не дошёл до
+    /// сервера, запись в поток упала), элемент возвращается в `pending` вместе
+    /// с уже назначенными `blob` и уходит после переподключения.
     async fn push(
         &mut self,
         conn: &Connection,
@@ -370,12 +406,28 @@ impl Engine {
         // элемент сразу, будет ждать частей, а не получит «файла нет».
         // Отказанным файлам blob снимается, загрузок по ним не будет.
         let (c, jobs) = match (&self.blobs, c) {
-            (Some(b), c @ Content::Files(_)) => b.reserve_files(conn, c).await,
+            (Some(b), c @ Content::Files(_)) => {
+                let give_up = self.reserve_failures + 1 >= MAX_RESERVE_ATTEMPTS;
+                match b.reserve_files(conn, c, give_up).await {
+                    Ok(r) => r,
+                    Err(f) => {
+                        self.reserve_failures += 1;
+                        let f = *f;
+                        self.restore_pending(f.content);
+                        bail!("файлы не зарезервировались: {}", f.error);
+                    }
+                }
+            }
             (_, c) => (c, Vec::new()),
         };
         let item = Item::new(self.device, c).with_device_name(self.device_name.clone());
         let sealed = self.state.invite.group_key.seal(&item)?;
-        write_msg(send, &ClientMsg::Push(sealed)).await?;
+        if let Err(e) = write_msg(send, &ClientMsg::Push(sealed)).await {
+            self.restore_pending(item.content);
+            return Err(e.into());
+        }
+        self.reserve_failures = 0;
+        self.pending_reserved = false;
         // Загрузки — только для элемента, который действительно ушёл.
         if let Some(b) = &self.blobs {
             b.enqueue(jobs);

@@ -176,7 +176,7 @@ pub async fn start(config: &Config) -> Result<Running> {
             blob_total_quota: config.blob_total_quota,
             blob_stall: config.blob_stall,
         },
-        streams: Arc::new(tokio::sync::Semaphore::new(transfer::MAX_SERVER_STREAMS)),
+        streams: Default::default(),
     });
 
     let purge = {

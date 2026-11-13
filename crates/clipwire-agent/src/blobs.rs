@@ -347,12 +347,18 @@ fn group_hex(key: &GroupKey) -> String {
 pub struct UploadQueue {
     file: PathBuf,
     jobs: Vec<UploadJob>,
+    /// Задания своей группы, выброшенные при загрузке по возрасту: их резерв
+    /// на сервере стоит отменить (см. [`Blobs::abort_later`]).
+    expired: Vec<BlobId>,
 }
 
 impl UploadQueue {
     /// Очередь группы `group` (hex). Нет файла или он битый — пустая очередь
     /// (битый — с предупреждением). Задания чужой группы и старше
-    /// [`QUEUE_MAX_AGE`] отбрасываются.
+    /// [`QUEUE_MAX_AGE`] отбрасываются; старые задания своей группы
+    /// запоминаются для отмены на сервере ([`UploadQueue::take_expired`]).
+    /// Задания чужой группы отменить нечем (нет её соединения), их убирает
+    /// срок хранения на сервере.
     pub fn load(state_dir: &Path, group: &str) -> Self {
         Self::load_at(state_dir, group, unix_ms())
     }
@@ -368,11 +374,17 @@ impl UploadQueue {
         };
         let max_age = QUEUE_MAX_AGE.as_millis() as u64;
         let before = jobs.len();
-        let jobs: Vec<UploadJob> = jobs
+        let (mine, _other): (Vec<UploadJob>, Vec<UploadJob>) =
+            jobs.into_iter().partition(|j| j.group == group);
+        let (jobs, old): (Vec<UploadJob>, Vec<UploadJob>) = mine
             .into_iter()
-            .filter(|j| j.group == group && now_ms.saturating_sub(j.queued_ms) <= max_age)
-            .collect();
-        let q = Self { file, jobs };
+            .partition(|j| now_ms.saturating_sub(j.queued_ms) <= max_age);
+        let expired = old.into_iter().map(|j| j.blob).collect();
+        let q = Self {
+            file,
+            jobs,
+            expired,
+        };
         if q.jobs.len() != before {
             tracing::info!(
                 dropped = before - q.jobs.len(),
@@ -387,6 +399,11 @@ impl UploadQueue {
 
     pub fn jobs(&self) -> &[UploadJob] {
         &self.jobs
+    }
+
+    /// Забрать `blob` заданий своей группы, выброшенных при загрузке по возрасту.
+    pub fn take_expired(&mut self) -> Vec<BlobId> {
+        std::mem::take(&mut self.expired)
     }
 
     /// Добавить задания (уже стоящие в очереди с тем же `blob` пропускаются).
@@ -460,6 +477,37 @@ impl std::error::Error for UploadError {}
 
 fn net(e: impl Into<anyhow::Error>) -> UploadError {
     UploadError::Network(e.into())
+}
+
+/// Резерв файлов не дошёл до сервера (обрыв или тайм-аут): элемент надо
+/// отправить позже. `content` — элемент с уже назначенными `blob` (у файлов с
+/// окончательным отказом `blob` снят).
+#[derive(Debug)]
+pub struct ReserveFailed {
+    pub content: Content,
+    pub error: UploadError,
+}
+
+/// Что делать с файлом после ответа на `Reserve`.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Зарезервирован: отправлять и грузить.
+    Keep,
+    /// Не дошло до сервера: отправить элемент позже с тем же `blob`.
+    Retry,
+    /// Окончательный отказ: снять `blob`, не грузить.
+    Strip,
+}
+
+/// Снимать `blob` только при окончательном отказе сервера (`Rejected`: лимит,
+/// квота, другой размер, ошибка протокола — повтор ничего не изменит). Обрыв
+/// и временные ошибки — повторить, если ещё не `give_up`.
+fn reserve_verdict(res: &Result<(), UploadError>, give_up: bool) -> Verdict {
+    match res {
+        Ok(()) => Verdict::Keep,
+        Err(e) if e.retry() && !give_up => Verdict::Retry,
+        Err(_) => Verdict::Strip,
+    }
 }
 
 /// Отказ сервера: временные ошибки — повторить, остальные — окончательные.
@@ -578,9 +626,10 @@ where
     }
 }
 
-/// Загрузить один файл на сервер по соединению движка (новый поток). Если
-/// файл изменился или пропал, сервер получает `Abort`: уже загруженные части
-/// удаляются, а те, кто ждёт файл, сразу узнают, что его не будет.
+/// Загрузить один файл на сервер по соединению движка (новый поток). При
+/// любой неповторяемой ошибке (файл изменился или пропал, сервер отказал)
+/// сервер получает `Abort`: уже загруженные части и резерв удаляются, а те,
+/// кто ждёт файл, сразу узнают, что его не будет.
 pub async fn upload_blob(
     conn: &Connection,
     key: &GroupKey,
@@ -593,7 +642,7 @@ pub async fn upload_blob(
         // Поток закрывается здесь: сервер видит конец загрузки и отпускает
         // замок файла, который нужен для Abort.
     };
-    if matches!(res, Err(UploadError::Changed | UploadError::Missing))
+    if res.as_ref().is_err_and(|e| !e.retry())
         && let Err(e) = abort_blob(conn, job.blob).await
     {
         tracing::info!("отмена загрузки не дошла до сервера: {e:#}");
@@ -868,6 +917,9 @@ pub struct Blobs {
     downloads: Mutex<HashMap<BlobId, Weak<tokio::sync::Mutex<()>>>>,
     /// `group_id` в hex: метка заданий в очереди.
     group: String,
+    /// Резервы, которые надо отменить на сервере (`Abort`), и номер
+    /// соединения, на котором отмена последний раз не дошла (0 — не пробовали).
+    to_abort: Mutex<Vec<(BlobId, u64)>>,
 }
 
 /// Пока жив, соединение доступно загрузкам и скачиваниям.
@@ -882,16 +934,54 @@ impl Drop for ConnGuard {
 impl Blobs {
     pub fn new(key: GroupKey, state_dir: &Path, sink: TransferSink) -> Arc<Self> {
         let group = group_hex(&key);
+        let mut queue = UploadQueue::load(state_dir, &group);
+        let to_abort = queue.take_expired().into_iter().map(|b| (b, 0)).collect();
         Arc::new(Self {
             key,
             files_dir: files_dir(state_dir),
-            queue: Mutex::new(UploadQueue::load(state_dir, &group)),
+            queue: Mutex::new(queue),
             transfers: Transfers::new(sink),
             conn: watch::Sender::new((0, None)),
             wake: Notify::new(),
             downloads: Mutex::new(HashMap::new()),
             group,
+            to_abort: Mutex::new(to_abort),
         })
+    }
+
+    /// Отменить резерв этих файлов на сервере при ближайшем соединении
+    /// (без гарантий: не дошло — повтор на следующем соединении, а дальше
+    /// файл уберёт срок хранения на сервере).
+    pub fn abort_later(&self, blobs: impl IntoIterator<Item = BlobId>) {
+        let mut list = self.to_abort.lock().unwrap_or_else(|e| e.into_inner());
+        let before = list.len();
+        for b in blobs {
+            if !list.iter().any(|(x, _)| *x == b) {
+                list.push((b, 0));
+            }
+        }
+        if list.len() != before {
+            drop(list);
+            self.wake.notify_one();
+        }
+    }
+
+    /// Отмены, которые стоит попробовать на соединении `n`; забираются из списка.
+    fn take_aborts(&self, n: u64) -> Vec<BlobId> {
+        let mut list = self.to_abort.lock().unwrap_or_else(|e| e.into_inner());
+        let (now, later): (Vec<_>, Vec<_>) = list.drain(..).partition(|(_, m)| *m != n);
+        *list = later;
+        now.into_iter().map(|(b, _)| b).collect()
+    }
+
+    /// Резервы, ждущие отмены (для тестов и отладки).
+    pub fn pending_aborts(&self) -> Vec<BlobId> {
+        self.to_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(b, _)| *b)
+            .collect()
     }
 
     pub fn files_dir(&self) -> &Path {
@@ -1019,18 +1109,25 @@ impl Blobs {
 
     /// Перед отправкой элемента с файлами: зарезервировать на сервере все его
     /// файлы с `blob` (параллельно, каждый с тайм-аутом [`CONTROL_TIMEOUT`]).
-    /// Файлам с отказом `blob` в отправляемом элементе снимается, а в событиях
-    /// передачи — `failed` с причиной. Возвращает элемент для отправки и
-    /// задания загрузки; их ставят в очередь ([`Blobs::enqueue`]) после того,
-    /// как элемент ушёл. Так копирования, вытесненные новыми, пока не было
-    /// связи, не грузятся вовсе.
+    ///
+    /// Окончательный отказ сервера (лимит, квота, другой размер) снимает файлу
+    /// `blob` в отправляемом элементе, а в событиях передачи — `failed` с
+    /// причиной. Обрыв связи или тайм-аут — ошибка [`ReserveFailed`]: элемент
+    /// (с уже назначенными `blob`) движок оставляет в очереди и отправляет
+    /// после переподключения, повторный `Reserve` того же `blob` у сервера —
+    /// как докачка. С `give_up` и обрыв считается окончательным отказом.
+    ///
+    /// Возвращает элемент для отправки и задания загрузки; их ставят в очередь
+    /// ([`Blobs::enqueue`]) после того, как элемент ушёл. Так копирования,
+    /// вытесненные новыми, пока не было связи, не грузятся вовсе.
     pub async fn reserve_files(
         &self,
         conn: &Connection,
         content: Content,
-    ) -> (Content, Vec<UploadJob>) {
+        give_up: bool,
+    ) -> Result<(Content, Vec<UploadJob>), Box<ReserveFailed>> {
         let Content::Files(mut files) = content else {
-            return (content, Vec::new());
+            return Ok((content, Vec::new()));
         };
         let mut tasks = tokio::task::JoinSet::new();
         for (i, f) in files.iter().enumerate() {
@@ -1043,24 +1140,36 @@ impl Blobs {
             }
         }
         let mut jobs = Vec::new();
+        let mut retry = None;
         while let Some(r) = tasks.join_next().await {
             let Ok((i, job, res)) = r else { continue };
-            match res {
-                Ok(()) => jobs.push((i, job)),
-                Err(e) => {
+            match (reserve_verdict(&res, give_up), res) {
+                (Verdict::Keep, _) => jobs.push((i, job)),
+                (Verdict::Retry, Err(e)) => {
+                    tracing::info!(path = %job.path, "резерв не дошёл до сервера: {e}");
+                    retry.get_or_insert(e);
+                }
+                (_, res) => {
+                    let e = res.err().map_or_else(String::new, |e| e.to_string());
                     tracing::warn!(path = %job.path, "файл не отправится: {e}");
                     files[i].blob = None;
                     self.transfers
-                        .finish(job.blob, Direction::Up, job.size, Err(e.to_string()));
+                        .finish(job.blob, Direction::Up, job.size, Err(e));
                 }
             }
         }
+        if let Some(error) = retry {
+            return Err(Box::new(ReserveFailed {
+                content: Content::Files(files),
+                error,
+            }));
+        }
         // Порядок заданий — как у файлов в элементе.
         jobs.sort_by_key(|(i, _)| *i);
-        (
+        Ok((
             Content::Files(files),
             jobs.into_iter().map(|(_, j)| j).collect(),
-        )
+        ))
     }
 
     /// Скачать все файлы по порядку. Первая ошибка прерывает.
@@ -1089,9 +1198,14 @@ impl Blobs {
         // На каком соединении и когда файл последний раз оборвался.
         let mut failed_on: HashMap<BlobId, (u64, Instant)> = HashMap::new();
         let mut tasks = tokio::task::JoinSet::new();
+        let mut aborts = tokio::task::JoinSet::new();
         loop {
             let (n, conn) = rx.borrow_and_update().clone();
             if let Some(conn) = conn {
+                for blob in self.take_aborts(n) {
+                    let conn = conn.clone();
+                    aborts.spawn(async move { (blob, n, abort_blob(&conn, blob).await) });
+                }
                 while running.len() < MAX_UPLOADS {
                     let job = self
                         .queue
@@ -1119,6 +1233,17 @@ impl Blobs {
                 r = rx.changed() => if r.is_err() { return },
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(RETRY_AFTER), if !failed_on.is_empty() => {}
+                Some(res) = aborts.join_next(), if !aborts.is_empty() => {
+                    if let Ok((blob, n, Err(e))) = res {
+                        tracing::info!(blob = %blob.hex(), "отмена резерва не дошла: {e}");
+                        if e.retry() {
+                            self.to_abort
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push((blob, n));
+                        }
+                    }
+                }
                 Some(res) = tasks.join_next(), if !tasks.is_empty() => {
                     if let Ok((blob, n, retry)) = res {
                         running.remove(&blob);
@@ -1299,11 +1424,14 @@ mod tests {
             job(4, "aa", now - day),
         ])
         .unwrap();
-        let q = UploadQueue::load_at(&dir, "aa", now);
+        let mut q = UploadQueue::load_at(&dir, "aa", now);
         assert_eq!(
             q.jobs(),
             &[job(1, "aa", now - 1000), job(4, "aa", now - day)]
         );
+        // Старое задание своей группы — к отмене на сервере, чужой — нет.
+        assert_eq!(q.take_expired(), vec![BlobId([3; 16])]);
+        assert!(q.take_expired().is_empty());
         // Отброшенное убрано и из файла: другая группа его уже не увидит.
         assert!(UploadQueue::load_at(&dir, "bb", now).jobs().is_empty());
         // Старый файл без группы и времени (до этих полей) — тоже мимо.
@@ -1718,6 +1846,45 @@ mod tests {
         job.path = dir.join("нет.txt").to_string_lossy().into_owned();
         let r = upload_stream(&mut aw, &mut ar, &key, &job, |_| {}).await;
         assert!(matches!(r, Err(UploadError::Missing)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reserve_drops_blob_only_on_final_refusal() {
+        let net = || Err(UploadError::Network(anyhow!("обрыв")));
+        let rejected = |f| Err(UploadError::Rejected(f));
+        assert_eq!(reserve_verdict(&Ok(()), false), Verdict::Keep);
+        assert_eq!(reserve_verdict(&Ok(()), true), Verdict::Keep);
+        // Обрыв и тайм-аут — повторить с тем же blob, пока не сдались.
+        assert_eq!(reserve_verdict(&net(), false), Verdict::Retry);
+        assert_eq!(reserve_verdict(&net(), true), Verdict::Strip);
+        // Временная ошибка сервера — тоже повтор.
+        assert_eq!(
+            reserve_verdict(&Err(server_fail(BlobFail::Internal("x".into()))), false),
+            Verdict::Retry
+        );
+        for f in [
+            BlobFail::TooLarge { max: 1 },
+            BlobFail::QuotaExceeded,
+            BlobFail::SizeMismatch,
+        ] {
+            assert_eq!(reserve_verdict(&rejected(f), false), Verdict::Strip);
+        }
+    }
+
+    #[test]
+    fn aborts_skip_connection_where_they_failed() {
+        let dir = tmp("aborts");
+        let b = Blobs::new(GroupKey([5; 32]), &dir, Arc::new(|_| {}));
+        let (x, y) = (BlobId([1; 16]), BlobId([2; 16]));
+        b.abort_later([x, y, x]);
+        assert_eq!(b.pending_aborts(), vec![x, y]);
+        assert_eq!(b.take_aborts(1), vec![x, y]);
+        assert!(b.pending_aborts().is_empty());
+        // Не дошло на соединении 1: там не повторяем, на следующем — да.
+        b.to_abort.lock().unwrap().push((x, 1));
+        assert!(b.take_aborts(1).is_empty());
+        assert_eq!(b.take_aborts(2), vec![x]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
