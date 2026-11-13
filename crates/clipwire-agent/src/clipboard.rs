@@ -356,11 +356,17 @@ mod win {
                     size: if is_dir {
                         0
                     } else {
-                        meta.map_or(0, |m| m.len())
+                        meta.as_ref().map_or(0, |m| m.len())
                     },
                     is_dir,
                     width,
                     height,
+                    modified_ms: meta
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_millis() as u64),
+                    // Хранилище назначает сервис, когда решает отправлять файл.
+                    blob: None,
                 }
             })
             .collect();

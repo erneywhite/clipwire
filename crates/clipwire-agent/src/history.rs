@@ -474,6 +474,8 @@ mod tests {
             is_dir: false,
             width: 0,
             height: 0,
+            modified_ms: 0,
+            blob: None,
         };
         let e = local_entry(
             DeviceId([1; 32]),

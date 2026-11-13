@@ -7,13 +7,18 @@
 //! по одному элементу (`History`) и `HistoryEnd`. Дальше обе стороны шлют
 //! сообщения когда угодно. История идёт отдельными кадрами, потому что в ней
 //! бывают картинки: одним кадром она легко перерастает [`MAX_FRAME`].
+//!
+//! Файлы идут по отдельным двунаправленным потокам того же соединения, которые
+//! агент открывает после входа в группу: первым кадром [`BlobRequest`], дальше
+//! части. Подробно — `docs/files-transfer.md`.
 
 use serde::{Deserialize, Serialize};
 
+use crate::blob::BlobId;
 use crate::crypto::{GroupId, JoinSecret, SealedItem};
 
 /// ALPN протокола. Меняем номер при несовместимых изменениях формата.
-pub const ALPN: &[u8] = b"clipwire/2";
+pub const ALPN: &[u8] = b"clipwire/3";
 
 /// Предел одного кадра. Сервер может выставить свой лимит на элемент
 /// меньше, этот нужен, чтобы не выделять память под мусорную длину.
@@ -49,6 +54,64 @@ pub enum ServerMsg {
     Backfill(SealedItem),
     /// Ошибка. После неё сервер закрывает соединение.
     Error(String),
+}
+
+/// Первый кадр потока файла.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlobRequest {
+    /// Загрузить файл размером `size` (открытый текст). Ответ — `PutReady`,
+    /// затем агент шлёт `BlobChunk` начиная с `have`, закрывает свою сторону
+    /// потока и ждёт `Stored`.
+    Put { blob: BlobId, size: u64 },
+    /// Скачать файл начиная с части `from`. Ответ — `GetReady`, затем `Chunk`
+    /// по порядку; если файл ещё загружается, сервер ждёт новых частей.
+    Get { blob: BlobId, from: u64 },
+}
+
+/// Часть файла от агента при загрузке.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobChunk {
+    pub index: u64,
+    /// `nonce || шифротекст`, см. [`crate::blob`].
+    pub data: Vec<u8>,
+}
+
+/// Кадры сервера в потоке файла.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlobReply {
+    /// На `Put`: сколько частей уже лежит на сервере, слать со следующей.
+    PutReady { have: u64 },
+    /// На `Put`: все части приняты и записаны на диск.
+    Stored,
+    /// На `Get`: размер файла (открытый текст), сколько частей уже есть и
+    /// закончена ли загрузка.
+    GetReady {
+        size: u64,
+        have: u64,
+        complete: bool,
+    },
+    /// Часть файла при скачивании.
+    Chunk(BlobChunk),
+    /// Отказ. После него сервер закрывает поток.
+    Error(BlobFail),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum BlobFail {
+    #[error("файла нет на сервере (не загружался или удалён по сроку)")]
+    NotFound,
+    #[error("файл больше {max} байт — предела сервера")]
+    TooLarge { max: u64 },
+    #[error("на сервере кончилось место, выделенное группе")]
+    QuotaExceeded,
+    #[error("файл с этим id уже загружается с другим размером")]
+    SizeMismatch,
+    #[error("загрузка файла остановилась на источнике")]
+    Stalled,
+    #[error("ошибка протокола: {0}")]
+    Protocol(String),
+    #[error("ошибка сервера: {0}")]
+    Internal(String),
 }
 
 #[derive(Debug, thiserror::Error)]
