@@ -506,21 +506,36 @@ mod win {
         }
     }
 
-    /// Полный путь exe программы, которая положила данные в буфер (владелец буфера).
-    /// Не все программы назначают владельца — тогда `None`.
+    /// Полный путь exe программы, которая положила данные в буфер (владелец
+    /// буфера). Не все назначают владельца: скриншот окна по Alt+PrintScreen
+    /// кладёт в буфер сама система. Тогда берётся программа активного окна —
+    /// для Alt+PrintScreen это как раз снятое окно.
     fn owner_exe() -> Option<String> {
-        use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::DataExchange::GetClipboardOwner;
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        unsafe {
+            GetClipboardOwner()
+                .ok()
+                .and_then(|w| window_exe(w))
+                .or_else(|| window_exe(GetForegroundWindow()))
+        }
+    }
+
+    /// Полный путь exe процесса, которому принадлежит окно.
+    unsafe fn window_exe(hwnd: HWND) -> Option<String> {
+        use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Threading::{
             OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
             QueryFullProcessImageNameW,
         };
         use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
         use windows::core::PWSTR;
+        if hwnd.0.is_null() {
+            return None;
+        }
         unsafe {
-            let owner = GetClipboardOwner().ok()?;
             let mut pid = 0u32;
-            GetWindowThreadProcessId(owner, Some(&mut pid));
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
             if pid == 0 {
                 return None;
             }

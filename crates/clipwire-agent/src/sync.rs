@@ -127,6 +127,8 @@ type DevicesWaiter = Option<tokio::sync::oneshot::Sender<Result<Vec<DeviceEntry>
 /// Если соединение оборвалось так скоро после `PublishCard`, сервер,
 /// скорее всего, старый и этого сообщения не знает.
 const CARD_CHECK: Duration = Duration::from_secs(10);
+/// Через сколько снова пробовать карточки после такого обрыва.
+const CARD_RETRY: Duration = Duration::from_secs(10 * 60);
 /// Как часто обновлять список устройств, пока есть связь: по нему
 /// проверяется, кто сменил ключ, и устройство, вошедшее в группу позже,
 /// должно успеть в нём оказаться.
@@ -176,8 +178,11 @@ pub struct Engine {
     terminal: bool,
     /// Когда отправлена карточка, если ответа на проверку ещё нет.
     card_check: Option<Instant>,
-    /// Сервер не знает карточек (старая версия): не отправлять их.
-    cards_unsupported: bool,
+    /// Сервер, похоже, не знает карточек (старая версия): до этого момента
+    /// их не отправлять. Признак временный: обрыв мог случиться и по другой
+    /// причине (сервер обновляли, сеть моргнула), поэтому через
+    /// [`CARD_RETRY`] карточка отправляется снова.
+    cards_off_until: Option<Instant>,
     /// Проверенные карточки устройств группы: по ним проверяется инициатор
     /// смены ключа.
     known: HashMap<DeviceId, DeviceCard>,
@@ -224,7 +229,7 @@ impl Engine {
             devices_waiters: VecDeque::new(),
             terminal: false,
             card_check: None,
-            cards_unsupported: false,
+            cards_off_until: None,
             known: HashMap::new(),
             listed_at: None,
             want_list: false,
@@ -258,6 +263,11 @@ impl Engine {
 
     pub fn device(&self) -> DeviceId {
         self.device
+    }
+
+    /// Отправлять ли карточки сейчас.
+    fn cards_on(&self) -> bool {
+        self.cards_off_until.is_none_or(|t| Instant::now() >= t)
     }
 
     fn emit(&self, e: Event) {
@@ -360,7 +370,7 @@ impl Engine {
                         .is_some_and(|t| t.elapsed() < CARD_CHECK)
                     {
                         tracing::info!("сервер, похоже, не знает карточек устройств");
-                        self.cards_unsupported = true;
+                        self.cards_off_until = Some(Instant::now() + CARD_RETRY);
                     }
                     tracing::warn!("нет связи с сервером: {e:#}");
                     self.emit(Event::Status(Status::Offline(format!("{e:#}"))));
@@ -569,7 +579,7 @@ impl Engine {
         self.apply_history(history);
         // Карточка устройства для списка устройств и смены ключа. Следом
         // запрос списка: ответ на него значит, что сервер карточки знает.
-        if !self.cards_unsupported {
+        if self.cards_on() {
             let card = crate::devices::sealed_card(
                 &key,
                 &self.state.device_key,
@@ -622,13 +632,13 @@ impl Engine {
                         let due = self
                             .listed_at
                             .is_none_or(|t| t.elapsed() >= DEVICES_REFRESH_MIN);
-                        if std::mem::take(&mut self.want_list) && due && !self.cards_unsupported {
+                        if std::mem::take(&mut self.want_list) && due && self.cards_on() {
                             self.request_list(&mut send).await?;
                         }
                     }
                     None => bail!("сервер закрыл соединение"),
                 },
-                _ = refresh.tick(), if !self.cards_unsupported => {
+                _ = refresh.tick(), if self.cards_on() => {
                     self.request_list(&mut send).await?;
                 }
                 ctl = next_control(control) => match ctl {
