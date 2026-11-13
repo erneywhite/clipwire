@@ -10,6 +10,7 @@ mod link;
 mod popup;
 mod settings_window;
 mod sound;
+mod storage;
 mod tray;
 mod updates;
 
@@ -148,13 +149,11 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
                 let _ = handle.emit("clipwire://group-rekey-failed", why);
             }
             // Настройки хранилища группы (без секретов) и предупреждение,
-            // что файл ушёл через сервер: для будущего раздела настроек.
+            // что файл ушёл через сервер: для карточки «Хранилище файлов».
             UiEvent::GroupConfig(view) => {
                 let _ = handle.emit("clipwire://group-config", &view);
             }
-            UiEvent::StorageWarning(w) => {
-                let _ = handle.emit("clipwire://storage-warning", w);
-            }
+            UiEvent::StorageWarning(w) => storage::on_warning(&handle, w),
             UiEvent::NewEntry => {
                 let on = handle
                     .state::<AppState>()
@@ -333,6 +332,7 @@ pub fn run() {
         .manage(state)
         .manage(popup::PopupState::default())
         .manage(link::LinkCache::default())
+        .manage(storage::LastWarning::default())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -379,6 +379,9 @@ pub fn run() {
             files::transfers,
             cache::cache_size,
             cache::cache_clear,
+            storage::storage_get,
+            storage::storage_save,
+            storage::storage_probe,
         ])
         .setup(|app| {
             let hide_from_capture = app

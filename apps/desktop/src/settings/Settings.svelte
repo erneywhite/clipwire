@@ -13,6 +13,7 @@
   import Toggle from './Toggle.svelte'
   import TitleBar from './TitleBar.svelte'
   import Devices from './Devices.svelte'
+  import Storage from './Storage.svelte'
 
   type Section = 'general' | 'sync' | 'privacy' | 'keys' | 'about'
   const sections: { id: Section; title: string; icon: string }[] = [
@@ -525,7 +526,7 @@
           <h2>Файлы</h2>
           <div class="card pad">
             <label class="field">
-              <span>Загружать на сервер файлы до N МБ</span>
+              <span>Загружать в хранилище файлы до N МБ</span>
               <input
                 class="num"
                 type="number"
@@ -537,8 +538,9 @@
               />
             </label>
             <p class="hint">
-              Скопированные файлы такого размера сразу уходят на сервер зашифрованными, и другие устройства
-              вставляют их, даже когда этот компьютер выключен. 0 — не загружать. Файлы крупнее порога
+              Скопированные файлы такого размера сразу уходят зашифрованными в хранилище группы (сервер
+              Clipwire или своё, см. «Хранилище файлов»), и другие устройства вставляют их, даже когда этот
+              компьютер выключен. 0 — не загружать. Файлы крупнее порога
               другие устройства берут напрямую с этого компьютера, пока он в сети.
             </p>
             <div class="cache">
@@ -551,6 +553,8 @@
               скачается заново при вставке.
             </p>
           </div>
+
+          <Storage />
 
           <h2>Добавить устройство</h2>
           <div class="card pad">

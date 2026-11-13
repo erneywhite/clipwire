@@ -167,6 +167,75 @@ export interface GroupRekeyed {
   result: RekeyResult | null
 }
 
+/** Вид хранилища файлов группы. */
+export type StorageKind = 'server' | 's3' | 'sftp'
+
+export interface S3Form {
+  endpoint: string
+  region: string
+  bucket: string
+  prefix: string
+  access_key: string
+  /** Пусто — оставить сохранённый. */
+  secret_key: string
+  path_style: boolean
+}
+
+export interface SftpForm {
+  host: string
+  port: number
+  user: string
+  auth: 'password' | 'key'
+  /** Секреты: пусто — оставить сохранённые. */
+  password: string
+  private_key: string
+  passphrase: string
+  path: string
+  /** Подтверждённый отпечаток ключа хоста, пусто — не подтверждён. */
+  host_key_sha256: string
+}
+
+/** Форма «Хранилище файлов». Обе вложенные формы есть всегда. */
+export interface StorageForm {
+  kind: StorageKind
+  /** Сколько хранить файлы во внешнем хранилище, часов; 0 — без чистки. */
+  file_ttl_hours: number
+  s3: S3Form
+  sftp: SftpForm
+}
+
+/** Какие секреты сохранены (сами значения в окно не приходят). */
+export interface SavedSecrets {
+  s3_secret: boolean
+  sftp_password: boolean
+  sftp_key: boolean
+  sftp_passphrase: boolean
+}
+
+/** Предупреждение «внешнее хранилище недоступно, файл ушёл через сервер». */
+export interface StorageWarning {
+  text: string
+  at_ms: number
+}
+
+export interface StorageState {
+  form: StorageForm
+  saved: SavedSecrets
+  /** 0 — настройки ещё никто не сохранял. */
+  version: number
+  /** Хранилище по сохранённым настройкам не открылось. */
+  error: string | null
+  insecure_http: boolean
+  warning: StorageWarning | null
+}
+
+/** Итог «Проверить подключение». */
+export type ProbeResult =
+  | { status: 'ok'; host_key: string | null; insecure_http: boolean }
+  | { status: 'confirm_host_key'; host_key: string }
+  | { status: 'host_key_mismatch'; expected: string; got: string }
+  | { status: 'error'; message: string }
+
 export const api = {
   settings: () => invoke<Settings>('get_settings'),
   saveSettings: (settings: Settings) => invoke<void>('save_settings', { settings }),
@@ -210,4 +279,9 @@ export const api = {
   /** Открыть папку из истории (свою или скачанную) в файловом менеджере. */
   folderOpen: (path: string) => invoke<void>('folder_open', { path }),
   transfers: () => invoke<Transfer[]>('transfers'),
+  /** Хранилище файлов группы: настройки без секретов. */
+  storageGet: () => invoke<StorageState>('storage_get'),
+  /** Сохранить настройки хранилища: уйдут всем устройствам группы. */
+  storageSave: (form: StorageForm) => invoke<StorageState>('storage_save', { form }),
+  storageProbe: (form: StorageForm) => invoke<ProbeResult>('storage_probe', { form }),
 }
