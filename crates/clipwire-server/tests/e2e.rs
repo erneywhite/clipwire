@@ -8,9 +8,12 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clipwire_core::blob::{CHUNK, OVERHEAD, chunk_count, chunk_len, sealed_size};
 use clipwire_core::proto::io::{read_msg, write_msg};
-use clipwire_core::proto::{ALPN, ClientMsg, ServerMsg};
-use clipwire_core::{Content, DeviceId, GroupKey, Item, SealedItem, ServerInfo};
+use clipwire_core::proto::{
+    ALPN, BlobChunk, BlobFail, BlobReply, BlobRequest, ClientMsg, ServerMsg,
+};
+use clipwire_core::{BlobId, Content, DeviceId, GroupKey, Item, SealedItem, ServerInfo};
 use clipwire_server::Config;
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
@@ -19,7 +22,7 @@ const T: Duration = Duration::from_secs(20);
 
 struct Client {
     _ep: Endpoint,
-    _conn: Connection,
+    conn: Connection,
     device: DeviceId,
     send: SendStream,
     recv: RecvStream,
@@ -42,7 +45,7 @@ impl Client {
         let device = DeviceId(*ep.id().as_bytes());
         Ok(Self {
             _ep: ep,
-            _conn: conn,
+            conn,
             device,
             send,
             recv,
@@ -88,8 +91,14 @@ impl Client {
 }
 
 async fn start_server() -> Result<(clipwire_server::Running, String)> {
+    start_server_with(|_| {}).await
+}
+
+async fn start_server_with(
+    tune: impl FnOnce(&mut Config),
+) -> Result<(clipwire_server::Running, String)> {
     let dir = std::env::temp_dir().join(format!("clipwire-e2e-{}", uuid::Uuid::now_v7()));
-    let config = Config {
+    let mut config = Config {
         data_dir: dir,
         public_url: "http://unused".into(),
         self_relay_url: "http://127.0.0.1:0".into(),
@@ -99,7 +108,11 @@ async fn start_server() -> Result<(clipwire_server::Running, String)> {
         max_item_bytes: 4096,
         history_len: 10,
         ttl: Duration::from_secs(3600),
+        max_file_bytes: 8 * 1024 * 1024,
+        blob_quota: 64 * 1024 * 1024,
+        blob_stall: Duration::from_secs(10),
     };
+    tune(&mut config);
     let server = clipwire_server::start(&config).await?;
     tokio::time::timeout(T, server.endpoint().online())
         .await
@@ -207,5 +220,365 @@ async fn oversized_item_is_dropped() -> Result<()> {
         ServerMsg::Deliver(sealed) => assert_eq!(key.open(&sealed)?, small),
         other => panic!("ждали Deliver, пришло {other:?}"),
     }
+    server.shutdown().await
+}
+
+// ---------- файлы ----------
+
+/// Один поток файла: открыть, отправить запрос.
+struct BlobStream {
+    send: SendStream,
+    recv: RecvStream,
+}
+
+impl BlobStream {
+    async fn open(conn: &Connection, req: BlobRequest) -> Result<Self> {
+        let (mut send, recv) = conn.open_bi().await?;
+        write_msg(&mut send, &req).await?;
+        Ok(Self { send, recv })
+    }
+
+    async fn next(&mut self) -> Result<Option<BlobReply>> {
+        Ok(tokio::time::timeout(T, read_msg(&mut self.recv))
+            .await
+            .context("таймаут чтения потока файла")??)
+    }
+
+    async fn reply(&mut self) -> Result<BlobReply> {
+        self.next().await?.context("сервер закрыл поток файла")
+    }
+
+    async fn chunk(
+        &mut self,
+        key: &GroupKey,
+        blob: BlobId,
+        size: u64,
+        index: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let last = index + 1 == chunk_count(size);
+        let start = index as usize * CHUNK;
+        let plain = &data[start..start + chunk_len(size, index)];
+        let sealed = key.blob_key(blob).seal(index, last, plain)?;
+        write_msg(
+            &mut self.send,
+            &BlobChunk {
+                index,
+                data: sealed,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// Узнаваемое содержимое, чтобы перепутанные части было видно.
+fn sample(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 31 + i / 7) as u8).collect()
+}
+
+/// Загрузить файл целиком (с того места, которое вернул сервер).
+async fn upload(conn: &Connection, key: &GroupKey, blob: BlobId, data: &[u8]) -> Result<u64> {
+    let size = data.len() as u64;
+    let mut s = BlobStream::open(conn, BlobRequest::Put { blob, size }).await?;
+    let have = match s.reply().await? {
+        BlobReply::PutReady { have } => have,
+        other => anyhow::bail!("ждали PutReady, пришло {other:?}"),
+    };
+    for i in have..chunk_count(size) {
+        s.chunk(key, blob, size, i, data).await?;
+    }
+    s.send.finish()?;
+    match s.reply().await? {
+        BlobReply::Stored => Ok(have),
+        other => anyhow::bail!("ждали Stored, пришло {other:?}"),
+    }
+}
+
+/// Прочитать части после GetReady и расшифровать их.
+async fn read_chunks(
+    s: &mut BlobStream,
+    key: &GroupKey,
+    blob: BlobId,
+    size: u64,
+    from: u64,
+) -> Result<Vec<u8>> {
+    let count = chunk_count(size);
+    let bk = key.blob_key(blob);
+    let mut out = Vec::new();
+    for i in from..count {
+        match s.reply().await? {
+            BlobReply::Chunk(c) => {
+                assert_eq!(c.index, i);
+                assert_eq!(c.data.len(), chunk_len(size, i) + OVERHEAD);
+                out.extend(bk.open(i, i + 1 == count, &c.data)?);
+            }
+            other => anyhow::bail!("ждали часть {i}, пришло {other:?}"),
+        }
+    }
+    assert!(
+        s.next().await?.is_none(),
+        "после последней части поток закрывается"
+    );
+    Ok(out)
+}
+
+async fn download(conn: &Connection, key: &GroupKey, blob: BlobId) -> Result<Vec<u8>> {
+    let mut s = BlobStream::open(conn, BlobRequest::Get { blob, from: 0 }).await?;
+    let size = match s.reply().await? {
+        BlobReply::GetReady {
+            size,
+            have,
+            complete,
+        } => {
+            assert_eq!(have, chunk_count(size));
+            assert!(complete);
+            size
+        }
+        other => anyhow::bail!("ждали GetReady, пришло {other:?}"),
+    };
+    read_chunks(&mut s, key, blob, size, 0).await
+}
+
+async fn expect_fail(s: &mut BlobStream) -> Result<BlobFail> {
+    match s.reply().await? {
+        BlobReply::Error(f) => Ok(f),
+        other => anyhow::bail!("ждали ошибку, пришло {other:?}"),
+    }
+}
+
+async fn joined(info: &ServerInfo, relay: &str, key: &GroupKey) -> Result<Client> {
+    let mut c = Client::connect(info, relay, "test-token").await?;
+    c.join(key).await?;
+    Ok(c)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_upload_and_download() -> Result<()> {
+    let (server, relay) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let a = joined(&server.info, &relay, &key).await?;
+    let b = joined(&server.info, &relay, &key).await?;
+
+    // Два с половиной МиБ — три части, последняя неполная.
+    let data = sample(CHUNK * 5 / 2);
+    let blob = BlobId::random()?;
+    assert_eq!(upload(&a.conn, &key, blob, &data).await?, 0);
+    assert_eq!(download(&b.conn, &key, blob).await?, data);
+
+    // Пустой файл — одна пустая часть.
+    let empty = BlobId::random()?;
+    upload(&a.conn, &key, empty, &[]).await?;
+    assert!(download(&b.conn, &key, empty).await?.is_empty());
+
+    // Повторный Put загруженного файла: сервер сразу говорит, что всё есть.
+    assert_eq!(upload(&a.conn, &key, blob, &data).await?, 3);
+
+    // Скачивание с середины.
+    let mut s = BlobStream::open(&b.conn, BlobRequest::Get { blob, from: 2 }).await?;
+    assert!(matches!(
+        s.reply().await?,
+        BlobReply::GetReady { have: 3, .. }
+    ));
+    assert_eq!(
+        read_chunks(&mut s, &key, blob, data.len() as u64, 2).await?,
+        data[2 * CHUNK..]
+    );
+
+    // Чужая группа файла не видит.
+    let other = GroupKey::generate()?;
+    let c = joined(&server.info, &relay, &other).await?;
+    let mut s = BlobStream::open(&c.conn, BlobRequest::Get { blob, from: 0 }).await?;
+    assert_eq!(expect_fail(&mut s).await?, BlobFail::NotFound);
+
+    // Несколько файлов параллельно на одном соединении, больше предела в 8 потоков.
+    let blobs: Vec<_> = (0..12)
+        .map(|_| BlobId::random())
+        .collect::<Result<_, _>>()?;
+    let small = sample(1000);
+    let mut ups = tokio::task::JoinSet::new();
+    for &id in &blobs {
+        let (conn, key, small) = (a.conn.clone(), key.clone(), small.clone());
+        ups.spawn(async move { upload(&conn, &key, id, &small).await });
+    }
+    while let Some(r) = ups.join_next().await {
+        r??;
+    }
+    for &id in &blobs {
+        assert_eq!(download(&b.conn, &key, id).await?, small);
+    }
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_upload_resumes_after_disconnect() -> Result<()> {
+    let (server, relay) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let data = sample(CHUNK * 5 / 2);
+    let size = data.len() as u64;
+    let blob = BlobId::random()?;
+
+    let a = joined(&server.info, &relay, &key).await?;
+    let mut put = BlobStream::open(&a.conn, BlobRequest::Put { blob, size }).await?;
+    assert_eq!(put.reply().await?, BlobReply::PutReady { have: 0 });
+    put.chunk(&key, blob, size, 0, &data).await?;
+    // Дожидаемся, что сервер записал часть: она приходит в Get.
+    let mut get = BlobStream::open(&a.conn, BlobRequest::Get { blob, from: 0 }).await?;
+    assert!(matches!(
+        get.reply().await?,
+        BlobReply::GetReady {
+            complete: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        get.reply().await?,
+        BlobReply::Chunk(BlobChunk { index: 0, .. })
+    ));
+    a.conn.close(0u32.into(), b"bye");
+    drop(a);
+
+    let a2 = joined(&server.info, &relay, &key).await?;
+    assert_eq!(upload(&a2.conn, &key, blob, &data).await?, 1);
+    assert_eq!(download(&a2.conn, &key, blob).await?, data);
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_download_while_uploading() -> Result<()> {
+    let (server, relay) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let a = joined(&server.info, &relay, &key).await?;
+    let b = joined(&server.info, &relay, &key).await?;
+    let data = sample(CHUNK * 5 / 2);
+    let size = data.len() as u64;
+    let blob = BlobId::random()?;
+
+    let mut put = BlobStream::open(&a.conn, BlobRequest::Put { blob, size }).await?;
+    assert_eq!(put.reply().await?, BlobReply::PutReady { have: 0 });
+
+    // Скачивание начинается раньше, чем пришла хоть одна часть.
+    let mut get = BlobStream::open(&b.conn, BlobRequest::Get { blob, from: 0 }).await?;
+    assert_eq!(
+        get.reply().await?,
+        BlobReply::GetReady {
+            size,
+            have: 0,
+            complete: false
+        }
+    );
+    let reader = {
+        let key = key.clone();
+        tokio::spawn(async move { read_chunks(&mut get, &key, blob, size, 0).await })
+    };
+    for i in 0..chunk_count(size) {
+        put.chunk(&key, blob, size, i, &data).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    put.send.finish()?;
+    assert_eq!(put.reply().await?, BlobReply::Stored);
+    assert_eq!(reader.await??, data);
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_limits_and_errors() -> Result<()> {
+    let max = 4000u64;
+    let (server, relay) = start_server_with(|c| {
+        c.max_file_bytes = max;
+        c.blob_quota = sealed_size(3000) + sealed_size(500);
+    })
+    .await?;
+    let key = GroupKey::generate()?;
+    let a = joined(&server.info, &relay, &key).await?;
+    let put = |blob, size| BlobStream::open(&a.conn, BlobRequest::Put { blob, size });
+
+    // Больше предела сервера.
+    let mut s = put(BlobId::random()?, max + 1).await?;
+    assert_eq!(expect_fail(&mut s).await?, BlobFail::TooLarge { max });
+
+    // Первый файл влезает, второй такой же уже нет.
+    let first = BlobId::random()?;
+    upload(&a.conn, &key, first, &sample(3000)).await?;
+    let mut s = put(BlobId::random()?, 3000).await?;
+    assert_eq!(expect_fail(&mut s).await?, BlobFail::QuotaExceeded);
+
+    // Тот же id с другим размером.
+    let mut s = put(first, 3001).await?;
+    assert_eq!(expect_fail(&mut s).await?, BlobFail::SizeMismatch);
+
+    // Часть не по порядку и часть не той длины.
+    let size = 100u64;
+    let blob = BlobId::random()?;
+    let mut s = put(blob, size).await?;
+    assert_eq!(s.reply().await?, BlobReply::PutReady { have: 0 });
+    write_msg(
+        &mut s.send,
+        &BlobChunk {
+            index: 1,
+            data: vec![0; 100 + OVERHEAD],
+        },
+    )
+    .await?;
+    assert!(matches!(expect_fail(&mut s).await?, BlobFail::Protocol(_)));
+    let mut s = put(blob, size).await?;
+    assert_eq!(s.reply().await?, BlobReply::PutReady { have: 0 });
+    write_msg(
+        &mut s.send,
+        &BlobChunk {
+            index: 0,
+            data: vec![0; 99 + OVERHEAD],
+        },
+    )
+    .await?;
+    assert!(matches!(expect_fail(&mut s).await?, BlobFail::Protocol(_)));
+
+    // Файла нет.
+    let mut s = BlobStream::open(
+        &a.conn,
+        BlobRequest::Get {
+            blob: BlobId::random()?,
+            from: 0,
+        },
+    )
+    .await?;
+    assert_eq!(expect_fail(&mut s).await?, BlobFail::NotFound);
+
+    // Основной поток после всего этого жив.
+    let mut b = joined(&server.info, &relay, &key).await?;
+    let mut a = a;
+    let sent = a.push_text(&key, "после файлов").await?;
+    match b.next().await? {
+        ServerMsg::Deliver(sealed) => assert_eq!(key.open(&sealed)?, sent),
+        other => panic!("ждали Deliver, пришло {other:?}"),
+    }
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_download_stalls_when_upload_stops() -> Result<()> {
+    let (server, relay) = start_server_with(|c| c.blob_stall = Duration::from_secs(1)).await?;
+    let key = GroupKey::generate()?;
+    let a = joined(&server.info, &relay, &key).await?;
+    let b = joined(&server.info, &relay, &key).await?;
+    let data = sample(CHUNK + 10);
+    let size = data.len() as u64;
+    let blob = BlobId::random()?;
+
+    let mut put = BlobStream::open(&a.conn, BlobRequest::Put { blob, size }).await?;
+    assert_eq!(put.reply().await?, BlobReply::PutReady { have: 0 });
+    put.chunk(&key, blob, size, 0, &data).await?;
+
+    let mut get = BlobStream::open(&b.conn, BlobRequest::Get { blob, from: 0 }).await?;
+    assert!(matches!(get.reply().await?, BlobReply::GetReady { .. }));
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        get.reply().await?,
+        BlobReply::Chunk(BlobChunk { index: 0, .. })
+    ));
+    assert_eq!(expect_fail(&mut get).await?, BlobFail::Stalled);
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    // Загрузчик тоже молчал дольше blob_stall — его поток сервер закрывает.
+    assert_eq!(expect_fail(&mut put).await?, BlobFail::Stalled);
     server.shutdown().await
 }

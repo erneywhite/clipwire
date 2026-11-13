@@ -14,6 +14,9 @@ services:
       # CLIPWIRE_MAX_ITEM_BYTES: 8388608
       # CLIPWIRE_HISTORY_LEN: 50
       # CLIPWIRE_TTL_HOURS: 24
+      # CLIPWIRE_MAX_FILE_BYTES: 104857600
+      # CLIPWIRE_BLOB_QUOTA: 2147483648
+      # CLIPWIRE_BLOB_STALL_SECS: 120
       # RUST_LOG: info
     ports:
       # relay по HTTP, только для локального прокси панели
