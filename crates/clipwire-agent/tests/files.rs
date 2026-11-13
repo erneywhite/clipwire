@@ -97,9 +97,11 @@ impl Device {
         let (mut send, mut recv) = conn.open_bi().await?;
         write_msg(
             &mut send,
-            &ClientMsg::Join {
+            // Как настоящий агент: с токеном сервера, иначе новую группу не создать.
+            &ClientMsg::JoinWithToken {
                 group_id: key.group_id(),
                 join_secret: key.join_secret(),
+                token: info.relay_token.clone(),
             },
         )
         .await?;
