@@ -19,3 +19,6 @@ CLAUDE.local.md
 
 # Промежуточный PNG для `tauri icon`, пересоздаётся scripts/icons.mjs
 apps/desktop/icons-src/
+
+# Временные рабочие копии агентов
+.claude/worktrees/
