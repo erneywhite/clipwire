@@ -112,6 +112,31 @@ pub struct EntryDto {
     pub rich: Option<&'static str>,
     /// HTML-фрагмент — только в `history_get`, для предпросмотра.
     pub html: Option<String>,
+    /// Скопированные файлы и папки.
+    pub files: Vec<FileDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileDto {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub is_dir: bool,
+    /// Файл ещё на месте.
+    pub exists: bool,
+}
+
+/// Полная картинка файла-картинки для предпросмотра и редактора (data URL).
+fn file_image_url(f: &clipwire_core::FileRef) -> Option<String> {
+    let mime = clipwire_agent::image::image_mime(&f.name)?;
+    if f.size > clipwire_agent::image::MAX_IMAGE_FILE {
+        return None;
+    }
+    let bytes = std::fs::read(&f.path).ok()?;
+    Some(format!(
+        "data:{mime};base64,{}",
+        data_encoding::BASE64.encode(&bytes)
+    ))
 }
 
 /// Сколько символов текста отдавать в список: хватает на две строки превью.
@@ -128,8 +153,29 @@ fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool) -> EntryDto {
     let (kind, text, width, height, image) = match &e.content {
         Content::Text(t) | Content::Rich { text: t, .. } => ("text", t.as_str(), 0, 0, None),
         Content::Image { width, height, png } => ("image", "", *width, *height, Some(png)),
+        Content::Files(f) => {
+            let (w, h) = if f.len() == 1 {
+                (f[0].width, f[0].height)
+            } else {
+                (0, 0)
+            };
+            ("files", "", w, h, None)
+        }
         #[allow(unreachable_patterns)]
         _ => ("other", "", 0, 0, None),
+    };
+    let files: Vec<FileDto> = match &e.content {
+        Content::Files(f) => f
+            .iter()
+            .map(|f| FileDto {
+                name: f.name.clone(),
+                path: f.path.clone(),
+                size: f.size,
+                is_dir: f.is_dir,
+                exists: std::path::Path::new(&f.path).exists(),
+            })
+            .collect(),
+        _ => Vec::new(),
     };
     let (rich, html) = match &e.content {
         Content::Rich { html, .. } => (
@@ -155,15 +201,19 @@ fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool) -> EntryDto {
         seen_ms: e.seen_ms,
         width,
         height,
-        bytes: e.content.len(),
+        bytes: match &e.content {
+            Content::Files(f) => f.iter().map(|f| f.size as usize).sum(),
+            c => c.len(),
+        },
         thumb: thumb.map(png_url),
-        image: if full {
-            image.map(|p| png_url(p))
-        } else {
-            None
+        image: match (&e.content, full) {
+            (_, false) => None,
+            (Content::Files(f), true) if f.len() == 1 && f[0].width > 0 => file_image_url(&f[0]),
+            (_, true) => image.map(|p| png_url(p)),
         },
         rich,
         html,
+        files,
     }
 }
 

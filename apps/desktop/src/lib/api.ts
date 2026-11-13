@@ -29,7 +29,7 @@ export interface DeviceInfo {
 
 export interface Entry {
   id: string
-  kind: 'text' | 'image' | 'other'
+  kind: 'text' | 'image' | 'files' | 'other'
   text: string
   chars: number
   lines: number
@@ -49,6 +49,17 @@ export interface Entry {
   rich: 'HTML' | 'RTF' | null
   /** HTML-фрагмент — только из history_get. */
   html: string | null
+  /** Скопированные файлы и папки. */
+  files: FileInfo[]
+}
+
+export interface FileInfo {
+  name: string
+  path: string
+  size: number
+  is_dir: boolean
+  /** Файл ещё на месте. */
+  exists: boolean
 }
 
 export interface LinkCard {

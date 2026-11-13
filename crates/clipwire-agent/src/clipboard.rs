@@ -44,6 +44,8 @@ pub fn write(content: &clipwire_core::Content) -> Result<()> {
         // shortcut: на других ОС пока только текст, форматирование теряется. Этап macOS.
         #[cfg(not(windows))]
         clipwire_core::Content::Rich { text, .. } => write_text(text),
+        #[cfg(windows)]
+        clipwire_core::Content::Files(files) => win::write_files(files),
         #[allow(unreachable_patterns)]
         _ => anyhow::bail!("этот тип пока не записывается в буфер"),
     }
@@ -217,6 +219,9 @@ mod win {
                 if let Some(ctx) = unsafe { ptr.as_mut() } {
                     if ctx.formats.excluded(hwnd) {
                         tracing::debug!("буфер помечен как приватный, пропускаю");
+                    } else if let Some(files) = read_files() {
+                        // Проводник кладёт файлы списком путей (CF_HDROP).
+                        (ctx.on_change)(Content::Files(files), owner_exe());
                     } else if let Some(text) = super::read_text()
                         && !text.is_empty()
                     {
@@ -317,6 +322,71 @@ mod win {
             (!out.is_empty()).then_some(out)
         });
         (html, rtf)
+    }
+
+    /// Файлы из буфера (CF_HDROP): имена, размеры, у картинок — размеры в пикселях.
+    fn read_files() -> Option<Vec<clipwire_core::FileRef>> {
+        use clipboard_win::raw;
+        const CF_HDROP: u32 = 15;
+        if !raw::is_format_avail(CF_HDROP) {
+            return None;
+        }
+        let paths = {
+            let _clip = clipboard_win::Clipboard::new_attempts(OPEN_ATTEMPTS).ok()?;
+            let mut out = Vec::new();
+            raw::get_file_list_path(&mut out).ok()?;
+            out
+        };
+        let files: Vec<_> = paths
+            .into_iter()
+            .map(|p| {
+                let meta = std::fs::metadata(&p).ok();
+                let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+                let (width, height) = if is_dir {
+                    (0, 0)
+                } else {
+                    crate::image::file_dimensions(&p).unwrap_or((0, 0))
+                };
+                clipwire_core::FileRef {
+                    name: p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.to_string_lossy().into_owned()),
+                    path: p.to_string_lossy().into_owned(),
+                    size: if is_dir {
+                        0
+                    } else {
+                        meta.map_or(0, |m| m.len())
+                    },
+                    is_dir,
+                    width,
+                    height,
+                }
+            })
+            .collect();
+        (!files.is_empty()).then_some(files)
+    }
+
+    /// Положить файлы в буфер так же, как Проводник: их можно вставить в папку,
+    /// в мессенджер или в письмо. Пропавшие файлы — ошибка с их именами.
+    pub fn write_files(files: &[clipwire_core::FileRef]) -> Result<()> {
+        use clipboard_win::options::DoClear;
+        let missing: Vec<&str> = files
+            .iter()
+            .filter(|f| !std::path::Path::new(&f.path).exists())
+            .map(|f| f.name.as_str())
+            .collect();
+        anyhow::ensure!(
+            missing.is_empty(),
+            "файлов уже нет на месте: {}",
+            missing.join(", ")
+        );
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        let _clip = clipboard_win::Clipboard::new_attempts(OPEN_ATTEMPTS)
+            .map_err(|e| anyhow!("буфер не открылся: {e}"))?;
+        clipboard_win::raw::set_file_list_with(&paths, DoClear)
+            .map_err(|e| anyhow!("файлы не записались в буфер: {e}"))?;
+        Ok(())
     }
 
     /// Положить текст вместе с HTML и RTF одним заходом: вставляющая программа

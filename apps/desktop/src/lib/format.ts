@@ -37,6 +37,22 @@ export function bytesLabel(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1).replace('.', ',')} МБ`
 }
 
+/** Подпись для набора файлов: «Отчёт.pdf», «3 файла: a.pdf, b.png, c.txt». */
+export function filesLabel(files: { name: string }[]): string {
+  if (files.length === 1) return files[0].name
+  const n = files.length
+  return `${n} ${plural(n, ['файл', 'файла', 'файлов'])}: ${files.map((f) => f.name).join(', ')}`
+}
+
+/** Мета для файлов: размер или «папка», у картинки — пиксели. */
+export function filesMeta(files: { size: number; is_dir: boolean }[], bytes: number, w: number, h: number): string {
+  if (files.length === 1 && files[0].is_dir) return 'папка'
+  const parts = []
+  if (w && h) parts.push(`${w}×${h}`)
+  parts.push(bytesLabel(bytes))
+  return parts.join(' · ')
+}
+
 /** Похоже на код или команду — показывать моноширинным. */
 export function looksLikeCode(text: string): boolean {
   if (/^\s*(\$ |docker |git |npm |cargo |sudo |cd |ls |kubectl )/m.test(text)) return true

@@ -2,7 +2,7 @@
   // Строка элемента истории. Общая для окна вставки и для превью в настройках,
   // чтобы превью выглядело ровно как настоящее окно.
   import type { Entry } from './api'
-  import { ago, bytesLabel, isUrl, looksLikeCode, sizeLabel } from './format'
+  import { ago, bytesLabel, filesLabel, filesMeta, isUrl, looksLikeCode, sizeLabel } from './format'
 
   let {
     item,
@@ -18,12 +18,25 @@
     onpaste?: () => void
   } = $props()
 
-  const kind = $derived(item.kind === 'image' ? 'image' : isUrl(item.text) ? 'link' : looksLikeCode(item.text) ? 'code' : 'text')
+  const kind = $derived(
+    item.kind === 'image' || item.kind === 'files'
+      ? item.kind
+      : isUrl(item.text)
+        ? 'link'
+        : looksLikeCode(item.text)
+          ? 'code'
+          : 'text',
+  )
+  const folder = $derived(item.files.length > 0 && item.files.every((f) => f.is_dir))
   const meta = $derived(
     [
       item.local ? 'Это устройство' : item.device_name || 'Другое устройство',
       ago(item.seen_ms),
-      kind === 'image' ? `${item.width}×${item.height} · ${bytesLabel(item.bytes)}` : sizeLabel(item.chars, item.lines),
+      kind === 'image'
+        ? `${item.width}×${item.height} · ${bytesLabel(item.bytes)}`
+        : kind === 'files'
+          ? filesMeta(item.files, item.bytes, item.width, item.height)
+          : sizeLabel(item.chars, item.lines),
       ...(item.rich ? [item.rich] : []),
     ].join(' · '),
   )
@@ -41,6 +54,10 @@
   <span class="glyph" aria-hidden="true">
     {#if kind === 'image'}
       <svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2" /><path d="m4 16 5-5 4 4 2-2 5 5" /></svg>
+    {:else if kind === 'files' && folder}
+      <svg viewBox="0 0 24 24"><path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" /></svg>
+    {:else if kind === 'files'}
+      <svg viewBox="0 0 24 24"><path d="M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" /><path d="M14 3v5h5" /></svg>
     {:else if kind === 'link'}
       <svg viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1" /><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" /></svg>
     {:else if kind === 'code'}
@@ -50,7 +67,18 @@
     {/if}
   </span>
   <span class="body">
-    {#if kind === 'image'}
+    {#if kind === 'files'}
+      {#if item.thumb}
+        <img
+          class="thumb"
+          src={item.thumb}
+          alt={item.files[0]?.name}
+          draggable="false"
+          style:--ratio={item.width && item.height ? item.width / item.height : 16 / 9}
+        />
+      {/if}
+      <span class="text" class:gone={item.files.some((f) => !f.exists)}>{filesLabel(item.files)}</span>
+    {:else if kind === 'image'}
       <!-- Картинка в списке крупно: по ней и узнают, что копировали. -->
       {#if item.thumb}
         <img
@@ -117,6 +145,10 @@
     overflow: hidden;
     overflow-wrap: anywhere;
     white-space: pre-line;
+  }
+  .text.gone {
+    text-decoration: line-through;
+    color: var(--c-muted);
   }
   .text.mono {
     font-family: var(--font-mono);

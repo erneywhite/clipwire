@@ -202,6 +202,7 @@ impl Service {
                     return;
                 }
                 if let Some(tx) = &tx
+                    && sendable(&content)
                     && tx.try_send(content.clone()).is_err()
                 {
                     tracing::warn!("очередь отправки переполнена, копирование пропущено");
@@ -273,6 +274,7 @@ impl Service {
         self.guard.wrote(&content);
         clipboard::write(&content)?;
         if !self.paused()
+            && sendable(&content)
             && let Some(tx) = &self.local_tx
             && tx.try_send(content.clone()).is_err()
         {
@@ -300,12 +302,19 @@ fn local_backfill(h: &History) -> Vec<(Content, u64)> {
     let mut out: Vec<(Content, u64)> = h
         .list("", false, usize::MAX)
         .into_iter()
-        .filter(|e| e.local)
+        .filter(|e| e.local && sendable(&e.content))
         .take(BACKFILL_MAX)
         .map(|e| (e.content.clone(), e.seen_ms.max(0) as u64))
         .collect();
     out.reverse();
     out
+}
+
+/// Уходит ли такое содержимое в группу.
+// shortcut: файлы пока только в локальной истории — это ссылки на пути этого
+// устройства. Передача файлов — части 2–4 этапа файлов, тогда убрать.
+fn sendable(c: &Content) -> bool {
+    !matches!(c, Content::Files(_))
 }
 
 fn record(history: &Mutex<History>, entry: Entry) {

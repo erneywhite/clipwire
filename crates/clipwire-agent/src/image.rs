@@ -49,7 +49,51 @@ pub fn content_from_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Content
 
 /// Миниатюра в PNG: длинная сторона не больше `THUMB_SIDE`, пропорции сохраняются.
 pub fn thumbnail(png: &[u8]) -> Result<Vec<u8>> {
-    let img = decode_png(png)?;
+    thumb_of(decode_png(png)?)
+}
+
+/// Файлы-картинки больше этого не открываем ради миниатюры и предпросмотра.
+pub const MAX_IMAGE_FILE: u64 = 64 * 1024 * 1024;
+
+/// MIME по расширению, если это картинка, которую мы умеем показать.
+pub fn image_mime(name: &str) -> Option<&'static str> {
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" | "jfif" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        _ => return None,
+    })
+}
+
+/// Размеры картинки по заголовку файла, без декодирования. `None` — не картинка.
+pub fn file_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+    image_mime(&path.file_name()?.to_string_lossy())?;
+    image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// Миниатюра файла-картинки.
+pub fn thumbnail_file(path: &std::path::Path) -> Result<Vec<u8>> {
+    let meta = std::fs::metadata(path).context("файл недоступен")?;
+    anyhow::ensure!(
+        meta.len() <= MAX_IMAGE_FILE,
+        "файл-картинка слишком большой"
+    );
+    let img = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .decode()
+        .context("картинка не читается")?;
+    thumb_of(img.to_rgba8())
+}
+
+fn thumb_of(img: RgbaImage) -> Result<Vec<u8>> {
     let (w, h) = img.dimensions();
     let scale = (THUMB_SIDE as f32 / w.max(h) as f32).min(1.0);
     let (tw, th) = (
@@ -106,6 +150,21 @@ mod tests {
                 .dimensions(),
             (40, 24)
         );
+    }
+
+    #[test]
+    fn image_files_are_recognised_and_thumbnailed() {
+        assert_eq!(image_mime("Скрин.JPG"), Some("image/jpeg"));
+        assert_eq!(image_mime("отчёт.pdf"), None);
+        assert_eq!(image_mime("без_расширения"), None);
+        let dir = std::env::temp_dir().join(format!("clipwire-img-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("кадр.png");
+        std::fs::write(&path, encode_png(800, 400, &checker(800, 400)).unwrap()).unwrap();
+        assert_eq!(file_dimensions(&path), Some((800, 400)));
+        let t = decode_png(&thumbnail_file(&path).unwrap()).unwrap();
+        assert_eq!(t.dimensions(), (320, 160));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

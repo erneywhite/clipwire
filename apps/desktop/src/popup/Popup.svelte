@@ -3,10 +3,10 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, type Entry, type Settings } from '../lib/api'
   import { applyTheme } from '../lib/theme'
-  import { ago, bytesLabel, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
+  import { ago, bytesLabel, filesMeta, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
   import EntryRow from '../lib/EntryRow.svelte'
   import LinkCard from './LinkCard.svelte'
-  import { openUrl } from '@tauri-apps/plugin-opener'
+  import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 
   let query = $state('')
   let tab = $state<'all' | 'pinned'>('all')
@@ -86,9 +86,14 @@
     await api.preview(false)
   }
 
+  /** Картинка или файл-картинка — их можно открыть в редакторе. */
+  function editable(e: Entry | undefined): boolean {
+    return !!e && (e.kind === 'image' || (e.kind === 'files' && e.width > 0))
+  }
+
   /** Открыть картинку в редакторе: стрелки, текст, размытие. */
   async function edit(entry: Entry | undefined) {
-    if (!entry || entry.kind !== 'image') return
+    if (!entry || !editable(entry)) return
     await closePreview()
     try {
       await api.editImage(entry.id)
@@ -254,7 +259,7 @@
     <footer class="hints">
       <span><kbd>↵</kbd> вставить</span>
       <span><kbd>␣</kbd> просмотр</span>
-      {#if current?.kind === 'image'}
+      {#if editable(current)}
         <span><kbd>Ctrl E</kbd> изменить</span>
       {:else}
         <span><kbd>Ctrl P</kbd> закрепить</span>
@@ -277,6 +282,35 @@
         <div class="actions">
           <button class="primary" onclick={() => paste(preview?.entry)}>Вставить</button>
           <button onclick={() => edit(preview?.entry)}>Изменить</button>
+          <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
+            {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
+          </button>
+        </div>
+      {:else if preview.entry.kind === 'files'}
+        {#if preview.entry.image}
+          <div class="image-view">
+            <img src={preview.entry.image} alt={preview.entry.files[0]?.name} draggable="false" />
+          </div>
+        {:else}
+          <ul class="file-list">
+            {#each preview.entry.files as f (f.path)}
+              <li class:gone={!f.exists}>
+                <span class="fname">{f.name}</span>
+                <span class="fmeta">{f.is_dir ? 'папка' : bytesLabel(f.size)}{f.exists ? '' : ' · файла нет на месте'}</span>
+                <span class="fpath">{f.path}</span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        <div class="preview-meta">
+          {preview.entry.files.length === 1 ? `${preview.entry.files[0].name} · ` : ''}{filesMeta(preview.entry.files, preview.entry.bytes, preview.entry.width, preview.entry.height)}
+        </div>
+        <div class="actions">
+          <button class="primary" onclick={() => paste(preview?.entry)}>Вставить</button>
+          {#if editable(preview.entry)}
+            <button onclick={() => edit(preview?.entry)}>Изменить</button>
+          {/if}
+          <button onclick={() => preview && revealItemInDir(preview.entry.files[0].path).catch((e) => (error = String(e)))}>Показать в папке</button>
           <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
             {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
           </button>
@@ -519,6 +553,44 @@
     border: 1px solid var(--c-border);
     border-radius: var(--radius-m);
     background: #fff;
+  }
+  .file-list {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .file-list li {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0 var(--space-2);
+    padding: var(--space-2);
+    border-radius: var(--radius-m);
+    background: var(--c-bg);
+  }
+  .fname {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .fmeta,
+  .fpath {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--c-muted);
+  }
+  .fpath {
+    grid-column: 1 / -1;
+    overflow-wrap: anywhere;
+  }
+  .file-list li.gone .fname {
+    text-decoration: line-through;
+    color: var(--c-muted);
   }
   .image-view {
     flex: 1;

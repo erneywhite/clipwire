@@ -9,7 +9,7 @@
 
   const now = Date.now()
   const min = 60_000
-  const base = { local: true, pinned: false, device_name: '', lines: 1, width: 0, height: 0, bytes: 0, thumb: null, image: null, rich: null, html: null }
+  const base = { local: true, pinned: false, device_name: '', lines: 1, width: 0, height: 0, bytes: 0, thumb: null, image: null, rich: null, html: null, files: [] }
   // Образец картинки: схематичный скриншот окна (16:9), чтобы превью показывало
   // настоящую высоту строки с картинкой.
   const sampleShot =

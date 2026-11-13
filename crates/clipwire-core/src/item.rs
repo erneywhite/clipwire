@@ -68,6 +68,24 @@ pub enum Content {
         html: Option<String>,
         rtf: Option<Vec<u8>>,
     },
+    /// Скопированные файлы и папки. Пока это ссылки на файлы устройства-источника:
+    /// сами файлы по сети не передаются, такой элемент живёт только в локальной
+    /// истории (передача — следующие части этапа файлов).
+    Files(Vec<FileRef>),
+}
+
+/// Файл или папка из буфера.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRef {
+    pub name: String,
+    /// Полный путь на устройстве-источнике.
+    pub path: String,
+    /// Байты; у папки 0.
+    pub size: u64,
+    pub is_dir: bool,
+    /// Файл-картинка: размеры в пикселях, иначе 0.
+    pub width: u32,
+    pub height: u32,
 }
 
 // Картинку не печатаем байтами в отладочный вывод: это мегабайты в логе.
@@ -84,6 +102,7 @@ impl std::fmt::Debug for Content {
                 html.as_ref().map_or(0, String::len),
                 rtf.as_ref().map_or(0, Vec::len)
             ),
+            Content::Files(files) => f.debug_tuple("Files").field(files).finish(),
         }
     }
 }
@@ -108,6 +127,14 @@ impl Content {
                 h.update(height.to_le_bytes());
                 h.update(png);
             }
+            Content::Files(files) => {
+                h.update(b"files\0");
+                for f in files {
+                    h.update(f.path.as_bytes());
+                    h.update(b"\0");
+                    h.update(f.size.to_le_bytes());
+                }
+            }
         }
         h.finalize().into()
     }
@@ -120,6 +147,8 @@ impl Content {
             Content::Rich { text, html, rtf } => {
                 text.len() + html.as_ref().map_or(0, String::len) + rtf.as_ref().map_or(0, Vec::len)
             }
+            // Сам элемент — только имена и пути; размер файлов тут ни при чём.
+            Content::Files(files) => files.iter().map(|f| f.name.len() + f.path.len() + 24).sum(),
         }
     }
 
@@ -131,7 +160,7 @@ impl Content {
     pub fn text(&self) -> Option<&str> {
         match self {
             Content::Text(t) | Content::Rich { text: t, .. } => Some(t),
-            Content::Image { .. } => None,
+            Content::Image { .. } | Content::Files(_) => None,
         }
     }
 

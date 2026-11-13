@@ -167,10 +167,15 @@ impl History {
     /// Сделать и сохранить миниатюру картинки. Ошибка не фатальна: в списке
     /// тогда будет значок вместо превью.
     fn store_thumb(&mut self, e: &Entry) {
-        let Content::Image { png, .. } = &e.content else {
-            return;
+        let made = match &e.content {
+            Content::Image { png, .. } => crate::image::thumbnail(png),
+            // Один файл-картинка: миниатюра из файла.
+            Content::Files(f) if f.len() == 1 && f[0].width > 0 => {
+                crate::image::thumbnail_file(std::path::Path::new(&f[0].path))
+            }
+            _ => return,
         };
-        let res = crate::image::thumbnail(png).and_then(|t| {
+        let res = made.and_then(|t| {
             let (nonce, data) = self.seal_blob(&t)?;
             self.conn.execute(
                 "UPDATE entries SET thumb_nonce = ?1, thumb = ?2 WHERE id = ?3",
@@ -271,6 +276,13 @@ impl History {
                     || match &e.content {
                         Content::Text(t) | Content::Rich { text: t, .. } => {
                             t.to_lowercase().contains(&q)
+                        }
+                        // Файлы — по именам и по словам «файл», «папка».
+                        Content::Files(files) => {
+                            files.iter().any(|f| f.name.to_lowercase().contains(&q))
+                                || ["файл", "папк", "file", "folder"]
+                                    .iter()
+                                    .any(|w| w.starts_with(q.as_str()) || q.starts_with(w))
                         }
                         // Картинки находятся по словам «картинка», «скрин» и т. п.
                         Content::Image { .. } => {
@@ -450,6 +462,29 @@ mod tests {
         text(&mut h, "жирный", 3);
         assert_eq!(h.list("", false, 1)[0].content, rich);
         assert_eq!(h.list("ЖИР", false, 5).len(), 1);
+    }
+
+    #[test]
+    fn files_are_found_by_name_and_word() {
+        let mut h = History::in_memory();
+        let f = |name: &str| clipwire_core::FileRef {
+            name: name.into(),
+            path: format!("C:\\tmp\\{name}"),
+            size: 10,
+            is_dir: false,
+            width: 0,
+            height: 0,
+        };
+        let e = local_entry(
+            DeviceId([1; 32]),
+            "ПК",
+            Content::Files(vec![f("Отчёт.pdf"), f("смета.xlsx")]),
+        );
+        h.add(e).unwrap();
+        text(&mut h, "просто текст", 2);
+        assert_eq!(h.list("СМЕТА", false, 5).len(), 1);
+        assert_eq!(h.list("файл", false, 5).len(), 1);
+        assert_eq!(h.list("текст", false, 5).len(), 1);
     }
 
     #[test]
