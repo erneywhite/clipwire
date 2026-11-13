@@ -9,14 +9,14 @@
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clipwire_core::blob::{BlobKey, CHUNK, chunk_count, chunk_len};
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{BlobChunk, BlobFail, BlobReply, BlobRequest};
-use clipwire_core::{BlobId, FileRef, GroupKey};
+use clipwire_core::{BlobId, Content, FileRef, GroupKey};
 use iroh::endpoint::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
@@ -29,13 +29,6 @@ pub const EMIT_EVERY: Duration = Duration::from_millis(200);
 /// Сколько скачивание ждёт соединения, если его сейчас нет (приложение только
 /// что запустилось или переподключается).
 const WAIT_CONN: Duration = Duration::from_secs(10);
-/// Сколько скачивание ждёт, пока файл появится на сервере. Элемент с файлами
-/// уходит в группу раньше, чем источник начнёт загрузку (а она может ещё и
-/// стоять в очереди за другими файлами), так что вставка сразу после
-/// копирования иначе получила бы «файла нет на сервере».
-pub const WAIT_UPLOAD: Duration = Duration::from_secs(10);
-/// Как часто спрашивать сервер, не появился ли файл.
-const POLL_UPLOAD: Duration = Duration::from_millis(500);
 /// Через сколько повторить загрузку после временной ошибки на том же соединении.
 pub const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Предел длины имени в кэше (в символах): с запасом под `.part` и под
@@ -109,7 +102,10 @@ fn shorten(s: &str) -> String {
     out
 }
 
-/// Зарезервированное имя устройства Windows, в том числе с расширением.
+/// Зарезервированное имя устройства Windows, в том числе с расширением и в
+/// любом регистре: `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`,
+/// `COM1`…`COM9`, `LPT1`…`LPT9` и с надстрочными цифрами `COM¹`…`LPT³`
+/// (Windows считает их теми же портами).
 fn is_reserved(name: &str) -> bool {
     let stem = name
         .split('.')
@@ -117,12 +113,17 @@ fn is_reserved(name: &str) -> bool {
         .unwrap_or_default()
         .trim_end_matches(' ')
         .to_ascii_uppercase();
-    if ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str()) {
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str()) {
         return true;
     }
     ["COM", "LPT"].iter().any(|p| {
-        stem.strip_prefix(p)
-            .is_some_and(|d| d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9'))
+        stem.strip_prefix(p).is_some_and(|d| {
+            let mut c = d.chars();
+            matches!(
+                (c.next(), c.next()),
+                (Some('1'..='9' | '¹' | '²' | '³'), None)
+            )
+        })
     })
 }
 
@@ -286,6 +287,12 @@ mod blob_hex {
     }
 }
 
+/// Файл очереди загрузок в каталоге состояния.
+pub const UPLOADS_FILE: &str = "uploads.json";
+/// Задания старше этого при запуске выбрасываются: сервер всё равно держит
+/// файлы не дольше суток по умолчанию, а элемент в группе давно устарел.
+pub const QUEUE_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
 /// Файл, который надо загрузить на сервер.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadJob {
@@ -294,10 +301,18 @@ pub struct UploadJob {
     pub path: String,
     pub size: u64,
     pub modified_ms: u64,
+    /// Группа, в которую ушёл элемент (`group_id` в hex). Задания другой
+    /// группы (устройство вышло и вошло в новую) при запуске выбрасываются.
+    #[serde(default)]
+    pub group: String,
+    /// Когда задание поставлено в очередь, мс Unix.
+    #[serde(default)]
+    pub queued_ms: u64,
 }
 
 impl UploadJob {
     /// Задание для файла с назначенным `blob`; у папок и файлов без `blob` — нет.
+    /// Группу и время ставит [`Blobs::enqueue`].
     pub fn from_file(f: &FileRef) -> Option<Self> {
         if f.is_dir {
             return None;
@@ -307,8 +322,24 @@ impl UploadJob {
             path: f.path.clone(),
             size: f.size,
             modified_ms: f.modified_ms,
+            group: String::new(),
+            queued_ms: 0,
         })
     }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn group_hex(key: &GroupKey) -> String {
+    key.group_id()
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Очередь загрузок, сохраняется в `<state dir>/uploads.json` и переживает
@@ -319,17 +350,39 @@ pub struct UploadQueue {
 }
 
 impl UploadQueue {
-    /// Нет файла или он битый — пустая очередь (битый — с предупреждением).
-    pub fn load(state_dir: &Path) -> Self {
-        let file = state_dir.join("uploads.json");
-        let jobs = match std::fs::read(&file) {
+    /// Очередь группы `group` (hex). Нет файла или он битый — пустая очередь
+    /// (битый — с предупреждением). Задания чужой группы и старше
+    /// [`QUEUE_MAX_AGE`] отбрасываются.
+    pub fn load(state_dir: &Path, group: &str) -> Self {
+        Self::load_at(state_dir, group, unix_ms())
+    }
+
+    fn load_at(state_dir: &Path, group: &str, now_ms: u64) -> Self {
+        let file = state_dir.join(UPLOADS_FILE);
+        let jobs: Vec<UploadJob> = match std::fs::read(&file) {
             Ok(raw) => serde_json::from_slice(&raw).unwrap_or_else(|e| {
                 tracing::warn!("uploads.json не читается, очередь загрузок пуста: {e}");
                 Vec::new()
             }),
             Err(_) => Vec::new(),
         };
-        Self { file, jobs }
+        let max_age = QUEUE_MAX_AGE.as_millis() as u64;
+        let before = jobs.len();
+        let jobs: Vec<UploadJob> = jobs
+            .into_iter()
+            .filter(|j| j.group == group && now_ms.saturating_sub(j.queued_ms) <= max_age)
+            .collect();
+        let q = Self { file, jobs };
+        if q.jobs.len() != before {
+            tracing::info!(
+                dropped = before - q.jobs.len(),
+                "из очереди загрузок убраны задания другой группы или старше суток"
+            );
+            if let Err(e) = q.save() {
+                tracing::warn!("очередь загрузок не сохранилась: {e:#}");
+            }
+        }
+        q
     }
 
     pub fn jobs(&self) -> &[UploadJob] {
@@ -498,10 +551,12 @@ where
     let bkey = key.blob_key(job.blob);
     progress(done_bytes(job.size, have));
     for index in have..count {
-        check_stamp(job)?;
         let plain = read_chunk(&mut file, job.size, index)
             .await
             .map_err(|_| UploadError::Changed)?;
+        // Проверка после чтения: так в часть точно не попадёт содержимое,
+        // записанное в файл уже после копирования (в том числе в последнюю).
+        check_stamp(job)?;
         let data = bkey
             .seal(index, index + 1 == count, &plain)
             .map_err(|e| net(anyhow!("{e}")))?;
@@ -510,6 +565,8 @@ where
             .map_err(net)?;
         progress(done_bytes(job.size, index + 1));
     }
+    // Последняя проверка перед тем, как сервер отметит файл загруженным.
+    check_stamp(job)?;
     send.shutdown().await.map_err(net)?;
     match read_msg::<_, BlobReply>(recv).await.map_err(net)? {
         Some(BlobReply::Stored) => Ok(()),
@@ -521,24 +578,105 @@ where
     }
 }
 
-/// Загрузить один файл на сервер по соединению движка (новый поток).
+/// Загрузить один файл на сервер по соединению движка (новый поток). Если
+/// файл изменился или пропал, сервер получает `Abort`: уже загруженные части
+/// удаляются, а те, кто ждёт файл, сразу узнают, что его не будет.
 pub async fn upload_blob(
     conn: &Connection,
     key: &GroupKey,
     job: &UploadJob,
     progress: impl FnMut(u64) + Send,
 ) -> Result<(), UploadError> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(net)?;
-    upload_stream(&mut send, &mut recv, key, job, progress).await
+    let res = {
+        let (mut send, mut recv) = conn.open_bi().await.map_err(net)?;
+        upload_stream(&mut send, &mut recv, key, job, progress).await
+        // Поток закрывается здесь: сервер видит конец загрузки и отпускает
+        // замок файла, который нужен для Abort.
+    };
+    if matches!(res, Err(UploadError::Changed | UploadError::Missing))
+        && let Err(e) = abort_blob(conn, job.blob).await
+    {
+        tracing::info!("отмена загрузки не дошла до сервера: {e:#}");
+    }
+    res
+}
+
+/// Сколько ждать ответа на `Reserve` и `Abort`.
+pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Короткий запрос по своему потоку: отправить, дождаться одного ответа.
+async fn control(conn: &Connection, req: BlobRequest) -> Result<BlobReply, UploadError> {
+    tokio::time::timeout(CONTROL_TIMEOUT, async {
+        let (mut send, mut recv) = conn.open_bi().await.map_err(net)?;
+        write_msg(&mut send, &req).await.map_err(net)?;
+        let _ = send.finish();
+        match read_msg::<_, BlobReply>(&mut recv).await.map_err(net)? {
+            Some(BlobReply::Error(f)) => Err(server_fail(f)),
+            Some(r) => Ok(r),
+            None => Err(net(anyhow!("сервер закрыл поток без ответа"))),
+        }
+    })
+    .await
+    .map_err(|_| net(anyhow!("сервер не ответил за {CONTROL_TIMEOUT:?}")))?
+}
+
+/// Завести файл на сервере до отправки элемента: проверяются лимиты и квоты,
+/// а `Get` с другого устройства после этого ждёт частей, а не получает
+/// «файла нет».
+pub async fn reserve_blob(conn: &Connection, blob: BlobId, size: u64) -> Result<(), UploadError> {
+    match control(conn, BlobRequest::Reserve { blob, size }).await? {
+        BlobReply::Reserved => Ok(()),
+        other => Err(UploadError::Rejected(BlobFail::Protocol(format!(
+            "неожиданный ответ на Reserve: {other:?}"
+        )))),
+    }
+}
+
+/// Отменить отправку файла: сервер удаляет его части.
+pub async fn abort_blob(conn: &Connection, blob: BlobId) -> Result<(), UploadError> {
+    match control(conn, BlobRequest::Abort { blob }).await? {
+        BlobReply::Aborted => Ok(()),
+        other => Err(UploadError::Rejected(BlobFail::Protocol(format!(
+            "неожиданный ответ на Abort: {other:?}"
+        )))),
+    }
 }
 
 // ----------------------------------------------------------------- скачивание
 
+/// Рядом с `.part` — сколько частей в нём точно на диске: `<имя>.part.ok`.
+fn part_ok_path(part: &Path) -> PathBuf {
+    let mut s = part.as_os_str().to_owned();
+    s.push(".ok");
+    PathBuf::from(s)
+}
+
+/// `.part` открывается только этим процессом: два скачивания одного файла
+/// (второй экземпляр приложения, гонка) не испортят его. На Windows —
+/// без совместного доступа; на других ОС такой блокировки нет, там спасает
+/// замок скачивания в [`Blobs`].
+fn open_part_exclusive(part: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).read(true).write(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        o.share_mode(0);
+    }
+    o.open(part)
+}
+
 /// Запись скачиваемого файла в `<имя>.part` с проверкой каждой части и
 /// докачкой: после обрыва продолжается с последней целой части.
+///
+/// Длине `.part` после сбоя ОС верить нельзя: размер файла мог уже
+/// записаться, а данные нет (там нули). Поэтому каждая часть сбрасывается на
+/// диск (`sync_data`), и только потом её номер пишется в `<имя>.part.ok`.
+/// Докачка идёт с `min(число в .part.ok, длина / CHUNK)`.
 pub struct PartWriter {
     file: tokio::fs::File,
     part: PathBuf,
+    ok: PathBuf,
     dest: PathBuf,
     size: u64,
     count: u64,
@@ -546,22 +684,28 @@ pub struct PartWriter {
 }
 
 impl PartWriter {
-    /// Открыть (или создать) `.part` для файла `dest` размером `size`. Хвост,
-    /// не кратный части, отрезается: с него и продолжаем.
+    /// Открыть (или создать) `.part` для файла `dest` размером `size`. Всё
+    /// после последней подтверждённой части отрезается: с неё и продолжаем.
     pub async fn open(dest: &Path, size: u64) -> std::io::Result<Self> {
         if let Some(dir) = dest.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
         let part = part_path(dest);
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&part)
-            .await?;
+        let ok = part_ok_path(&part);
+        let mut file = {
+            let part = part.clone();
+            let f = tokio::task::spawn_blocking(move || open_part_exclusive(&part))
+                .await
+                .map_err(std::io::Error::other)??;
+            tokio::fs::File::from_std(f)
+        };
         let len = file.metadata().await?.len();
-        let mut next = len / CHUNK as u64;
+        let confirmed = tokio::fs::read_to_string(&ok)
+            .await
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let mut next = confirmed.min(len / CHUNK as u64);
         // Больше, чем весь файл, — это не наш .part: начинаем заново.
         if next * CHUNK as u64 > size {
             next = 0;
@@ -572,6 +716,7 @@ impl PartWriter {
         Ok(Self {
             file,
             part,
+            ok,
             dest: dest.to_path_buf(),
             size,
             count: chunk_count(size),
@@ -610,9 +755,12 @@ impl PartWriter {
             plain.len()
         );
         self.file.write_all(&plain).await?;
-        // Сразу на диск: после обрыва докачка считает части по длине файла.
+        // Сначала часть на диск, потом её номер: после сбоя ОС .part.ok не
+        // обгонит настоящие данные.
         self.file.flush().await?;
+        self.file.sync_data().await?;
         self.next += 1;
+        tokio::fs::write(&self.ok, self.next.to_string()).await?;
         Ok(())
     }
 
@@ -625,6 +773,7 @@ impl PartWriter {
         tokio::fs::rename(&self.part, &self.dest)
             .await
             .with_context(|| format!("не переименовался {}", self.part.display()))?;
+        let _ = tokio::fs::remove_file(&self.ok).await;
         Ok(self.dest)
     }
 }
@@ -666,8 +815,8 @@ where
         Some(BlobReply::GetReady { size: s, .. }) => {
             bail!("на сервере файл другого размера: {s} байт вместо {size}")
         }
-        // Отказ сервера уходит как есть: по нему [`Blobs::download`] отличает
-        // ещё не начатую загрузку (`NotFound`) от прочих ошибок.
+        // Отказ сервера уходит как есть (`BlobFail` внутри anyhow): по нему
+        // вызывающий может отличить «файла нет» от прочих ошибок.
         Some(BlobReply::Error(f)) => return Err(f.into()),
         Some(other) => bail!("неожиданный ответ сервера: {other:?}"),
         None => bail!("сервер закрыл поток"),
@@ -714,7 +863,11 @@ pub struct Blobs {
     /// Номер соединения (растёт при каждой смене) и само соединение.
     conn: watch::Sender<(u64, Option<Connection>)>,
     wake: Notify,
-    downloads: Mutex<HashMap<BlobId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Замки скачивания по файлу. Слабые ссылки: замок живёт, пока его держит
+    /// или ждёт хоть одно скачивание, и не пропадает из карты у ждущих.
+    downloads: Mutex<HashMap<BlobId, Weak<tokio::sync::Mutex<()>>>>,
+    /// `group_id` в hex: метка заданий в очереди.
+    group: String,
 }
 
 /// Пока жив, соединение доступно загрузкам и скачиваниям.
@@ -728,14 +881,16 @@ impl Drop for ConnGuard {
 
 impl Blobs {
     pub fn new(key: GroupKey, state_dir: &Path, sink: TransferSink) -> Arc<Self> {
+        let group = group_hex(&key);
         Arc::new(Self {
             key,
             files_dir: files_dir(state_dir),
-            queue: Mutex::new(UploadQueue::load(state_dir)),
+            queue: Mutex::new(UploadQueue::load(state_dir, &group)),
             transfers: Transfers::new(sink),
             conn: watch::Sender::new((0, None)),
             wake: Notify::new(),
             downloads: Mutex::new(HashMap::new()),
+            group,
         })
     }
 
@@ -757,12 +912,17 @@ impl Blobs {
             .to_vec()
     }
 
-    /// Поставить файлы в очередь загрузки.
-    pub fn enqueue(&self, jobs: Vec<UploadJob>) {
+    /// Поставить файлы в очередь загрузки (с меткой своей группы и временем).
+    /// Движок зовёт это, когда элемент с файлами действительно уходит в
+    /// группу; см. [`Blobs::reserve_files`].
+    pub fn enqueue(&self, mut jobs: Vec<UploadJob>) {
         if jobs.is_empty() {
             return;
         }
-        for j in &jobs {
+        let now = unix_ms();
+        for j in &mut jobs {
+            j.group.clone_from(&self.group);
+            j.queued_ms = now;
             self.transfers.progress(j.blob, Direction::Up, 0, j.size);
         }
         if let Err(e) = self
@@ -815,39 +975,24 @@ impl Blobs {
         if dest.is_file() {
             return Ok(dest);
         }
-        let lock = self
-            .downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(blob)
-            .or_default()
-            .clone();
+        let lock = self.download_lock(blob);
         let _g = lock.lock().await;
         if dest.is_file() {
             return Ok(dest);
         }
+        // Повторять Get на NotFound не нужно: источник резервирует файл на
+        // сервере до того, как элемент уйдёт в группу, и сервер сам ждёт
+        // первых частей. NotFound значит, что файла правда нет.
         let res = async {
-            let started = Instant::now();
-            loop {
-                let conn = self
-                    .wait_conn(WAIT_CONN)
-                    .await
-                    .ok_or_else(|| anyhow!("нет связи с сервером"))?;
-                let size = f.size;
-                let res = download_blob(&conn, &self.key, blob, size, &dest, |done| {
-                    self.transfers.progress(blob, Direction::Down, done, size)
-                })
-                .await;
-                match res {
-                    Err(e)
-                        if matches!(e.downcast_ref(), Some(BlobFail::NotFound))
-                            && started.elapsed() < WAIT_UPLOAD =>
-                    {
-                        tokio::time::sleep(POLL_UPLOAD).await;
-                    }
-                    other => return other,
-                }
-            }
+            let conn = self
+                .wait_conn(WAIT_CONN)
+                .await
+                .ok_or_else(|| anyhow!("нет связи с сервером"))?;
+            let size = f.size;
+            download_blob(&conn, &self.key, blob, size, &dest, |done| {
+                self.transfers.progress(blob, Direction::Down, done, size)
+            })
+            .await
         }
         .await
         .with_context(|| format!("«{}» не скачался", f.name));
@@ -857,11 +1002,65 @@ impl Blobs {
             f.size,
             res.as_ref().map(|_| ()).map_err(|e| format!("{e:#}")),
         );
-        self.downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&blob);
         res
+    }
+
+    /// Замок скачивания файла: общий для всех, кто качает его сейчас или ждёт.
+    fn download_lock(&self, blob: BlobId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(l) = map.get(&blob).and_then(Weak::upgrade) {
+            return l;
+        }
+        map.retain(|_, w| w.strong_count() > 0);
+        let l = Arc::new(tokio::sync::Mutex::new(()));
+        map.insert(blob, Arc::downgrade(&l));
+        l
+    }
+
+    /// Перед отправкой элемента с файлами: зарезервировать на сервере все его
+    /// файлы с `blob` (параллельно, каждый с тайм-аутом [`CONTROL_TIMEOUT`]).
+    /// Файлам с отказом `blob` в отправляемом элементе снимается, а в событиях
+    /// передачи — `failed` с причиной. Возвращает элемент для отправки и
+    /// задания загрузки; их ставят в очередь ([`Blobs::enqueue`]) после того,
+    /// как элемент ушёл. Так копирования, вытесненные новыми, пока не было
+    /// связи, не грузятся вовсе.
+    pub async fn reserve_files(
+        &self,
+        conn: &Connection,
+        content: Content,
+    ) -> (Content, Vec<UploadJob>) {
+        let Content::Files(mut files) = content else {
+            return (content, Vec::new());
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        for (i, f) in files.iter().enumerate() {
+            if let Some(job) = UploadJob::from_file(f) {
+                let conn = conn.clone();
+                tasks.spawn(async move {
+                    let res = reserve_blob(&conn, job.blob, job.size).await;
+                    (i, job, res)
+                });
+            }
+        }
+        let mut jobs = Vec::new();
+        while let Some(r) = tasks.join_next().await {
+            let Ok((i, job, res)) = r else { continue };
+            match res {
+                Ok(()) => jobs.push((i, job)),
+                Err(e) => {
+                    tracing::warn!(path = %job.path, "файл не отправится: {e}");
+                    files[i].blob = None;
+                    self.transfers
+                        .finish(job.blob, Direction::Up, job.size, Err(e.to_string()));
+                }
+            }
+        }
+        // Порядок заданий — как у файлов в элементе.
+        jobs.sort_by_key(|(i, _)| *i);
+        (
+            Content::Files(files),
+            jobs.into_iter().map(|(_, j)| j).collect(),
+        )
     }
 
     /// Скачать все файлы по порядку. Первая ошибка прерывает.
@@ -879,6 +1078,11 @@ impl Blobs {
     /// файлов одновременно. Файл, оборвавшийся из-за связи, остаётся в очереди
     /// и повторяется на следующем соединении (или на этом же через
     /// [`RETRY_AFTER`], если связь не рвалась, а сервер ответил временной ошибкой).
+    // shortcut: загрузки отдельных файлов идут задачами JoinSet; когда движок
+    // снимают, они получают abort и останавливаются на ближайшем await, а не
+    // вместе с ним. Окно — доли миллисекунды (запись uploads.json после
+    // загрузки). Переделать на FuturesUnordered внутри этой функции, если
+    // всплывут гонки при выходе из группы.
     pub async fn run_uploads(self: Arc<Self>) {
         let mut rx = self.conn.subscribe();
         let mut running: HashSet<BlobId> = HashSet::new();
@@ -986,6 +1190,16 @@ mod tests {
         assert_eq!(sanitize_name("lpt1"), "_lpt1");
         assert_eq!(sanitize_name("COM0"), "COM0");
         assert_eq!(sanitize_name("CONSOLE.txt"), "CONSOLE.txt");
+        assert_eq!(sanitize_name("COM¹"), "_COM¹");
+        assert_eq!(sanitize_name("com².txt"), "_com².txt");
+        assert_eq!(sanitize_name("Lpt³.tar.gz"), "_Lpt³.tar.gz");
+        assert_eq!(sanitize_name("LPT¹"), "_LPT¹");
+        assert_eq!(sanitize_name("COM⁴"), "COM⁴");
+        assert_eq!(sanitize_name("COM1²"), "COM1²");
+        assert_eq!(sanitize_name("conin$"), "_conin$");
+        assert_eq!(sanitize_name("CONOUT$.log"), "_CONOUT$.log");
+        assert_eq!(sanitize_name("CONIN$x"), "CONIN$x");
+        assert_eq!(sanitize_name("CONOUT"), "CONOUT");
         assert_eq!(sanitize_name("trailing. "), "trailing");
         assert_eq!(sanitize_name(""), "file");
         assert_eq!(sanitize_name(".."), "file");
@@ -998,6 +1212,26 @@ mod tests {
         let s = sanitize_name(&long);
         assert_eq!(s.chars().count(), MAX_NAME_CHARS);
         assert!(s.ends_with(".txt"));
+    }
+
+    #[test]
+    fn download_lock_is_shared_while_anyone_waits() {
+        let dir = tmp("lock");
+        let b = Blobs::new(GroupKey([1; 32]), &dir, Arc::new(|_| {}));
+        let id = BlobId([1; 16]);
+        let first = b.download_lock(id);
+        let waiter = b.download_lock(id);
+        assert!(Arc::ptr_eq(&first, &waiter));
+        // Первый закончил, второй ещё ждёт: третий встаёт в ту же очередь,
+        // а не получает свой замок.
+        drop(first);
+        let third = b.download_lock(id);
+        assert!(Arc::ptr_eq(&waiter, &third));
+        drop((waiter, third));
+        // Мёртвые записи вычищаются при следующем обращении.
+        let _other = b.download_lock(BlobId([2; 16]));
+        assert_eq!(b.downloads.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1014,13 +1248,16 @@ mod tests {
     #[test]
     fn queue_survives_reload() {
         let dir = tmp("queue");
+        let now = unix_ms();
         let job = |b: u8| UploadJob {
             blob: BlobId([b; 16]),
             path: format!("C:\\f{b}.txt"),
             size: b as u64,
             modified_ms: 1000 + b as u64,
+            group: "aa".into(),
+            queued_ms: now,
         };
-        let mut q = UploadQueue::load(&dir);
+        let mut q = UploadQueue::load(&dir, "aa");
         assert!(q.jobs().is_empty());
         q.push([job(1), job(2), job(1)]).unwrap();
         assert_eq!(q.jobs(), &[job(1), job(2)]);
@@ -1029,14 +1266,114 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v[0]["blob"], BlobId([1; 16]).hex());
         assert_eq!(v[0]["modified_ms"], 1001);
+        assert_eq!(v[0]["group"], "aa");
 
-        let mut q = UploadQueue::load(&dir);
+        let mut q = UploadQueue::load(&dir, "aa");
         assert_eq!(q.jobs(), &[job(1), job(2)]);
         q.remove(BlobId([1; 16])).unwrap();
-        assert_eq!(UploadQueue::load(&dir).jobs(), &[job(2)]);
+        assert_eq!(UploadQueue::load(&dir, "aa").jobs(), &[job(2)]);
 
         std::fs::write(dir.join("uploads.json"), b"{broken").unwrap();
-        assert!(UploadQueue::load(&dir).jobs().is_empty());
+        assert!(UploadQueue::load(&dir, "aa").jobs().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn queue_drops_other_group_and_old_jobs() {
+        let dir = tmp("queue-group");
+        let day = QUEUE_MAX_AGE.as_millis() as u64;
+        let now = 10 * day;
+        let job = |b: u8, group: &str, queued_ms: u64| UploadJob {
+            blob: BlobId([b; 16]),
+            path: format!("/f{b}"),
+            size: 1,
+            modified_ms: 1,
+            group: group.into(),
+            queued_ms,
+        };
+        let mut q = UploadQueue::load_at(&dir, "aa", now);
+        q.push([
+            job(1, "aa", now - 1000),
+            job(2, "bb", now - 1000),
+            job(3, "aa", now - day - 1),
+            job(4, "aa", now - day),
+        ])
+        .unwrap();
+        let q = UploadQueue::load_at(&dir, "aa", now);
+        assert_eq!(
+            q.jobs(),
+            &[job(1, "aa", now - 1000), job(4, "aa", now - day)]
+        );
+        // Отброшенное убрано и из файла: другая группа его уже не увидит.
+        assert!(UploadQueue::load_at(&dir, "bb", now).jobs().is_empty());
+        // Старый файл без группы и времени (до этих полей) — тоже мимо.
+        std::fs::write(
+            dir.join(UPLOADS_FILE),
+            format!(
+                r#"[{{"blob":"{}","path":"/x","size":1,"modified_ms":1}}]"#,
+                BlobId([7; 16]).hex()
+            ),
+        )
+        .unwrap();
+        assert!(UploadQueue::load_at(&dir, "aa", now).jobs().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// После сбоя ОС длина .part может опережать данные: докачка верит
+    /// только числу в .part.ok, а без него начинает с нуля.
+    #[tokio::test]
+    async fn part_resume_trusts_ok_counter() {
+        let dir = tmp("part-ok");
+        let key = GroupKey([4; 32]);
+        let blob = BlobId([5; 16]);
+        let bkey = key.blob_key(blob);
+        let size = CHUNK as u64 * 3;
+        let plain = vec![3u8; CHUNK];
+        let dest = dir.join("f.bin");
+        let part = part_path(&dest);
+        let ok = part_ok_path(&part);
+
+        let mut w = PartWriter::open(&dest, size).await.unwrap();
+        w.write_chunk(&bkey, 0, &bkey.seal(0, false, &plain).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&ok).unwrap(), "1");
+        drop(w);
+
+        // «Сбой»: размер файла дорос до двух частей, а подтверждена одна.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .unwrap()
+            .set_len(2 * CHUNK as u64)
+            .unwrap();
+        let w = PartWriter::open(&dest, size).await.unwrap();
+        assert_eq!(w.next(), 1);
+        drop(w);
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), CHUNK as u64);
+
+        // Счётчик больше длины (данные потерялись целиком) — верим длине.
+        std::fs::write(&ok, "3").unwrap();
+        let w = PartWriter::open(&dest, size).await.unwrap();
+        assert_eq!(w.next(), 1);
+        drop(w);
+
+        // Нет счётчика — с нуля.
+        std::fs::remove_file(&ok).unwrap();
+        let mut w = PartWriter::open(&dest, size).await.unwrap();
+        assert_eq!(w.next(), 0);
+
+        // .part открыт эксклюзивно: второе скачивание того же файла не влезет.
+        #[cfg(windows)]
+        assert!(PartWriter::open(&dest, size).await.is_err());
+
+        for i in 0..3 {
+            w.write_chunk(&bkey, i, &bkey.seal(i, i == 2, &plain).unwrap())
+                .await
+                .unwrap();
+        }
+        w.finish().await.unwrap();
+        assert!(dest.is_file() && !part.exists() && !ok.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1255,6 +1592,8 @@ mod tests {
             path: src.to_string_lossy().into_owned(),
             size: fsize,
             modified_ms: modified,
+            group: String::new(),
+            queued_ms: 0,
         };
         let key = GroupKey([2; 32]);
         let mut store = FakeStore {
@@ -1363,6 +1702,8 @@ mod tests {
             path: src.to_string_lossy().into_owned(),
             size,
             modified_ms: modified,
+            group: String::new(),
+            queued_ms: 0,
         };
         job.size += 1;
         let (a, _b) = tokio::io::duplex(64);

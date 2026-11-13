@@ -4,15 +4,15 @@
 
 use std::sync::Arc;
 
-use clipwire_core::blob::chunk_count;
-use clipwire_core::proto::io::{IoError, read_msg, write_msg};
+use clipwire_core::blob::{CHUNK, OVERHEAD, chunk_count};
+use clipwire_core::proto::io::{IoError, read_msg_limited, write_msg};
 use clipwire_core::proto::{BlobChunk, BlobFail, BlobReply, BlobRequest};
 use clipwire_core::{BlobId, GroupId};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::blobs::{Blobs, sealed_chunk_len};
+use crate::blobs::{Blobs, Live, Progress, sealed_chunk_len};
 use crate::session::{Shared, now_ms};
 use crate::store::BlobBegin;
 
@@ -20,6 +20,13 @@ use crate::store::BlobBegin;
 /// Остальные ждут: сервер просто не принимает следующий поток, пока не
 /// освободится место.
 pub const MAX_STREAMS: usize = 8;
+/// Сколько потоков файлов сервер обслуживает одновременно на все соединения.
+/// Принятый сверх этого поток ждёт свободного места.
+pub const MAX_SERVER_STREAMS: usize = 64;
+/// Предел первого кадра потока: в запросе только id файла и пара чисел.
+pub const MAX_REQUEST_FRAME: usize = 256;
+/// Предел кадра с частью файла: сама часть и запас на разметку postcard.
+pub const MAX_CHUNK_FRAME: usize = CHUNK + OVERHEAD + 64;
 
 /// Почему поток файла закончился неудачно.
 enum Fail {
@@ -68,6 +75,10 @@ pub async fn serve_streams(shared: Arc<Shared>, conn: Connection, group: GroupId
         let shared = shared.clone();
         tasks.spawn(async move {
             let _permit = permit;
+            // Общий предел сервера: поток ждёт здесь, пока не освободится место.
+            let Ok(_server_permit) = shared.streams.clone().acquire_owned().await else {
+                return;
+            };
             serve_stream(&shared, &group, send, recv).await;
         });
     }
@@ -79,7 +90,8 @@ async fn serve_stream(
     mut send: SendStream,
     mut recv: RecvStream,
 ) {
-    let res = match tokio::time::timeout(shared.limits.blob_stall, read_msg(&mut recv)).await {
+    let first = read_msg_limited(&mut recv, MAX_REQUEST_FRAME);
+    let res = match tokio::time::timeout(shared.limits.blob_stall, first).await {
         Err(_) => Err(Fail::Reply(BlobFail::Stalled)),
         Ok(Err(e)) => Err(e.into()),
         Ok(Ok(None)) => return,
@@ -89,6 +101,10 @@ async fn serve_stream(
         Ok(Ok(Some(BlobRequest::Get { blob, from }))) => {
             get(shared, group, &mut send, blob, from).await
         }
+        Ok(Ok(Some(BlobRequest::Reserve { blob, size }))) => {
+            reserve(shared, group, &mut send, blob, size).await
+        }
+        Ok(Ok(Some(BlobRequest::Abort { blob }))) => abort(shared, group, &mut send, blob).await,
     };
     let fail = match res {
         Ok(()) => None,
@@ -108,6 +124,124 @@ async fn serve_stream(
     let _ = send.finish();
 }
 
+/// Проверки до замка, общие для `Put` и `Reserve`: предел размера и размер
+/// уже известного файла. Размер сверяем до замка, иначе ответ ждал бы, пока
+/// закончит другой загрузчик этого файла.
+fn precheck(shared: &Shared, group: &GroupId, blob: &BlobId, size: u64) -> Result<Arc<Live>, Fail> {
+    let limits = &shared.limits;
+    if size > limits.max_file_bytes {
+        return Err(BlobFail::TooLarge {
+            max: limits.max_file_bytes,
+        }
+        .into());
+    }
+    let known = shared
+        .store
+        .blob_info(group, blob, shared.not_before_ms())?;
+    if let Some((s, _)) = known
+        && s != size
+    {
+        return Err(BlobFail::SizeMismatch.into());
+    }
+    Ok(shared.blobs.live(group, blob, known.map_or(0, |(_, h)| h)))
+}
+
+/// Завести файл в базе или найти заведённый. Вызывать под замком записи
+/// `live`. Возвращает, сколько частей уже есть и новый ли это файл. У нового
+/// файла на диске обнуляется старое содержимое с тем же именем (истёкший файл).
+async fn begin(
+    shared: &Shared,
+    group: &GroupId,
+    blob: &BlobId,
+    size: u64,
+    live: &Live,
+) -> Result<(u64, bool), Fail> {
+    let limits = &shared.limits;
+    let begin = shared.store.blob_begin(
+        group,
+        blob,
+        size,
+        now_ms(),
+        shared.not_before_ms(),
+        limits.blob_quota,
+        limits.blob_total_quota,
+    )?;
+    let (have, fresh) = match begin {
+        BlobBegin::Created => (0, true),
+        BlobBegin::Existing { have } => (have, false),
+        BlobBegin::SizeMismatch => return Err(BlobFail::SizeMismatch.into()),
+        BlobBegin::QuotaExceeded | BlobBegin::ServerFull => {
+            return Err(BlobFail::QuotaExceeded.into());
+        }
+    };
+    let now = Progress {
+        have,
+        cancelled: false,
+    };
+    live.state
+        .send_if_modified(|p| std::mem::replace(p, now) != now);
+    if fresh {
+        drop(shared.blobs.open_write(group, blob, true).await?);
+    }
+    Ok((have, fresh))
+}
+
+async fn reserve(
+    shared: &Shared,
+    group: &GroupId,
+    send: &mut SendStream,
+    blob: BlobId,
+    size: u64,
+) -> Result<(), Fail> {
+    let live = precheck(shared, group, &blob, size)?;
+    {
+        let _writer = live.writer.lock().await;
+        begin(shared, group, &blob, size, &live).await?;
+    }
+    write_msg(send, &BlobReply::Reserved).await?;
+    Ok(())
+}
+
+/// Отмена отправки: строка и файл удаляются под замком записи, ждущие `Get`
+/// получают `Cancelled`. Место сразу возвращается в квоты.
+async fn abort(
+    shared: &Shared,
+    group: &GroupId,
+    send: &mut SendStream,
+    blob: BlobId,
+) -> Result<(), Fail> {
+    let live = shared.blobs.live(group, &blob, 0);
+    {
+        let _writer = live.writer.lock().await;
+        // Сначала строка: новый Get после этого получит NotFound, а не
+        // подпишется на удаляемый файл.
+        shared.store.blob_delete(group, &blob)?;
+        shared.blobs.remove(group, &blob);
+        live.state.send_modify(|p| p.cancelled = true);
+    }
+    write_msg(send, &BlobReply::Aborted).await?;
+    Ok(())
+}
+
+/// Чистка по сроку: строки удаляются в базе, файлы — под замком записи.
+/// Пока ждали замок, файл с тем же id могли завести заново (повторный `Put`
+/// после истечения): тогда строка снова есть и файл уже новый, его не трогаем.
+/// Возвращает, сколько файлов убрано с диска.
+pub async fn purge_expired(shared: &Shared) -> anyhow::Result<usize> {
+    let gone = shared.store.purge_expired_blobs(shared.not_before_ms())?;
+    let mut removed = 0;
+    for (group, blob) in &gone {
+        let live = shared.blobs.live(group, blob, 0);
+        let _writer = live.writer.lock().await;
+        if shared.store.blob_exists(group, blob)? {
+            continue;
+        }
+        shared.blobs.remove(group, blob);
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 async fn put(
     shared: &Shared,
     group: &GroupId,
@@ -116,48 +250,16 @@ async fn put(
     blob: BlobId,
     size: u64,
 ) -> Result<(), Fail> {
-    let limits = &shared.limits;
-    if size > limits.max_file_bytes {
-        return Err(BlobFail::TooLarge {
-            max: limits.max_file_bytes,
-        }
-        .into());
-    }
-    // Размер сверяем ещё до замка: иначе ответ ждал бы, пока закончит другой
-    // загрузчик этого файла.
-    let known = shared
-        .store
-        .blob_info(group, &blob, shared.not_before_ms())?;
-    if let Some((s, _)) = known
-        && s != size
-    {
-        return Err(BlobFail::SizeMismatch.into());
-    }
-
-    let live = shared.blobs.live(group, &blob, known.map_or(0, |(_, h)| h));
+    let live = precheck(shared, group, &blob, size)?;
     let _writer = live.writer.lock().await;
-    let begin = shared.store.blob_begin(
-        group,
-        &blob,
-        size,
-        now_ms(),
-        shared.not_before_ms(),
-        limits.blob_quota,
-    )?;
-    let (mut have, fresh) = match begin {
-        BlobBegin::Created => (0, true),
-        BlobBegin::Existing { have } => (have, false),
-        BlobBegin::SizeMismatch => return Err(BlobFail::SizeMismatch.into()),
-        BlobBegin::QuotaExceeded => return Err(BlobFail::QuotaExceeded.into()),
-    };
-    live.have
-        .send_if_modified(|h| std::mem::replace(h, have) != have);
+    let (mut have, fresh) = begin(shared, group, &blob, size, &live).await?;
     let mut file = shared.blobs.open_write(group, &blob, fresh).await?;
     write_msg(send, &BlobReply::PutReady { have }).await?;
 
     let count = chunk_count(size);
     loop {
-        let msg = tokio::time::timeout(limits.blob_stall, read_msg::<_, BlobChunk>(recv))
+        let next = read_msg_limited::<_, BlobChunk>(recv, MAX_CHUNK_FRAME);
+        let msg = tokio::time::timeout(shared.limits.blob_stall, next)
             .await
             .map_err(|_| BlobFail::Stalled)??;
         let Some(chunk) = msg else {
@@ -191,7 +293,7 @@ async fn put(
         Blobs::write_chunk(&mut file, chunk.index, &chunk.data).await?;
         have += 1;
         shared.store.blob_set_have(group, &blob, have)?;
-        live.have.send_replace(have);
+        live.state.send_modify(|p| p.have = have);
     }
 }
 
@@ -202,6 +304,8 @@ async fn get(
     blob: BlobId,
     from: u64,
 ) -> Result<(), Fail> {
+    // Неизвестный файл — сразу NotFound. Заведённый через Reserve (have = 0)
+    // в базе есть: его ждём так же, как недогруженный.
     let Some((size, db_have)) = shared
         .store
         .blob_info(group, &blob, shared.not_before_ms())?
@@ -215,8 +319,27 @@ async fn get(
     // Подписываемся после чтения базы: загрузчик пишет сначала в базу, потом
     // в watch, так что ни одна часть не потеряется между этими двумя шагами.
     let live = shared.blobs.live(group, &blob, db_have);
-    let mut rx = live.have.subscribe();
-    let mut have = (*rx.borrow_and_update()).max(db_have);
+    let mut rx = live.state.subscribe();
+    // Abort мог успеть удалить файл между чтением базы и подпиской (и уже
+    // отпустить своё состояние). Если строка на месте и сейчас, любой
+    // следующий Abort пометит отменённым именно наше состояние.
+    let Some((_, db_have)) = shared
+        .store
+        .blob_info(group, &blob, shared.not_before_ms())?
+    else {
+        let cancelled = rx.borrow().cancelled;
+        return Err(if cancelled {
+            BlobFail::Cancelled
+        } else {
+            BlobFail::NotFound
+        }
+        .into());
+    };
+    let now = *rx.borrow_and_update();
+    if now.cancelled {
+        return Err(BlobFail::Cancelled.into());
+    }
+    let mut have = now.have.max(db_have);
     write_msg(
         send,
         &BlobReply::GetReady {
@@ -232,6 +355,9 @@ async fn get(
     let mut file = None;
     let mut index = from;
     while index < count {
+        if rx.borrow().cancelled {
+            return Err(BlobFail::Cancelled.into());
+        }
         if index < have {
             let f = match &mut file {
                 Some(f) => f,
@@ -243,7 +369,13 @@ async fn get(
             continue;
         }
         match tokio::time::timeout(shared.limits.blob_stall, rx.changed()).await {
-            Ok(Ok(())) => have = *rx.borrow_and_update(),
+            Ok(Ok(())) => {
+                let p = *rx.borrow_and_update();
+                if p.cancelled {
+                    return Err(BlobFail::Cancelled.into());
+                }
+                have = p.have;
+            }
             // Отправитель живёт в `live`, который мы держим, так что Err не
             // придёт; на всякий случай считаем это остановкой.
             Ok(Err(_)) | Err(_) => return Err(BlobFail::Stalled.into()),

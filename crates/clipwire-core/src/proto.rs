@@ -66,6 +66,13 @@ pub enum BlobRequest {
     /// Скачать файл начиная с части `from`. Ответ — `GetReady`, затем `Chunk`
     /// по порядку; если файл ещё загружается, сервер ждёт новых частей.
     Get { blob: BlobId, from: u64 },
+    /// Завести файл на сервере до загрузки: те же проверки, что у `Put`
+    /// (размер, квоты), но частей нет. Ответ — `Reserved` или `Error`. После
+    /// этого `Get` того же файла ждёт первых частей, а не отвечает `NotFound`.
+    Reserve { blob: BlobId, size: u64 },
+    /// Отменить отправку: сервер удаляет файл и его части, ждущие `Get`
+    /// получают `Error(Cancelled)`. Ответ — `Aborted` (и если файла не было).
+    Abort { blob: BlobId },
 }
 
 /// Часть файла от агента при загрузке.
@@ -94,6 +101,10 @@ pub enum BlobReply {
     Chunk(BlobChunk),
     /// Отказ. После него сервер закрывает поток.
     Error(BlobFail),
+    /// На `Reserve`: файл заведён, место под него учтено в квотах.
+    Reserved,
+    /// На `Abort`: файла на сервере больше нет.
+    Aborted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -102,7 +113,8 @@ pub enum BlobFail {
     NotFound,
     #[error("файл больше {max} байт — предела сервера")]
     TooLarge { max: u64 },
-    #[error("на сервере кончилось место, выделенное группе")]
+    /// Не хватает места группы или общего места сервера под файлы.
+    #[error("на сервере кончилось место под файлы")]
     QuotaExceeded,
     #[error("файл с этим id уже загружается с другим размером")]
     SizeMismatch,
@@ -112,12 +124,14 @@ pub enum BlobFail {
     Protocol(String),
     #[error("ошибка сервера: {0}")]
     Internal(String),
+    #[error("источник отменил отправку файла")]
+    Cancelled,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
-    #[error("кадр {0} байт больше допустимого {MAX_FRAME}")]
-    TooLarge(usize),
+    #[error("кадр {len} байт больше допустимого {max}")]
+    TooLarge { len: usize, max: usize },
     #[error("кадр не разобрался: {0}")]
     Decode(#[from] postcard::Error),
 }
@@ -126,7 +140,10 @@ pub enum FrameError {
 pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
     let body = postcard::to_stdvec(msg)?;
     if body.len() > MAX_FRAME {
-        return Err(FrameError::TooLarge(body.len()));
+        return Err(FrameError::TooLarge {
+            len: body.len(),
+            max: MAX_FRAME,
+        });
     }
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&(body.len() as u32).to_be_bytes());
@@ -137,9 +154,16 @@ pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
 /// Разбирает префикс длины. Читающая сторона сначала читает 4 байта,
 /// проверяет их здесь и только потом выделяет буфер под тело.
 pub fn frame_len(prefix: [u8; 4]) -> Result<usize, FrameError> {
+    frame_len_limited(prefix, MAX_FRAME)
+}
+
+/// То же с своим пределом (не больше [`MAX_FRAME`]): например, для запроса
+/// в потоке файла, который занимает пару десятков байт.
+pub fn frame_len_limited(prefix: [u8; 4], max: usize) -> Result<usize, FrameError> {
+    let max = max.min(MAX_FRAME);
     let len = u32::from_be_bytes(prefix) as usize;
-    if len > MAX_FRAME {
-        return Err(FrameError::TooLarge(len));
+    if len > max {
+        return Err(FrameError::TooLarge { len, max });
     }
     Ok(len)
 }
@@ -156,7 +180,7 @@ pub mod io {
     use serde::de::DeserializeOwned;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-    use super::{FrameError, decode_body, encode_frame, frame_len};
+    use super::{FrameError, MAX_FRAME, decode_body, encode_frame, frame_len_limited};
 
     #[derive(Debug, thiserror::Error)]
     pub enum IoError {
@@ -184,13 +208,23 @@ pub mod io {
         R: AsyncRead + Unpin,
         T: DeserializeOwned,
     {
+        read_msg_limited(r, MAX_FRAME).await
+    }
+
+    /// То же, но кадр длиннее `max` байт отклоняется по префиксу длины, до
+    /// того как под него выделится память.
+    pub async fn read_msg_limited<R, T>(r: &mut R, max: usize) -> Result<Option<T>, IoError>
+    where
+        R: AsyncRead + Unpin,
+        T: DeserializeOwned,
+    {
         let mut prefix = [0u8; 4];
         match r.read_exact(&mut prefix).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
         }
-        let len = frame_len(prefix)?;
+        let len = frame_len_limited(prefix, max)?;
         let mut body = vec![0u8; len];
         r.read_exact(&mut body).await?;
         Ok(Some(decode_body(&body)?))
@@ -214,6 +248,23 @@ pub mod io {
             assert_eq!(m1, ServerMsg::Error("x".into()));
             assert_eq!(m2, ServerMsg::Joined);
             assert!(read_msg::<_, ServerMsg>(&mut b).await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn limited_read_rejects_long_prefix() {
+            let (mut a, mut b) = tokio::io::duplex(1024);
+            // Префикс обещает 1 МиБ, а тела нет: ошибка приходит сразу, без
+            // ожидания тела и без буфера под него.
+            a.write_all(&(1u32 << 20).to_be_bytes()).await.unwrap();
+            let r = read_msg_limited::<_, ServerMsg>(&mut b, 256).await;
+            assert!(matches!(
+                r,
+                Err(IoError::Frame(FrameError::TooLarge { len, max: 256 })) if len == 1 << 20
+            ));
+            // Короткий кадр в пределе читается как обычно.
+            write_msg(&mut a, &ServerMsg::Joined).await.unwrap();
+            let m: ServerMsg = read_msg_limited(&mut b, 256).await.unwrap().unwrap();
+            assert_eq!(m, ServerMsg::Joined);
         }
     }
 }
@@ -241,6 +292,14 @@ mod tests {
     #[test]
     fn rejects_huge_length() {
         let prefix = (MAX_FRAME as u32 + 1).to_be_bytes();
-        assert!(matches!(frame_len(prefix), Err(FrameError::TooLarge(_))));
+        assert!(matches!(
+            frame_len(prefix),
+            Err(FrameError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            frame_len_limited(300u32.to_be_bytes(), 256),
+            Err(FrameError::TooLarge { len: 300, max: 256 })
+        ));
+        assert_eq!(frame_len_limited(256u32.to_be_bytes(), 256).unwrap(), 256);
     }
 }

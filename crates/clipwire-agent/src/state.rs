@@ -77,8 +77,11 @@ impl Paths {
         write_atomic(&self.state(), &crate::secret::protect(&plain)?)
     }
 
+    /// Выход из группы: ключ, курсор и очередь загрузок (её файлы уходили в
+    /// старую группу, в новой им не место).
     pub fn reset(&self) -> Result<()> {
-        for p in [self.state(), self.cursor()] {
+        let uploads = self.dir.join(crate::blobs::UPLOADS_FILE);
+        for p in [self.state(), self.cursor(), uploads] {
             match std::fs::remove_file(&p) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -155,9 +158,11 @@ mod tests {
         paths.save_cursor(id).unwrap();
         assert_eq!(paths.load_cursor(), Some(id));
 
+        std::fs::write(dir.join("uploads.json"), b"[]").unwrap();
         paths.reset().unwrap();
         assert!(paths.load().unwrap().is_none());
         assert!(paths.load_cursor().is_none());
+        assert!(!dir.join("uploads.json").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

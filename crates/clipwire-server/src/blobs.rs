@@ -30,11 +30,20 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Что видят ждущие `Get`: сколько частей готово и не отменён ли файл.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub have: u64,
+    /// Источник отменил отправку (`Abort`): ждать больше нечего.
+    pub cancelled: bool,
+}
+
 /// Состояние файла, пока с ним кто-то работает: сколько частей готово и
 /// замок, чтобы файл не писали два потока сразу (например, старое соединение
-/// ещё не умерло, а агент уже переподключился и докачивает).
+/// ещё не умерло, а агент уже переподключился и докачивает). Под этим же
+/// замком файл удаляется (отмена, чистка по сроку).
 pub struct Live {
-    pub have: watch::Sender<u64>,
+    pub state: watch::Sender<Progress>,
     pub writer: AsyncMutex<()>,
 }
 
@@ -66,7 +75,10 @@ impl Blobs {
         }
         map.retain(|_, w| w.strong_count() > 0);
         let l = Arc::new(Live {
-            have: watch::Sender::new(have),
+            state: watch::Sender::new(Progress {
+                have,
+                cancelled: false,
+            }),
             writer: AsyncMutex::new(()),
         });
         map.insert((*group, *blob), Arc::downgrade(&l));
@@ -121,7 +133,8 @@ impl Blobs {
         Ok(buf)
     }
 
-    /// Убрать файл с диска (после чистки по сроку). Пустую папку группы тоже.
+    /// Убрать файл с диска (отмена, чистка по сроку). Пустую папку группы тоже.
+    /// Вызывать под замком записи файла.
     pub fn remove(&self, group: &GroupId, blob: &BlobId) {
         let path = self.path(group, blob);
         if let Err(e) = std::fs::remove_file(&path)
@@ -171,10 +184,10 @@ mod tests {
         let a = b.live(&g, &id, 3);
         let c = b.live(&g, &id, 0);
         assert!(Arc::ptr_eq(&a, &c));
-        assert_eq!(*c.have.borrow(), 3);
+        assert_eq!(c.state.borrow().have, 3);
         drop((a, c));
         // Никто не держит — новое состояние берёт свежее значение из базы.
-        assert_eq!(*b.live(&g, &id, 7).have.borrow(), 7);
+        assert_eq!(b.live(&g, &id, 7).state.borrow().have, 7);
     }
 
     #[tokio::test]

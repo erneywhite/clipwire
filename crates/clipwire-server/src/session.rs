@@ -25,6 +25,7 @@ pub struct Limits {
     pub ttl: Duration,
     pub max_file_bytes: u64,
     pub blob_quota: u64,
+    pub blob_total_quota: u64,
     pub blob_stall: Duration,
 }
 
@@ -33,6 +34,9 @@ pub struct Shared {
     pub hub: Hub,
     pub blobs: Blobs,
     pub limits: Limits,
+    /// Общий на сервер предел одновременно обслуживаемых потоков файлов
+    /// (сверх предела на соединение).
+    pub streams: Arc<tokio::sync::Semaphore>,
 }
 
 impl Shared {
