@@ -389,6 +389,22 @@ fn install_pending(app: &AppHandle, dir: &Path, paused: bool) -> Result<(), Stri
     run_installer(app, &update, &bytes, auto, paused)
 }
 
+/// Подготовка к любой установке (автоматической, отложенной, по кнопке).
+/// На Windows плагин завершит процесс до того, как станет известно,
+/// справился ли установщик. Поэтому скачанное удаляется сейчас, чтобы
+/// упавший установщик не запускался снова при каждом старте, а неудачу
+/// запомнит следующий запуск по пометке (`announce`). Возвращает путь
+/// пометки.
+fn prepare_install(dir: &Path, inst: &Installing) -> PathBuf {
+    forget_pending(dir);
+    let marker = dir.join("installing.json");
+    let written = std::fs::create_dir_all(dir).and_then(|_| write_json(&marker, inst));
+    if let Err(e) = written {
+        tracing::warn!("не записалась пометка об установке: {e}");
+    }
+    marker
+}
+
 /// Пометка, проверка подписи и запуск установщика. На Windows при успехе не
 /// возвращается: плагин завершает процесс.
 fn run_installer(
@@ -398,21 +414,12 @@ fn run_installer(
     auto: bool,
     paused: bool,
 ) -> Result<(), String> {
-    let dir = dir(app);
-    // На Windows плагин завершит процесс до того, как станет известно,
-    // справился ли установщик. Скачанное удаляем сейчас, чтобы упавший
-    // установщик не запускался снова при каждом старте; неудачу запомнит
-    // следующий запуск по пометке (`announce`).
-    forget_pending(&dir);
-    let marker = dir.join("installing.json");
     let inst = Installing {
         version: update.version.clone(),
         auto,
         paused,
     };
-    if let Err(e) = write_json(&marker, &inst) {
-        tracing::warn!("не записалась пометка об установке: {e}");
-    }
+    let marker = prepare_install(&dir(app), &inst);
     // `install` ещё раз проверяет подпись.
     if let Err(e) = update.install(bytes) {
         let _ = std::fs::remove_file(&marker);
@@ -667,6 +674,39 @@ mod tests {
         assert!(!may_auto_install("v0.1.1", Some(&f)));
         // Вышла новая версия — её ставим.
         assert!(may_auto_install("0.1.2", Some(&f)));
+    }
+
+    /// Перед любой установкой скачанное удаляется, а пометка хранит паузу:
+    /// упавший установщик не запустится снова на следующем старте.
+    #[test]
+    fn prepare_install_forgets_pending_and_marks() {
+        let dir = std::env::temp_dir().join(format!("clipwire-upd-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pending.bin"), b"exe").unwrap();
+        std::fs::write(dir.join("pending.json"), b"{}").unwrap();
+        let marker = prepare_install(
+            &dir,
+            &Installing {
+                version: "0.1.1".into(),
+                auto: true,
+                paused: true,
+            },
+        );
+        assert!(!dir.join("pending.bin").exists());
+        assert!(!dir.join("pending.json").exists());
+        let inst: Installing = read_json(&marker).unwrap();
+        assert_eq!(inst.version, "0.1.1");
+        assert!(inst.auto && inst.paused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Неудача, замеченная на запуске, обрывает цикл «скачал — поставил —
+    /// пропал из трея»: ту же версию программа сама больше не ставит.
+    #[test]
+    fn failed_install_stops_auto_retry() {
+        let v = judge("0.1.0", "0.1.1", None, None);
+        assert!(!may_auto_install("0.1.1", v.failed.as_ref()));
+        assert!(may_auto_install("0.1.2", v.failed.as_ref()));
     }
 
     #[test]
