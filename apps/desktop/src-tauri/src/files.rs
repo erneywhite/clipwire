@@ -170,17 +170,6 @@ fn missing_error(e: &Entry, files: &[FileRef], plan: &[Source]) -> Option<String
     }
 }
 
-/// Все файлы записи лежат на этом компьютере, качать ничего не надо.
-pub fn all_here(app: &AppHandle, e: &Entry) -> bool {
-    let Content::Files(files) = &e.content else {
-        return true;
-    };
-    let dir = files_dir(&app.state::<AppState>().paths.dir);
-    plan(e, files, &dir)
-        .iter()
-        .all(|s| matches!(s, Source::Here(_)))
-}
-
 /// Скачать в кэш файлы записи (уже скачанные берутся из кэша). Возвращает
 /// пути на этом компьютере в том же порядке.
 async fn download(app: &AppHandle, e: &Entry, files: &[FileRef]) -> Result<Vec<PathBuf>, String> {
@@ -206,11 +195,18 @@ async fn download(app: &AppHandle, e: &Entry, files: &[FileRef]) -> Result<Vec<P
     Ok(paths)
 }
 
+/// Хоть у одного файла путь здесь не исходный (взят из кэша). Такую запись
+/// кладём в буфер тихо: в историю и группу запись с подменёнными путями не
+/// уходит.
+pub fn paths_replaced(orig: &[FileRef], here: &[FileRef]) -> bool {
+    orig.len() != here.len() || orig.iter().zip(here).any(|(a, b)| a.path != b.path)
+}
+
 /// Файлы записи для вставки: чего нет на этом компьютере, скачивается в
-/// кэш; в `FileRef.path` — пути здесь. Касается и чужих записей, и своих, у
-/// которых файл переместили или удалили, а копия есть на сервере. Если хоть
-/// один файл не получить (нет на сервере, не скачался) — ошибка и ничего не
-/// возвращается.
+/// кэш; в `FileRef.path` — пути здесь (исходные для своих файлов на месте,
+/// из кэша для остальных). Касается и чужих записей, и своих, у которых файл
+/// переместили или удалили, а копия есть на сервере. Если хоть один файл не
+/// получить (нет на сервере, не скачался) — ошибка и ничего не возвращается.
 pub async fn fetch_for_paste(app: &AppHandle, e: &Entry) -> Result<Vec<FileRef>, String> {
     let Content::Files(files) = &e.content else {
         return Err("В записи нет файлов".into());
@@ -221,12 +217,24 @@ pub async fn fetch_for_paste(app: &AppHandle, e: &Entry) -> Result<Vec<FileRef>,
         return Err(err);
     }
     let need = to_fetch(files, &plan);
-    let mut fetched = if need.is_empty() {
+    let fetched = if need.is_empty() {
         Vec::new()
     } else {
         download(app, e, &need).await?
-    }
-    .into_iter();
+    };
+    with_local_paths(e, files, plan, fetched.into_iter())
+}
+
+/// Файлы записи с путями на этом компьютере: путь каждого файла берётся из
+/// `plan` (исходный, если своя запись и файл на месте, иначе из кэша), для
+/// `Source::Fetch` — очередной скачанный путь из `fetched` в том же порядке.
+/// Если хоть один файл взять неоткуда — ошибка.
+fn with_local_paths(
+    e: &Entry,
+    files: &[FileRef],
+    plan: Vec<Source>,
+    mut fetched: impl Iterator<Item = PathBuf>,
+) -> Result<Vec<FileRef>, String> {
     let mut out = Vec::with_capacity(files.len());
     for (f, s) in files.iter().zip(plan) {
         let p = match s {
@@ -530,6 +538,71 @@ mod tests {
             missing_error(&remote, &lost[..1], &p).as_deref(),
             Some("Есть только на устройстве «Ноутбук»: пропал.txt")
         );
+    }
+
+    #[test]
+    fn paste_uses_paths_on_this_computer() {
+        let tmp = Tmp::new("paths");
+        let dir = tmp.0.join("files");
+        let here = tmp.0.join("на месте.txt");
+        std::fs::write(&here, b"abc").unwrap();
+        let gone_blob = BlobId([4; 16]);
+        let remote_blob = BlobId([5; 16]);
+        let gone_cached = cache_path(&dir, gone_blob, "пропал.txt");
+        let remote_cached = cache_path(&dir, remote_blob, "чужой.txt");
+        for p in [&gone_cached, &remote_cached] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"abc").unwrap();
+        }
+        let on_place = file("на месте.txt", &here, Some(BlobId([6; 16])), false);
+        let gone = file(
+            "пропал.txt",
+            &tmp.0.join("пропал.txt"),
+            Some(gone_blob),
+            false,
+        );
+        let none = std::iter::empty::<PathBuf>;
+
+        // Свой файл на месте: путь исходный, подмены нет.
+        let own = entry_with(true, on_place.clone());
+        let files = vec![on_place.clone()];
+        let out = with_local_paths(&own, &files, plan(&own, &files, &dir), none()).unwrap();
+        assert_eq!(out[0].path, on_place.path);
+        assert!(!paths_replaced(&files, &out));
+
+        // Свой пропал, но есть в кэше: путь из кэша, это подмена.
+        let files = vec![on_place.clone(), gone.clone()];
+        let mut own = entry_with(true, on_place.clone());
+        own.content = Content::Files(files.clone());
+        let out = with_local_paths(&own, &files, plan(&own, &files, &dir), none()).unwrap();
+        assert_eq!(out[0].path, on_place.path);
+        assert_eq!(out[1].path, gone_cached.to_string_lossy());
+        assert_eq!(out[1].name, "пропал.txt");
+        assert!(paths_replaced(&files, &out));
+
+        // Чужой в кэше: путь из кэша, даже если по исходному пути что-то есть.
+        let theirs = file("чужой.txt", &here, Some(remote_blob), false);
+        let remote = entry_with(false, theirs.clone());
+        let files = vec![theirs];
+        let out = with_local_paths(&remote, &files, plan(&remote, &files, &dir), none()).unwrap();
+        assert_eq!(out[0].path, remote_cached.to_string_lossy());
+        assert!(paths_replaced(&files, &out));
+
+        // Скачанный путь встаёт на место Fetch; не скачался — ошибка.
+        let fresh = file(
+            "новый.txt",
+            &tmp.0.join("новый.txt"),
+            Some(BlobId([8; 16])),
+            false,
+        );
+        let remote = entry_with(false, fresh.clone());
+        let files = vec![fresh];
+        let got = tmp.0.join("скачан.txt");
+        let p = plan(&remote, &files, &dir);
+        let out = with_local_paths(&remote, &files, p, std::iter::once(got.clone())).unwrap();
+        assert_eq!(out[0].path, got.to_string_lossy());
+        let p = plan(&remote, &files, &dir);
+        assert!(with_local_paths(&remote, &files, p, none()).is_err());
     }
 
     #[test]
