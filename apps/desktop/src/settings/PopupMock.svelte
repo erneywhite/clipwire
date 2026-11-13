@@ -29,7 +29,7 @@
       </svg>`,
     )
   // Образец файла с другого устройства: идёт скачивание, видна полоса прогресса.
-  const sampleFile = { name: 'Отчёт за ноябрь.pdf', path: '/Users/me/Отчёт за ноябрь.pdf', size: 2_400_000, is_dir: false, exists: false, blob: '0'.repeat(32), local_path: null, remote: true }
+  const sampleFile = { name: 'Отчёт за ноябрь.pdf', path: '/Users/me/Отчёт за ноябрь.pdf', size: 2_400_000, is_dir: false, exists: false, blob: '0'.repeat(32), p2p: false, blob_size: 2_400_000, local_path: null, remote: true }
   const sampleTransfers: TransferMap = {
     [sampleFile.blob]: { blob: sampleFile.blob, direction: 'down', done: 1_100_000, total: 2_400_000, state: 'active', error: null },
   }

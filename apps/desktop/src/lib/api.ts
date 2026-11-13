@@ -62,8 +62,15 @@ export interface FileInfo {
   is_dir: boolean
   /** Файл по local_path есть на диске. */
   exists: boolean
-  /** Id файла на сервере (32 hex); null — папка или файл крупнее порога. */
+  /**
+   * Id переданного файла (32 hex); null — не передавался, есть только на
+   * источнике. Есть и у папок (архив), и у файлов больше порога (p2p).
+   */
   blob: string | null
+  /** Передаётся напрямую с устройства-источника, а не через сервер. */
+  p2p: boolean
+  /** Сколько байт передаётся: у файла — его размер, у папки — размер архива. */
+  blob_size: number
   /** Путь на этом компьютере: исходный у локальной записи, путь в кэше у скачанной. */
   local_path: string | null
   /** Запись пришла с другого устройства. */
@@ -136,5 +143,7 @@ export const api = {
   filePreview: (path: string) => invoke<FilePreview>('file_preview', { path }),
   /** Скачать файлы записи с другого устройства без вставки. Прогресс идёт событиями. */
   filesDownload: (id: string) => invoke<void>('files_download', { id }),
+  /** Открыть папку из истории (свою или скачанную) в файловом менеджере. */
+  folderOpen: (path: string) => invoke<void>('folder_open', { path }),
   transfers: () => invoke<Transfer[]>('transfers'),
 }

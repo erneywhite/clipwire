@@ -6,7 +6,7 @@ import type { FileInfo, Transfer } from './api'
 
 // Node требует расширение в пути, а TypeScript без allowImportingTsExtensions его
 // не пропускает: путь собирается строкой, тип берётся отдельно.
-const { allUploaded, canDownload, entryProgress, isGone, onlyThere, percentOf, progressLabel } = (await import('./transfer' + '.ts')) as typeof import('./transfer')
+const { allUploaded, canDownload, entryProgress, fetchLabel, isDirect, isGone, onlyThere, percentOf, progressLabel } = (await import('./transfer' + '.ts')) as typeof import('./transfer')
 
 function check(cond: boolean, msg: string) {
   if (!cond) throw new Error(`не прошло: ${msg}`)
@@ -75,6 +75,8 @@ check(entryProgress([{ blob: 'a' }], { a: t('a', { state: 'done', done: 100 }) }
     is_dir: false,
     exists: false,
     blob: 'b'.repeat(32),
+    p2p: false,
+    blob_size: 3,
     local_path: null,
     remote: false,
     ...over,
@@ -83,10 +85,24 @@ check(entryProgress([{ blob: 'a' }], { a: t('a', { state: 'done', done: 100 }) }
   check(canDownload(f({})), 'свой пропавший файл с копией на сервере можно скачать')
   check(!isGone(f({})), 'свой пропавший с копией на сервере — не пропал')
   check(!canDownload(f({ exists: true, local_path: 'C:\\a.txt' })), 'файл на месте качать не надо')
-  check(!canDownload(f({ is_dir: true })), 'папку не скачать')
+  check(canDownload(f({ is_dir: true, remote: true })), 'чужую папку можно скачать архивом')
+  check(canDownload(f({ is_dir: true })), 'свою пропавшую папку до порога можно скачать с сервера')
+  check(!canDownload(f({ is_dir: true, remote: true, exists: true, local_path: 'D:\\files\\b\\Папка' })), 'распакованную папку качать не надо')
+  check(canDownload(f({ remote: true, p2p: true })), 'чужой файл больше порога качается напрямую')
+  check(isDirect(f({ remote: true, p2p: true })), 'чужой p2p-файл — напрямую с устройства')
+  check(!isDirect(f({ remote: true })), 'чужой файл до порога — через сервер')
+  check(!canDownload(f({ p2p: true })), 'свой p2p-файл пропал — брать неоткуда')
+  check(isGone(f({ p2p: true })), 'свой p2p-файл пропал — пропал насовсем')
   check(isGone(f({ blob: null })), 'свой пропавший без копии — пропал')
   check(!isGone(f({ blob: null, remote: true })), 'чужой без копии не «пропал», он только там')
   check(onlyThere(f({ blob: null, remote: true })), 'чужой без копии — есть только на источнике')
+  check(onlyThere(f({ blob: null, remote: true, is_dir: true })), 'чужая папка без blob — только на источнике')
+  check(!onlyThere(f({ remote: true, p2p: true })), 'p2p-файл не «только там»: его можно скачать')
+
+  check(fetchLabel(f({ remote: true, p2p: true }), 'Ноутбук') === 'напрямую с устройства «Ноутбук»', 'подпись прямой передачи')
+  check(fetchLabel(f({ remote: true }), 'Ноутбук') === 'не скачан', 'подпись чужого с сервера')
+  check(fetchLabel(f({}), 'Ноутбук') === 'нет на месте, копия на сервере', 'подпись своего пропавшего')
+  check(fetchLabel(f({ remote: true, exists: true, local_path: 'D:\\a.txt' }), 'Ноутбук') === null, 'скачанному подпись не нужна')
 }
 
 {

@@ -125,8 +125,13 @@ pub struct FileDto {
     pub is_dir: bool,
     /// `local_path` существует.
     pub exists: bool,
-    /// Файл в хранилище сервера (32 hex), `None` — только на источнике.
+    /// Id переданного файла (32 hex), `None` — не передавался, есть только на
+    /// источнике. Есть и у папок (архив), и у файлов больше порога.
     pub blob: Option<String>,
+    /// Передаётся напрямую с устройства-источника, а не через сервер.
+    pub p2p: bool,
+    /// Сколько байт передаётся: у файла — его размер, у папки — размер архива.
+    pub blob_size: u64,
     /// Путь на этом компьютере: исходный у своей записи, путь в кэше у
     /// скачанного чужого файла.
     pub local_path: Option<String>,
@@ -161,6 +166,8 @@ fn file_dto(local: bool, f: &clipwire_core::FileRef, files_dir: &std::path::Path
         is_dir: f.is_dir,
         exists: local_path.is_some(),
         blob: f.blob.map(|b| b.hex()),
+        p2p: f.p2p,
+        blob_size: f.blob_size,
         local_path: local_path.map(|p| p.to_string_lossy().into_owned()),
         remote: !local,
     }

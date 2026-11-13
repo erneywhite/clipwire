@@ -45,9 +45,12 @@ export function filesLabel(files: { name: string }[]): string {
   return `${n} ${plural(n, ['файл', 'файла', 'файлов'])}: ${files.map((f) => f.name).join(', ')}`
 }
 
-/** Мета для файлов: размер или «папка», у картинки — пиксели. */
+/**
+ * Мета для файлов: размер, у папки — «папка» и размер содержимого, у картинки —
+ * пиксели. У папок из старых записей размер не считался (0): тогда просто «папка».
+ */
 export function filesMeta(files: { size: number; is_dir: boolean }[], bytes: number, w: number, h: number): string {
-  if (files.length === 1 && files[0].is_dir) return 'папка'
+  if (files.length === 1 && files[0].is_dir) return bytes > 0 ? `папка · ${bytesLabel(bytes)}` : 'папка'
   const parts = []
   if (w && h) parts.push(`${w}×${h}`)
   parts.push(bytesLabel(bytes))

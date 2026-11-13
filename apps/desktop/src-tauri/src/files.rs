@@ -1,5 +1,9 @@
 //! Файлы в истории: предпросмотр и скачивание файлов с других устройств.
 //!
+//! Скачивание идёт через сервер или напрямую с устройства-источника (файлы и
+//! папки больше порога, `FileRef.p2p`), путь выбирает агент. Папка приходит
+//! архивом и распаковывается в кэш, дальше это обычный путь папки.
+//!
 //! Предпросмотр: текст читаем сами (начало файла), PDF, видео и аудио
 //! показывает WebView через asset-протокол. Доступ к файлу через протокол
 //! открывается только для файлов из истории: своих по исходному пути (или по
@@ -12,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use clipwire_agent::blobs::{Transfer, cache_path, files_dir};
 use clipwire_agent::history::{Entry, now_ms};
+use clipwire_agent::p2p::P2pError;
 use clipwire_core::{Content, FileRef};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -124,10 +129,17 @@ fn gone_here(files: &[&FileRef]) -> String {
 enum Source {
     /// Уже здесь: исходный путь своей записи или кэш.
     Here(PathBuf),
-    /// Скачать с сервера в кэш.
+    /// Скачать в кэш: с сервера или напрямую с устройства-источника.
     Fetch,
-    /// Взять неоткуда: папка или файл без копии на сервере.
+    /// Взять неоткуда: файл не передавался или свой файл пропал с места.
     Missing,
+}
+
+/// Файл можно получить с сервера или с другого устройства. У файла без
+/// `blob` передавать нечего. Свой файл с `p2p` на сервер не уходил, а брать
+/// его напрямую у самого себя бессмысленно: если он пропал, то насовсем.
+fn fetchable(e: &Entry, f: &FileRef) -> bool {
+    f.blob.is_some() && !(e.local && f.p2p)
 }
 
 fn plan(e: &Entry, files: &[FileRef], files_dir: &Path) -> Vec<Source> {
@@ -136,7 +148,7 @@ fn plan(e: &Entry, files: &[FileRef], files_dir: &Path) -> Vec<Source> {
         .map(
             |f| match crate::commands::local_file(e.local, f, files_dir) {
                 Some(p) => Source::Here(p),
-                None if f.blob.is_some() && !f.is_dir => Source::Fetch,
+                None if fetchable(e, f) => Source::Fetch,
                 None => Source::Missing,
             },
         )
@@ -179,10 +191,10 @@ async fn download(app: &AppHandle, e: &Entry, files: &[FileRef]) -> Result<Vec<P
         svc.as_ref().and_then(|s| s.blobs())
     }
     .ok_or("Устройство не в группе: файлы с других устройств не скачать")?;
-    let res = blobs.download_all(files).await;
+    let res = blobs.download_all(files, e.origin).await;
     // Даже при ошибке часть файлов могла скачаться — окну стоит перечитать.
     let _ = app.emit("clipwire://history-changed", ());
-    let paths = res.map_err(|e| format!("{e:#}"))?;
+    let paths = res.map_err(|err| download_error(&err, &e.device_name))?;
     // Миниатюра нужна только записи из одного файла-картинки.
     if let (Content::Files(all), [f], [p]) = (&e.content, files, paths.as_slice())
         && all.len() == 1
@@ -193,6 +205,19 @@ async fn download(app: &AppHandle, e: &Entry, files: &[FileRef]) -> Result<Vec<P
         h.file_thumb(e.id, p);
     }
     Ok(paths)
+}
+
+/// Текст ошибки скачивания для окна. Агент не знает имени устройства, поэтому
+/// «устройство не в сети» дополняется именем из записи: «устройство «X» не в
+/// сети». Остальные ошибки показываются как есть, всей цепочкой.
+fn download_error(err: &anyhow::Error, device: &str) -> String {
+    match err.chain().find_map(|c| c.downcast_ref::<P2pError>()) {
+        Some(P2pError::Offline) => format!("{err}: устройство «{device}» не в сети"),
+        Some(P2pError::Denied) => {
+            format!("{err}: устройство «{device}» не пустило, у него другой ключ группы")
+        }
+        _ => format!("{err:#}"),
+    }
 }
 
 /// Хоть у одного файла путь здесь не исходный (взят из кэша). Такую запись
@@ -286,6 +311,23 @@ pub async fn files_download(app: AppHandle, id: String) -> Result<(), String> {
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+/// Открыть папку из истории в файловом менеджере: свою на месте или скачанную
+/// в кэш. Путь проверяется по истории, как в предпросмотре, и это должна быть
+/// папка: открыть так файл значило бы запустить его.
+#[tauri::command]
+pub fn folder_open(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    if !in_history(&app, &path) {
+        return Err("Этой папки нет в истории".into());
+    }
+    if !Path::new(&path).is_dir() {
+        return Err("Папки нет на месте: её переместили или удалили".into());
+    }
+    app.opener()
+        .open_path(&path, None::<&str>)
+        .map_err(|e| format!("Папка не открылась: {e}"))
 }
 
 /// Текущие передачи файлов — начальное состояние окна.
@@ -522,10 +564,13 @@ mod tests {
             Some(cached.clone())
         );
 
-        // Пропавший файл без копии на сервере и папка — понятная ошибка.
+        // Пропавший файл без копии на сервере и своя папка больше порога
+        // (на сервер не уходила) — понятная ошибка.
+        let mut big_dir = file("Папка", &tmp.0.join("Папка"), Some(gone_blob), true);
+        big_dir.p2p = true;
         let lost = vec![
             file("пропал.txt", &tmp.0.join("пропал.txt"), None, false),
-            file("Папка", &tmp.0.join("Папка"), Some(gone_blob), true),
+            big_dir.clone(),
         ];
         let p = plan(&own, &lost, &dir);
         assert_eq!(p, vec![Source::Missing, Source::Missing]);
@@ -541,6 +586,81 @@ mod tests {
         assert_eq!(
             missing_error(&remote, &lost[..1], &p).as_deref(),
             Some("Есть только на устройстве «Ноутбук»: пропал.txt")
+        );
+    }
+
+    #[test]
+    fn folders_and_direct_files_are_fetched() {
+        let tmp = Tmp::new("dirs");
+        let dir = tmp.0.join("files");
+        let blob = BlobId([9; 16]);
+        let mut big = file("Большой.iso", &tmp.0.join("Большой.iso"), Some(blob), false);
+        big.p2p = true;
+        let folder = file(
+            "Проект",
+            &tmp.0.join("Проект"),
+            Some(BlobId([10; 16])),
+            true,
+        );
+
+        // Чужие файл больше порога и папка качаются, путь выбирает агент.
+        let mut remote = entry_with(false, big.clone());
+        let files = vec![big.clone(), folder.clone()];
+        remote.content = Content::Files(files.clone());
+        let p = plan(&remote, &files, &dir);
+        assert_eq!(p, vec![Source::Fetch, Source::Fetch]);
+        assert_eq!(missing_error(&remote, &files, &p), None);
+
+        // Своя папка до порога пропала, архив есть на сервере — тоже качается.
+        let own = entry_with(true, folder.clone());
+        assert_eq!(plan(&own, &files[1..], &dir), vec![Source::Fetch]);
+        // Свой файл больше порога пропал — взять неоткуда.
+        let own = entry_with(true, big.clone());
+        assert_eq!(plan(&own, &files[..1], &dir), vec![Source::Missing]);
+
+        // Папка в кэше считается скачанной, только когда распакована.
+        let cached = cache_path(&dir, folder.blob.unwrap(), &folder.name);
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(cached.with_extension("tar"), b"tar").unwrap();
+        assert_eq!(plan(&remote, &files[1..], &dir), vec![Source::Fetch]);
+        std::fs::create_dir_all(cached.join("src")).unwrap();
+        assert_eq!(
+            plan(&remote, &files[1..], &dir),
+            vec![Source::Here(cached.clone())]
+        );
+        // Вставка кладёт в буфер путь распакованной папки.
+        let out = with_local_paths(
+            &remote,
+            &files[1..],
+            plan(&remote, &files[1..], &dir),
+            std::iter::empty(),
+        )
+        .unwrap();
+        assert_eq!(out[0].path, cached.to_string_lossy());
+        assert!(out[0].is_dir);
+        // И предпросмотр пускает к этой папке.
+        assert!(entry_has_path(&remote, &dir, &cached));
+    }
+
+    #[test]
+    fn offline_source_is_named() {
+        let offline = anyhow::Error::new(P2pError::Offline)
+            .context("подключение")
+            .context("«отчёт.pdf» не скачался");
+        assert_eq!(
+            download_error(&offline, "Ноутбук"),
+            "«отчёт.pdf» не скачался: устройство «Ноутбук» не в сети"
+        );
+        let denied = anyhow::Error::new(P2pError::Denied).context("«a» не скачался");
+        assert_eq!(
+            download_error(&denied, "Ноутбук"),
+            "«a» не скачался: устройство «Ноутбук» не пустило, у него другой ключ группы"
+        );
+        let other = anyhow::anyhow!("на устройстве-источнике этого файла уже нет в истории")
+            .context("«a» не скачался");
+        assert_eq!(
+            download_error(&other, "Ноутбук"),
+            "«a» не скачался: на устройстве-источнике этого файла уже нет в истории"
         );
     }
 
