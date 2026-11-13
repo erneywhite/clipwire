@@ -322,6 +322,15 @@ cd apps/desktop && npm ci && npx tauri dev
 процессе (ключ хоста, вход паролем и ключом, проверка подключения, чистка). Подпись S3
 проверяется на официальных примерах AWS (`crates/clipwire-agent/src/storage/sigv4.rs`).
 
+`s3_live.rs` проверяет S3-хранилище на настоящем сервере: проверку подключения, запись и
+чтение, файл из нескольких частей, список длиннее 1000 объектов, чистку по сроку и тексты
+ошибок (неверный ключ, нет бакета, нет связи). Он запускается вручную, бакет должен уже
+существовать; проверено на MinIO:
+
+```bash
+CLIPWIRE_S3_ENDPOINT=http://127.0.0.1:9000 CLIPWIRE_S3_BUCKET=clipwire-test CLIPWIRE_S3_ACCESS=... CLIPWIRE_S3_SECRET=... cargo test -p clipwire-agent --test s3_live -- --ignored
+```
+
 Чистая логика окна настроек проверяется без сборки, в Node 23.6+ (он сам убирает типы):
 `node src/lib/storage.test.ts` (поля карточки «Хранилище файлов», сохранённые секреты,
 сброс отпечатка ключа хоста), `devices.test.ts` и `transfer.test.ts` из `apps/desktop`.
