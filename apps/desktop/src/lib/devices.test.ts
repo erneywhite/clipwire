@@ -3,7 +3,7 @@
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
 import type { GroupDevice } from './api'
 
-const { confirmText, deviceTitle, leftOut, seenLabel } = (await import('./devices' + '.ts')) as typeof import('./devices')
+const { confirmText, deviceTitle, leftOut, rekeyedBy, seenLabel } = (await import('./devices' + '.ts')) as typeof import('./devices')
 const fmt = (await import('./format' + '.ts')) as typeof import('./format')
 
 function check(cond: boolean, msg: string) {
@@ -22,6 +22,8 @@ const unknown = d('dddd', { name: null, os: null, known: false })
 const list = [me, work, phone, unknown]
 
 check(deviceTitle(unknown) === 'Неизвестное устройство', 'без карточки — неизвестное устройство')
+check(rekeyedBy('Рабочий') === 'Ключ группы сменило устройство «Рабочий»', 'кто сменил ключ')
+check(rekeyedBy(' ') === 'Ключ группы сменён на другом устройстве', 'без имени')
 check(deviceTitle(d('x', { name: '  ' })) === 'Неизвестное устройство', 'пустое имя тоже')
 check(seenLabel(me, fmt, now) === 'в сети', 'своё в сети')
 check(seenLabel(work, fmt, now) === 'не в сети', 'без времени — не в сети')

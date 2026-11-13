@@ -6,6 +6,15 @@ import type * as format from './format'
  *  Node для тестов без сборки (импорт без расширения Node не находит). */
 export type Fmt = Pick<typeof format, 'ago' | 'plural'>
 
+/** Ответ на смену ключа потерялся: результат придёт событием. */
+export const CHECKING = 'Ответ сервера не пришёл, проверяю…'
+
+/** Сообщение после смены ключа на другом устройстве. */
+export function rekeyedBy(name: string): string {
+  const n = name.trim()
+  return n ? `Ключ группы сменило устройство «${n}»` : 'Ключ группы сменён на другом устройстве'
+}
+
 /** Имя для показа: из карточки или «Неизвестное устройство». */
 export function deviceTitle(d: GroupDevice): string {
   return d.name?.trim() || 'Неизвестное устройство'

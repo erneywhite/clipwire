@@ -13,7 +13,7 @@ use clipwire_core::proto::{
     ALPN, BlobChunk, BlobReply, BlobRequest, ClientMsg, DeviceEntry, ServerMsg,
 };
 use clipwire_core::{BlobId, Content, DeviceId, GroupKey, Item, ServerInfo};
-use clipwire_server::Config;
+use clipwire_server::{Config, Guards};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
 
@@ -118,6 +118,17 @@ impl Client {
         }
     }
 
+    /// `JoinWithToken` (с правом создать группу) и первый ответ сервера.
+    async fn join_first(&mut self, key: &GroupKey) -> Result<ServerMsg> {
+        self.send(&ClientMsg::JoinWithToken {
+            group_id: key.group_id(),
+            join_secret: key.join_secret(),
+            token: "test-token".into(),
+        })
+        .await?;
+        self.next().await
+    }
+
     /// Обычный `Join` и первый ответ сервера.
     async fn join_plain(&mut self, key: &GroupKey) -> Result<ServerMsg> {
         self.send(&ClientMsg::Join {
@@ -158,6 +169,10 @@ async fn joined(dev: &Dev, info: &ServerInfo, relay: &str, key: &GroupKey) -> Re
 }
 
 async fn start_server() -> Result<(clipwire_server::Running, String, PathBuf)> {
+    start_server_with(Guards::default()).await
+}
+
+async fn start_server_with(guards: Guards) -> Result<(clipwire_server::Running, String, PathBuf)> {
     let dir = std::env::temp_dir().join(format!("clipwire-dev-e2e-{}", uuid::Uuid::now_v7()));
     let config = Config {
         data_dir: dir.clone(),
@@ -174,7 +189,7 @@ async fn start_server() -> Result<(clipwire_server::Running, String, PathBuf)> {
         blob_total_quota: u64::MAX,
         blob_stall: Duration::from_secs(10),
     };
-    let server = clipwire_server::start(&config).await?;
+    let server = clipwire_server::start_with(&config, &guards).await?;
     tokio::time::timeout(T, server.endpoint().online())
         .await
         .context("сервер не подключился к своему relay")?;
@@ -455,5 +470,65 @@ async fn rekey_moves_group_to_new_key() -> Result<()> {
         ServerMsg::Deliver(s) => assert_eq!(new.open(&s)?, item),
         other => panic!("ждали Deliver, пришло {other:?}"),
     }
+    server.shutdown().await
+}
+
+/// Через срок пакеты сменённой группы удаляются, а сама группа остаётся
+/// надгробием: вход старым ключом, даже с кодом сервера, получает «исключено»
+/// и группу заново не создаёт. Места под предел групп надгробие не занимает.
+#[tokio::test(flavor = "multi_thread")]
+async fn rotated_group_becomes_tombstone() -> Result<()> {
+    let guards = Guards {
+        rotated_keep: Duration::from_secs(1),
+        max_groups: 2,
+        ..Guards::default()
+    };
+    let (server, relay, _dir) = start_server_with(guards).await?;
+    let info = server.info.clone();
+    let (old, new, third) = (
+        GroupKey::generate()?,
+        GroupKey::generate()?,
+        GroupKey::generate()?,
+    );
+    let (r, d) = (Dev::new(&relay).await?, Dev::new(&relay).await?);
+    let mut cr = joined(&r, &info, &relay, &old).await?;
+    {
+        let mut cd = joined(&d, &info, &relay, &old).await?;
+        cd.publish(&old, &d, "Домашний").await?;
+        cd.conn.close(0u32.into(), b"bye");
+    }
+    let mut rn = joined(&r, &info, &relay, &new).await?;
+    rn.publish(&new, &r, "R").await?;
+    let envelope = seal_rekey(&new, &old, &r.key, d.id(), &rekey_public(&d.key))?;
+    cr.send(&ClientMsg::Rekey {
+        new_group: new.group_id(),
+        envelopes: vec![(d.id(), envelope)],
+    })
+    .await?;
+    cr.expect_closed().await?;
+
+    // Пока срок не вышел, D получает свой пакет; потом — только «исключено».
+    let started = std::time::Instant::now();
+    loop {
+        let mut cd = Client::connect(&d, &info, &relay).await?;
+        match cd.join_first(&old).await? {
+            ServerMsg::Excluded => break,
+            ServerMsg::Rekeyed { .. } => {}
+            other => panic!("ждали Rekeyed или Excluded, пришло {other:?}"),
+        }
+        assert!(
+            started.elapsed() < T,
+            "пакеты сменённой группы не удалились"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // Новое устройство с кодом сервера и старым ключом тоже не создаёт группу.
+    let late = Dev::new(&relay).await?;
+    let mut cl = Client::connect(&late, &info, &relay).await?;
+    assert_eq!(cl.join_first(&old).await?, ServerMsg::Excluded);
+    cl.expect_closed().await?;
+    // Предел 2: новая группа и третья; надгробие места не занимает.
+    let mut ct = Client::connect(&late, &info, &relay).await?;
+    assert_eq!(ct.join(&third).await?, 0);
     server.shutdown().await
 }

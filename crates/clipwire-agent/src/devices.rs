@@ -150,10 +150,15 @@ pub fn seal_envelopes(
 /// состояние (тот же сервер и ключ устройства). Очередь загрузок и архивы
 /// папок принадлежали старой группе, на сервере их файлов уже нет, поэтому
 /// они удаляются. Кэш скачанных файлов и курсор остаются: история не меняется.
+/// Проверенные карточки переходят в новую группу: в ней те же устройства.
 ///
 /// Если на диске уже другая группа (новый ключ сохранён раньше, или
 /// устройство с тех пор вошло в другую группу), ничего не делает и
 /// возвращает `false`.
+///
+/// Ключ сохранён — дальше всё по возможности: если очередь загрузок не
+/// удалилась, это не провал (её задания старой группы новый сервис
+/// отбросит по id группы), только запись в лог.
 pub fn adopt_key(paths: &Paths, old: GroupId, new_key: GroupKey) -> Result<bool> {
     let Some(mut state) = paths.load()? else {
         return Ok(false);
@@ -161,25 +166,120 @@ pub fn adopt_key(paths: &Paths, old: GroupId, new_key: GroupKey) -> Result<bool>
     if state.invite.group_key.group_id() != old {
         return Ok(false);
     }
+    let new = new_key.group_id();
     state.invite.group_key = new_key;
     paths.save(&state)?;
-    paths.forget_uploads()?;
+    if let Err(e) = paths.forget_uploads() {
+        tracing::warn!("очередь загрузок старой группы не удалилась: {e:#}");
+    }
+    let known = load_known(paths, old);
+    if let Err(e) = save_known(paths, new, &known) {
+        tracing::warn!("карточки устройств не перенеслись в новую группу: {e:#}");
+    }
+    if let Err(e) = clear_excluded(paths) {
+        tracing::warn!("отметка об исключении не удалилась: {e:#}");
+    }
     Ok(true)
 }
 
-/// Устройство исключили из группы `old`: выйти из неё, как при отключении
-/// (ключ, курсор, очередь загрузок и кэш файлов удаляются, история остаётся).
+/// Файл отметки «исключено»: id группы в hex.
+pub const EXCLUDED_FILE: &str = "excluded";
+
+fn group_hex(g: GroupId) -> String {
+    g.0.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Сервер сообщил, что устройство исключено из группы `old` (`Excluded`
+/// или пакет, которому нельзя верить). Ключ и история остаются: такое
+/// сообщение сервер может прислать и без смены ключа, а стёртый ключ не
+/// вернуть. Устройство помечается исключённым, синхронизация с этой
+/// группой не запускается, пока человек не решит: выйти из группы
+/// ([`Paths::reset`]) или попробовать снова ([`clear_excluded`]). Отметка
+/// лежит на диске и переживает перезапуск.
+///
 /// Если на диске уже другая группа — ничего не делает и возвращает `false`:
-/// так `Excluded` из старой группы не выбросит устройство, которое уже
+/// так `Excluded` из старой группы не тронет устройство, которое уже
 /// перешло на новый ключ.
-pub fn leave_excluded(paths: &Paths, old: GroupId) -> Result<bool> {
+pub fn mark_excluded(paths: &Paths, old: GroupId) -> Result<bool> {
     match paths.load()? {
         Some(s) if s.invite.group_key.group_id() == old => {
-            paths.reset()?;
+            std::fs::create_dir_all(&paths.dir)?;
+            crate::state::write_atomic(&paths.dir.join(EXCLUDED_FILE), group_hex(old).as_bytes())?;
             Ok(true)
         }
         _ => Ok(false),
     }
+}
+
+/// Помечено ли устройство исключённым из группы `group`.
+pub fn is_excluded(paths: &Paths, group: GroupId) -> bool {
+    std::fs::read_to_string(paths.dir.join(EXCLUDED_FILE))
+        .is_ok_and(|s| s.trim() == group_hex(group))
+}
+
+/// Снять отметку «исключено» («Попробовать снова»).
+pub fn clear_excluded(paths: &Paths) -> Result<()> {
+    match std::fs::remove_file(paths.dir.join(EXCLUDED_FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).context("не удалилась отметка об исключении"),
+    }
+}
+
+/// Файл проверенных карточек устройств группы.
+pub const KNOWN_FILE: &str = "devices.bin";
+
+/// Проверенные карточки на диске: для какой группы и сами карточки.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KnownOnDisk {
+    group: [u8; 32],
+    cards: Vec<DeviceCard>,
+}
+
+/// Карточки устройств группы `group`, которые этот клиент уже видел и
+/// проверил ([`open_entries`]). По ним проверяется, кто сменил ключ группы:
+/// выключенное устройство после включения получает пакет сразу при входе,
+/// списка устройств у него в этот момент уже не спросить. Файл другой
+/// группы или битый — пусто.
+pub fn load_known(paths: &Paths, group: GroupId) -> Vec<DeviceCard> {
+    let Ok(raw) = std::fs::read(paths.dir.join(KNOWN_FILE)) else {
+        return Vec::new();
+    };
+    match postcard::from_bytes::<KnownOnDisk>(&raw) {
+        Ok(k) if k.group == group.0 => k.cards,
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!("devices.bin не разобрался: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Сохранить проверенные карточки группы `group`.
+pub fn save_known(paths: &Paths, group: GroupId, cards: &[DeviceCard]) -> Result<()> {
+    std::fs::create_dir_all(&paths.dir)?;
+    let raw = postcard::to_stdvec(&KnownOnDisk {
+        group: group.0,
+        cards: cards.to_vec(),
+    })?;
+    crate::state::write_atomic(&paths.dir.join(KNOWN_FILE), &raw)
+}
+
+/// Ключ группы сменился, и движок принял новый ключ (`sync::Event::Rekeyed`).
+#[derive(Debug, Clone)]
+pub struct RekeyNotice {
+    pub old: GroupId,
+    pub key: GroupKey,
+    /// Устройство, которое сменило ключ (подпись пакета проверена).
+    pub initiator: DeviceId,
+    /// Имя инициатора из проверенной карточки.
+    pub initiator_name: String,
+    /// Ключ сменило это устройство: ответ сервера на `Rekey` потерялся, и
+    /// свой пакет пришёл при повторном входе в старую группу.
+    pub by_me: bool,
+    /// Если `by_me` и смена шла в этом же движке: устройства без карточки,
+    /// которым ключ не достался.
+    pub skipped: Vec<DeviceId>,
 }
 
 /// Новое состояние после смены ключа: тот же сервер и ключ устройства.
@@ -394,6 +494,22 @@ mod tests {
         assert_eq!(s.invite.server.relay_url, "https://r");
         assert!(!paths.dir.join(crate::blobs::UPLOADS_FILE).exists());
         assert_eq!(paths.load_cursor(), Some(cursor));
+        // Чужая группа: ни ключ, ни отметка об исключении не трогаются.
+        std::fs::write(paths.dir.join(EXCLUDED_FILE), b"x").unwrap();
+        assert!(!adopt_key(&paths, GroupKey([9; 32]).group_id(), GroupKey([6; 32])).unwrap());
+        assert!(paths.dir.join(EXCLUDED_FILE).exists());
+
+        // Ключ сохранён, а очередь загрузок не удалилась (на её месте папка) —
+        // переход на новый ключ всё равно состоялся.
+        let p2 = tmp();
+        p2.save(&state(2)).unwrap();
+        std::fs::create_dir_all(p2.dir.join(crate::blobs::UPLOADS_FILE).join("x")).unwrap();
+        assert!(adopt_key(&p2, old.group_id(), GroupKey([5; 32])).unwrap());
+        assert_eq!(
+            p2.load().unwrap().unwrap().invite.group_key,
+            GroupKey([5; 32])
+        );
+        let _ = std::fs::remove_dir_all(&p2.dir);
 
         // Повтор (пакет пришёл ещё раз) — уже другая группа, ничего не меняется.
         assert!(!adopt_key(&paths, old.group_id(), GroupKey([6; 32])).unwrap());
@@ -405,14 +521,47 @@ mod tests {
     }
 
     #[test]
-    fn excluded_leaves_only_the_old_group() {
+    fn excluded_marks_only_the_old_group_and_keeps_the_key() {
         let paths = tmp();
         paths.save(&state(5)).unwrap();
+        let (old, cur) = (GroupKey([2; 32]).group_id(), GroupKey([5; 32]).group_id());
         // Устройство уже на новом ключе: Excluded из старой группы не в счёт.
-        assert!(!leave_excluded(&paths, GroupKey([2; 32]).group_id()).unwrap());
+        assert!(!mark_excluded(&paths, old).unwrap());
+        assert!(!is_excluded(&paths, cur));
+        assert!(mark_excluded(&paths, cur).unwrap());
+        // Ключ на месте, отметка переживает перезапуск (лежит на диске).
         assert!(paths.load().unwrap().is_some());
-        assert!(leave_excluded(&paths, GroupKey([5; 32]).group_id()).unwrap());
-        assert!(paths.load().unwrap().is_none());
+        assert!(is_excluded(&paths, cur));
+        assert!(!is_excluded(&paths, old));
+        // «Попробовать снова» снимает отметку, «Выйти» стирает и её.
+        clear_excluded(&paths).unwrap();
+        assert!(!is_excluded(&paths, cur));
+        clear_excluded(&paths).unwrap();
+        mark_excluded(&paths, cur).unwrap();
+        paths.reset().unwrap();
+        assert!(!is_excluded(&paths, cur));
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[test]
+    fn known_cards_are_per_group_and_move_with_the_key() {
+        let paths = tmp();
+        let (g2, g5) = (GroupKey([2; 32]), GroupKey([5; 32]));
+        let card = open_entries(&g2, vec![entry(&g2, dev(1), "Ноутбук")])
+            .remove(0)
+            .card
+            .unwrap();
+        assert!(load_known(&paths, g2.group_id()).is_empty());
+        save_known(&paths, g2.group_id(), std::slice::from_ref(&card)).unwrap();
+        assert_eq!(load_known(&paths, g2.group_id()), vec![card.clone()]);
+        assert!(load_known(&paths, g5.group_id()).is_empty(), "чужая группа");
+        // Смена ключа переносит карточки в новую группу.
+        paths.save(&state(2)).unwrap();
+        assert!(adopt_key(&paths, g2.group_id(), g5.clone()).unwrap());
+        assert_eq!(load_known(&paths, g5.group_id()), vec![card]);
+        // Битый файл — просто пусто.
+        std::fs::write(paths.dir.join(KNOWN_FILE), [0xffu8]).unwrap();
+        assert!(load_known(&paths, g5.group_id()).is_empty());
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 

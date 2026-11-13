@@ -154,6 +154,18 @@ export type Status =
   | { kind: 'online' }
   | { kind: 'offline'; detail: string }
   | { kind: 'paused' }
+  /** Сервер сообщил, что устройство исключено: синхронизация остановлена, ключ на месте. */
+  | { kind: 'excluded' }
+
+/** Событие `clipwire://group-rekeyed`. */
+export interface GroupRekeyed {
+  /** Ключ сменили на этом устройстве. */
+  by_me: boolean
+  /** Имя устройства, которое сменило ключ (если не это). */
+  by: string
+  /** Новый код и кому ключ не достался — если сменили здесь. */
+  result: RekeyResult | null
+}
 
 export const api = {
   settings: () => invoke<Settings>('get_settings'),
@@ -183,6 +195,8 @@ export const api = {
   devicesList: () => invoke<GroupDevice[]>('devices_list'),
   deviceRemove: (deviceId: string) => invoke<RekeyResult>('device_remove', { deviceId }),
   groupRekey: () => invoke<RekeyResult>('group_rekey'),
+  /** После исключения: снять отметку и снова запустить синхронизацию. */
+  groupRetry: () => invoke<void>('group_retry'),
   copyQuietly: (text: string) => invoke<void>('copy_quietly', { text }),
   /** Сколько места занимает кэш скачанных файлов, байт. */
   cacheSize: () => invoke<number>('cache_size'),

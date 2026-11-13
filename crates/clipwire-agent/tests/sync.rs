@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clipwire_agent::state::{AgentState, random_key};
-use clipwire_agent::sync::{Engine, Event, Status};
-use clipwire_core::{Content, GroupKey, Invite, ItemId, ServerInfo};
+use clipwire_agent::sync::{Engine, Event, Outgoing, Status};
+use clipwire_core::{Content, GroupKey, Invite, ItemId, ServerInfo, SourceApp};
 use clipwire_server::Config;
 use tokio::sync::mpsc;
 
@@ -38,7 +38,7 @@ async fn start_server() -> Result<(clipwire_server::Running, ServerInfo)> {
 }
 
 struct Agent {
-    local: mpsc::Sender<Content>,
+    local: mpsc::Sender<Outgoing>,
     events: mpsc::UnboundedReceiver<Event>,
     task: tokio::task::JoinHandle<Result<()>>,
 }
@@ -122,13 +122,15 @@ async fn text_goes_from_one_agent_to_another() -> Result<()> {
     b.online().await?;
 
     a.local
-        .send(Content::Text("скопировано на A".into()))
+        .send(Content::Text("скопировано на A".into()).into())
         .await?;
     assert_eq!(b.incoming_text().await?, "скопировано на A");
     // A своё же не получает.
     assert!(a.no_incoming(Duration::from_millis(500)).await);
 
-    b.local.send(Content::Text("ответ с B".into())).await?;
+    b.local
+        .send(Content::Text("ответ с B".into()).into())
+        .await?;
     assert_eq!(a.incoming_text().await?, "ответ с B");
 
     drop(a.local);
@@ -143,8 +145,8 @@ async fn history_respects_cursor() -> Result<()> {
     let mut a = Agent::spawn(&info, &key, None)?;
     a.online().await?;
     let before = ItemId::new();
-    a.local.send(Content::Text("старое".into())).await?;
-    a.local.send(Content::Text("свежее".into())).await?;
+    a.local.send(Content::Text("старое".into()).into()).await?;
+    a.local.send(Content::Text("свежее".into()).into()).await?;
     // Дать серверу сохранить оба элемента.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -173,7 +175,7 @@ async fn cursor_from_future_does_not_block_new_items() -> Result<()> {
     // часами вперёд. С ним новые элементы считались бы уже виденными.
     let mut b = Agent::spawn(&info, &key, Some(ItemId::at_ms(4_070_908_800_000)))?;
     b.online().await?;
-    a.local.send(Content::Text("после".into())).await?;
+    a.local.send(Content::Text("после".into()).into()).await?;
     assert_eq!(b.incoming_text().await?, "после");
     server.shutdown().await
 }
@@ -272,10 +274,53 @@ async fn send_then_shutdown_still_delivers() -> Result<()> {
     a.online().await?;
     b.online().await?;
     a.local
-        .send(Content::Text("последнее слово".into()))
+        .send(Content::Text("последнее слово".into()).into())
         .await?;
     drop(a.local);
     a.task.await??;
     assert_eq!(b.incoming_text().await?, "последнее слово");
+    server.shutdown().await
+}
+
+/// Приложение-источник своего копирования уходит в группу внутри элемента
+/// (`Item.ext`) и приходит на другое устройство.
+#[tokio::test(flavor = "multi_thread")]
+async fn source_app_travels_with_item() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key, None)?;
+    let mut b = Agent::spawn(&info, &key, None)?;
+    a.online().await?;
+    b.online().await?;
+    let app = SourceApp {
+        name: "Блокнот".into(),
+        exe: "notepad.exe".into(),
+        icon_png: vec![1, 2, 3],
+    };
+    a.local
+        .send(Outgoing::new(
+            Content::Text("из блокнота".into()),
+            Some(&app),
+        ))
+        .await?;
+    let item = b
+        .wait(|e| match e {
+            Event::Incoming(item) => Some(item.clone()),
+            _ => None,
+        })
+        .await?;
+    assert_eq!(item.content, Content::Text("из блокнота".into()));
+    assert_eq!(item.source_app(), Some(app));
+    // Без источника — без сведений.
+    a.local
+        .send(Content::Text("без источника".into()).into())
+        .await?;
+    let item = b
+        .wait(|e| match e {
+            Event::Incoming(item) => Some(item.clone()),
+            _ => None,
+        })
+        .await?;
+    assert_eq!(item.source_app(), None);
     server.shutdown().await
 }

@@ -2,9 +2,9 @@
   // Устройства группы: список, удаление устройства и смена ключа группы.
   import { onMount } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
-  import { api, type GroupDevice, type RekeyResult, type Status } from '../lib/api'
+  import { api, type GroupDevice, type GroupRekeyed, type RekeyResult, type Status } from '../lib/api'
   import { ago, plural } from '../lib/format'
-  import { confirmText, deviceTitle, seenLabel } from '../lib/devices'
+  import { CHECKING, confirmText, deviceTitle, seenLabel } from '../lib/devices'
 
   let { onRekeyed }: { onRekeyed?: (invite: string) => void } = $props()
 
@@ -18,6 +18,8 @@
   let confirming = $state<string | null>(null)
   let result = $state<RekeyResult | null>(null)
   let copied = $state(false)
+  /** Ответ на смену ключа потерялся, ждём, что скажет сервер при повторном входе. */
+  let checking = $state(false)
 
   const explain = $derived(confirming === null ? [] : confirmText(list, confirming || null, fmt))
 
@@ -36,17 +38,29 @@
     if (confirming === null) return
     busy = true
     error = ''
+    checking = false
     try {
       const id = confirming
-      result = id ? await api.deviceRemove(id) : await api.groupRekey()
-      confirming = null
-      copied = false
-      onRekeyed?.(result.invite)
+      done(id ? await api.deviceRemove(id) : await api.groupRekey())
     } catch (e) {
-      error = String(e)
+      const msg = String(e)
+      if (msg.includes(CHECKING)) {
+        checking = true
+        confirming = null
+      } else {
+        error = msg
+      }
     } finally {
       busy = false
     }
+  }
+
+  function done(r: RekeyResult) {
+    result = r
+    confirming = null
+    copied = false
+    checking = false
+    onRekeyed?.(r.invite)
   }
 
   async function copyInvite() {
@@ -61,6 +75,15 @@
     const unlisten = [
       listen<Status>('clipwire://status', (e) => {
         if (e.payload.kind === 'online') load()
+      }),
+      // Ключ сменили здесь, а ответ сервера потерялся: успех приходит
+      // событием, когда устройство снова вошло в старую группу.
+      listen<GroupRekeyed>('clipwire://group-rekeyed', (e) => {
+        if (e.payload.by_me && e.payload.result) done(e.payload.result)
+      }),
+      listen<string>('clipwire://group-rekey-failed', (e) => {
+        checking = false
+        error = e.payload
       }),
     ]
     load()
@@ -118,6 +141,7 @@
       Сменить ключ группы
     </button>
   {/if}
+  {#if checking}<p class="hint" role="status">{CHECKING}</p>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if result}
     <div class="done" role="status">

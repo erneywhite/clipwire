@@ -135,10 +135,17 @@ pub struct Guards {
     /// Через сколько удаляется группа, в которую никто не входил и в которой
     /// нет ни элементов, ни файлов. Освобождает места под `max_groups`.
     pub group_idle: Duration,
+    /// Сколько хранить пакеты нового ключа и устройства группы со сменённым
+    /// ключом. Потом от группы остаётся надгробие: строка без пакетов, по
+    /// которой вход старым ключом получает `Excluded`, а не новую группу.
+    pub rotated_keep: Duration,
 }
 
 /// Через сколько удаляется заброшенная группа: 90 дней.
 pub const GROUP_IDLE: Duration = Duration::from_secs(90 * 24 * 3600);
+/// Сколько живут пакеты нового ключа после смены: 30 дней. За это время
+/// выключенные устройства успеют включиться и забрать свой ключ.
+pub const ROTATED_KEEP: Duration = Duration::from_secs(30 * 24 * 3600);
 
 impl Default for Guards {
     fn default() -> Self {
@@ -149,6 +156,7 @@ impl Default for Guards {
             history_total_bytes: 1024 * 1024 * 1024,
             max_device_conns: 4,
             group_idle: GROUP_IDLE,
+            rotated_keep: ROTATED_KEEP,
         }
     }
 }
@@ -171,6 +179,7 @@ impl Guards {
             history_total_bytes: parse("CLIPWIRE_HISTORY_TOTAL_BYTES", d.history_total_bytes)?,
             max_device_conns,
             group_idle: d.group_idle,
+            rotated_keep: d.rotated_keep,
         })
     }
 }

@@ -5,7 +5,8 @@
   import { check, type Update } from '@tauri-apps/plugin-updater'
   import { relaunch } from '@tauri-apps/plugin-process'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { api, type DeviceInfo, type Retention, type Settings, type Status, type Theme } from '../lib/api'
+  import { api, type DeviceInfo, type GroupRekeyed, type Retention, type Settings, type Status, type Theme } from '../lib/api'
+  import { rekeyedBy } from '../lib/devices'
   import { applyTheme } from '../lib/theme'
   import { bytesLabel } from '../lib/format'
   import { fromEvent, label as hotkeyLabel } from '../lib/hotkey'
@@ -66,6 +67,20 @@
   let updateError = $state('')
 
   const configured = $derived(status.kind !== 'unconfigured' && status.kind !== 'local')
+  let retrying = $state(false)
+
+  async function retry() {
+    retrying = true
+    error = ''
+    try {
+      await api.groupRetry()
+      notice = ''
+    } catch (e) {
+      error = String(e)
+    } finally {
+      retrying = false
+    }
+  }
 
   function flash(msg: string) {
     notice = msg
@@ -317,6 +332,8 @@
         return 'Только это устройство'
       case 'unconfigured':
         return 'Синхронизация не запустилась'
+      case 'excluded':
+        return 'Устройство исключено из группы'
     }
   }
 
@@ -340,16 +357,16 @@
         applyTheme(e.payload.theme, e.payload.mode)
       }),
       // Смена ключа группы: старый код приглашения больше не действует.
-      listen<{ by_me: boolean }>('clipwire://group-rekeyed', (e) => {
+      listen<GroupRekeyed>('clipwire://group-rekeyed', (e) => {
         invite = ''
         createdInvite = ''
-        if (!e.payload.by_me) flash('Ключ группы сменён на другом устройстве')
+        if (!e.payload.by_me) notice = `${rekeyedBy(e.payload.by)}. Старый код приглашения больше не действует.`
         refresh()
       }),
       listen('clipwire://group-excluded', () => {
         invite = ''
         createdInvite = ''
-        notice = 'Это устройство удалили из группы. Clipwire работает только здесь, история осталась.'
+        section = 'sync'
         refresh()
       }),
     ]
@@ -447,7 +464,24 @@
         </div>
       {:else if section === 'sync'}
         <h1>Синхронизация</h1>
-        {#if !configured}
+        {#if status.kind === 'excluded'}
+          <div class="card pad">
+            <h2 class="in-card">Устройство исключено из группы</h2>
+            <p class="hint">
+              Сервер сообщил, что этого устройства больше нет в группе: его удалили на другом устройстве, ключ
+              группы сменили, пока оно было не в сети дольше 30 дней, или новый ключ пришёл от устройства, которого
+              здесь не видели. Синхронизация остановлена. Ключ группы и история остались на этом устройстве.
+            </p>
+            <p class="hint">
+              Если вы этого не делали, попробуйте снова. Если устройство и правда удалили, выйдите из группы и
+              подключитесь заново по новому коду приглашения.
+            </p>
+            <div class="buttons">
+              <button class="danger" disabled={retrying} onclick={leave}>Выйти из группы</button>
+              <button disabled={retrying} onclick={retry}>{retrying ? 'Подключаю…' : 'Попробовать снова'}</button>
+            </div>
+          </div>
+        {:else if !configured}
           <p class="lead">
             Сейчас Clipwire работает только на этом устройстве: история и окно вставки есть, синхронизации нет.
             Чтобы буфер был общим с другими компьютерами, подключите сервер. Группу создаёт первое устройство,
@@ -820,6 +854,7 @@
     background: var(--st-paused);
   }
   .status[data-kind='offline'] .dot,
+  .status[data-kind='excluded'] .dot,
   .status[data-kind='unconfigured'] .dot {
     background: var(--st-error);
   }

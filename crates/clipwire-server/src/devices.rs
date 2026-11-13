@@ -18,9 +18,6 @@ use crate::store::{RekeyLimits, RekeyOutcome, Rotation};
 pub const MAX_CARD_BYTES: usize = 4096;
 /// Предел одного пакета нового ключа. Настоящий — 32 + 32 + 24 + 32 + 16 байт.
 pub const MAX_ENVELOPE_BYTES: usize = 512;
-/// Сколько хранить группу со сменённым ключом и её пакеты: за это время
-/// выключенные устройства успеют включиться и забрать свой новый ключ.
-pub const ROTATED_KEEP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Что сказать устройству, которое пришло в группу со сменённым ключом.
 pub fn rotation_msg(r: Rotation) -> ServerMsg {
@@ -116,9 +113,12 @@ async fn remove_files(shared: Arc<Shared>, group: GroupId, blobs: Vec<BlobId>) {
     }
 }
 
-/// Чистка: группы со сменённым ключом старше [`ROTATED_KEEP`] удаляются
-/// вместе с пакетами. Возвращает, сколько групп удалено.
+/// Чистка: у групп, ключ которых сменён раньше `rotated_keep`
+/// (`config::ROTATED_KEEP`, 30 дней), удаляются пакеты, карточки и
+/// устройства, а строка группы остаётся надгробием. Возвращает, сколько групп
+/// стало надгробиями.
 pub fn purge_rotated(shared: &Shared) -> Result<usize> {
-    let before = now_ms() - ROTATED_KEEP.as_millis() as i64;
-    shared.store.purge_rotated(before)
+    let now = now_ms();
+    let before = now - shared.limits.rotated_keep.as_millis() as i64;
+    shared.store.purge_rotated(before, now)
 }

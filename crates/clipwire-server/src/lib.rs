@@ -184,6 +184,7 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
     let purge_every = PURGE_EVERY
         .min(guards.reserve_ttl)
         .min(guards.group_idle)
+        .min(guards.rotated_keep)
         .max(Duration::from_secs(1));
 
     let purge = {
@@ -209,7 +210,7 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
                 }
                 match devices::purge_rotated(&shared) {
                     Ok(0) => {}
-                    Ok(n) => tracing::info!("удалено групп со сменённым ключом: {n}"),
+                    Ok(n) => tracing::info!("групп со сменённым ключом стало надгробиями: {n}"),
                     Err(e) => tracing::warn!("очистка групп со сменённым ключом не удалась: {e:#}"),
                 }
                 // После чистки истории и файлов: у заброшенной группы их уже нет.

@@ -68,7 +68,8 @@ pub async fn editor_save(app: AppHandle, png: String, paste: bool) -> Result<(),
         height: img.height(),
         png,
     };
-    crate::popup::copy(&app, content)?;
+    // Картинка из редактора — новое содержимое, приложения-источника у неё нет.
+    crate::popup::copy(&app, content, None)?;
     let _ = app.emit("clipwire://history-changed", ());
     crate::popup::return_and_paste(&app, "editor", paste).await;
     Ok(())

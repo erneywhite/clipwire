@@ -204,7 +204,12 @@ impl Store {
         let outcome = match existing {
             None if !may_create => return Ok(JoinOutcome::NoGroup),
             None => {
-                let groups: i64 = tx.query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0))?;
+                // Надгробия сменённых групп (`store/devices.rs`) места не занимают.
+                let groups: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM groups WHERE tombstone_ms IS NULL",
+                    [],
+                    |r| r.get(0),
+                )?;
                 if groups as u64 >= max_groups as u64 {
                     return Ok(JoinOutcome::TooManyGroups);
                 }
