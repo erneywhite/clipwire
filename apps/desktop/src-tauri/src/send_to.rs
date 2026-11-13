@@ -110,24 +110,31 @@ fn flush(app: &AppHandle) {
             .unwrap_or_else(|e| e.into_inner()),
     );
     let paths = clean(paths);
-    if paths.is_empty() {
-        return;
-    }
-    #[cfg(windows)]
-    {
-        let n = paths.len();
-        let files = paths
-            .iter()
-            .map(|p| clipwire_agent::clipboard::local_file_ref(p))
-            .collect();
-        let text = match crate::popup::copy(app, clipwire_core::Content::Files(files), None) {
-            Ok(()) if n == 1 => "Файл в Clipwire".to_string(),
-            Ok(()) => format!("В Clipwire: {n} {}", files_word(n)),
-            Err(e) => format!("Не удалось отправить в Clipwire: {e}"),
-        };
-        crate::updates::notify(app, &text);
+    if !paths.is_empty() {
+        send(app, &paths);
     }
 }
+
+/// Скопировать файлы как пользователь и сказать об этом уведомлением.
+#[cfg(windows)]
+fn send(app: &AppHandle, paths: &[PathBuf]) {
+    let n = paths.len();
+    let files = paths
+        .iter()
+        .map(|p| clipwire_agent::clipboard::local_file_ref(p))
+        .collect();
+    let text = match crate::popup::copy(app, clipwire_core::Content::Files(files), None) {
+        Ok(()) if n == 1 => "Файл в Clipwire".to_string(),
+        Ok(()) => format!("В Clipwire: {n} {}", files_word(n)),
+        Err(e) => format!("Не удалось отправить в Clipwire: {e}"),
+    };
+    crate::updates::notify(app, &text);
+}
+
+// shortcut: пункт меню есть только в Проводнике; для Linux и macOS сделать
+// вместе с их клиентами (Nautilus scripts, Finder Quick Action).
+#[cfg(not(windows))]
+fn send(_app: &AppHandle, _paths: &[PathBuf]) {}
 
 #[cfg(windows)]
 fn files_word(n: usize) -> &'static str {
