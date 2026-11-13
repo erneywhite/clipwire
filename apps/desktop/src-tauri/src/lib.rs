@@ -428,26 +428,22 @@ pub fn run() {
             app.state::<AppState>()
                 .service_attempted
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            let configured = match started {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("синхронизация не запустилась: {e:#}");
-                    false
-                }
-            };
+            if let Err(e) = started {
+                tracing::error!("синхронизация не запустилась: {e:#}");
+            }
             // Перед установкой обновления синхронизация стояла на паузе.
             if after_update.paused {
                 updates::restore_pause(app.handle());
             }
             publish_status(app.handle());
 
-            // Без группы или при обычном запуске — показываем настройки;
-            // из автозагрузки — только трей.
-            // После автоматического обновления — тоже только трей: человек
-            // программу не открывал.
-            if !configured
-                || (!after_update.after_auto && !std::env::args().any(|a| a == "--background"))
-            {
+            // Обычный запуск — показываем настройки. Из автозагрузки и после
+            // автоматического обновления — только трей: человек программу не
+            // открывал. Это и без группы: локальный режим — нормальная работа,
+            // окно при каждом входе в систему ни к чему, а сбой синхронизации
+            // виден по значку в трее.
+            let background = std::env::args().any(|a| a == "--background");
+            if !background && !after_update.after_auto {
                 show_settings(app.handle());
             }
             Ok(())
