@@ -138,6 +138,10 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
         std::sync::Arc::new(move |e| match e {
             UiEvent::Status(_) => publish_status(&handle),
             UiEvent::Copied(_) | UiEvent::Received(_) | UiEvent::HistoryMerged(_) => {
+                // Своё копирование откладывает автообновление.
+                if updates::is_activity(&e) {
+                    updates::touch(&handle);
+                }
                 let _ = handle.emit("clipwire://history-changed", ());
             }
             UiEvent::Transfer(t) => {
@@ -389,7 +393,7 @@ pub fn run() {
         .setup(|app| {
             // Первым делом: обновление, скачанное в прошлый раз, ставится до
             // запуска движка, а после автоматической установки окно не нужно.
-            let after_auto_update = updates::on_startup(app.handle());
+            let after_update = updates::on_startup(app.handle());
             let hide_from_capture = app
                 .state::<AppState>()
                 .settings
@@ -428,13 +432,18 @@ pub fn run() {
                     false
                 }
             };
+            // Перед установкой обновления синхронизация стояла на паузе.
+            if after_update.paused {
+                updates::restore_pause(app.handle());
+            }
             publish_status(app.handle());
 
             // Без группы или при обычном запуске — показываем настройки;
             // из автозагрузки — только трей.
             // После автоматического обновления — тоже только трей: человек
             // программу не открывал.
-            if !configured || (!after_auto_update && !std::env::args().any(|a| a == "--background"))
+            if !configured
+                || (!after_update.after_auto && !std::env::args().any(|a| a == "--background"))
             {
                 show_settings(app.handle());
             }

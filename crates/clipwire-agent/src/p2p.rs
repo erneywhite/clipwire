@@ -494,9 +494,12 @@ async fn handle(inc: Incoming, ctx: &Ctx, pending: OwnedSemaphorePermit) -> Resu
             }
         };
         let (blobs, in_use) = (blobs.clone(), usage.begin());
+        // Для автообновления: пока отдаём файл, программу не перезапускать.
+        let serving = crate::activity::SERVING.begin();
         tasks.spawn(async move {
             let _permit = permit;
             let _in_use = in_use;
+            let _serving = serving;
             if let Err(e) = serve_get(send, recv, &blobs).await {
                 tracing::info!("прямая отдача файла прервалась: {e:#}");
             }
