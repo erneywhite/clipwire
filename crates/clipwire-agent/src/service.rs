@@ -203,6 +203,7 @@ impl Service {
     ) -> Result<Self> {
         let paused = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(Status::Connecting));
+        let paths_dir = paths.dir.clone();
         let guard = Arc::new(LoopGuard::default());
 
         // Текущее содержимое буфера на старте не отправляем, но запоминаем,
@@ -379,7 +380,25 @@ impl Service {
         // Изменения буфера ОС.
         let watcher = {
             let (paused, guard, copier) = (paused.clone(), guard.clone(), copier.clone());
-            Watcher::start(move |content, owner| {
+            let opts = {
+                let (paused, ignored) = (paused.clone(), ignored_apps.clone());
+                clipboard::WatchOptions {
+                    virtual_dir: clipboard::virtual_dir(&paths_dir),
+                    limit_mb: copier.limit_mb.clone(),
+                    // Пауза и игнорируемые программы проверяются ещё раз в
+                    // колбэке, здесь — чтобы не писать файлы на диск зря.
+                    accept_virtual: Box::new(move |owner| {
+                        if paused.load(Ordering::Relaxed) {
+                            return false;
+                        }
+                        let exe = owner.and_then(crate::source_app::file_name);
+                        !exe.is_some_and(|exe| {
+                            is_ignored(&ignored.lock().unwrap_or_else(|e| e.into_inner()), &exe)
+                        })
+                    }),
+                }
+            };
+            Watcher::start(opts, move |content, owner| {
                 if paused.load(Ordering::Relaxed) {
                     return;
                 }

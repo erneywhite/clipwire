@@ -17,3 +17,5 @@ pub mod source_app;
 pub mod state;
 pub mod sync;
 pub mod uploaded;
+#[cfg(windows)]
+pub mod virtual_files;
