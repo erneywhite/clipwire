@@ -266,6 +266,18 @@
     if (ctx) paint(ctx, false)
   }
 
+  /** Вписать картинку в окно: крупные уменьшаются, мелкие увеличиваются.
+   *  Это только показ, рисуем и сохраняем в исходном разрешении. */
+  function layout() {
+    if (!canvas || !stage || !W) return
+    const cs = getComputedStyle(stage)
+    const aw = stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)
+    const ah = stage.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom)
+    const k = Math.max(0.01, Math.min(aw / W, ah / H))
+    canvas.style.width = `${Math.floor(W * k)}px`
+    canvas.style.height = `${Math.floor(H * k)}px`
+  }
+
   function accent(): string {
     return getComputedStyle(document.documentElement).getPropertyValue('--c-accent').trim() || '#e2a63b'
   }
@@ -524,6 +536,7 @@
         canvas.width = W
         canvas.height = H
       }
+      layout()
       pickTool(tool)
       render()
     } catch (e) {
@@ -618,7 +631,10 @@
 
   onMount(() => {
     api.settings().then(applySettings)
-    const ro = new ResizeObserver(() => render())
+    const ro = new ResizeObserver(() => {
+      layout()
+      render()
+    })
     if (stage) ro.observe(stage)
     const unlisten = [
       listen<string>('editor://open', (e) => open(e.payload)),
@@ -834,8 +850,6 @@
   }
   canvas {
     display: block;
-    max-width: 100%;
-    max-height: 100%;
     touch-action: none;
     box-shadow: 0 0 0 1px var(--c-border);
   }
