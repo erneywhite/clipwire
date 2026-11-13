@@ -26,7 +26,8 @@ pub enum UiEvent {
     Copied(Content),
     /// Пришло с другого устройства.
     Received(Item),
-    /// В историю влились элементы с других устройств (без записи в буфер).
+    /// В историю влились элементы без записи в буфер: с других устройств
+    /// или виртуальные файлы, дочитанные после смены буфера.
     HistoryMerged(usize),
     /// Прогресс загрузки или скачивания файла (не чаще раза в 200 мс на файл
     /// плюс финальное).
@@ -135,6 +136,35 @@ impl Copier {
             content
         };
         self.finish(content, send, source);
+    }
+
+    /// Виртуальные файлы, дочитанные после того, как буфер сменился: в
+    /// историю на место по времени начала чтения, не наверх и не в группу,
+    /// чтобы не перекрыть то, что скопировали позже. `false` — не записано.
+    // shortcut: в группу такие файлы не уходят вовсе (движок шлёт только
+    // текущий элемент); если понадобится — отправлять их как запись истории.
+    fn record_late(&self, content: Content, source: Option<SourceApp>, seen_ms: i64) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        let mut entry = local_entry(self.device, &self.device_name, content);
+        entry.seen_ms = seen_ms;
+        if let Some(app) = &source {
+            entry.set_source_app(app);
+        }
+        let added = self
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .merge(entry)
+            .unwrap_or_else(|e| {
+                tracing::warn!("не записалось в историю: {e:#}");
+                false
+            });
+        if added {
+            (self.on_event)(UiEvent::HistoryMerged(1));
+        }
+        added
     }
 
     fn is_cancelled(&self) -> bool {
@@ -404,6 +434,17 @@ impl Service {
         // Изменения буфера ОС.
         let watcher = {
             let (paused, guard, copier) = (paused.clone(), guard.clone(), copier.clone());
+            let late: clipboard::OnLateVirtual = {
+                let (paused, copier) = (paused.clone(), copier.clone());
+                Box::new(move |content, owner, started_ms| {
+                    // Пауза включилась, пока файлы читались: не берём.
+                    if paused.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                    let source = owner.as_deref().and_then(crate::source_app::lookup);
+                    copier.record_late(content, source, started_ms)
+                })
+            };
             let opts = {
                 let (paused, ignored) = (paused.clone(), ignored_apps.clone());
                 clipboard::WatchOptions {
@@ -420,6 +461,7 @@ impl Service {
                             is_ignored(&ignored.lock().unwrap_or_else(|e| e.into_inner()), &exe)
                         })
                     }),
+                    on_late_virtual: late,
                 }
             };
             Watcher::start(opts, move |content, owner| {
@@ -1006,6 +1048,77 @@ mod tests {
         let e = h.find(&Content::Text("раз".into())).unwrap();
         assert_eq!(e.source_app(), Some(app), "источник записан в историю");
         drop(h);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Виртуальные файлы, дочитанные после смены буфера, встают в историю
+    /// на время начала чтения, ниже скопированного позже, и не уходят в
+    /// группу.
+    #[tokio::test]
+    async fn late_virtual_files_go_to_history_below_newer() {
+        let d = tmp("late");
+        let history = Arc::new(Mutex::new(History::open(&d).unwrap()));
+        let (tx, mut rx) = mpsc::channel(4);
+        let merged = Arc::new(AtomicU64::new(0));
+        let m2 = merged.clone();
+        let c = Copier {
+            tx: Arc::new(Mutex::new(Some(tx))),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            history: history.clone(),
+            device: DeviceId([1; 32]),
+            device_name: "тест".into(),
+            on_event: Arc::new(move |e| match e {
+                UiEvent::HistoryMerged(n) => {
+                    m2.fetch_add(n as u64, Ordering::SeqCst);
+                }
+                UiEvent::Copied(_) | UiEvent::NewEntry => panic!("позднее — не текущий буфер"),
+                _ => {}
+            }),
+            blobs: None,
+            limit_mb: Arc::new(AtomicU64::new(1)),
+            rt: tokio::runtime::Handle::current(),
+        };
+        let started = now_ms() - 5_000;
+        history
+            .lock()
+            .unwrap()
+            .add(local_entry(
+                DeviceId([1; 32]),
+                "тест",
+                Content::Text("позже".into()),
+            ))
+            .unwrap();
+        let file = FileRef {
+            name: "вложение.txt".into(),
+            path: d.join("вложение.txt").to_string_lossy().into_owned(),
+            size: 1,
+            is_dir: false,
+            width: 0,
+            height: 0,
+            modified_ms: 0,
+            blob: None,
+            blob_size: 0,
+            p2p: false,
+        };
+        let late = Content::Files(vec![file]);
+        assert!(c.record_late(late.clone(), None, started));
+        assert_eq!(merged.load(Ordering::SeqCst), 1);
+        let h = history.lock().unwrap();
+        let list = h.list("", false, 10);
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            list[0].content,
+            Content::Text("позже".into()),
+            "наверху — новое"
+        );
+        assert_eq!(list[1].content, late);
+        assert_eq!(list[1].seen_ms, started);
+        drop(h);
+        // В группу ничего не ушло.
+        assert!(rx.try_recv().is_err());
+        // Снятый сервис не пишет.
+        c.cancel();
+        assert!(!c.record_late(Content::Text("x".into()), None, started));
         let _ = std::fs::remove_dir_all(d);
     }
 

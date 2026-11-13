@@ -211,7 +211,7 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
             UiEvent::Status(Status::Connecting) => eprintln!("подключение…"),
             UiEvent::Copied(_) => eprintln!("отправлено скопированное"),
             UiEvent::Received(_) => eprintln!("получено с другого устройства"),
-            UiEvent::HistoryMerged(n) => eprintln!("в историю добавлено с других устройств: {n}"),
+            UiEvent::HistoryMerged(n) => eprintln!("в историю добавлено без записи в буфер: {n}"),
             UiEvent::NewEntry => {}
             UiEvent::Transfer(t) => match t.state {
                 TransferState::Active => {}

@@ -20,7 +20,7 @@
   let copied = $state(false)
   /** Ответ на смену ключа потерялся, ждём, что скажет сервер при повторном входе. */
   let checking = $state(false)
-  /** Вид хранилища файлов группы: у внешнего доступы остаются у исключённого. */
+  /** Вид хранилища файлов группы: у внешнего доступы остаются у тех, кто окажется вне группы. */
   let storageKind = $state<StorageKind | null>(null)
 
   const explain = $derived(confirming === null ? [] : confirmText(list, confirming || null, fmt, storageKind))

@@ -33,15 +33,22 @@ export function leftOut(list: GroupDevice[], removeId: string | null): GroupDevi
   return list.filter((d) => !d.me && !d.known && d.id !== removeId)
 }
 
-/** Предупреждение про доступы к внешнему хранилищу у исключаемого устройства. */
-export function exposedAccessText(kind: StorageKind | null): string {
-  if (kind === 's3') {
-    return 'Внимание: у исключённого устройства остались доступы к хранилищу файлов. Смените ключ S3 у поставщика хранилища и сохраните новый в настройках «Хранилище файлов».'
-  }
-  if (kind === 'sftp') {
-    return 'Внимание: у исключённого устройства остались доступы к хранилищу файлов. Смените пароль или ключ SSH на сервере и сохраните новые в настройках «Хранилище файлов».'
-  }
-  return ''
+/**
+ * Предупреждение про доступы к внешнему хранилищу у устройств, которые
+ * окажутся вне группы: исключаемого (`removing`) и/или оставшихся без
+ * нового ключа (`leftOut`, их `lost` штук).
+ */
+export function exposedAccessText(kind: StorageKind | null, removing = true, lost = 0): string {
+  const fix =
+    kind === 's3'
+      ? 'Смените ключ S3 у поставщика хранилища и сохраните новый в настройках «Хранилище файлов».'
+      : kind === 'sftp'
+        ? 'Смените пароль или ключ SSH на сервере и сохраните новые в настройках «Хранилище файлов».'
+        : ''
+  if (!fix || (!removing && lost === 0)) return ''
+  const unknown = lost === 1 ? 'у устройства без карточки' : 'у устройств без карточки'
+  const who = removing && lost > 0 ? `у исключённого устройства и ${unknown}` : removing ? 'у исключённого устройства' : unknown
+  return `Внимание: ${who} остались доступы к хранилищу файлов. ${fix}`
 }
 
 /**
@@ -55,16 +62,18 @@ export function confirmText(list: GroupDevice[], removeId: string | null, { plur
     out.push(
       `«${deviceTitle(target)}» потеряет доступ к группе: не получит новые элементы и файлы и не сможет вернуться по старому коду приглашения. То, что уже есть на нём, останется.`,
     )
-    const exposed = exposedAccessText(storage)
-    if (exposed) out.push(exposed)
   }
+  const lost = leftOut(list, removeId)
+  // Доступы к внешнему хранилищу остаются у всех, кто окажется вне группы:
+  // и у исключаемого, и у тех, кому новый ключ не передать.
+  const exposed = exposedAccessText(storage, !!target, lost.length)
+  if (exposed) out.push(exposed)
   const others = list.filter((d) => !d.me && d.known && d.id !== removeId)
   if (others.length > 0) {
     out.push(
       `${others.length} ${plural(others.length, ['устройство получит', 'устройства получат', 'устройств получат'])} новый ключ сами, когда будут в сети.`,
     )
   }
-  const lost = leftOut(list, removeId)
   if (lost.length > 0) {
     const ids = lost.map((d) => d.fingerprint).join(', ')
     out.push(

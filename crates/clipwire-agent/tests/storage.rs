@@ -341,6 +341,85 @@ async fn files_go_through_external_store() -> Result<()> {
     server.shutdown().await
 }
 
+/// Папка, при первом резерве (`meta`) которой устройство узнаёт, что у
+/// соседа настройки новее: между резервом и загрузкой свои устаревают.
+struct StaleAfterReserve {
+    inner: DirStore,
+    storage: Arc<GroupStorage>,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl ObjectStore for StaleAfterReserve {
+    fn put<'a>(&'a self, name: &'a str, data: Vec<u8>) -> StoreFuture<'a, ()> {
+        if name.ends_with("/meta") && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.storage.note_version(self.storage.version() + 1);
+        }
+        self.inner.put(name, data)
+    }
+    fn get<'a>(&'a self, name: &'a str, max: u64) -> StoreFuture<'a, Option<Vec<u8>>> {
+        self.inner.get(name, max)
+    }
+    fn head<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<ObjectInfo>> {
+        self.inner.head(name)
+    }
+    fn delete<'a>(&'a self, name: &'a str) -> StoreFuture<'a, ()> {
+        self.inner.delete(name)
+    }
+    fn list<'a>(&'a self, dir: &'a str) -> StoreFuture<'a, Vec<ObjectInfo>> {
+        self.inner.list(dir)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reserved_file_finishes_in_its_store_after_settings_go_stale() -> Result<()> {
+    let server_dir = tmp("server");
+    let (server, info) = start_server(&server_dir).await?;
+    let key = GroupKey::generate()?;
+    let shared = tmp("bucket");
+    let mut a = Agent::spawn(&info, &key, &tmp("a"))?;
+    let mut b = Agent::spawn(&info, &key, &tmp("b"))?;
+    let gated = StaleAfterReserve {
+        inner: DirStore::new(&shared),
+        storage: a.blobs.storage().clone(),
+        fired: false.into(),
+    };
+    a.blobs.storage().use_store(7, Arc::new(gated));
+    b.blobs
+        .storage()
+        .use_store(7, Arc::new(DirStore::new(&shared)));
+    a.online().await?;
+    b.online().await?;
+
+    let src = tmp("src");
+    let (data, f) = make_file(&src, "устарели посреди.bin", CHUNK as u64 * 3 / 2);
+    a.local
+        .as_ref()
+        .unwrap()
+        .send(Content::Files(vec![f.clone()]).into())
+        .await?;
+    let item = b.incoming().await?;
+    let p = places(&item.ext);
+    assert_eq!(
+        p,
+        vec![(f.blob.unwrap(), BlobPlace::External { config_version: 7 })]
+    );
+    // Новые резервы по устаревшим настройкам не заводятся...
+    assert!(a.blobs.storage().external().is_none());
+    let Content::Files(files) = &item.content else {
+        unreachable!()
+    };
+    // ...а заведённый догружается в то же хранилище: B не ждёт брошенную
+    // загрузку десять минут, а получает файл.
+    let got =
+        tokio::time::timeout(T, b.blobs.download_all_at(files, DeviceId([0; 32]), &p)).await??;
+    assert_eq!(std::fs::read(&got[0])?, data);
+    assert!(!on_server(&server_dir, &key, f.blob.unwrap()));
+
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
 /// Хранилище, которое всегда недоступно.
 struct DownStore;
 

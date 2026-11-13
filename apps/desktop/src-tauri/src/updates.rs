@@ -79,6 +79,18 @@ fn norm(v: &str) -> String {
     v.trim().trim_start_matches('v').to_string()
 }
 
+/// Запущенная версия `current` не старше поставленной `installed` (semver).
+/// Версии, которые не разбираются, сравниваются как строки на равенство.
+fn not_older(current: &str, installed: &str) -> bool {
+    match (
+        semver::Version::parse(&norm(current)),
+        semver::Version::parse(&norm(installed)),
+    ) {
+        (Ok(c), Ok(i)) => c >= i,
+        _ => norm(current) == norm(installed),
+    }
+}
+
 /// Версия, установка которой не удалась.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Failed {
@@ -107,15 +119,17 @@ pub struct Verdict {
     pub failed: Option<Failed>,
 }
 
-/// Разобрать пометку: запустилась поставленная версия — установка прошла и
-/// прошлые неудачи забываются, иначе — ещё одна неудача этой версии.
+/// Разобрать пометку: запустилась поставленная версия или новее — установка
+/// прошла (или человек сам поставил версию поновее) и прошлые неудачи
+/// забываются, иначе — ещё одна неудача этой версии. Сообщение «обновлён до
+/// X» — только о той версии, что ставили.
 pub fn judge(
     current: &str,
     installed: &str,
     announced: Option<&str>,
     failed: Option<Failed>,
 ) -> Verdict {
-    if norm(installed) == norm(current) {
+    if not_older(current, installed) {
         return Verdict {
             announce: should_announce(current, Some(installed), announced),
             failed: None,
@@ -394,15 +408,29 @@ fn install_pending(app: &AppHandle, dir: &Path, paused: bool) -> Result<(), Stri
 /// справился ли установщик. Поэтому скачанное удаляется сейчас, чтобы
 /// упавший установщик не запускался снова при каждом старте, а неудачу
 /// запомнит следующий запуск по пометке (`announce`). Возвращает путь
-/// пометки.
-fn prepare_install(dir: &Path, inst: &Installing) -> PathBuf {
+/// пометки и записалась ли она.
+fn prepare_install(dir: &Path, inst: &Installing) -> (PathBuf, std::io::Result<()>) {
     forget_pending(dir);
     let marker = dir.join("installing.json");
     let written = std::fs::create_dir_all(dir).and_then(|_| write_json(&marker, inst));
-    if let Err(e) = written {
+    if let Err(e) = &written {
         tracing::warn!("не записалась пометка об установке: {e}");
     }
-    marker
+    (marker, written)
+}
+
+/// Можно ли запускать установщик после [`prepare_install`]. Без пометки
+/// следующий запуск не узнает о неудаче, и автоматическая установка пошла бы
+/// по кругу «поставил — пропал из трея» (а нехватка места — как раз частая
+/// причина и неудачи установщика, и незаписанной пометки). Поэтому сама
+/// программа без пометки не ставит; по кнопке человек видит, что происходит.
+fn may_run_installer(auto: bool, marker: &std::io::Result<()>) -> Result<(), String> {
+    match marker {
+        Err(e) if auto => Err(format!(
+            "не записалась пометка об установке ({e}), автоматическая установка отложена"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Пометка, проверка подписи и запуск установщика. На Windows при успехе не
@@ -419,7 +447,8 @@ fn run_installer(
         auto,
         paused,
     };
-    let marker = prepare_install(&dir(app), &inst);
+    let (marker, written) = prepare_install(&dir(app), &inst);
+    may_run_installer(auto, &written)?;
     // `install` ещё раз проверяет подпись.
     if let Err(e) = update.install(bytes) {
         let _ = std::fs::remove_file(&marker);
@@ -684,7 +713,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("pending.bin"), b"exe").unwrap();
         std::fs::write(dir.join("pending.json"), b"{}").unwrap();
-        let marker = prepare_install(
+        let (marker, written) = prepare_install(
             &dir,
             &Installing {
                 version: "0.1.1".into(),
@@ -692,12 +721,35 @@ mod tests {
                 paused: true,
             },
         );
+        assert!(written.is_ok() && may_run_installer(true, &written).is_ok());
         assert!(!dir.join("pending.bin").exists());
         assert!(!dir.join("pending.json").exists());
         let inst: Installing = read_json(&marker).unwrap();
         assert_eq!(inst.version, "0.1.1");
         assert!(inst.auto && inst.paused);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Пометка не записалась (на месте папки файл — как и при нехватке
+    /// места, запись падает): сама программа не ставит, по кнопке — можно.
+    #[test]
+    fn no_marker_no_auto_install() {
+        let base = std::env::temp_dir().join(format!("clipwire-upd-nomark-{}", now_ms()));
+        std::fs::create_dir_all(&base).unwrap();
+        let blocked = base.join("update");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let (_, written) = prepare_install(
+            &blocked,
+            &Installing {
+                version: "0.1.1".into(),
+                auto: true,
+                paused: false,
+            },
+        );
+        assert!(written.is_err());
+        assert!(may_run_installer(true, &written).is_err());
+        assert!(may_run_installer(false, &written).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Неудача, замеченная на запуске, обрывает цикл «скачал — поставил —
@@ -726,6 +778,22 @@ mod tests {
         // Неудача другой версии начинает счёт заново.
         let v = judge("0.1.0", "0.1.2", None, v.failed);
         assert_eq!(v.failed.as_ref().map(|f| f.attempts), Some(1));
+        // Тихая установка 0.1.1 упала, человек сам поставил 0.1.2: не
+        // неудача и не «обновлён до 0.1.1», прошлые неудачи забываются.
+        let newer = judge("0.1.2", "0.1.1", None, v.failed.clone());
+        assert_eq!(
+            newer,
+            Verdict {
+                announce: false,
+                failed: None
+            }
+        );
+        assert!(
+            judge("v0.1.10", "0.1.9", None, None).failed.is_none(),
+            "semver, не строки"
+        );
+        assert!(judge("0.1.1", "0.1.1-beta.1", None, None).failed.is_none());
+        assert!(judge("0.1.1-beta.1", "0.1.1", None, None).failed.is_some());
         // Поставилась (например, по кнопке) — сообщаем, неудачи забываем.
         let v = judge("0.1.2", "0.1.2", Some("0.1.0"), v.failed);
         assert_eq!(

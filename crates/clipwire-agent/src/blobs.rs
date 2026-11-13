@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, watch};
 
+use crate::storage::ObjectStore;
+
 /// Через сколько после запуска движка первый раз чистить внешнее хранилище.
 const EXTERNAL_CLEANUP_DELAY: Duration = Duration::from_secs(60);
 
@@ -808,6 +810,9 @@ pub async fn upload_blob(
 /// Сколько ждать ответа на `Reserve` и `Abort`.
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Сколько ждать удаления папки файла из внешнего хранилища.
+const DROP_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Короткий запрос по своему потоку: отправить, дождаться одного ответа.
 async fn control(conn: &Connection, req: BlobRequest) -> Result<BlobReply, UploadError> {
     tokio::time::timeout(CONTROL_TIMEOUT, async {
@@ -1499,11 +1504,35 @@ impl Blobs {
     /// дочистит срок хранения).
     async fn drop_external(&self, blob: BlobId) {
         if let Some((_, store)) = self.storage.external() {
-            let dir = crate::storage::external::blob_dir(&self.key.group_id(), blob);
-            if let Err(e) = store.delete_dir(&dir).await {
-                tracing::info!(blob = %blob.hex(), "файл не удалился из внешнего хранилища: {e}");
+            self.drop_external_in(store.as_ref(), blob).await;
+        }
+    }
+
+    /// То же в заданном хранилище. Не дольше [`DROP_TIMEOUT`]: хранилище
+    /// недоверенное, и зависшее удаление не должно держать загрузку.
+    async fn drop_external_in(&self, store: &dyn ObjectStore, blob: BlobId) {
+        let dir = crate::storage::external::blob_dir(&self.key.group_id(), blob);
+        match tokio::time::timeout(DROP_TIMEOUT, store.delete_dir(&dir)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::info!(blob = %blob.hex(), "файл не удалился из внешнего хранилища: {e}")
+            }
+            Err(_) => {
+                tracing::info!(blob = %blob.hex(), "удаление из внешнего хранилища не уложилось в срок")
             }
         }
+    }
+
+    /// Внешнее хранилище для задания, заведённого там: то, где лежит его
+    /// `meta`, даже если свои настройки с тех пор устарели
+    /// ([`GroupStorage::external_for`]). Если с тех пор применены другие
+    /// настройки — текущее внешнее хранилище (`upload` заведёт `meta` там
+    /// заново). `None` — грузить через сервер.
+    fn job_store(&self, job: &UploadJob) -> Option<Arc<dyn ObjectStore>> {
+        let v = job.external?;
+        self.storage
+            .external_for(v)
+            .or_else(|| self.storage.external().map(|(_, s)| s))
     }
 
     /// Отменить резерв этих файлов на сервере при ближайшем соединении
@@ -1908,7 +1937,7 @@ impl Blobs {
             // Файл грузится во внешнее хранилище: резерв на сервере ему не
             // нужен и только занял бы квоту. Если группа с тех пор вернулась
             // на сервер, загрузка пойдёт туда, и резерв продлевается.
-            if job.external.is_some() && self.storage.external().is_some() {
+            if self.job_store(&job).is_some() {
                 continue;
             }
             let queued = self
@@ -2106,8 +2135,8 @@ impl Blobs {
             self.transfers
                 .progress(job.blob, Direction::Up, done, total)
         };
-        let res = match (job.external, self.storage.external()) {
-            (Some(_), Some((_, store))) => {
+        let res = match self.job_store(job) {
+            Some(store) => {
                 let res =
                     crate::storage::external::upload(store.as_ref(), &self.key, job, progress)
                         .await;
@@ -2120,11 +2149,11 @@ impl Blobs {
                         self.storage.warn(format!(
                             "Внешнее хранилище отказало ({e}), файл отправляется через сервер Clipwire"
                         ));
-                        self.drop_external(job.blob).await;
+                        self.drop_external_in(store.as_ref(), job.blob).await;
                         upload_blob(conn, &self.key, job, progress).await
                     }
                     Err(e @ (UploadError::Changed | UploadError::Missing)) => {
-                        self.drop_external(job.blob).await;
+                        self.drop_external_in(store.as_ref(), job.blob).await;
                         Err(e)
                     }
                     r => r,

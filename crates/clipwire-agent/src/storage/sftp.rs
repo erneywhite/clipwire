@@ -17,9 +17,9 @@ use std::time::Duration;
 use clipwire_core::storage::{SftpAuth, SftpConfig};
 use russh::client;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
-use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpError;
-use russh_sftp::protocol::StatusCode;
+use russh_sftp::client::{RawSftpSession, SftpSession};
+use russh_sftp::protocol::{FileAttributes, Name, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{ObjectInfo, ObjectStore, StoreError, StoreFuture, check_name, join_prefix};
@@ -65,7 +65,16 @@ impl client::Handler for HostCheck {
 struct Conn {
     // Держим соединение, пока жива сессия SFTP.
     _handle: client::Handle<HostCheck>,
+    link: Link,
+}
+
+/// Две сессии SFTP на одном SSH-соединении. Высокоуровневая — для файлов;
+/// низкоуровневая — для чтения папок: `SftpSession::read_dir` копит ответы
+/// READDIR до EOF без предела, а здесь записи считаются после каждого ответа.
+#[derive(Clone)]
+struct Link {
     sftp: Arc<SftpSession>,
+    raw: Arc<RawSftpSession>,
 }
 
 pub struct SftpStore {
@@ -204,33 +213,33 @@ impl SftpStore {
                 self.cfg.user
             )));
         }
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| StoreError::Network(e.to_string()))?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .map_err(|e| StoreError::Network(e.to_string()))?;
-        let sftp = SftpSession::new(channel.into_stream())
+        let sftp = SftpSession::new(open_sftp_channel(&handle).await?)
             .await
             .map_err(|e| StoreError::Other(format!("сервер не дал SFTP: {e}")))?;
         sftp.set_timeout(OP_TIMEOUT_SECS);
+        let raw = RawSftpSession::new(open_sftp_channel(&handle).await?);
+        raw.set_timeout(OP_TIMEOUT_SECS);
+        raw.init()
+            .await
+            .map_err(|e| StoreError::Other(format!("сервер не дал SFTP: {e}")))?;
         Ok(Conn {
             _handle: handle,
-            sftp: Arc::new(sftp),
+            link: Link {
+                sftp: Arc::new(sftp),
+                raw: Arc::new(raw),
+            },
         })
     }
 
-    async fn session(&self) -> Result<Arc<SftpSession>, StoreError> {
+    async fn session(&self) -> Result<Link, StoreError> {
         let mut g = self.conn.lock().await;
         if let Some(c) = g.as_ref()
             && !c._handle.is_closed()
         {
-            return Ok(c.sftp.clone());
+            return Ok(c.link.clone());
         }
         let c = self.connect().await?;
-        let s = c.sftp.clone();
+        let s = c.link.clone();
         *g = Some(c);
         Ok(s)
     }
@@ -240,6 +249,15 @@ impl SftpStore {
     async fn run<T, F, Fut>(&self, f: F) -> Result<T, StoreError>
     where
         F: FnOnce(Arc<SftpSession>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, StoreError>>,
+    {
+        self.run_link(|l| f(l.sftp)).await
+    }
+
+    /// Как [`Self::run`], но с обеими сессиями (для обхода папок).
+    async fn run_link<T, F, Fut>(&self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(Link) -> Fut,
         Fut: std::future::Future<Output = Result<T, StoreError>>,
     {
         let s = self.session().await?;
@@ -263,6 +281,86 @@ impl SftpStore {
             Err(StoreError::HostKey { got, .. }) => Ok(got),
             Err(e) => Err(e),
             Ok(_) => Err(StoreError::Other("сервер не прислал ключ хоста".into())),
+        }
+    }
+}
+
+async fn open_sftp_channel(
+    handle: &client::Handle<HostCheck>,
+) -> Result<russh::ChannelStream<client::Msg>, StoreError> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| StoreError::Network(e.to_string()))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| StoreError::Network(e.to_string()))?;
+    Ok(channel.into_stream())
+}
+
+/// Записи одной папки (без `.` и `..`) через OPENDIR/READDIR/CLOSE.
+/// `seen` — сколько записей набрано за весь обход; после каждого ответа
+/// READDIR он сверяется с [`super::MAX_LIST`], так что сервер, который
+/// никогда не отвечает EOF, получит отказ, а не съест память. `None` —
+/// папки нет.
+async fn read_dir_capped(
+    raw: &RawSftpSession,
+    path: &str,
+    seen: &mut usize,
+    dir: &str,
+) -> Result<Option<Vec<(String, FileAttributes)>>, StoreError> {
+    let handle = match raw.opendir(path.to_string()).await {
+        Ok(h) => h.handle,
+        Err(e) if is_missing(&e) => return Ok(None),
+        Err(e) => return Err(sftp_err(e)),
+    };
+    let r = collect_capped(|| raw.readdir(handle.clone()), seen, dir).await;
+    // Закрыть хэндл и после отказа, иначе сервер держит его до обрыва.
+    let closed = raw.close(handle).await;
+    let out = r?;
+    closed.map_err(sftp_err)?;
+    Ok(Some(out))
+}
+
+/// Читать ответы READDIR до EOF, проверяя предел после каждого ответа.
+/// По одной `.` и `..` на папку не в счёт, лишние считаются и не попадают
+/// в результат; пустые ответы тоже ограничены, чтобы сервер не гонял цикл.
+async fn collect_capped<F, Fut>(
+    mut next: F,
+    seen: &mut usize,
+    dir: &str,
+) -> Result<Vec<(String, FileAttributes)>, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Name, SftpError>>,
+{
+    let mut out = Vec::new();
+    let (mut dot, mut dotdot, mut replies) = (false, false, 0usize);
+    loop {
+        let name = match next().await {
+            Ok(n) => n,
+            Err(SftpError::Status(s)) if s.status_code == StatusCode::Eof => return Ok(out),
+            Err(e) => return Err(sftp_err(e)),
+        };
+        replies += 1;
+        if replies > super::MAX_LIST {
+            return Err(too_many(dir));
+        }
+        for f in name.files {
+            match f.filename.as_str() {
+                "." if !dot => dot = true,
+                ".." if !dotdot => dotdot = true,
+                n => {
+                    *seen += 1;
+                    if *seen > super::MAX_LIST {
+                        return Err(too_many(dir));
+                    }
+                    if n != "." && n != ".." {
+                        out.push((f.filename, f.attrs));
+                    }
+                }
+            }
         }
     }
 }
@@ -412,27 +510,16 @@ impl ObjectStore for SftpStore {
     fn list<'a>(&'a self, dir: &'a str) -> StoreFuture<'a, Vec<ObjectInfo>> {
         Box::pin(async move {
             let root = self.path(dir)?;
-            self.run(|s| async move {
+            self.run_link(|l| async move {
                 let mut out = Vec::new();
                 // Обход: (путь на сервере, имя без префикса, глубина).
                 let mut queue = vec![(root, dir.to_string(), 0)];
                 let mut seen = 0usize;
                 while let Some((path, rel, depth)) = queue.pop() {
-                    let rd = match s.read_dir(path.clone()).await {
-                        Ok(rd) => rd,
-                        Err(e) if is_missing(&e) => continue,
-                        Err(e) => return Err(sftp_err(e)),
+                    let Some(rd) = read_dir_capped(&l.raw, &path, &mut seen, dir).await? else {
+                        continue;
                     };
-                    for e in rd {
-                        let n = e.file_name();
-                        if n == "." || n == ".." {
-                            continue;
-                        }
-                        seen += 1;
-                        if seen > super::MAX_LIST {
-                            return Err(too_many(dir));
-                        }
-                        let m = e.metadata();
+                    for (n, m) in rd {
                         let (p, r) = (format!("{path}/{n}"), format!("{rel}/{n}"));
                         if m.is_dir() {
                             // Глубже раскладки Clipwire ничего не кладёт.
@@ -457,28 +544,19 @@ impl ObjectStore for SftpStore {
     fn delete_dir<'a>(&'a self, dir: &'a str) -> StoreFuture<'a, ()> {
         Box::pin(async move {
             let root = self.path(dir)?;
-            self.run(|s| async move {
+            self.run_link(|l| async move {
+                let s = &l.sftp;
                 // Сначала файлы, потом папки от самых глубоких.
                 let mut dirs = vec![root.clone()];
                 let mut queue = vec![(root, 0)];
                 let mut seen = 0usize;
                 while let Some((path, depth)) = queue.pop() {
-                    let rd = match s.read_dir(path.clone()).await {
-                        Ok(rd) => rd,
-                        Err(e) if is_missing(&e) => continue,
-                        Err(e) => return Err(sftp_err(e)),
+                    let Some(rd) = read_dir_capped(&l.raw, &path, &mut seen, dir).await? else {
+                        continue;
                     };
-                    for e in rd {
-                        let n = e.file_name();
-                        if n == "." || n == ".." {
-                            continue;
-                        }
-                        seen += 1;
-                        if seen > super::MAX_LIST {
-                            return Err(too_many(dir));
-                        }
+                    for (n, m) in rd {
                         let p = format!("{path}/{n}");
-                        if e.metadata().is_dir() {
+                        if m.is_dir() {
                             // Папку глубже раскладки не обходим: удалить её
                             // не выйдет, и это честная ошибка.
                             if depth < super::MAX_DEPTH {
@@ -557,6 +635,89 @@ mod tests {
         assert!(!is_refusal(&st(StatusCode::ConnectionLost)));
         assert!(!is_refusal(&SftpError::Timeout));
         assert!(!is_refusal(&SftpError::IO("обрыв".into())));
+    }
+
+    fn entry(n: &str) -> russh_sftp::protocol::File {
+        russh_sftp::protocol::File {
+            filename: n.into(),
+            longname: String::new(),
+            attrs: FileAttributes::default(),
+        }
+    }
+
+    fn eof() -> SftpError {
+        SftpError::Status(russh_sftp::protocol::Status {
+            id: 0,
+            status_code: StatusCode::Eof,
+            error_message: String::new(),
+            language_tag: String::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn readdir_stops_at_limit_without_eof() {
+        // Сервер без EOF: каждый ответ — тысяча новых записей.
+        let mut replies = 0usize;
+        let mut seen = 0usize;
+        let r = collect_capped(
+            || {
+                replies += 1;
+                let files = (0..1000).map(|i| entry(&format!("f{i}"))).collect();
+                async move { Ok(Name { id: 0, files }) }
+            },
+            &mut seen,
+            "x",
+        )
+        .await;
+        assert!(matches!(r, Err(StoreError::Corrupt(_))));
+        // Остановились на первом ответе, перевалившем за предел.
+        assert_eq!(replies, super::super::MAX_LIST / 1000 + 1);
+
+        // Пустые ответы без EOF тоже не крутятся вечно.
+        let mut seen = 0usize;
+        let r = collect_capped(
+            || async {
+                Ok(Name {
+                    id: 0,
+                    files: vec![],
+                })
+            },
+            &mut seen,
+            "x",
+        )
+        .await;
+        assert!(matches!(r, Err(StoreError::Corrupt(_))));
+    }
+
+    #[tokio::test]
+    async fn readdir_skips_dots_and_counts_across_folders() {
+        let mut step = 0;
+        let mut seen = 5usize;
+        let got = collect_capped(
+            || {
+                step += 1;
+                let r = match step {
+                    1 => Ok(Name {
+                        id: 0,
+                        files: vec![entry("."), entry(".."), entry("a")],
+                    }),
+                    // Повторная «.» — подозрительно: считается, но не выдаётся.
+                    2 => Ok(Name {
+                        id: 0,
+                        files: vec![entry("b"), entry(".")],
+                    }),
+                    _ => Err(eof()),
+                };
+                async move { r }
+            },
+            &mut seen,
+            "x",
+        )
+        .await
+        .unwrap();
+        let names: Vec<_> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(seen, 8);
     }
 
     #[test]

@@ -36,6 +36,11 @@ struct Fs {
     /// Путь → содержимое и mtime (секунды).
     files: BTreeMap<String, (Vec<u8>, u32)>,
     dirs: std::collections::BTreeSet<String>,
+    /// Папка, на READDIR которой сервер никогда не отвечает EOF, а шлёт всё
+    /// новые записи (злой сервер).
+    endless: Option<String>,
+    /// Сколько ответов READDIR отдано по `endless`.
+    endless_replies: usize,
 }
 
 fn now_secs() -> u32 {
@@ -245,11 +250,22 @@ impl russh_sftp::server::Handler for Sftp {
         let Some(H::Dir(p, done)) = self.handles.get_mut(&handle) else {
             return Err(StatusCode::Failure);
         };
+        let mut fs = self.fs.lock().unwrap();
+        if fs.endless.as_deref() == Some(p.as_str()) {
+            fs.endless_replies += 1;
+            let base = fs.endless_replies * 1000;
+            let mut a = FileAttributes::empty();
+            a.size = Some(1);
+            a.set_regular(true);
+            let files = (0..1000)
+                .map(|i| File::new(format!("f{}", base + i), a.clone()))
+                .collect();
+            return Ok(Name { id, files });
+        }
         if *done {
             return Err(StatusCode::Eof);
         }
         *done = true;
-        let fs = self.fs.lock().unwrap();
         let files = fs
             .children(p)
             .into_iter()
@@ -626,4 +642,33 @@ async fn file_roundtrip_overwrite_list_and_cleanup() {
         fs.dirs
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Сервер, который не отвечает EOF на READDIR: список и удаление папки
+/// получают отказ на пределе `MAX_LIST`, а не копят записи без конца.
+#[tokio::test(flavor = "multi_thread")]
+async fn endless_readdir_is_cut_at_limit() {
+    let s = start().await;
+    {
+        let mut fs = s.fs.lock().unwrap();
+        for d in ["/srv", "/srv/clip", "/srv/clip/x"] {
+            fs.dirs.insert(d.into());
+        }
+        fs.endless = Some("/srv/clip/x".into());
+    }
+    let store = SftpStore::new(cfg(&s, password(), &s.fingerprint)).unwrap();
+    let limit = clipwire_agent::storage::MAX_LIST;
+    let r = tokio::time::timeout(Duration::from_secs(120), store.list("x"))
+        .await
+        .expect("список завис");
+    assert!(matches!(r, Err(StoreError::Corrupt(_))), "{r:?}");
+    let replies = s.fs.lock().unwrap().endless_replies;
+    assert_eq!(replies, limit / 1000 + 1, "читал дальше предела");
+
+    s.fs.lock().unwrap().endless_replies = 0;
+    let r = tokio::time::timeout(Duration::from_secs(120), store.delete_dir("x"))
+        .await
+        .expect("удаление зависло");
+    assert!(matches!(r, Err(StoreError::Corrupt(_))), "{r:?}");
+    assert_eq!(s.fs.lock().unwrap().endless_replies, limit / 1000 + 1);
 }
