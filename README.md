@@ -348,6 +348,14 @@ cd apps/desktop && npm ci && npx tauri dev
 CLIPWIRE_S3_ENDPOINT=http://127.0.0.1:9000 CLIPWIRE_S3_BUCKET=clipwire-test CLIPWIRE_S3_ACCESS=... CLIPWIRE_S3_SECRET=... cargo test -p clipwire-agent --test s3_live -- --ignored
 ```
 
+`sftp_live.rs` так же проверяет SFTP на настоящем OpenSSH: отпечаток ключа хоста, вход
+паролем и ключом с паролем к нему, файл из нескольких частей, чистку, неверный пароль и
+чужой отпечаток. Проверено и с `MaxSessions 1`:
+
+```bash
+CLIPWIRE_SFTP_HOST=127.0.0.1 CLIPWIRE_SFTP_PORT=2222 CLIPWIRE_SFTP_USER=... CLIPWIRE_SFTP_PASSWORD=... CLIPWIRE_SFTP_PATH=/папка CLIPWIRE_SFTP_KEY=путь/к/ключу CLIPWIRE_SFTP_KEY_PASS=... cargo test -p clipwire-agent --test sftp_live -- --ignored
+```
+
 Чистая логика окна настроек проверяется без сборки, в Node 23.6+ (он сам убирает типы):
 `node src/lib/storage.test.ts` (поля карточки «Хранилище файлов», сохранённые секреты,
 сброс отпечатка ключа хоста), `devices.test.ts` и `transfer.test.ts` из `apps/desktop`.

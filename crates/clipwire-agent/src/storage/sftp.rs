@@ -71,10 +71,12 @@ struct Conn {
 /// Две сессии SFTP на одном SSH-соединении. Высокоуровневая — для файлов;
 /// низкоуровневая — для чтения папок: `SftpSession::read_dir` копит ответы
 /// READDIR до EOF без предела, а здесь записи считаются после каждого ответа.
+/// Сервер с `MaxSessions 1` второй канал не даёт: тогда `raw` нет и папки
+/// читаются высокоуровневой сессией.
 #[derive(Clone)]
 struct Link {
     sftp: Arc<SftpSession>,
-    raw: Arc<RawSftpSession>,
+    raw: Option<Arc<RawSftpSession>>,
 }
 
 pub struct SftpStore {
@@ -217,16 +219,33 @@ impl SftpStore {
             .await
             .map_err(|e| StoreError::Other(format!("сервер не дал SFTP: {e}")))?;
         sftp.set_timeout(OP_TIMEOUT_SECS);
-        let raw = RawSftpSession::new(open_sftp_channel(&handle).await?);
-        raw.set_timeout(OP_TIMEOUT_SECS);
-        raw.init()
-            .await
-            .map_err(|e| StoreError::Other(format!("сервер не дал SFTP: {e}")))?;
+        // shortcut: без второго канала (MaxSessions 1) чтение папки не
+        // ограничено по ходу, предел проверяется после ответа сервера; переделать,
+        // если russh-sftp даст READDIR поверх уже открытой сессии.
+        let raw = match open_sftp_channel(&handle).await {
+            Ok(ch) => {
+                let raw = RawSftpSession::new(ch);
+                raw.set_timeout(OP_TIMEOUT_SECS);
+                match raw.init().await {
+                    Ok(_) => Some(Arc::new(raw)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "второй канал SFTP не поднялся ({e}), папки читаются основным"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("сервер не дал второй канал SFTP ({e}), папки читаются основным");
+                None
+            }
+        };
         Ok(Conn {
             _handle: handle,
             link: Link {
                 sftp: Arc::new(sftp),
-                raw: Arc::new(raw),
+                raw,
             },
         })
     }
@@ -297,6 +316,40 @@ async fn open_sftp_channel(
         .await
         .map_err(|e| StoreError::Network(e.to_string()))?;
     Ok(channel.into_stream())
+}
+
+/// Записи одной папки (без `.` и `..`): через второй канал с пределом по ходу
+/// чтения, а без него — через основную сессию с проверкой предела после.
+async fn read_dir_any(
+    l: &Link,
+    path: &str,
+    seen: &mut usize,
+    dir: &str,
+) -> Result<Option<Vec<(String, FileAttributes)>>, StoreError> {
+    if let Some(raw) = &l.raw {
+        return read_dir_capped(raw, path, seen, dir).await;
+    }
+    let rd = match l.sftp.read_dir(path.to_string()).await {
+        Ok(rd) => rd,
+        Err(e) if is_missing(&e) => return Ok(None),
+        Err(e) => return Err(sftp_err(e)),
+    };
+    let mut out = Vec::new();
+    for e in rd {
+        let n = e.file_name();
+        if n == "." || n == ".." {
+            continue;
+        }
+        *seen += 1;
+        if *seen > super::MAX_LIST {
+            return Err(StoreError::Corrupt(format!(
+                "в папке {dir} больше {} записей",
+                super::MAX_LIST
+            )));
+        }
+        out.push((n, e.metadata()));
+    }
+    Ok(Some(out))
 }
 
 /// Записи одной папки (без `.` и `..`) через OPENDIR/READDIR/CLOSE.
@@ -516,7 +569,7 @@ impl ObjectStore for SftpStore {
                 let mut queue = vec![(root, dir.to_string(), 0)];
                 let mut seen = 0usize;
                 while let Some((path, rel, depth)) = queue.pop() {
-                    let Some(rd) = read_dir_capped(&l.raw, &path, &mut seen, dir).await? else {
+                    let Some(rd) = read_dir_any(&l, &path, &mut seen, dir).await? else {
                         continue;
                     };
                     for (n, m) in rd {
@@ -551,7 +604,7 @@ impl ObjectStore for SftpStore {
                 let mut queue = vec![(root, 0)];
                 let mut seen = 0usize;
                 while let Some((path, depth)) = queue.pop() {
-                    let Some(rd) = read_dir_capped(&l.raw, &path, &mut seen, dir).await? else {
+                    let Some(rd) = read_dir_any(&l, &path, &mut seen, dir).await? else {
                         continue;
                     };
                     for (n, m) in rd {
