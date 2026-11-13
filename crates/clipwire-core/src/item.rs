@@ -300,6 +300,9 @@ pub struct Ext {
 pub mod ext {
     /// Приложение, из которого скопировано: [`super::SourceApp`].
     pub const SOURCE_APP: u16 = 1;
+    /// Где лежат файлы элемента: [`crate::storage::BlobPlaces`]. Нет метки —
+    /// хранилище сервера (элементы до появления выбора хранилища).
+    pub const BLOB_PLACES: u16 = 2;
 }
 
 /// Из какого приложения скопировано.

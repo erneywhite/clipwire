@@ -304,6 +304,11 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                             write_msg(&mut send, &reply).await?;
                         }
                     }
+                    // shortcut: заглушка до реализации хранения настроек группы (волна 3).
+                    Some(ClientMsg::SetGroupConfig(_)) => {}
+                    Some(ClientMsg::GetGroupConfig) => {
+                        write_msg(&mut send, &ServerMsg::GroupConfig(None)).await?;
+                    }
                     Some(ClientMsg::ListDevices) => {
                         write_msg(&mut send, &crate::devices::list_devices(shared, &group)?).await?;
                     }

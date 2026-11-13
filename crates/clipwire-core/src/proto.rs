@@ -62,6 +62,15 @@ pub enum ClientMsg {
         new_group: GroupId,
         envelopes: Vec<(DeviceId, Vec<u8>)>,
     },
+    /// Сохранить настройки группы (`GroupKey::seal_config`, не больше
+    /// `storage::MAX_CONFIG_BYTES`). Сервер хранит последние и рассылает их
+    /// `GroupConfig` тем подключённым устройствам, которые уже спрашивали
+    /// `GetGroupConfig` в этом соединении (клиенты 0.1.0 такого варианта не
+    /// знают, им слать нельзя).
+    SetGroupConfig(Vec<u8>),
+    /// Попросить настройки группы — ответ `GroupConfig`. Заодно подписывает
+    /// соединение на их изменения.
+    GetGroupConfig,
 }
 
 /// Устройство группы в списке `Devices`.
@@ -97,6 +106,10 @@ pub enum ServerMsg {
     Excluded,
     /// Ошибка. После неё сервер закрывает соединение.
     Error(String),
+    /// Зашифрованные настройки группы (`GroupKey::open_config`), `None` —
+    /// не задавались. Только в ответ на `GetGroupConfig` и после него при
+    /// каждом `SetGroupConfig` с любого устройства группы.
+    GroupConfig(Option<Vec<u8>>),
 }
 
 /// Первый кадр потока файла.
