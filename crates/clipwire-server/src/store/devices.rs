@@ -4,6 +4,9 @@
 //! каждое устройство группы. Смена ключа переводит группу в режим «ключ
 //! сменён»: в `groups` появляются `rotated_to` и `rotated_ms`, пакеты нового
 //! ключа лежат в `rekeys` по устройствам, элементы и файлы группы удаляются.
+//! Через `rotated_keep` (30 дней) пакеты, карточки и устройства удаляются, а
+//! строка группы остаётся навсегда надгробием (`tombstone_ms`): иначе вход
+//! старым ключом с токеном сервера создал бы группу с тем же id заново.
 
 use std::collections::HashSet;
 
@@ -41,6 +44,12 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
              ALTER TABLE groups ADD COLUMN rotated_ms INTEGER;
              COMMIT;",
         )?;
+    }
+    let has_tombstone: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups') WHERE name = 'tombstone_ms'")?
+        .exists([])?;
+    if !has_tombstone {
+        conn.execute_batch("ALTER TABLE groups ADD COLUMN tombstone_ms INTEGER;")?;
     }
     Ok(())
 }
@@ -226,14 +235,37 @@ impl Store {
         Ok(RekeyOutcome::Done { blobs })
     }
 
-    /// Удалить группы, ключ которых сменён раньше `before_ms`, вместе с
-    /// пакетами, устройствами и всем остальным (каскадом). Возвращает,
-    /// сколько групп удалено.
-    pub fn purge_rotated(&self, before_ms: i64) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM groups WHERE rotated_ms IS NOT NULL AND rotated_ms < ?1",
-            params![before_ms],
-        )?)
+    /// Группы, ключ которых сменён раньше `before_ms`, превратить в надгробия:
+    /// удалить пакеты, карточки, устройства (и элементы с файлами, если вдруг
+    /// остались), а строку группы оставить с отметкой `tombstone_ms = now_ms`.
+    /// Вход в надгробие верным секретом получает `Excluded`
+    /// ([`rotation_in`]: пакета нет), заново группа не создаётся. Надгробия не
+    /// считаются в пределе групп. Возвращает, сколько групп стало надгробиями.
+    pub fn purge_rotated(&self, before_ms: i64, now_ms: i64) -> Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let groups: Vec<Vec<u8>> = {
+            let mut stmt = tx.prepare(
+                "SELECT group_id FROM groups
+                 WHERE rotated_ms IS NOT NULL AND rotated_ms < ?1 AND tombstone_ms IS NULL",
+            )?;
+            stmt.query_map(params![before_ms], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for g in &groups {
+            for table in ["rekeys", "cards", "devices", "items", "blobs"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE group_id = ?1"),
+                    params![g],
+                )?;
+            }
+            tx.execute(
+                "UPDATE groups SET tombstone_ms = ?2 WHERE group_id = ?1",
+                params![g, now_ms],
+            )?;
+        }
+        tx.commit()?;
+        Ok(groups.len())
     }
 }
 
@@ -405,12 +437,52 @@ mod tests {
             .unwrap();
         assert_eq!(wrong, JoinOutcome::Denied);
 
-        // Заброшенной её чистка не считает; через срок удаляется целиком.
+        // Заброшенной её чистка не считает; через срок остаётся надгробием.
         assert!(s.idle_groups(i64::MAX).unwrap().iter().all(|x| *x != g));
-        assert_eq!(s.purge_rotated(50).unwrap(), 0);
-        assert_eq!(s.purge_rotated(51).unwrap(), 1);
-        assert_eq!(s.rotation(&g, &d).unwrap(), None);
+        assert_eq!(s.purge_rotated(50, 100).unwrap(), 0);
+        assert_eq!(s.purge_rotated(51, 100).unwrap(), 1);
+        assert_eq!(
+            s.purge_rotated(51, 100).unwrap(),
+            0,
+            "повтор ничего не трогает"
+        );
+        // Пакетов больше нет: и бывшему участнику, и исключённому — «исключено».
+        assert_eq!(s.rotation(&g, &d).unwrap(), Some(Rotation::Excluded));
+        assert_eq!(join(&s, &old, 2), JoinOutcome::Rotated(Rotation::Excluded));
+        assert!(s.list_devices(&g, &HashSet::new()).unwrap().is_empty());
         assert_eq!(s.rotation(&g2, &d).unwrap(), None);
+        // Надгробие не заброшенная группа и не удаляется никогда.
+        assert!(s.idle_groups(i64::MAX).unwrap().iter().all(|x| *x != g));
+        assert!(!s.delete_idle_group(&g, i64::MAX).unwrap());
+        assert_eq!(
+            s.join(&g, &new.join_secret(), &d, 80, true, usize::MAX)
+                .unwrap(),
+            JoinOutcome::Denied
+        );
+    }
+
+    #[test]
+    fn tombstones_do_not_count_toward_max_groups() {
+        let s = Store::in_memory().unwrap();
+        let (old, new, third) = (GroupKey([1; 32]), GroupKey([2; 32]), GroupKey([3; 32]));
+        let r = DeviceId([1; 32]);
+        let join_max = |k: &GroupKey| {
+            s.join(&k.group_id(), &k.join_secret(), &r, 10, true, 2)
+                .unwrap()
+        };
+        assert_eq!(join_max(&old), JoinOutcome::Created);
+        assert_eq!(join_max(&new), JoinOutcome::Created);
+        assert!(matches!(
+            s.rekey(&old.group_id(), &r, &new.group_id(), &[], 50, &LIMITS)
+                .unwrap(),
+            RekeyOutcome::Done { .. }
+        ));
+        // До срока сменённая группа ещё занимает место.
+        assert_eq!(join_max(&third), JoinOutcome::TooManyGroups);
+        assert_eq!(s.purge_rotated(51, 60).unwrap(), 1);
+        assert_eq!(join_max(&third), JoinOutcome::Created);
+        // А вход старым ключом с правом создавать группу её не воскрешает.
+        assert_eq!(join_max(&old), JoinOutcome::Rotated(Rotation::Excluded));
     }
 
     #[test]

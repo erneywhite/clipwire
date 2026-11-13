@@ -18,7 +18,7 @@ use clipwire_agent::blobs::{
 use clipwire_agent::p2p::{MAX_CONNS, P2pError};
 use clipwire_agent::service::assign_blobs;
 use clipwire_agent::state::{AgentState, random_key};
-use clipwire_agent::sync::{Engine, Event, Status};
+use clipwire_agent::sync::{Engine, Event, Outgoing, Status};
 use clipwire_core::blob::{CHUNK, OVERHEAD, chunk_count, chunk_len};
 use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
@@ -143,6 +143,9 @@ async fn server_have(conn: &Connection, blob: BlobId, size: u64) -> Result<Optio
     match tokio::time::timeout(T, read_msg::<_, BlobReply>(&mut recv)).await?? {
         Some(BlobReply::GetReady { have, .. }) => Ok(Some(have)),
         Some(BlobReply::Error(BlobFail::NotFound)) => Ok(None),
+        // `Get` пришёл, пока файл удалялся (`Abort`, чистка): сервер успел
+        // прочитать строку, а файл уже отменён. Это тоже «файла нет».
+        Some(BlobReply::Error(BlobFail::Cancelled)) => Ok(None),
         other => bail!("ждали GetReady, пришло {other:?}"),
     }
 }
@@ -480,7 +483,7 @@ async fn download_starts_before_upload_ends() -> Result<()> {
 
 /// Движок с передачей файлов, как его собирает сервис.
 struct Agent {
-    local: mpsc::Sender<Content>,
+    local: mpsc::Sender<Outgoing>,
     events: mpsc::UnboundedReceiver<Event>,
     blobs: Arc<Blobs>,
     transfers: mpsc::UnboundedReceiver<Transfer>,
@@ -550,7 +553,7 @@ impl Agent {
     /// Скопировать файлы так же, как сервис: элемент уходит в движок, а тот
     /// резервирует файлы на сервере, отправляет элемент и ставит загрузки.
     async fn copy_files(&self, files: Vec<FileRef>) -> Result<()> {
-        self.local.send(Content::Files(files)).await?;
+        self.local.send(Content::Files(files).into()).await?;
         Ok(())
     }
 

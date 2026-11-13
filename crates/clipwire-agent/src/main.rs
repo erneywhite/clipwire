@@ -13,6 +13,8 @@ clipwire-agent — общий буфер обмена Clipwire
   invite                      снова напечатать код приглашения
   run                         синхронизировать буфер без интерфейса (до Ctrl+C)
   reset                       забыть группу и ключи на этом устройстве
+  retry                       снять отметку «исключено» и снова пробовать
+                              синхронизацию (ключ группы не менялся)
 
 Отладка, без буфера и трея:
   listen                      печатать всё, что приходит в группу
@@ -74,10 +76,20 @@ fn main() -> Result<()> {
             paths.reset()?;
             println!("Группа и ключи на этом устройстве удалены.");
         }
+        "retry" => {
+            clipwire_agent::devices::clear_excluded(&paths)?;
+            println!("Отметка об исключении снята. Запуск синхронизации: clipwire-agent run");
+        }
         "run" => {
             let state = paths
                 .load()?
                 .context("устройство ещё не в группе: сначала create или join")?;
+            if clipwire_agent::devices::is_excluded(&paths, state.invite.group_key.group_id()) {
+                bail!(
+                    "сервер сообщил, что это устройство исключено из группы. Выйти из группы — \
+                     clipwire-agent reset, попробовать снова — clipwire-agent retry"
+                );
+            }
             run(state, paths)?;
         }
         "listen" => {
@@ -129,7 +141,7 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
                     if let Some(text) = &send
                         && let Some(tx) = ltx.take()
                     {
-                        tx.send(Content::Text(text.clone())).await?;
+                        tx.send(Content::Text(text.clone()).into()).await?;
                     }
                 }
                 Event::Status(Status::Offline(e)) => eprintln!("нет связи: {e}"),
@@ -143,8 +155,12 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
                 }
                 Event::Cursor(_) => {}
                 // Отладочный режим ничего не сохраняет: только сообщает.
-                Event::Rekeyed { .. } => eprintln!("ключ группы сменён на другом устройстве"),
-                Event::Excluded { .. } => eprintln!("это устройство удалили из группы"),
+                Event::Rekeyed(n) => {
+                    eprintln!("ключ группы сменило устройство «{}»", n.initiator_name)
+                }
+                Event::Excluded { .. } => eprintln!("сервер сообщил, что устройство исключено"),
+                Event::KnownDevices(_) => {}
+                Event::RekeyLost(why) => eprintln!("{why}"),
             }
         }
         task.await??;
@@ -201,22 +217,29 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
                     t.error.unwrap_or_default()
                 ),
             },
-            UiEvent::Rekeyed { old, key } => {
+            UiEvent::Rekeyed(n) => {
+                let who = n.initiator_name.clone();
                 match Paths::resolve()
-                    .and_then(|p| clipwire_agent::devices::adopt_key(&p, old, key))
+                    .and_then(|p| clipwire_agent::devices::adopt_key(&p, n.old, n.key))
                 {
-                    Ok(_) => eprintln!("ключ группы сменён, перезапустите clipwire-agent run"),
+                    Ok(_) => eprintln!(
+                        "ключ группы сменило устройство «{who}», перезапустите clipwire-agent run"
+                    ),
                     Err(e) => eprintln!("новый ключ группы не сохранился: {e:#}"),
                 }
             }
             UiEvent::Excluded { old } => {
-                match Paths::resolve()
-                    .and_then(|p| clipwire_agent::devices::leave_excluded(&p, old))
+                match Paths::resolve().and_then(|p| clipwire_agent::devices::mark_excluded(&p, old))
                 {
-                    Ok(_) => eprintln!("это устройство удалили из группы"),
-                    Err(e) => eprintln!("выйти из группы не удалось: {e:#}"),
+                    Ok(_) => eprintln!(
+                        "сервер сообщил, что устройство исключено из группы. Ключ и история \
+                         остались: выйти — clipwire-agent reset, попробовать снова — \
+                         clipwire-agent retry"
+                    ),
+                    Err(e) => eprintln!("отметка об исключении не сохранилась: {e:#}"),
                 }
             }
+            UiEvent::RekeyLost(why) => eprintln!("{why}"),
         }),
     )?;
     eprintln!("синхронизация буфера запущена, Ctrl+C — выход");

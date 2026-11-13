@@ -47,6 +47,7 @@ pub struct Limits {
     pub history_total_bytes: u64,
     pub max_device_conns: usize,
     pub group_idle: Duration,
+    pub rotated_keep: Duration,
 }
 
 impl Limits {
@@ -65,6 +66,7 @@ impl Limits {
             history_total_bytes: guards.history_total_bytes,
             max_device_conns: guards.max_device_conns,
             group_idle: guards.group_idle,
+            rotated_keep: guards.rotated_keep,
         }
     }
 }

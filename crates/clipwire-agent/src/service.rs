@@ -16,7 +16,7 @@ use crate::clipboard::{self, Watcher};
 use crate::history::{Entry, History, local_entry, now_ms};
 use crate::loopguard::LoopGuard;
 use crate::state::{AgentState, Paths};
-use crate::sync::{Engine, Event, Status};
+use crate::sync::{Engine, Event, Outgoing, Status};
 
 /// Что интерфейсу стоит знать.
 #[derive(Debug, Clone)]
@@ -31,17 +31,18 @@ pub enum UiEvent {
     /// Прогресс загрузки или скачивания файла (не чаще раза в 200 мс на файл
     /// плюс финальное).
     Transfer(Transfer),
-    /// Ключ группы `old` сменили с другого устройства, `key` — новый.
-    /// Сервис больше не синхронизируется: сохранить ключ
-    /// (`devices::adopt_key`) и перезапустить.
-    Rekeyed {
-        old: clipwire_core::GroupId,
-        key: clipwire_core::GroupKey,
-    },
-    /// Это устройство исключили из группы `old` (`devices::leave_excluded`).
+    /// Ключ группы сменили (кто — в `initiator_name`, или это устройство,
+    /// если ответ на свой `Rekey` потерялся). Сервис больше не
+    /// синхронизируется: сохранить ключ (`devices::adopt_key`) и перезапустить.
+    Rekeyed(crate::devices::RekeyNotice),
+    /// Сервер сообщил, что устройство исключено из группы `old`: пометить
+    /// (`devices::mark_excluded`), ключ и история остаются.
     Excluded {
         old: clipwire_core::GroupId,
     },
+    /// Смена ключа на этом устройстве не состоялась, хотя ответ на неё
+    /// потерялся (текст для человека).
+    RekeyLost(String),
     /// В истории появилась новая запись: своё копирование или пришедшее с
     /// другого устройства. Повтор того, что уже есть в истории (вставка из
     /// истории, то же содержимое ещё раз), новой записью не считается.
@@ -80,7 +81,7 @@ pub struct Service {
 struct Copier {
     /// Канал движка, общий для всех копий: [`Copier::cancel`] забирает его,
     /// и канал закрывается, даже пока фоновая задача с папкой держит копию.
-    tx: Arc<Mutex<Option<mpsc::Sender<Content>>>>,
+    tx: Arc<Mutex<Option<mpsc::Sender<Outgoing>>>>,
     /// Сервис снимается: копирования больше не отправляются и не пишутся.
     cancelled: Arc<AtomicBool>,
     history: Arc<Mutex<History>>,
@@ -162,7 +163,9 @@ impl Copier {
                 return;
             }
             if let Some(tx) = tx.as_ref()
-                && tx.try_send(content.clone()).is_err()
+                && tx
+                    .try_send(Outgoing::new(content.clone(), source.as_ref()))
+                    .is_err()
             {
                 tracing::warn!("очередь отправки переполнена, копирование не ушло в группу");
                 discard_outbox(self.blobs.as_deref(), &content);
@@ -214,7 +217,8 @@ impl Service {
             .as_ref()
             .map(|s| s.invite.encode())
             .unwrap_or_default();
-        let (local_tx, local_rx) = mpsc::channel::<Content>(32);
+        let (local_tx, local_rx) = mpsc::channel::<Outgoing>(32);
+        let group = state.as_ref().map(|s| s.invite.group_key.group_id());
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
         let blobs = state.as_ref().map(|s| {
             let on_event = on_event.clone();
@@ -242,6 +246,7 @@ impl Service {
                     Arc::new(|| {}),
                 )
                 .with_backfill(local_history)
+                .with_known_devices(crate::devices::load_known(&paths, group_key.group_id()))
                 .with_blobs(blobs.clone().expect("в группе передача файлов есть"))
                 .with_control(ctl_rx);
                 let device = engine.device();
@@ -356,8 +361,16 @@ impl Service {
                                 on_event(UiEvent::HistoryMerged(added));
                             }
                         }
-                        Event::Rekeyed { old, key } => on_event(UiEvent::Rekeyed { old, key }),
+                        Event::Rekeyed(n) => on_event(UiEvent::Rekeyed(n)),
                         Event::Excluded { old } => on_event(UiEvent::Excluded { old }),
+                        Event::RekeyLost(why) => on_event(UiEvent::RekeyLost(why)),
+                        Event::KnownDevices(cards) => {
+                            if let Some(g) = group
+                                && let Err(e) = crate::devices::save_known(&paths, g, &cards)
+                            {
+                                tracing::warn!("карточки устройств не сохранились: {e:#}");
+                            }
+                        }
                     }
                 }
             });
@@ -455,11 +468,13 @@ impl Service {
 
     /// Скопировать как будто пользователем: в буфер, в историю (наверх) и в
     /// группу. Так работают вставка из истории и сохранение из редактора.
-    pub fn copy(&self, content: Content) -> Result<()> {
+    /// `source` — приложение-источник (у вставки из истории — из записи): оно
+    /// уходит в группу вместе с элементом.
+    pub fn copy(&self, content: Content, source: Option<SourceApp>) -> Result<()> {
         self.guard.wrote(&content);
         clipboard::write(&content)?;
         if let Some(c) = &self.copier {
-            c.dispatch(content, !self.paused(), None);
+            c.dispatch(content, !self.paused(), source);
         }
         Ok(())
     }
@@ -494,13 +509,19 @@ impl Service {
 }
 
 /// Последние локальные элементы, от старых к новым, для отправки в группу.
-fn local_backfill(h: &History) -> Vec<(Content, u64)> {
-    let mut out: Vec<(Content, u64)> = h
+fn local_backfill(h: &History) -> Vec<(Outgoing, u64)> {
+    let mut out: Vec<(Outgoing, u64)> = h
         .list("", false, usize::MAX)
         .into_iter()
         .filter(|e| e.local && sendable_backfill(&e.content))
         .take(BACKFILL_MAX)
-        .map(|e| (e.content.clone(), e.seen_ms.max(0) as u64))
+        .map(|e| {
+            let out = Outgoing {
+                content: e.content.clone(),
+                ext: e.ext.clone(),
+            };
+            (out, e.seen_ms.max(0) as u64)
+        })
         .collect();
     out.reverse();
     out
@@ -855,8 +876,17 @@ mod tests {
             limit_mb: Arc::new(AtomicU64::new(1)),
             rt: tokio::runtime::Handle::current(),
         };
-        c.finish(Content::Text("до".into()), true, None);
-        assert_eq!(rx.recv().await, Some(Content::Text("до".into())));
+        let app = SourceApp {
+            name: "Блокнот".into(),
+            exe: "notepad.exe".into(),
+            icon_png: Vec::new(),
+        };
+        c.finish(Content::Text("до".into()), true, Some(app.clone()));
+        // В движок уходит и приложение-источник.
+        assert_eq!(
+            rx.recv().await,
+            Some(Outgoing::new(Content::Text("до".into()), Some(&app)))
+        );
         // Копия как у фоновой задачи с папкой.
         let late = c.clone();
         c.cancel();

@@ -1,7 +1,9 @@
 //! Устройства группы и смена ключа (`docs/devices.md`): команды для раздела
 //! «Синхронизация» и обработка `Rekeyed` / `Excluded` от движка.
+//! Исключённое устройство не стирает ключ: оно помечается
+//! (`devices::mark_excluded`), и человек выбирает, выйти или попробовать снова.
 
-use clipwire_agent::devices::{self, Controller, DeviceView};
+use clipwire_agent::devices::{self, Controller, DeviceView, RekeyNotice};
 use clipwire_core::{DeviceId, GroupId, GroupKey};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -107,74 +109,123 @@ pub async fn group_rekey(app: AppHandle) -> CmdResult<RekeyDto> {
 async fn rekey(app: &AppHandle, remove: Option<DeviceId>) -> CmdResult<RekeyDto> {
     let ctl = controller(app)?;
     let done = ctl.rekey(remove).await?;
-    let state = app.state::<AppState>();
     // Движок старой группы уже не подключается: сохранить ключ и запустить
     // новый. Если сохранить не вышло, при следующем запуске устройство войдёт
     // в старую группу и получит свой пакет нового ключа.
-    devices::adopt_key(&state.paths, done.old, done.key)
-        .map_err(|e| format!("Ключ сменён, но не сохранился: {e:#}"))?;
+    let res = switch_to(app, done.old, done.key.clone()).await?;
+    let dto = RekeyDto {
+        invite: res,
+        skipped: done.skipped.into_iter().map(devices::fingerprint).collect(),
+    };
+    emit_rekeyed(app, true, "", Some(&dto));
+    Ok(dto)
+}
+
+/// Сохранить новый ключ группы `old` и перезапустить сервис. Возвращает новый
+/// код приглашения. Если сохранение сообщило об ошибке, но на диске уже новая
+/// группа (ключ записался, а следом что-то не удалось), сервис всё равно
+/// перезапускается: иначе он так и остался бы без синхронизации.
+async fn switch_to(app: &AppHandle, old: GroupId, key: GroupKey) -> CmdResult<String> {
+    let state = app.state::<AppState>();
+    let new = key.group_id();
+    let saved = devices::adopt_key(&state.paths, old, key);
+    let on_disk = || {
+        state
+            .paths
+            .load()
+            .ok()
+            .flatten()
+            .filter(|s| s.invite.group_key.group_id() == new)
+    };
+    match saved {
+        Ok(true) => {}
+        Ok(false) => {
+            if on_disk().is_none() {
+                return Err("Ключ группы уже сменён".into());
+            }
+        }
+        Err(e) => {
+            if on_disk().is_none() {
+                return Err(format!("Ключ сменён, но не сохранился: {e:#}"));
+            }
+            tracing::warn!("новый ключ сохранён с ошибкой, перезапускаю всё равно: {e:#}");
+        }
+    }
     crate::restart_service(app)
         .await
         .map_err(|e| format!("Ключ сменён, но синхронизация не перезапустилась: {e:#}"))?;
-    let invite = state
-        .paths
-        .load()
-        .map_err(|e| e.to_string())?
-        .map(|s| s.invite.encode())
-        .unwrap_or_default();
-    let _ = app.emit("clipwire://group-rekeyed", RekeyedEvent { by_me: true });
-    Ok(RekeyDto {
-        invite,
-        skipped: done.skipped.into_iter().map(devices::fingerprint).collect(),
-    })
+    Ok(on_disk().map(|s| s.invite.encode()).unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct RekeyedEvent {
+struct RekeyedEvent<'a> {
     /// Ключ сменили на этом устройстве.
     by_me: bool,
+    /// Имя устройства, которое сменило ключ (если не это).
+    by: &'a str,
+    /// Новый код приглашения и кому ключ не достался — если сменили здесь.
+    result: Option<&'a RekeyDto>,
 }
 
-/// Ключ группы сменили на другом устройстве: сохранить новый и перезапустить.
-pub fn on_rekeyed(app: &AppHandle, old: GroupId, key: GroupKey) {
+fn emit_rekeyed(app: &AppHandle, by_me: bool, by: &str, result: Option<&RekeyDto>) {
+    let _ = app.emit(
+        "clipwire://group-rekeyed",
+        RekeyedEvent { by_me, by, result },
+    );
+}
+
+/// Ключ группы сменили: сохранить новый и перезапустить. Если ключ сменило
+/// это устройство, а ответ сервера потерялся, интерфейс получает тот же
+/// успех, что и при обычной смене: новый код приглашения.
+pub fn on_rekeyed(app: &AppHandle, n: RekeyNotice) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let adopted = devices::adopt_key(&app.state::<AppState>().paths, old, key);
-        match adopted {
-            Ok(true) => {
-                if let Err(e) = crate::restart_service(&app).await {
-                    tracing::error!("после смены ключа синхронизация не запустилась: {e:#}");
-                }
-                let _ = app.emit("clipwire://group-rekeyed", RekeyedEvent { by_me: false });
+        match switch_to(&app, n.old, n.key).await {
+            Ok(invite) if n.by_me => {
+                let dto = RekeyDto {
+                    invite,
+                    skipped: n.skipped.into_iter().map(devices::fingerprint).collect(),
+                };
+                emit_rekeyed(&app, true, "", Some(&dto));
             }
-            Ok(false) => tracing::info!("ключ группы уже сменён, пакет не нужен"),
-            Err(e) => tracing::error!("новый ключ группы не сохранился: {e:#}"),
+            Ok(_) => emit_rekeyed(&app, false, &n.initiator_name, None),
+            Err(e) => tracing::error!("новый ключ группы не принят: {e}"),
         }
     });
 }
 
-/// Это устройство исключили из группы: дальше работать локально, история
-/// остаётся.
+/// Сервер сообщил, что устройство исключено из группы. Ключ и история
+/// остаются, синхронизация останавливается до решения человека: «Выйти из
+/// группы» (`leave_group`) или «Попробовать снова» (`group_retry`).
 pub fn on_excluded(app: &AppHandle, old: GroupId) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         // Устройство уже перешло на новый ключ: `Excluded` из старой группы
         // не в счёт.
-        let current = state.paths.load().ok().flatten();
-        if current.is_none_or(|s| s.invite.group_key.group_id() != old) {
-            return;
+        match devices::mark_excluded(&state.paths, old) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => tracing::error!("отметка об исключении не сохранилась: {e:#}"),
         }
         crate::stop_service(&app).await;
-        if let Err(e) = devices::leave_excluded(&state.paths, old) {
-            tracing::error!("выйти из группы после исключения не удалось: {e:#}");
-        }
         if let Err(e) = crate::start_service(&app) {
             tracing::error!("локальный режим не запустился: {e:#}");
         }
         crate::publish_status(&app);
         let _ = app.emit("clipwire://group-excluded", ());
     });
+}
+
+/// «Попробовать снова» после исключения: снять отметку и запустить
+/// синхронизацию с тем же ключом.
+#[tauri::command]
+pub async fn group_retry(app: AppHandle) -> CmdResult<()> {
+    devices::clear_excluded(&app.state::<AppState>().paths).map_err(|e| format!("{e:#}"))?;
+    crate::restart_service(&app)
+        .await
+        .map_err(|e| format!("Синхронизация не запустилась: {e:#}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

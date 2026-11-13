@@ -2,22 +2,22 @@
 //! изменения буфера и отдаёт наружу чужие. С буфером ОС сам не работает —
 //! это делает платформенный слой, поэтому движок тестируется без GUI.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clipwire_core::device::{open_rekey, rekey_public};
+use clipwire_core::device::{DeviceCard, Rekey, open_rekey, rekey_public};
 use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{ALPN, ClientMsg, DeviceEntry, ServerMsg};
-use clipwire_core::{Content, DeviceId, GroupId, GroupKey, Item, ItemId};
+use clipwire_core::{Content, DeviceId, Ext, ExtList, GroupId, GroupKey, Item, ItemId, SourceApp};
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey, Watcher};
 use tokio::sync::mpsc;
 
 use crate::blobs::Blobs;
-use crate::devices::{Control, Rekeyed};
+use crate::devices::{Control, RekeyNotice, Rekeyed};
 use crate::state::AgentState;
 
 /// Больше этого не отправляем: сервер по умолчанию принимает до 8 МиБ
@@ -46,6 +46,43 @@ pub const FRESH_LIVE: Duration = Duration::from_secs(6 * 3600);
 /// не на связи, не должно внезапно подменить то, что человек скопировал у себя.
 pub const FRESH_FROM_HISTORY: Duration = Duration::from_secs(10 * 60);
 
+/// Копирование на этом устройстве, которое уходит в группу: содержимое и
+/// сведения для `Item.ext` (приложение-источник).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outgoing {
+    pub content: Content,
+    pub ext: Vec<Ext>,
+}
+
+impl Outgoing {
+    /// Содержимое и, если известно, приложение, из которого скопировано.
+    pub fn new(content: Content, source: Option<&SourceApp>) -> Self {
+        let mut out = Self::from(content);
+        if let Some(app) = source {
+            out.ext_set(clipwire_core::item::ext::SOURCE_APP, app);
+        }
+        out
+    }
+}
+
+impl ExtList for Outgoing {
+    fn ext_list(&self) -> &[Ext] {
+        &self.ext
+    }
+    fn ext_list_mut(&mut self) -> &mut Vec<Ext> {
+        &mut self.ext
+    }
+}
+
+impl From<Content> for Outgoing {
+    fn from(content: Content) -> Self {
+        Self {
+            content,
+            ext: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     Connecting,
@@ -64,18 +101,23 @@ pub enum Event {
     /// Агент увидел элемент с этим id; сохранить, чтобы после перезапуска не
     /// применять старое повторно.
     Cursor(ItemId),
-    /// Ключ группы `old` сменили с другого устройства, новый ключ — `key`.
-    /// Движок дальше не подключается: сохранить новое состояние и запустить
-    /// новый движок (`devices::adopt_key`).
-    Rekeyed {
-        old: GroupId,
-        key: GroupKey,
-    },
-    /// Ключ группы `old` сменили без этого устройства: его исключили.
-    /// Движок дальше не подключается (`devices::leave_excluded`).
+    /// Ключ группы сменили, пакет открылся, инициатор проверен по
+    /// карточкам. Движок дальше не подключается: сохранить новое состояние и
+    /// запустить новый движок (`devices::adopt_key`).
+    Rekeyed(RekeyNotice),
+    /// Сервер сообщил, что устройство исключено из группы `old` (или пакету
+    /// нового ключа нельзя верить). Движок дальше не подключается
+    /// (`devices::mark_excluded`).
     Excluded {
         old: GroupId,
     },
+    /// Проверенные карточки устройств группы изменились: сохранить
+    /// (`devices::save_known`), чтобы после перезапуска проверить инициатора
+    /// смены ключа.
+    KnownDevices(Vec<DeviceCard>),
+    /// Ответ на `Rekey` потерялся, а при повторном входе оказалось, что сервер
+    /// запрос не получил: ключ не сменился. Текст для человека.
+    RekeyLost(String),
 }
 
 /// Кто ждёт ответа `Devices`, по порядку запросов: команда интерфейса или
@@ -85,6 +127,18 @@ type DevicesWaiter = Option<tokio::sync::oneshot::Sender<Result<Vec<DeviceEntry>
 /// Если соединение оборвалось так скоро после `PublishCard`, сервер,
 /// скорее всего, старый и этого сообщения не знает.
 const CARD_CHECK: Duration = Duration::from_secs(10);
+/// Как часто обновлять список устройств, пока есть связь: по нему
+/// проверяется, кто сменил ключ, и устройство, вошедшее в группу позже,
+/// должно успеть в нём оказаться.
+const DEVICES_REFRESH: Duration = Duration::from_secs(5 * 60);
+/// Не чаще этого запрашивать список, увидев элемент с незнакомого устройства.
+const DEVICES_REFRESH_MIN: Duration = Duration::from_secs(30);
+
+/// Смена ключа на этом устройстве, на которую сервер ещё не ответил.
+struct PendingRekey {
+    key: GroupKey,
+    skipped: Vec<DeviceId>,
+}
 
 /// Как сообщить UI, что в канале событий что-то появилось (на Windows —
 /// PostMessage в окно трея).
@@ -102,13 +156,13 @@ pub struct Engine {
     went_online: bool,
     /// Локальная история, которую надо отправить в группу (устройство только
     /// что подключилось): содержимое и когда скопировано, от старых к новым.
-    backfill: Vec<(Content, u64)>,
+    backfill: Vec<(Outgoing, u64)>,
     /// Передача файлов: загрузчик живёт здесь, соединение отдаётся ему на
     /// время сессии.
     blobs: Option<Arc<Blobs>>,
     /// Последнее копирование, которое ещё не ушло в группу: скопировано без
     /// связи или отправка оборвалась. Уходит первым после входа.
-    pending: Option<Content>,
+    pending: Option<Outgoing>,
     /// У `pending` могли остаться резервы на сервере (отправка уже
     /// начиналась): если его вытеснит новое копирование, резервы отменяются.
     pending_reserved: bool,
@@ -124,6 +178,15 @@ pub struct Engine {
     card_check: Option<Instant>,
     /// Сервер не знает карточек (старая версия): не отправлять их.
     cards_unsupported: bool,
+    /// Проверенные карточки устройств группы: по ним проверяется инициатор
+    /// смены ключа.
+    known: HashMap<DeviceId, DeviceCard>,
+    /// Когда последний раз запрашивали список устройств.
+    listed_at: Option<Instant>,
+    /// Увидели элемент с устройства без карточки: обновить список.
+    want_list: bool,
+    /// `Rekey` отправлен, ответа ещё нет (или он потерялся).
+    pending_rekey: Option<PendingRekey>,
 }
 
 impl Engine {
@@ -162,7 +225,17 @@ impl Engine {
             terminal: false,
             card_check: None,
             cards_unsupported: false,
+            known: HashMap::new(),
+            listed_at: None,
+            want_list: false,
+            pending_rekey: None,
         }
+    }
+
+    /// Карточки устройств группы, проверенные раньше (`devices::load_known`).
+    pub fn with_known_devices(mut self, cards: Vec<DeviceCard>) -> Self {
+        self.known = cards.into_iter().map(|c| (c.device, c)).collect();
+        self
     }
 
     /// Принимать команды интерфейса (`devices::Controller`).
@@ -178,7 +251,7 @@ impl Engine {
     }
 
     /// Отправить в группу эту локальную историю после входа.
-    pub fn with_backfill(mut self, items: Vec<(Content, u64)>) -> Self {
+    pub fn with_backfill(mut self, items: Vec<(Outgoing, u64)>) -> Self {
         self.backfill = items;
         self
     }
@@ -197,7 +270,7 @@ impl Engine {
     /// Загрузчик файлов работает внутри этой же задачи: если задачу движка
     /// снять (`abort`), загрузчик снимается вместе с ней, и следующий движок
     /// не столкнётся со старым на одной очереди загрузок.
-    pub async fn run(self, local: mpsc::Receiver<Content>) -> Result<()> {
+    pub async fn run(self, local: mpsc::Receiver<Outgoing>) -> Result<()> {
         let server = &self.state.invite.server;
         let url: RelayUrl = server
             .relay_url
@@ -249,7 +322,7 @@ impl Engine {
         mut self,
         ep: Endpoint,
         url: RelayUrl,
-        mut local: mpsc::Receiver<Content>,
+        mut local: mpsc::Receiver<Outgoing>,
     ) -> Result<()> {
         let server = &self.state.invite.server;
         let addr = EndpointAddr::new(PublicKey::from_bytes(&server.server_id)?).with_relay_url(url);
@@ -318,7 +391,7 @@ impl Engine {
     /// Копирования за это время в группу не уходят: старой группы больше нет.
     async fn idle(
         &mut self,
-        local: &mut mpsc::Receiver<Content>,
+        local: &mut mpsc::Receiver<Outgoing>,
         control: &mut Option<mpsc::Receiver<Control>>,
     ) {
         loop {
@@ -335,26 +408,29 @@ impl Engine {
     /// Сервер сообщил, что ключ группы сменён (`Rekeyed` с пакетом или
     /// `Excluded`). Возвращает ошибку, которой заканчивается сессия.
     ///
-    /// Пакет, который не открылся, равен исключению: нового ключа у
-    /// устройства всё равно нет. Так сервер может выбросить устройство из
-    /// группы, но это не больше, чем отказ в обслуживании.
+    /// Пакет, который не открылся, и пакет от устройства, которого этот
+    /// клиент не видел с проверенной карточкой, равны исключению: нового
+    /// ключа нет или ему нельзя верить. Так сервер может остановить
+    /// синхронизацию устройства, но это не больше, чем отказ в обслуживании,
+    /// и ключ с историей при этом не стираются (`devices::mark_excluded`).
     fn rotated(&mut self, envelope: Option<Vec<u8>>) -> anyhow::Error {
         let old = self.state.invite.group_key.group_id();
         self.terminal = true;
         let old_key = self.state.invite.group_key.clone();
-        // shortcut: инициатор смены ключа (k.initiator) пока не сверяется с
-        // известными карточками и не показывается человеку — следующий шаг.
-        let key = envelope.and_then(|e| match open_rekey(&self.state.device_key, &old_key, &e) {
-            Ok(k) => Some(k.key),
-            Err(err) => {
-                tracing::warn!("пакет нового ключа не открылся: {err}");
-                None
-            }
-        });
-        match key {
-            Some(key) => {
-                tracing::info!("ключ группы сменён, перехожу на новый");
-                self.emit(Event::Rekeyed { old, key });
+        let pending = self.pending_rekey.take();
+        let notice = envelope
+            .and_then(|e| match open_rekey(&self.state.device_key, &old_key, &e) {
+                Ok(k) => Some(k),
+                Err(err) => {
+                    tracing::warn!("пакет нового ключа не открылся: {err}");
+                    None
+                }
+            })
+            .and_then(|k| self.check_initiator(old, k, pending));
+        match notice {
+            Some(n) => {
+                tracing::info!(by_me = n.by_me, "ключ группы сменён, перехожу на новый");
+                self.emit(Event::Rekeyed(n));
                 anyhow!("ключ группы сменён")
             }
             None => {
@@ -365,11 +441,81 @@ impl Engine {
         }
     }
 
+    /// Можно ли верить пакету: его выпустило это устройство (ответ на свой
+    /// `Rekey` потерялся) или устройство группы, карточку которого этот
+    /// клиент проверял. `None` — инициатор неизвестен.
+    fn check_initiator(
+        &self,
+        old: GroupId,
+        k: Rekey,
+        pending: Option<PendingRekey>,
+    ) -> Option<RekeyNotice> {
+        if k.initiator == self.device {
+            let skipped = pending
+                .filter(|p| p.key == k.key)
+                .map(|p| p.skipped)
+                .unwrap_or_default();
+            return Some(RekeyNotice {
+                old,
+                key: k.key,
+                initiator: self.device,
+                initiator_name: self.device_name.clone(),
+                by_me: true,
+                skipped,
+            });
+        }
+        // shortcut: устройство, вошедшее в группу позже последнего списка
+        // (он обновляется при входе, раз в DEVICES_REFRESH и при элементе с
+        // незнакомого устройства) и сразу сменившее ключ, здесь неизвестно:
+        // такая смена считается исключением. Переделать, если сервер начнёт
+        // сам рассылать карточки новых устройств.
+        let Some(card) = self.known.get(&k.initiator) else {
+            tracing::warn!(
+                initiator = %crate::devices::fingerprint(k.initiator),
+                "ключ сменило устройство без проверенной карточки, считаю исключением"
+            );
+            return None;
+        };
+        Some(RekeyNotice {
+            old,
+            key: k.key,
+            initiator: k.initiator,
+            initiator_name: card.name.clone(),
+            by_me: false,
+            skipped: Vec::new(),
+        })
+    }
+
+    /// Запомнить проверенные карточки из ответа `Devices`.
+    fn learn(&mut self, list: &[DeviceEntry]) {
+        let key = self.state.invite.group_key.clone();
+        let mut changed = false;
+        for v in crate::devices::open_entries(&key, list.to_vec()) {
+            if let Some(card) = v.card
+                && self.known.get(&card.device) != Some(&card)
+            {
+                self.known.insert(card.device, card);
+                changed = true;
+            }
+        }
+        if changed {
+            self.emit(Event::KnownDevices(self.known.values().cloned().collect()));
+        }
+    }
+
+    /// Запросить список устройств (ответ уйдёт в [`Engine::learn`]).
+    async fn request_list(&mut self, send: &mut iroh::endpoint::SendStream) -> Result<()> {
+        write_msg(send, &ClientMsg::ListDevices).await?;
+        self.devices_waiters.push_back(None);
+        self.listed_at = Some(Instant::now());
+        Ok(())
+    }
+
     async fn session(
         &mut self,
         ep: &Endpoint,
         addr: EndpointAddr,
-        local: &mut mpsc::Receiver<Content>,
+        local: &mut mpsc::Receiver<Outgoing>,
         control: &mut Option<mpsc::Receiver<Control>>,
     ) -> Result<()> {
         let server_addr = addr.clone();
@@ -397,6 +543,14 @@ impl Engine {
                 }
             }
         };
+        // Вошли в старую группу как обычно: `Rekey`, на который не пришёл
+        // ответ, до сервера не дошёл, ключ не сменился.
+        if self.pending_rekey.take().is_some() {
+            tracing::warn!("смена ключа не дошла до сервера");
+            self.emit(Event::RekeyLost(
+                "Ключ не сменился: сервер не получил запрос. Попробуйте ещё раз".into(),
+            ));
+        }
         // История идёт по элементу; таймаут на каждый, а не на всю: с
         // картинками она может качаться дольше CONNECT_TIMEOUT.
         let mut history = Vec::new();
@@ -423,10 +577,14 @@ impl Engine {
                 now_ms(),
             )?;
             write_msg(&mut send, &ClientMsg::PublishCard(card)).await?;
-            write_msg(&mut send, &ClientMsg::ListDevices).await?;
-            self.devices_waiters.push_back(None);
+            self.request_list(&mut send).await?;
             self.card_check = Some(Instant::now());
         }
+        let mut refresh = tokio::time::interval_at(
+            tokio::time::Instant::now() + DEVICES_REFRESH,
+            DEVICES_REFRESH,
+        );
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Файлы ходят по своим потокам этого же соединения, пока сессия жива.
         let _files = self.blobs.as_ref().map(|b| b.attach(conn.clone()));
         self.went_online = true;
@@ -459,9 +617,20 @@ impl Engine {
                     }
                 },
                 msg = read_msg::<_, ServerMsg>(&mut recv) => match msg? {
-                    Some(m) => self.handle_msg(&key, m)?,
+                    Some(m) => {
+                        self.handle_msg(&key, m)?;
+                        let due = self
+                            .listed_at
+                            .is_none_or(|t| t.elapsed() >= DEVICES_REFRESH_MIN);
+                        if std::mem::take(&mut self.want_list) && due && !self.cards_unsupported {
+                            self.request_list(&mut send).await?;
+                        }
+                    }
                     None => bail!("сервер закрыл соединение"),
                 },
+                _ = refresh.tick(), if !self.cards_unsupported => {
+                    self.request_list(&mut send).await?;
+                }
                 ctl = next_control(control) => match ctl {
                     Control::ListDevices(reply) => {
                         write_msg(&mut send, &ClientMsg::ListDevices).await?;
@@ -484,7 +653,15 @@ impl Engine {
                                 let _ = reply.send(Err(refused));
                             }
                             Err(e) => {
-                                let _ = reply.send(Err(format!("Ключ не сменился: {e:#}")));
+                                // `Rekey` ушёл, а ответа нет: чем кончилось,
+                                // станет ясно при повторном входе в старую
+                                // группу (свой `Rekeyed` или обычный вход).
+                                let msg = if self.pending_rekey.is_some() {
+                                    "Ответ сервера не пришёл, проверяю…".to_string()
+                                } else {
+                                    format!("Ключ не сменился: {e:#}")
+                                };
+                                let _ = reply.send(Err(msg));
                                 return Err(e);
                             }
                         }
@@ -497,7 +674,12 @@ impl Engine {
     /// Сообщение сервера посреди сессии. Ошибка заканчивает сессию.
     fn handle_msg(&mut self, key: &GroupKey, msg: ServerMsg) -> Result<()> {
         match msg {
-            ServerMsg::Deliver(sealed) => self.deliver(&sealed),
+            ServerMsg::Deliver(sealed) => {
+                if sealed.origin != self.device && !self.known.contains_key(&sealed.origin) {
+                    self.want_list = true;
+                }
+                self.deliver(&sealed)
+            }
             ServerMsg::Backfill(sealed) => {
                 if sealed.origin != self.device {
                     match key.open(&sealed) {
@@ -517,6 +699,7 @@ impl Engine {
 
     /// Ответ `Devices` — первому, кто его ждёт.
     fn answer_devices(&mut self, list: Vec<DeviceEntry>) {
+        self.learn(&list);
         match self.devices_waiters.pop_front() {
             Some(Some(reply)) => {
                 let _ = reply.send(Ok(list));
@@ -539,6 +722,7 @@ impl Engine {
                 .context("сервер не прислал список устройств")??;
             match msg {
                 Some(ServerMsg::Devices(list)) if self.devices_waiters.is_empty() => {
+                    self.learn(&list);
                     return Ok(list);
                 }
                 Some(m) => self.handle_msg(key, m)?,
@@ -605,6 +789,11 @@ impl Engine {
 
         let envelopes =
             crate::devices::seal_envelopes(&new_key, &old_key, &self.state.device_key, &plan)?;
+        // С этого момента сервер мог сменить ключ, даже если ответ потеряется.
+        self.pending_rekey = Some(PendingRekey {
+            key: new_key.clone(),
+            skipped: plan.skipped.clone(),
+        });
         write_msg(
             send,
             &ClientMsg::Rekey {
@@ -620,7 +809,11 @@ impl Engine {
                 .context("сервер не ответил на смену ключа")??;
             match msg {
                 None => break Ok(()),
-                Some(ServerMsg::Error(e)) => break Err(anyhow!("сервер отказал: {e}")),
+                Some(ServerMsg::Error(e)) => {
+                    // Отказ: ничего не изменилось.
+                    self.pending_rekey = None;
+                    break Err(anyhow!("сервер отказал: {e}"));
+                }
                 Some(m) => {
                     if let Err(e) = self.handle_msg(&old_key, m) {
                         break Err(e);
@@ -631,6 +824,7 @@ impl Engine {
         let _ = send2.finish();
         conn2.close(0u32.into(), b"bye");
         res?;
+        self.pending_rekey = None;
         tracing::info!(
             recipients = plan.recipients.len(),
             skipped = plan.skipped.len(),
@@ -716,11 +910,12 @@ impl Engine {
             n = self.backfill.len(),
             "отправляю локальную историю в группу"
         );
-        while let Some((content, ms)) = self.backfill.first().cloned() {
-            let content = content.fit(MAX_ITEM_BYTES);
+        while let Some((out, ms)) = self.backfill.first().cloned() {
+            let content = out.content.fit(MAX_ITEM_BYTES);
             if content.len() <= MAX_ITEM_BYTES {
-                let item = Item::backdated(self.device, content, ms)
+                let mut item = Item::backdated(self.device, content, ms)
                     .with_device_name(self.device_name.clone());
+                item.ext = out.ext;
                 let sealed = self.state.invite.group_key.seal(&item)?;
                 write_msg(send, &ClientMsg::Backfill(sealed)).await?;
             }
@@ -762,10 +957,10 @@ impl Engine {
     /// отправка вытесненного уже начиналась, его резервы на сервере
     /// отменяются при следующем соединении. Архивы его папок из outbox
     /// удаляются: загружать их некому.
-    fn replace_pending(&mut self, c: Content) {
+    fn replace_pending(&mut self, c: Outgoing) {
         let reserved = std::mem::take(&mut self.pending_reserved);
         if let Some(old) = self.pending.replace(c)
-            && let (Some(b), Content::Files(files)) = (&self.blobs, &old)
+            && let (Some(b), Content::Files(files)) = (&self.blobs, &old.content)
         {
             if reserved {
                 b.abort_later(files.iter().filter_map(|f| f.blob));
@@ -777,7 +972,7 @@ impl Engine {
 
     /// Вернуть неотправленный элемент в очередь движка: он уйдёт первым
     /// после переподключения (если его не вытеснит новое копирование).
-    fn restore_pending(&mut self, c: Content) {
+    fn restore_pending(&mut self, c: Outgoing) {
         if self.pending.is_none() {
             self.pending = Some(c);
             self.pending_reserved = true;
@@ -791,8 +986,9 @@ impl Engine {
         &mut self,
         conn: &Connection,
         send: &mut iroh::endpoint::SendStream,
-        c: Content,
+        out: Outgoing,
     ) -> Result<()> {
+        let Outgoing { content: c, ext } = out;
         // Огромный HTML из Word не повод не отправить сам текст.
         let c = c.fit(MAX_ITEM_BYTES);
         if c.len() > MAX_ITEM_BYTES {
@@ -813,17 +1009,24 @@ impl Engine {
                     Err(f) => {
                         self.reserve_failures += 1;
                         let f = *f;
-                        self.restore_pending(f.content);
+                        self.restore_pending(Outgoing {
+                            content: f.content,
+                            ext,
+                        });
                         bail!("файлы не зарезервировались: {}", f.error);
                     }
                 }
             }
             (_, c) => (c, Vec::new()),
         };
-        let item = Item::new(self.device, c).with_device_name(self.device_name.clone());
+        let mut item = Item::new(self.device, c).with_device_name(self.device_name.clone());
+        item.ext = ext;
         let sealed = self.state.invite.group_key.seal(&item)?;
         if let Err(e) = write_msg(send, &ClientMsg::Push(sealed)).await {
-            self.restore_pending(item.content);
+            self.restore_pending(Outgoing {
+                content: item.content,
+                ext: item.ext,
+            });
             return Err(e.into());
         }
         self.reserve_failures = 0;
@@ -1185,6 +1388,115 @@ mod tests {
         e.apply_history(vec![(sealed(2, now - 300_000), false)]);
         let (clip, _) = drain(&mut rx);
         assert_eq!(clip, texts(&[now - 300_000]));
+    }
+
+    /// Что движок сделал с пакетом: новый ключ (с инициатором) или исключение.
+    fn rotation(rx: &mut mpsc::UnboundedReceiver<Event>) -> Option<RekeyNotice> {
+        while let Ok(e) = rx.try_recv() {
+            match e {
+                Event::Rekeyed(n) => return Some(n),
+                Event::Excluded { .. } => return None,
+                _ => {}
+            }
+        }
+        panic!("движок ничего не сообщил о смене ключа");
+    }
+
+    #[test]
+    fn rekey_is_trusted_only_from_known_device_or_self() {
+        use clipwire_core::device::{device_id, seal_rekey};
+        let (mut e, mut rx) = engine(None);
+        let (me, me_key, other) = (e.device(), [9u8; 32], [5u8; 32]);
+        let new = GroupKey([2; 32]);
+        let env = |by: &[u8; 32]| seal_rekey(&new, &key(), by, me, &rekey_public(&me_key)).unwrap();
+
+        // Инициатора нет среди проверенных карточек — исключение.
+        e.rotated(Some(env(&other)));
+        assert!(rotation(&mut rx).is_none());
+
+        let card = DeviceCard {
+            device: device_id(&other),
+            name: "Рабочий".into(),
+            os: "Windows".into(),
+            rekey_pub: rekey_public(&other),
+            issued_ms: 1,
+        };
+        e.known.insert(card.device, card);
+        e.rotated(Some(env(&other)));
+        let n = rotation(&mut rx).expect("известное устройство");
+        assert_eq!(n.key, new);
+        assert_eq!(n.initiator_name, "Рабочий");
+        assert!(!n.by_me);
+
+        // Свой пакет после потерянного ответа: успех этого устройства с теми
+        // же пропущенными устройствами, что были в плане.
+        e.pending_rekey = Some(PendingRekey {
+            key: new.clone(),
+            skipped: vec![DeviceId([7; 32])],
+        });
+        e.rotated(Some(env(&me_key)));
+        let n = rotation(&mut rx).expect("свой пакет");
+        assert!(n.by_me);
+        assert_eq!(n.skipped, vec![DeviceId([7; 32])]);
+        assert!(e.pending_rekey.is_none());
+        // Свой пакет без плана в памяти (приложение перезапускалось) — тоже свой.
+        e.rotated(Some(env(&me_key)));
+        let n = rotation(&mut rx).expect("свой пакет");
+        assert!(n.by_me && n.skipped.is_empty());
+
+        // Испорченный пакет и Excluded — исключение.
+        let mut bad = env(&other);
+        bad[200] ^= 1;
+        e.rotated(Some(bad));
+        assert!(rotation(&mut rx).is_none());
+        e.rotated(None);
+        assert!(rotation(&mut rx).is_none());
+        assert!(e.terminal);
+    }
+
+    #[test]
+    fn learned_cards_are_kept_and_reported_once() {
+        let (mut e, mut rx) = engine(None);
+        let dk = [5u8; 32];
+        let entry = DeviceEntry {
+            device: clipwire_core::device::device_id(&dk),
+            card: crate::devices::sealed_card(&key(), &dk, "Ноутбук", 1).unwrap(),
+            last_seen_ms: 1,
+            online: true,
+        };
+        let junk = DeviceEntry {
+            device: DeviceId([3; 32]),
+            card: vec![1, 2, 3],
+            last_seen_ms: 1,
+            online: false,
+        };
+        e.learn(&[entry.clone(), junk]);
+        let saved: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|ev| match ev {
+                Event::KnownDevices(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].len(), 1, "битая карточка не запоминается");
+        assert_eq!(saved[0][0].name, "Ноутбук");
+        // Тот же список ещё раз — сохранять нечего.
+        e.learn(&[entry]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn outgoing_carries_source_app() {
+        let app = SourceApp {
+            name: "Telegram".into(),
+            exe: "Telegram.exe".into(),
+            icon_png: vec![1],
+        };
+        let o = Outgoing::new(Content::Text("x".into()), Some(&app));
+        let mut item = Item::new(DeviceId([1; 32]), o.content.clone());
+        item.ext = o.ext;
+        assert_eq!(item.source_app(), Some(app));
+        assert!(Outgoing::from(Content::Text("x".into())).ext.is_empty());
     }
 
     #[test]

@@ -3,7 +3,9 @@
 //! - `state.bin` — код приглашения (сервер + ключ группы) и ключ устройства,
 //!   защищён через [`crate::secret`];
 //! - `cursor` — id последнего элемента, который агент уже видел. Секретом не
-//!   является, меняется часто, поэтому лежит отдельно открытым текстом.
+//!   является, меняется часто, поэтому лежит отдельно открытым текстом;
+//! - `devices.bin` — проверенные карточки устройств группы, `excluded` —
+//!   отметка «устройство исключено» (`crate::devices`).
 
 use std::path::{Path, PathBuf};
 
@@ -92,7 +94,9 @@ impl Paths {
     /// остаётся там и убирается при следующем запуске ([`Paths::clean_trash`]).
     pub fn reset(&self) -> Result<()> {
         let uploads = self.dir.join(crate::blobs::UPLOADS_FILE);
-        for p in [self.state(), self.cursor(), uploads] {
+        let known = self.dir.join(crate::devices::KNOWN_FILE);
+        let excluded = self.dir.join(crate::devices::EXCLUDED_FILE);
+        for p in [self.state(), self.cursor(), uploads, known, excluded] {
             match std::fs::remove_file(&p) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -184,7 +188,7 @@ impl Paths {
     }
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, data).with_context(|| format!("не записался {}", tmp.display()))?;
     #[cfg(unix)]
@@ -241,6 +245,8 @@ mod tests {
         assert_eq!(paths.load_cursor(), Some(id));
 
         std::fs::write(dir.join("uploads.json"), b"[]").unwrap();
+        std::fs::write(dir.join("devices.bin"), b"x").unwrap();
+        std::fs::write(dir.join("excluded"), b"x").unwrap();
         std::fs::create_dir_all(dir.join("outbox")).unwrap();
         std::fs::write(dir.join("outbox").join("a.tar"), b"x").unwrap();
         std::fs::create_dir_all(dir.join("files").join("ab12")).unwrap();
@@ -251,6 +257,8 @@ mod tests {
         assert!(paths.load().unwrap().is_none());
         assert!(paths.load_cursor().is_none());
         assert!(!dir.join("uploads.json").exists());
+        assert!(!dir.join("devices.bin").exists());
+        assert!(!dir.join("excluded").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 

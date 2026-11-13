@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clipwire_agent::devices::{Control, Controller, DeviceView};
+use clipwire_agent::devices::{Control, Controller, DeviceView, RekeyNotice};
 use clipwire_agent::state::{AgentState, random_key};
-use clipwire_agent::sync::{Engine, Event, Status};
-use clipwire_core::device::device_id;
+use clipwire_agent::sync::{Engine, Event, Outgoing, Status};
+use clipwire_core::device::{DeviceCard, device_id};
 use clipwire_core::{Content, DeviceId, GroupKey, Invite, ServerInfo};
 use clipwire_server::Config;
 use tokio::sync::mpsc;
@@ -40,11 +40,13 @@ async fn start_server() -> Result<(clipwire_server::Running, ServerInfo)> {
 }
 
 /// Устройство: постоянный ключ устройства, движок пересоздаётся с новым
-/// ключом группы, как это делает приложение.
+/// ключом группы, как это делает приложение. Проверенные карточки
+/// переживают перезапуск движка, как `devices.bin` у приложения.
 struct Agent {
     name: &'static str,
     device_key: [u8; 32],
-    local: Option<mpsc::Sender<Content>>,
+    known: Vec<DeviceCard>,
+    local: Option<mpsc::Sender<Outgoing>>,
     events: mpsc::UnboundedReceiver<Event>,
     ctl: Controller,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -53,10 +55,11 @@ struct Agent {
 impl Agent {
     fn new(name: &'static str, info: &ServerInfo, key: &GroupKey) -> Result<Self> {
         let device_key = random_key()?;
-        let (events, ctl, local, task) = Self::engine(name, info, key, device_key);
+        let (events, ctl, local, task) = Self::engine(name, info, key, device_key, Vec::new());
         Ok(Self {
             name,
             device_key,
+            known: Vec::new(),
             local: Some(local),
             events,
             ctl,
@@ -70,10 +73,11 @@ impl Agent {
         info: &ServerInfo,
         key: &GroupKey,
         device_key: [u8; 32],
+        known: Vec<DeviceCard>,
     ) -> (
         mpsc::UnboundedReceiver<Event>,
         Controller,
-        mpsc::Sender<Content>,
+        mpsc::Sender<Outgoing>,
         tokio::task::JoinHandle<Result<()>>,
     ) {
         let state = AgentState {
@@ -86,7 +90,9 @@ impl Agent {
         let (etx, events) = mpsc::unbounded_channel();
         let (local, lrx) = mpsc::channel(16);
         let (ctx, crx) = mpsc::channel::<Control>(4);
-        let engine = Engine::new(state, name.into(), None, etx, Arc::new(|| {})).with_control(crx);
+        let engine = Engine::new(state, name.into(), None, etx, Arc::new(|| {}))
+            .with_control(crx)
+            .with_known_devices(known);
         let ctl = Controller::new(ctx, key.clone(), engine.device());
         let task = tokio::spawn(engine.run(lrx));
         (events, ctl, local, task)
@@ -101,13 +107,24 @@ impl Agent {
         if let Some(t) = self.task.take() {
             tokio::time::timeout(T, t).await???;
         }
+        // Карточки, сохранённые движком до остановки.
+        while let Ok(e) = self.events.try_recv() {
+            self.note(&e);
+        }
         Ok(())
+    }
+
+    fn note(&mut self, e: &Event) {
+        if let Event::KnownDevices(cards) = e {
+            self.known = cards.clone();
+        }
     }
 
     /// Остановить движок и запустить с новым ключом группы.
     async fn restart(&mut self, info: &ServerInfo, key: &GroupKey) -> Result<()> {
         self.stop().await?;
-        let (events, ctl, local, task) = Self::engine(self.name, info, key, self.device_key);
+        let known = self.known.clone();
+        let (events, ctl, local, task) = Self::engine(self.name, info, key, self.device_key, known);
         self.events = events;
         self.ctl = ctl;
         self.local = Some(local);
@@ -119,6 +136,7 @@ impl Agent {
         tokio::time::timeout(T, async {
             loop {
                 let e = self.events.recv().await.context("движок остановился")?;
+                self.note(&e);
                 if let Some(v) = f(&e) {
                     return Ok(v);
                 }
@@ -137,7 +155,7 @@ impl Agent {
         self.local
             .as_ref()
             .context("движок остановлен")?
-            .send(Content::Text(text.into()))
+            .send(Content::Text(text.into()).into())
             .await?;
         Ok(())
     }
@@ -158,8 +176,14 @@ impl Agent {
     }
 
     async fn rotation(&mut self) -> Result<Option<GroupKey>> {
+        Ok(self.notice().await?.map(|n| n.key))
+    }
+
+    /// Чем кончилась смена ключа для этого устройства: новый ключ с
+    /// инициатором или `None` (исключено).
+    async fn notice(&mut self) -> Result<Option<RekeyNotice>> {
         self.wait(|e| match e {
-            Event::Rekeyed { key, .. } => Some(Some(key.clone())),
+            Event::Rekeyed(n) => Some(Some(n.clone())),
             Event::Excluded { .. } => Some(None),
             _ => None,
         })
@@ -226,7 +250,10 @@ async fn removing_device_moves_others_to_new_key() -> Result<()> {
     for x in [&mut a, &mut b, &mut c] {
         x.online().await?;
     }
-    a.devices_with_cards(3).await?;
+    // Каждый видел карточки остальных: по ним проверяется, кто сменил ключ.
+    for x in [&a, &b, &c] {
+        x.devices_with_cards(3).await?;
+    }
 
     // Своё устройство так не удалить.
     assert!(a.ctl.rekey(Some(a.id())).await.is_err());
@@ -241,7 +268,12 @@ async fn removing_device_moves_others_to_new_key() -> Result<()> {
     let k2 = done.key;
     assert_ne!(k2, key);
 
-    assert_eq!(b.rotation().await?, Some(k2.clone()));
+    let n = b.notice().await?.context("B должен получить ключ")?;
+    assert_eq!(n.key, k2);
+    assert_eq!(
+        (n.initiator, n.initiator_name.as_str(), n.by_me),
+        (a.id(), "A", false)
+    );
     assert_eq!(c.rotation().await?, None);
 
     a.restart(&info, &k2).await?;
@@ -282,7 +314,9 @@ async fn offline_device_gets_its_key_later() -> Result<()> {
     for x in [&mut a, &mut b, &mut c] {
         x.online().await?;
     }
-    a.devices_with_cards(3).await?;
+    for x in [&a, &b, &c] {
+        x.devices_with_cards(3).await?;
+    }
     b.stop().await?;
 
     let k2 = a
@@ -293,6 +327,14 @@ async fn offline_device_gets_its_key_later() -> Result<()> {
         .key;
     assert_eq!(c.rotation().await?, None);
 
+    // Без сохранённых карточек B не знает, кто сменил ключ: не переходит, а
+    // считает себя исключённым. С карточками с диска — переходит.
+    let saved = std::mem::take(&mut b.known);
+    assert!(saved.iter().any(|c| c.device == a.id()));
+    b.restart(&info, &key).await?;
+    assert_eq!(b.rotation().await?, None, "инициатор неизвестен");
+    b.stop().await?;
+    b.known = saved;
     b.restart(&info, &key).await?;
     assert_eq!(b.rotation().await?, Some(k2.clone()));
 
@@ -304,9 +346,11 @@ async fn offline_device_gets_its_key_later() -> Result<()> {
     assert_eq!(a.incoming_text().await?, "B вернулся");
 
     // A, у которого ответ сервера якобы потерялся, при входе в старую группу
-    // получает свой пакет (он кладёт его и себе).
+    // получает свой пакет (он кладёт его и себе) и видит, что сменил сам.
     a.restart(&info, &key).await?;
-    assert_eq!(a.rotation().await?, Some(k2));
+    let n = a.notice().await?.context("A должен получить свой пакет")?;
+    assert_eq!(n.key, k2);
+    assert!(n.by_me);
 
     for x in [&mut a, &mut b, &mut c] {
         x.stop().await?;
@@ -325,7 +369,9 @@ async fn rekey_without_removal_keeps_everyone() -> Result<()> {
     for x in [&mut a, &mut b, &mut c] {
         x.online().await?;
     }
-    a.devices_with_cards(3).await?;
+    for x in [&a, &b, &c] {
+        x.devices_with_cards(3).await?;
+    }
     let k2 = b.ctl.rekey(None).await.map_err(anyhow::Error::msg)?.key;
     assert_eq!(a.rotation().await?, Some(k2.clone()));
     assert_eq!(c.rotation().await?, Some(k2.clone()));
@@ -337,6 +383,34 @@ async fn rekey_without_removal_keeps_everyone() -> Result<()> {
     b.copy("всем").await?;
     assert_eq!(a.incoming_text().await?, "всем");
     assert_eq!(c.incoming_text().await?, "всем");
+    for x in [&mut a, &mut b, &mut c] {
+        x.stop().await?;
+    }
+    server.shutdown().await
+}
+
+/// C вошёл в группу после последнего списка устройств у B и сразу сменил
+/// ключ: B не видел его карточку и не переходит на новый ключ, а считает
+/// себя исключённым. A, который карточку C видел, переходит и знает, кто
+/// сменил ключ.
+#[tokio::test(flavor = "multi_thread")]
+async fn rekey_by_unknown_device_counts_as_exclusion() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::new("A", &info, &key)?;
+    let mut b = Agent::new("B", &info, &key)?;
+    a.online().await?;
+    b.online().await?;
+    b.devices_with_cards(2).await?;
+    let mut c = Agent::new("C", &info, &key)?;
+    c.online().await?;
+    c.devices_with_cards(3).await?;
+    a.devices_with_cards(3).await?;
+
+    let k2 = c.ctl.rekey(None).await.map_err(anyhow::Error::msg)?.key;
+    let n = a.notice().await?.context("A должен получить ключ")?;
+    assert_eq!((n.key, n.initiator_name.as_str()), (k2, "C"));
+    assert!(b.notice().await?.is_none(), "B не знает C");
     for x in [&mut a, &mut b, &mut c] {
         x.stop().await?;
     }

@@ -35,6 +35,9 @@ pub struct AppState {
     pub service: Mutex<Option<Service>>,
     /// Сервис уже пытались запустить. До этого статус — «подключение», а не ошибка.
     pub service_attempted: std::sync::atomic::AtomicBool,
+    /// Сервер сообщил, что устройство исключено (`devices::mark_excluded`):
+    /// сервис работает локально, ключ группы на месте.
+    pub excluded: std::sync::atomic::AtomicBool,
 }
 
 /// Статус для интерфейса.
@@ -49,6 +52,10 @@ pub enum StatusDto {
     Online,
     Offline(String),
     Paused,
+    /// Сервер сообщил, что устройство исключено из группы. Синхронизация
+    /// остановлена, ключ и история на месте: человек решает, выйти из группы
+    /// или попробовать снова.
+    Excluded,
 }
 
 impl StatusDto {
@@ -71,6 +78,7 @@ pub fn current_status(app: &AppHandle) -> StatusDto {
     let state = app.state::<AppState>();
     let guard = state.service.lock().unwrap_or_else(|e| e.into_inner());
     match guard.as_ref() {
+        Some(_) if state.excluded.load(std::sync::atomic::Ordering::Relaxed) => StatusDto::Excluded,
         Some(s) => StatusDto::from_service(s),
         None if !state
             .service_attempted
@@ -101,6 +109,15 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
     let state = app.state::<AppState>();
     let agent = state.paths.load()?;
     let configured = agent.is_some();
+    // Устройство помечено исключённым: группа на диске остаётся, но
+    // синхронизация не запускается, пока человек не решит, что делать.
+    let excluded = agent.as_ref().is_some_and(|s| {
+        clipwire_agent::devices::is_excluded(&state.paths, s.invite.group_key.group_id())
+    });
+    state
+        .excluded
+        .store(excluded, std::sync::atomic::Ordering::Relaxed);
+    let agent = if excluded { None } else { agent };
     let handle = app.clone();
     let device_name = state
         .settings
@@ -125,8 +142,11 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
             UiEvent::Transfer(t) => {
                 let _ = handle.emit("clipwire://transfer", &t);
             }
-            UiEvent::Rekeyed { old, key } => devices::on_rekeyed(&handle, old, key),
+            UiEvent::Rekeyed(n) => devices::on_rekeyed(&handle, n),
             UiEvent::Excluded { old } => devices::on_excluded(&handle, old),
+            UiEvent::RekeyLost(why) => {
+                let _ = handle.emit("clipwire://group-rekey-failed", why);
+            }
             UiEvent::NewEntry => {
                 let on = handle
                     .state::<AppState>()
@@ -167,6 +187,7 @@ fn load_state() -> anyhow::Result<AppState> {
         history: Arc::new(Mutex::new(history)),
         service: Mutex::new(None),
         service_attempted: Default::default(),
+        excluded: Default::default(),
         paths,
     })
 }
@@ -330,6 +351,7 @@ pub fn run() {
             devices::devices_list,
             devices::device_remove,
             devices::group_rekey,
+            devices::group_retry,
             commands::copy_quietly,
             commands::set_window_background,
             popup::popup_preview,

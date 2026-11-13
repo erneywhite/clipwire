@@ -238,7 +238,8 @@ pub async fn popup_paste(
         // записью в истории и ушло бы в группу с новыми файлами.
         if entry.local && !partial && !crate::files::paths_replaced(orig, &files) {
             // Свои файлы на месте — как обычное копирование.
-            return paste_content(&app, entry.content, Some(paste)).await;
+            let source = entry.source_app();
+            return paste_content(&app, entry.content, source, Some(paste)).await;
         }
         // Скачивание могло идти долго: пользователь мог закрыть окно и уйти
         // работать в другую программу. Тогда Ctrl+V туда нельзя, а буфер не
@@ -252,12 +253,14 @@ pub async fn popup_paste(
         return_and_paste(&app, "popup", paste).await;
         return Ok(());
     }
+    // Источник остаётся тем же: элемент уходит в группу с ним.
+    let source = entry.source_app();
     let content = if plain {
         entry.content.plain()
     } else {
         entry.content
     };
-    paste_content(&app, content, into_active).await
+    paste_content(&app, content, source, into_active).await
 }
 
 /// Оставить в записи с файлами только выбранные (по номерам, в исходном
@@ -304,7 +307,7 @@ pub async fn popup_paste_text(
     text: String,
     into_active: Option<bool>,
 ) -> Result<(), String> {
-    paste_content(&app, clipwire_core::Content::Text(text), into_active).await
+    paste_content(&app, clipwire_core::Content::Text(text), None, into_active).await
 }
 
 /// Положить содержимое в буфер (оно уходит и в группу, и наверх истории) и,
@@ -312,10 +315,11 @@ pub async fn popup_paste_text(
 async fn paste_content(
     app: &AppHandle,
     content: clipwire_core::Content,
+    source: Option<clipwire_core::SourceApp>,
     into_active: Option<bool>,
 ) -> Result<(), String> {
     let paste = into_active.unwrap_or_else(|| paste_into_active(app));
-    copy(app, content)?;
+    copy(app, content, source)?;
     return_and_paste(app, "popup", paste).await;
     Ok(())
 }
@@ -329,12 +333,17 @@ pub fn paste_into_active(app: &AppHandle) -> bool {
         .paste_into_active
 }
 
-/// Скопировать как пользователь: буфер, история, группа.
-pub fn copy(app: &AppHandle, content: clipwire_core::Content) -> Result<(), String> {
+/// Скопировать как пользователь: буфер, история, группа. `source` —
+/// приложение-источник, если оно известно (у вставки из истории — из записи).
+pub fn copy(
+    app: &AppHandle,
+    content: clipwire_core::Content,
+    source: Option<clipwire_core::SourceApp>,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let svc = state.service.lock().unwrap_or_else(|e| e.into_inner());
     match svc.as_ref() {
-        Some(s) => s.copy(content),
+        Some(s) => s.copy(content, source),
         // Сервис ещё не поднялся: хотя бы в буфер.
         None => clipwire_agent::clipboard::write(&content),
     }

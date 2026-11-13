@@ -31,6 +31,15 @@ pub fn clear(files_dir: &Path, busy: &HashSet<BlobId>) -> Cleaned {
     remove_where(files_dir, |b| !busy.contains(&b))
 }
 
+/// Начало имени папки, в которую копия переименовывается перед удалением.
+const TRASH_PREFIX: &str = "trash-";
+
+/// Копия удаляется в два шага: папка `<blob>` переименовывается во временное
+/// имя и только потом удаляется целиком. Если в копии открыт файл (на Windows
+/// без `FILE_SHARE_DELETE` такую папку не переименовать), копию не трогаем
+/// вовсе и считаем в `failed`: удаление по одному файлу оставило бы
+/// полкопии, которая выглядит целой. Временная папка, которую не удалось
+/// дочистить, убирается при следующей чистке.
 fn remove_where(files_dir: &Path, remove: impl Fn(BlobId) -> bool) -> Cleaned {
     let mut out = Cleaned::default();
     let Ok(entries) = std::fs::read_dir(files_dir) else {
@@ -38,18 +47,32 @@ fn remove_where(files_dir: &Path, remove: impl Fn(BlobId) -> bool) -> Cleaned {
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if is_dir && name.to_string_lossy().starts_with(TRASH_PREFIX) {
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::info!("остаток удалённой копии пока не удалился: {e}");
+            }
+            continue;
+        }
         let Some(blob) = name.to_str().and_then(BlobId::from_hex) else {
             continue;
         };
-        if !remove(blob) || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        if !remove(blob) || !is_dir {
             continue;
         }
-        match std::fs::remove_dir_all(entry.path()) {
-            Ok(()) => out.removed += 1,
-            Err(e) => {
-                tracing::info!("копия в кэше пока не удалилась ({}): {e}", blob.hex());
-                out.failed += 1;
-            }
+        let trash = files_dir.join(format!(
+            "{TRASH_PREFIX}{}-{}",
+            blob.hex(),
+            uuid::Uuid::now_v7().simple()
+        ));
+        if let Err(e) = std::fs::rename(entry.path(), &trash) {
+            tracing::info!("копия в кэше занята, не трогаю ({}): {e}", blob.hex());
+            out.failed += 1;
+            continue;
+        }
+        out.removed += 1;
+        if let Err(e) = std::fs::remove_dir_all(&trash) {
+            tracing::info!("копия {} удалилась не целиком: {e}", blob.hex());
         }
     }
     out
@@ -123,6 +146,74 @@ mod tests {
         let none = dir.join("нет");
         assert_eq!(prune(&none, &keep, &busy), Cleaned::default());
         assert_eq!(size(&none), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Файл копии открыт другой программой без `FILE_SHARE_DELETE`: копия
+    /// остаётся целиком (оба файла на месте) и считается неудалённой. Когда
+    /// файл закрыт, следующая чистка её убирает.
+    #[cfg(windows)]
+    #[test]
+    fn busy_copy_is_left_whole() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+
+        let dir =
+            std::env::temp_dir().join(format!("clipwire-cache-busy-{}", uuid::Uuid::now_v7()));
+        let (a, b) = (BlobId([1; 16]), BlobId([2; 16]));
+        put(&dir, a, "открыт.pdf", 10);
+        put(&dir, a, "второй.txt", 5);
+        put(&dir, b, "свободный.txt", 7);
+        let open = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(dir.join(a.hex()).join("открыт.pdf"))
+            .unwrap();
+
+        let r = clear(&dir, &HashSet::new());
+        assert_eq!(
+            r,
+            Cleaned {
+                removed: 1,
+                failed: 1
+            }
+        );
+        assert!(dir.join(a.hex()).join("открыт.pdf").exists());
+        assert!(
+            dir.join(a.hex()).join("второй.txt").exists(),
+            "копия не разобрана"
+        );
+        assert!(!dir.join(b.hex()).exists());
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![a.hex()], "временных папок не осталось");
+
+        drop(open);
+        assert_eq!(
+            clear(&dir, &HashSet::new()),
+            Cleaned {
+                removed: 1,
+                failed: 0
+            }
+        );
+        assert!(!dir.join(a.hex()).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn leftover_trash_is_removed_on_next_prune() {
+        let dir =
+            std::env::temp_dir().join(format!("clipwire-cache-trash-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join("trash-x").join("в")).unwrap();
+        std::fs::write(dir.join("trash-x").join("в").join("f"), b"1").unwrap();
+        assert_eq!(
+            prune(&dir, &HashSet::new(), &HashSet::new()),
+            Cleaned::default()
+        );
+        assert!(!dir.join("trash-x").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
