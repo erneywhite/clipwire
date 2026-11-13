@@ -219,14 +219,18 @@ pub async fn popup_paste(
             None => return Err("Элемента уже нет в истории".into()),
         }
     };
-    // Файлы с другого устройства или свои, пропавшие с места: скачать и
-    // положить в буфер пути из кэша. В группу повторно не отправляем — это та
-    // же запись, она есть у всех.
-    if matches!(entry.content, clipwire_core::Content::Files(_))
-        && (!entry.local || !crate::files::all_here(&app, &entry))
-    {
+    // Файлы: в буфер всегда идут пути на этом компьютере, чего здесь нет —
+    // скачивается в кэш. Если хоть один путь не исходный (чужая запись или
+    // свой файл пропал с места и взят из кэша), кладём тихо и поднимаем
+    // запись: в историю и группу запись с подменёнными путями не уходит, это
+    // та же запись, она есть у всех.
+    if let clipwire_core::Content::Files(orig) = &entry.content {
         let paste = into_active.unwrap_or_else(|| paste_into_active(&app));
         let files = crate::files::fetch_for_paste(&app, &entry).await?;
+        if entry.local && !crate::files::paths_replaced(orig, &files) {
+            // Свои файлы на месте — как обычное копирование.
+            return paste_content(&app, entry.content, Some(paste)).await;
+        }
         // Скачивание могло идти долго: пользователь мог закрыть окно и уйти
         // работать в другую программу. Тогда Ctrl+V туда нельзя, а буфер не
         // трогаем: файлы уже в кэше, вставить их можно ещё раз из окна.
