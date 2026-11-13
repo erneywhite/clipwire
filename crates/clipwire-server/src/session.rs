@@ -128,7 +128,9 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     None => return Ok(()),
                     Some(ClientMsg::Push(item)) => accept(shared, &group, device, reg.id, item, false)?,
                     Some(ClientMsg::Backfill(item)) => accept(shared, &group, device, reg.id, item, true)?,
-                    Some(ClientMsg::Join { .. }) => bail!("повторный Join"),
+                    Some(ClientMsg::Join { .. } | ClientMsg::JoinWithToken { .. }) => {
+                        bail!("повторный Join")
+                    }
                 }
             }
             out = rx.recv() => {
