@@ -24,21 +24,31 @@ fn busy(state: &AppState) -> HashSet<BlobId> {
         .unwrap_or_default()
 }
 
-/// Удалить в фоне копии, на которые не ссылается ни одна запись истории.
+/// Удалить в фоне копии и забранные виртуальные файлы, на которые не
+/// ссылается ни одна запись истории.
 /// Зовётся после удаления записи, очистки истории, чистки по сроку и на старте.
 pub fn prune_later(app: &AppHandle) {
     let state = app.state::<AppState>();
     let busy = busy(&state);
-    let keep = state
-        .history
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .blobs();
+    let (keep, paths) = {
+        let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        (h.blobs(), h.file_paths())
+    };
     let dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
+    let virtual_dir = clipwire_agent::clipboard::virtual_dir(&state.paths.dir);
     std::thread::spawn(move || {
         let r = clipwire_agent::cache::prune(&dir, &keep, &busy);
         if r.removed > 0 {
             tracing::info!(removed = r.removed, "из кэша удалены ненужные копии");
+        }
+        // Забранные вложения Outlook: держатся, пока на них ссылается запись.
+        let r = clipwire_agent::cache::prune_virtual(
+            &virtual_dir,
+            &paths,
+            clipwire_agent::cache::VIRTUAL_GRACE,
+        );
+        if r.removed > 0 {
+            tracing::info!(removed = r.removed, "удалены ненужные виртуальные файлы");
         }
     });
 }

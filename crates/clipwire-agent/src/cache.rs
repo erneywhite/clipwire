@@ -4,9 +4,14 @@
 //! Удалили запись, очистили историю или запись ушла по сроку — копия
 //! больше не нужна и удаляется. То, что качается прямо сейчас, не трогаем:
 //! рядом лежат недокачанные части, и запись может ещё появиться.
+//!
+//! Так же чистятся забранные виртуальные файлы Windows (вложения Outlook,
+//! `<state>/virtual/<id>/…`, см. [`prune_virtual`]): это не копии, а сами
+//! файлы записей, поэтому их держит ссылка на путь, а не на `blob`.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use clipwire_core::BlobId;
 
@@ -23,12 +28,42 @@ pub struct Cleaned {
 /// тех, что качаются сейчас (`busy`). Посторонние папки и файлы с именем не
 /// из 32 hex не трогаем: их клал не Clipwire.
 pub fn prune(files_dir: &Path, keep: &HashSet<BlobId>, busy: &HashSet<BlobId>) -> Cleaned {
-    remove_where(files_dir, |b| !keep.contains(&b) && !busy.contains(&b))
+    remove_where(files_dir, |name, _| {
+        BlobId::from_hex(name).is_some_and(|b| !keep.contains(&b) && !busy.contains(&b))
+    })
 }
 
 /// Удалить весь кэш, кроме того, что качается сейчас.
 pub fn clear(files_dir: &Path, busy: &HashSet<BlobId>) -> Cleaned {
-    remove_where(files_dir, |b| !busy.contains(&b))
+    remove_where(files_dir, |name, _| {
+        BlobId::from_hex(name).is_some_and(|b| !busy.contains(&b))
+    })
+}
+
+/// Сколько живёт папка виртуальных файлов, на которую ещё никто не
+/// ссылается: чтение идёт до 10 минут, потом файлы ещё попадают в историю.
+/// Младше этого не трогаем, иначе чистка снесла бы то, что забирается сейчас.
+pub const VIRTUAL_GRACE: Duration = Duration::from_secs(3600);
+
+/// Удалить папки забранных виртуальных файлов (`virtual_dir/<id>`), на
+/// которые не ссылается ни один путь из `keep` (пути файлов записей
+/// истории). Папки моложе `grace` не трогаем: их ещё забирают или запись
+/// вот-вот появится. Имена не из 32 hex не трогаем: их клал не Clipwire.
+pub fn prune_virtual(virtual_dir: &Path, keep: &HashSet<PathBuf>, grace: Duration) -> Cleaned {
+    let used: HashSet<&std::ffi::OsStr> = keep
+        .iter()
+        .filter_map(|p| p.strip_prefix(virtual_dir).ok()?.iter().next())
+        .collect();
+    let now = SystemTime::now();
+    remove_where(virtual_dir, |name, path| {
+        let ours = name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit());
+        let young = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_none_or(|age| age < grace);
+        ours && !young && !used.contains(std::ffi::OsStr::new(name))
+    })
 }
 
 /// Начало имени папки, в которую копия переименовывается перед удалением.
@@ -40,7 +75,7 @@ const TRASH_PREFIX: &str = "trash-";
 /// вовсе и считаем в `failed`: удаление по одному файлу оставило бы
 /// полкопии, которая выглядит целой. Временная папка, которую не удалось
 /// дочистить, убирается при следующей чистке.
-fn remove_where(files_dir: &Path, remove: impl Fn(BlobId) -> bool) -> Cleaned {
+fn remove_where(files_dir: &Path, remove: impl Fn(&str, &Path) -> bool) -> Cleaned {
     let mut out = Cleaned::default();
     let Ok(entries) = std::fs::read_dir(files_dir) else {
         return out;
@@ -54,25 +89,24 @@ fn remove_where(files_dir: &Path, remove: impl Fn(BlobId) -> bool) -> Cleaned {
             }
             continue;
         }
-        let Some(blob) = name.to_str().and_then(BlobId::from_hex) else {
+        let Some(name) = name.to_str() else {
             continue;
         };
-        if !remove(blob) || !is_dir {
+        if !is_dir || !remove(name, &entry.path()) {
             continue;
         }
         let trash = files_dir.join(format!(
-            "{TRASH_PREFIX}{}-{}",
-            blob.hex(),
+            "{TRASH_PREFIX}{name}-{}",
             uuid::Uuid::now_v7().simple()
         ));
         if let Err(e) = std::fs::rename(entry.path(), &trash) {
-            tracing::info!("копия в кэше занята, не трогаю ({}): {e}", blob.hex());
+            tracing::info!("копия в кэше занята, не трогаю ({name}): {e}");
             out.failed += 1;
             continue;
         }
         out.removed += 1;
         if let Err(e) = std::fs::remove_dir_all(&trash) {
-            tracing::info!("копия {} удалилась не целиком: {e}", blob.hex());
+            tracing::info!("копия {name} удалилась не целиком: {e}");
         }
     }
     out
@@ -214,6 +248,51 @@ mod tests {
             Cleaned::default()
         );
         assert!(!dir.join("trash-x").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn virtual_files_are_kept_while_history_references_them() {
+        let dir = std::env::temp_dir().join(format!("clipwire-virtual-{}", uuid::Uuid::now_v7()));
+        let id = |n: u8| format!("{n:032x}");
+        for n in 1..=3 {
+            std::fs::create_dir_all(dir.join(id(n)).join("Вложения")).unwrap();
+            std::fs::write(dir.join(id(n)).join("Вложения").join("a.pdf"), b"1").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("чужая")).unwrap();
+        // Запись ссылается на папку внутри первого копирования, вторая — на
+        // файл с похожим, но другим путём.
+        let keep = HashSet::from([
+            dir.join(id(1)).join("Вложения"),
+            PathBuf::from("C:/elsewhere").join(id(2)),
+        ]);
+
+        // Свежие папки не трогаем, даже без ссылок: их могут ещё забирать.
+        assert_eq!(
+            prune_virtual(&dir, &keep, VIRTUAL_GRACE),
+            Cleaned::default()
+        );
+        assert!(dir.join(id(2)).exists());
+
+        // Старше срока: без ссылок — удалить, со ссылкой — оставить
+        // (закреплённая запись или локальный режим, файлы больше нигде нет).
+        let r = prune_virtual(&dir, &keep, Duration::ZERO);
+        assert_eq!(r.removed, 2);
+        assert!(dir.join(id(1)).join("Вложения").join("a.pdf").exists());
+        assert!(!dir.join(id(2)).exists());
+        assert!(!dir.join(id(3)).exists());
+        assert!(dir.join("чужая").exists());
+
+        // Запись удалили — следующая чистка забирает и её папку.
+        assert_eq!(
+            prune_virtual(&dir, &HashSet::new(), Duration::ZERO).removed,
+            1
+        );
+        assert!(!dir.join(id(1)).exists());
+        assert_eq!(
+            prune_virtual(&dir.join("нет"), &keep, Duration::ZERO),
+            Cleaned::default()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

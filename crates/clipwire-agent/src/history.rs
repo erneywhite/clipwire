@@ -533,6 +533,19 @@ impl History {
         referenced_blobs(&self.entries)
     }
 
+    /// Пути файлов всех записей: забранные виртуальные файлы по ним ещё
+    /// нужны (см. `cache::prune_virtual`).
+    pub fn file_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        self.entries
+            .iter()
+            .filter_map(|e| match &e.content {
+                Content::Files(f) => Some(f.iter().map(|f| std::path::PathBuf::from(&f.path))),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

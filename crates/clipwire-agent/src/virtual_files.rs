@@ -11,6 +11,11 @@
 //! Чтение идёт в отдельном потоке: источник — чужой процесс, и он может
 //! зависнуть посреди передачи. Сторожевой поток отменяет вызов COM, если
 //! данных нет дольше [`STALL`], а общее время чтения ограничено [`TOTAL_TIMEOUT`].
+//!
+//! Забранные файлы пришли из чужого источника (чаще всего из почты), поэтому
+//! на каждый ставится Mark-of-the-Web, как на скачанное с других устройств.
+//! Папки `virtual/<id>` чистит `cache::prune_virtual` вместе с историей:
+//! пока на файл ссылается запись, он остаётся.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,7 +29,7 @@ use windows::Win32::System::Com::{
     STGC_DEFAULT, STGM_CREATE, STGM_READWRITE, STGM_SHARE_EXCLUSIVE, STGMEDIUM, STREAM_SEEK_SET,
     TYMED, TYMED_HGLOBAL, TYMED_ISTORAGE, TYMED_ISTREAM,
 };
-use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+use windows::Win32::System::DataExchange::{GetClipboardSequenceNumber, RegisterClipboardFormatW};
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{
     OleGetClipboard, OleInitialize, OleUninitialize, ReleaseStgMedium,
@@ -42,12 +47,8 @@ pub const FALLBACK_LIMIT_MB: u64 = 100;
 pub const STALL: Duration = Duration::from_secs(30);
 /// Дольше этого одно копирование не читается, даже если данные идут.
 pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// Забранные файлы старше этого удаляются при следующем виртуальном копировании.
-// shortcut: файлы удаляются по сроку, даже если на них ещё ссылается запись
-// локальной истории (в группе они к этому времени уже на сервере или в кэше
-// других устройств). Если начнут теряться — чистить по ссылкам из истории,
-// как `cache::prune`.
-pub const MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+/// Ошибка чтения, когда буфер сменился посреди него.
+pub const CLIPBOARD_CHANGED: &str = "буфер сменился во время чтения";
 
 /// Размер `FILEDESCRIPTORW` и смещения его полей (shlobj_core.h).
 const FD_SIZE: usize = 592;
@@ -194,35 +195,6 @@ pub fn plan(descs: &[Descriptor]) -> Result<(Vec<Planned>, Vec<PathBuf>)> {
     Ok((planned, tops))
 }
 
-/// Удалить из `root` копирования старше `max_age`. Возвращает, сколько удалено.
-pub fn clean_old(root: &Path, max_age: Duration) -> usize {
-    let Ok(dir) = std::fs::read_dir(root) else {
-        return 0;
-    };
-    let now = SystemTime::now();
-    let mut n = 0;
-    for e in dir.flatten() {
-        let old = e
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| now.duration_since(t).ok())
-            .is_some_and(|age| age >= max_age);
-        if !old {
-            continue;
-        }
-        let removed = if e.path().is_dir() {
-            std::fs::remove_dir_all(e.path()).is_ok()
-        } else {
-            std::fs::remove_file(e.path()).is_ok()
-        };
-        if removed {
-            n += 1;
-        }
-    }
-    n
-}
-
 /// Номера форматов `FileGroupDescriptorW` и `FileContents`.
 fn formats() -> (u16, u16) {
     unsafe {
@@ -297,6 +269,32 @@ pub fn capture(
     res
 }
 
+/// [`capture`] при условии, что буфер всё это время тот же: `unchanged`
+/// проверяется до чтения, перед каждым файлом и куском и после. Объект
+/// буфера OLE отдаёт текущее содержимое буфера, поэтому после смены
+/// следующие файлы пришли бы уже от другой программы, мимо проверок
+/// владельца и меток приватности. Сменился — ошибка [`CLIPBOARD_CHANGED`],
+/// `dest` удалена.
+pub fn capture_unchanged(
+    obj: &IDataObject,
+    dest: &Path,
+    max_bytes: u64,
+    progress: &Progress,
+    unchanged: &dyn Fn() -> bool,
+) -> Result<Vec<PathBuf>> {
+    ensure!(unchanged(), CLIPBOARD_CHANGED);
+    let tick = || -> Result<()> {
+        ensure!(unchanged(), CLIPBOARD_CHANGED);
+        (progress.tick)()
+    };
+    let tops = capture(obj, dest, max_bytes, &Progress { tick: &tick })?;
+    if !unchanged() {
+        let _ = std::fs::remove_dir_all(dest);
+        bail!(CLIPBOARD_CHANGED);
+    }
+    Ok(tops)
+}
+
 fn capture_into(
     obj: &IDataObject,
     dest: &Path,
@@ -367,6 +365,10 @@ fn capture_into(
         };
         drop(m);
         used += written;
+        // Файл из чужого источника (вложение письма): Windows и Office должны
+        // предупредить перед запуском. Метка ставится до времени изменения:
+        // запись потока могла бы его сдвинуть.
+        crate::blobs::mark_from_internet(&path);
         if let Some(ms) = p.modified_ms {
             let t = UNIX_EPOCH + Duration::from_millis(ms);
             if let Ok(f) = std::fs::File::options().write(true).open(&path) {
@@ -438,9 +440,25 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Забранное копирование: папка `virtual/<id>` и элементы верхнего уровня в ней.
+#[derive(Debug)]
+pub struct Captured {
+    pub dir: PathBuf,
+    pub tops: Vec<PathBuf>,
+}
+
+impl Captured {
+    /// Результат не нужен (буфер уже сменился): удалить папку.
+    pub fn discard(self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Запустить чтение виртуальных файлов из буфера в отдельном потоке.
-/// `done` вызывается в том же потоке с путями верхнего уровня. Если прошлое
-/// чтение ещё идёт, новое не начинается и возвращается `false`.
+/// `seq` — номер версии буфера (`GetClipboardSequenceNumber`), для которого
+/// проверены владелец и метки: другой буфер читаться не будет. `done`
+/// вызывается в том же потоке. Если прошлое чтение ещё идёт, новое не
+/// начинается и возвращается `false`.
 // shortcut: если источник завис так, что даже CoCancelCall не помог (вызов
 // внутри своего процесса), поток остаётся висеть, и следующие виртуальные
 // копирования пропускаются до перезапуска. Если станет встречаться — пускать
@@ -449,7 +467,8 @@ pub fn spawn_read(
     busy: &Arc<AtomicBool>,
     root: PathBuf,
     max_bytes: u64,
-    done: impl FnOnce(Result<Vec<PathBuf>>) + Send + 'static,
+    seq: u32,
+    done: impl FnOnce(Result<Captured>) + Send + 'static,
 ) -> bool {
     if busy.swap(true, Ordering::SeqCst) {
         return false;
@@ -458,7 +477,7 @@ pub fn spawn_read(
     let spawned = std::thread::Builder::new()
         .name("clipboard-virtual".into())
         .spawn(move || {
-            let res = read_clipboard(&root, max_bytes);
+            let res = read_clipboard(&root, max_bytes, seq);
             flag.store(false, Ordering::SeqCst);
             done(res);
         });
@@ -469,8 +488,8 @@ pub fn spawn_read(
     true
 }
 
-/// Тело потока чтения: OLE, сторож, очистка старого и само копирование.
-fn read_clipboard(root: &Path, max_bytes: u64) -> Result<Vec<PathBuf>> {
+/// Тело потока чтения: OLE, сторож и само копирование.
+fn read_clipboard(root: &Path, max_bytes: u64, seq: u32) -> Result<Captured> {
     unsafe { OleInitialize(None) }.map_err(|e| anyhow!("OLE не запустился: {e}"))?;
     struct Ole;
     impl Drop for Ole {
@@ -482,11 +501,7 @@ fn read_clipboard(root: &Path, max_bytes: u64) -> Result<Vec<PathBuf>> {
     // Без этого CoCancelCall из сторожа не сработает.
     let _ = unsafe { CoEnableCallCancellation(None) };
     let tid = unsafe { GetCurrentThreadId() };
-
-    let cleaned = clean_old(root, MAX_AGE);
-    if cleaned > 0 {
-        tracing::debug!(cleaned, "удалены старые виртуальные файлы");
-    }
+    let unchanged = || unsafe { GetClipboardSequenceNumber() } == seq;
 
     let start = Instant::now();
     let last = Arc::new(AtomicU64::new(now_ms()));
@@ -519,8 +534,9 @@ fn read_clipboard(root: &Path, max_bytes: u64) -> Result<Vec<PathBuf>> {
     let res = (|| {
         let obj =
             unsafe { OleGetClipboard() }.map_err(|e| anyhow!("буфер OLE не открылся: {e}"))?;
-        let dest = root.join(uuid::Uuid::now_v7().simple().to_string());
-        capture(&obj, &dest, max_bytes, &Progress { tick: &tick })
+        let dir = root.join(uuid::Uuid::now_v7().simple().to_string());
+        let tops = capture_unchanged(&obj, &dir, max_bytes, &Progress { tick: &tick }, &unchanged)?;
+        Ok(Captured { dir, tops })
     })();
     finished.store(true, Ordering::SeqCst);
     if let Some(w) = watchdog {
@@ -674,21 +690,6 @@ mod tests {
         assert_eq!(limit_bytes(0), FALLBACK_LIMIT_MB * 1024 * 1024);
         assert_eq!(limit_bytes(5), 5 * 1024 * 1024);
         assert_eq!(limit_bytes(u64::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn old_captures_are_removed() {
-        let dir = std::env::temp_dir().join(format!("cw-virt-{}", uuid::Uuid::now_v7().simple()));
-        std::fs::create_dir_all(dir.join("a/sub")).unwrap();
-        std::fs::write(dir.join("a/sub/x"), b"x").unwrap();
-        std::fs::write(dir.join("stray"), b"y").unwrap();
-        // Свежие не трогаем.
-        assert_eq!(clean_old(&dir, Duration::from_secs(3600)), 0);
-        assert!(dir.join("a/sub/x").exists());
-        assert_eq!(clean_old(&dir, Duration::ZERO), 2);
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        assert_eq!(clean_old(&dir.join("нет"), Duration::ZERO), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Как отдавать содержимое файла.
@@ -927,6 +928,82 @@ mod tests {
         let obj: IDataObject = FakeSource::new(files).into();
         assert!(capture(&obj, &dest3, 10 * 1024 * 1024, &Progress { tick: &stop }).is_err());
         assert!(!dest3.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Поток `Zone.Identifier` файла, если есть.
+    fn zone(p: &Path) -> Option<String> {
+        let mut ads = p.as_os_str().to_owned();
+        ads.push(":Zone.Identifier");
+        std::fs::read_to_string(ads).ok()
+    }
+
+    #[test]
+    fn captured_files_are_marked_from_internet() {
+        let obj: IDataObject = FakeSource::new(sample()).into();
+        let dest = tmp().join("one");
+        let ok = || Ok(());
+        capture(&obj, &dest, 10 * 1024 * 1024, &Progress { tick: &ok }).unwrap();
+        for f in [
+            "письмо.txt",
+            "Вложения/схема.bin",
+            "image001.png",
+            "image001 (2).png",
+        ] {
+            let z = zone(&dest.join(f)).unwrap_or_default();
+            assert!(z.contains("ZoneId=3"), "{f}: нет метки «из интернета»");
+        }
+        let _ = std::fs::remove_dir_all(dest.parent().unwrap());
+    }
+
+    #[test]
+    fn capture_stops_when_clipboard_changes() {
+        let root = tmp();
+        let ok = || Ok(());
+        let progress = Progress { tick: &ok };
+
+        // Буфер тот же — файлы забраны.
+        let obj: IDataObject = FakeSource::new(sample()).into();
+        let same = || true;
+        assert!(capture_unchanged(&obj, &root.join("a"), u64::MAX, &progress, &same).is_ok());
+
+        // Сменился ещё до чтения — источник даже не спрашиваем.
+        let src = FakeSource::new(sample());
+        let obj: IDataObject = src.into();
+        let changed = || false;
+        let e = capture_unchanged(&obj, &root.join("b"), u64::MAX, &progress, &changed);
+        assert_eq!(e.unwrap_err().to_string(), CLIPBOARD_CHANGED);
+        assert!(!root.join("b").exists());
+
+        // Сменился посреди чтения: следующий файл уже не читается, папки нет.
+        let calls = std::cell::Cell::new(0);
+        let flips = || {
+            calls.set(calls.get() + 1);
+            calls.get() < 3
+        };
+        let obj: IDataObject = FakeSource::new(sample()).into();
+        let e = capture_unchanged(&obj, &root.join("c"), u64::MAX, &progress, &flips);
+        assert_eq!(e.unwrap_err().to_string(), CLIPBOARD_CHANGED);
+        assert!(!root.join("c").exists());
+
+        // Сменился сразу после последнего куска — результат тоже не годится.
+        let n = std::cell::Cell::new(0usize);
+        let obj: IDataObject = FakeSource::new(sample()).into();
+        let counting = || {
+            n.set(n.get() + 1);
+            true
+        };
+        capture_unchanged(&obj, &root.join("d"), u64::MAX, &progress, &counting).unwrap();
+        let total = n.get();
+        let m = std::cell::Cell::new(0usize);
+        let last_fails = || {
+            m.set(m.get() + 1);
+            m.get() < total
+        };
+        let obj: IDataObject = FakeSource::new(sample()).into();
+        let e = capture_unchanged(&obj, &root.join("e"), u64::MAX, &progress, &last_fails);
+        assert_eq!(e.unwrap_err().to_string(), CLIPBOARD_CHANGED);
+        assert!(!root.join("e").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
