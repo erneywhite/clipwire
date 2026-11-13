@@ -1,6 +1,7 @@
 //! Клиент Clipwire: движок синхронизации, работа с буфером ОС и состояние.
 //! Используется приложением (Tauri) и консольным `clipwire-agent`.
 
+pub mod activity;
 pub mod blobs;
 pub mod cache;
 pub mod clipboard;

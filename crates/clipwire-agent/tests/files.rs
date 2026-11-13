@@ -1428,3 +1428,45 @@ async fn external_upload_does_not_reserve_on_server() -> Result<()> {
     dev.drop_link().await;
     server.shutdown().await
 }
+
+/// Пока файл отдаётся напрямую, источник считается занятым: автообновление
+/// не должно перезапускать программу посреди отдачи.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_serving_marks_source_busy() -> Result<()> {
+    use clipwire_agent::activity;
+    let (server, info) = start_server(1024 * 1024).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key)?;
+    let mut b = Agent::spawn(&info, &key)?;
+    a.online().await?;
+    b.online().await?;
+
+    let src = tmp("busy-src");
+    let (data, mut f) = make_file(&src, "отдаётся.bin", CHUNK as u64 * 24);
+    f.p2p = true;
+    serve_files(&a, std::slice::from_ref(&f));
+    a.copy_files(vec![f.clone()]).await?;
+    let got = b.incoming_files().await?;
+
+    // Счётчик общий на процесс, поэтому смотрим, что во время скачивания он
+    // хоть раз был больше нуля.
+    let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watch = {
+        let (seen, stop) = (seen.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                if activity::SERVING.get() > 0 {
+                    seen.store(true, Ordering::SeqCst);
+                }
+                std::thread::yield_now();
+            }
+        })
+    };
+    let paths = tokio::time::timeout(T, b.blobs.download_all(&got, a.device)).await??;
+    stop.store(true, Ordering::SeqCst);
+    watch.join().unwrap();
+    assert_eq!(std::fs::read(&paths[0])?, data);
+    assert!(seen.load(Ordering::SeqCst), "прямая отдача не отмечена");
+    server.shutdown().await
+}

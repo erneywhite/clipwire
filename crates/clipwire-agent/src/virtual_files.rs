@@ -474,9 +474,12 @@ pub fn spawn_read(
         return false;
     }
     let flag = busy.clone();
+    // Для автообновления: пока читаем, программу не перезапускать.
+    let reading = crate::activity::VIRTUAL_READS.begin();
     let spawned = std::thread::Builder::new()
         .name("clipboard-virtual".into())
         .spawn(move || {
+            let _reading = reading;
             let res = read_clipboard(&root, max_bytes, seq);
             flag.store(false, Ordering::SeqCst);
             done(res);
@@ -1070,5 +1073,21 @@ mod tests {
         assert!(p.starts_with(crate::clipboard::virtual_dir(&state)));
         assert_eq!(std::fs::read_to_string(p).unwrap(), "привет из Outlook");
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Чтение учитывается в `activity`, пока поток не закончил: по этому
+    /// признаку автообновление не перезапускает программу посреди чтения.
+    /// Буфер только читается (виртуальных файлов там нет, чтение упадёт).
+    #[test]
+    fn spawn_read_counts_as_activity_until_done() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let root = tmp();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(spawn_read(&busy, root.clone(), 1024, move |_| {
+            let _ = tx.send(crate::activity::VIRTUAL_READS.get());
+        }));
+        let during = rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(during >= 1, "чтение виртуальных файлов не отмечено");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

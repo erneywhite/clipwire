@@ -118,6 +118,7 @@
       "endpoints": [
         "https://github.com/erneywhite/clipwire/releases/latest/download/latest.json"
       ],
+      "requireSignedVersion": true,
       "windows": {
         "installMode": "quiet"
       }
