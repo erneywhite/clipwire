@@ -11,7 +11,30 @@
   let info = $state<FilePreview | null>(null)
   let failed = $state('')
   let mediaError = $state(false)
+  let media: HTMLMediaElement | undefined = $state()
   const src = $derived(convertFileSrc(file.path))
+
+  // Открыли — сразу играет. Закрыли — сразу тишина: Chromium не глушит
+  // плеер, убранный со страницы, он доигрывает, пока его не соберёт GC.
+  $effect(() => {
+    const m = media
+    if (!m) return
+    m.play().catch(() => {})
+    return () => stop(m)
+  })
+
+  function stop(m: HTMLMediaElement | undefined) {
+    if (!m) return
+    // Сброс источника вызывает error — это не «формат не поддерживается».
+    m.dataset.stopped = '1'
+    m.pause()
+    m.removeAttribute('src')
+    m.load()
+  }
+
+  function onMediaError(e: Event) {
+    if (!(e.currentTarget as HTMLElement).dataset.stopped) mediaError = true
+  }
 
   $effect(() => {
     const path = file.path
@@ -27,6 +50,11 @@
   })
 </script>
 
+<!-- Окно вставки прячется, когда теряет фокус: звук не должен играть в спрятанном окне. -->
+<svelte:window onblur={() => media?.pause()} />
+
+<!-- Свой плеер на каждый файл: при переключении старый останавливается. -->
+{#key file.path}
 {#if failed}
   <div class="box muted">{failed}</div>
 {:else if !info}
@@ -40,11 +68,11 @@
   <iframe class="box pdf" src={src} title={file.name}></iframe>
 {:else if info.kind === 'video' && !mediaError}
   <!-- svelte-ignore a11y_media_has_caption -->
-  <video class="box video" {src} controls preload="metadata" onerror={() => (mediaError = true)}></video>
+  <video bind:this={media} class="box video" {src} controls preload="metadata" onerror={onMediaError}></video>
 {:else if info.kind === 'audio' && !mediaError}
   <div class="box audio">
     <span class="name">{file.name}</span>
-    <audio {src} controls preload="metadata" onerror={() => (mediaError = true)}></audio>
+    <audio bind:this={media} {src} controls preload="metadata" onerror={onMediaError}></audio>
   </div>
 {:else}
   <div class="box muted">
@@ -56,6 +84,7 @@
     <span class="path">{file.path}</span>
   </div>
 {/if}
+{/key}
 
 <style>
   .box {
