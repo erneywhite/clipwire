@@ -767,3 +767,72 @@ async fn file_stream_rejects_oversized_frames() -> Result<()> {
     }
     server.shutdown().await
 }
+
+/// Ждущие частей `Get` занимают только свои пропуска: `Reserve`, `Abort` и
+/// `Put` того же соединения, того же источника и другой группы проходят.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_waiting_gets_do_not_block_other_streams() -> Result<()> {
+    let (server, relay) = start_server_with(|c| c.blob_stall = Duration::from_secs(60)).await?;
+    let (k1, k2) = (GroupKey::generate()?, GroupKey::generate()?);
+    let a = joined(&server.info, &relay, &k1).await?;
+    let b = joined(&server.info, &relay, &k1).await?;
+    let c = joined(&server.info, &relay, &k1).await?;
+    let other = joined(&server.info, &relay, &k2).await?;
+    let data = sample(CHUNK + 10);
+    let size = data.len() as u64;
+    let blob = BlobId::random()?;
+
+    let mut r = BlobStream::open(&a.conn, BlobRequest::Reserve { blob, size }).await?;
+    assert_eq!(r.reply().await?, BlobReply::Reserved);
+    // По 10 Get на двух соединениях: на каждом 8 обслуживаются (весь пул
+    // соединения) и 2 ждут; у группы заняты все 16 мест под Get.
+    let mut gets = Vec::new();
+    for conn in [&b.conn, &c.conn] {
+        for _ in 0..10 {
+            gets.push(BlobStream::open(conn, BlobRequest::Get { blob, from: 0 }).await?);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // То же соединение: Reserve и Abort пропусков Get не ждут.
+    let mut r = BlobStream::open(
+        &b.conn,
+        BlobRequest::Reserve {
+            blob: BlobId::random()?,
+            size: 10,
+        },
+    )
+    .await?;
+    assert_eq!(r.reply().await?, BlobReply::Reserved);
+    let mut ab = BlobStream::open(
+        &c.conn,
+        BlobRequest::Abort {
+            blob: BlobId::random()?,
+        },
+    )
+    .await?;
+    assert_eq!(ab.reply().await?, BlobReply::Aborted);
+    // Другая группа: и Reserve, и Put.
+    let mut r = BlobStream::open(
+        &other.conn,
+        BlobRequest::Reserve {
+            blob: BlobId::random()?,
+            size: 10,
+        },
+    )
+    .await?;
+    assert_eq!(r.reply().await?, BlobReply::Reserved);
+    let ob = BlobId::random()?;
+    upload(&other.conn, &k2, ob, &sample(500)).await?;
+    assert_eq!(download(&other.conn, &k2, ob).await?, sample(500));
+    // Источник той же группы загружает файл, которого ждут все Get.
+    assert_eq!(upload(&a.conn, &k1, blob, &data).await?, 0);
+    for mut g in gets {
+        match g.reply().await? {
+            BlobReply::GetReady { size: s, .. } => assert_eq!(s, size),
+            other => anyhow::bail!("ждали GetReady, пришло {other:?}"),
+        }
+        assert_eq!(read_chunks(&mut g, &k1, blob, size, 0).await?, data);
+    }
+    server.shutdown().await
+}

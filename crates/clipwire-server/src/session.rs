@@ -34,9 +34,9 @@ pub struct Shared {
     pub hub: Hub,
     pub blobs: Blobs,
     pub limits: Limits,
-    /// Общий на сервер предел одновременно обслуживаемых потоков файлов
-    /// (сверх предела на соединение).
-    pub streams: Arc<tokio::sync::Semaphore>,
+    /// Пределы одновременных `Put` и `Get` на сервер и на группу (сверх
+    /// предела на соединение).
+    pub streams: crate::transfer::StreamLimits,
 }
 
 impl Shared {

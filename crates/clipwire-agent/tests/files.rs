@@ -38,6 +38,13 @@ fn tmp(tag: &str) -> PathBuf {
 }
 
 async fn start_server(max_file_bytes: u64) -> Result<(clipwire_server::Running, ServerInfo)> {
+    start_server_stall(max_file_bytes, Duration::from_secs(10)).await
+}
+
+async fn start_server_stall(
+    max_file_bytes: u64,
+    blob_stall: Duration,
+) -> Result<(clipwire_server::Running, ServerInfo)> {
     let config = Config {
         data_dir: tmp("server"),
         public_url: "http://unused".into(),
@@ -51,7 +58,7 @@ async fn start_server(max_file_bytes: u64) -> Result<(clipwire_server::Running, 
         max_file_bytes,
         blob_quota: 64 * 1024 * 1024,
         blob_total_quota: u64::MAX,
-        blob_stall: Duration::from_secs(10),
+        blob_stall,
     };
     let server = clipwire_server::start(&config).await?;
     tokio::time::timeout(T, server.endpoint().online()).await?;
@@ -455,6 +462,11 @@ struct Agent {
 
 impl Agent {
     fn spawn(info: &ServerInfo, key: &GroupKey) -> Result<Self> {
+        Self::spawn_in(info, key, &tmp("agent"))
+    }
+
+    /// Движок с каталогом состояния `dir` (там может уже лежать очередь загрузок).
+    fn spawn_in(info: &ServerInfo, key: &GroupKey, dir: &Path) -> Result<Self> {
         let state = AgentState {
             invite: Invite {
                 server: info.clone(),
@@ -462,7 +474,7 @@ impl Agent {
             },
             device_key: random_key()?,
         };
-        let (b, transfers) = blobs(key, &tmp("agent"));
+        let (b, transfers) = blobs(key, dir);
         let (etx, events) = mpsc::unbounded_channel();
         let (local, lrx) = mpsc::channel(16);
         let engine =
@@ -777,5 +789,95 @@ async fn engine_aborts_changed_file() -> Result<()> {
     a.task.await??;
     drop(b.local);
     b.task.await??;
+    server.shutdown().await
+}
+
+/// Резерв не дошёл до сервера за тайм-аут (замок файла держит чужая
+/// загрузка): элемент не теряется и не теряет `blob`, а уходит после
+/// переподключения, когда резерв проходит.
+#[tokio::test(flavor = "multi_thread")]
+async fn reserve_timeout_keeps_item_until_reconnect() -> Result<()> {
+    let (server, info) = start_server_stall(8 * 1024 * 1024, Duration::from_secs(60)).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key)?;
+    let mut b = Agent::spawn(&info, &key)?;
+    a.online().await?;
+    b.online().await?;
+    let probe = Device::join(&info, &key).await?;
+
+    let src = tmp("src");
+    let (data, f) = make_file(&src, "занят.bin", 100);
+    let blob = f.blob.unwrap();
+    // Загрузка того же blob с другого соединения держит замок записи, и
+    // Reserve ждёт его дольше тайм-аута агента.
+    let (mut psend, mut precv) = probe.conn.open_bi().await?;
+    write_msg(&mut psend, &BlobRequest::Put { blob, size: f.size }).await?;
+    match tokio::time::timeout(T, read_msg::<_, BlobReply>(&mut precv)).await?? {
+        Some(BlobReply::PutReady { have: 0 }) => {}
+        other => bail!("ждали PutReady, пришло {other:?}"),
+    }
+    a.copy_files(vec![f.clone()]).await?;
+    a.wait(|e| matches!(e, Event::Status(Status::Offline(_))).then_some(()))
+        .await?;
+    // Чужая загрузка бросает поток, замок свободен.
+    psend.finish()?;
+    drop((psend, precv));
+
+    let got = b.incoming_files().await?;
+    assert_eq!(got, vec![f.clone()], "элемент ушёл с тем же blob");
+    let paths = tokio::time::timeout(T, b.blobs.download_all(&got)).await??;
+    assert_eq!(std::fs::read(&paths[0])?, data);
+    let ok = a.upload_ends(&[blob]).await?.remove(0);
+    assert_eq!(ok.state, TransferState::Done, "{ok:?}");
+
+    probe.drop_link().await;
+    drop(a.local);
+    a.task.await??;
+    drop(b.local);
+    b.task.await??;
+    server.shutdown().await
+}
+
+/// Задание своей группы старше суток при запуске выбрасывается из очереди, а
+/// его резерв на сервере отменяется при первом соединении.
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_upload_job_is_aborted_on_first_connection() -> Result<()> {
+    let (server, info) = start_server(8 * 1024 * 1024).await?;
+    let key = GroupKey::generate()?;
+    let probe = Device::join(&info, &key).await?;
+    let blob = BlobId::random()?;
+    reserve_blob(&probe.conn, blob, 100).await?;
+    assert_eq!(server_have(&probe.conn, blob, 100).await?, Some(0));
+
+    let dir = tmp("agent");
+    let group: String = key
+        .group_id()
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(
+        dir.join("uploads.json"),
+        format!(
+            r#"[{{"blob":"{}","path":"/nope","size":100,"modified_ms":1,"group":"{group}","queued_ms":1}}]"#,
+            blob.hex()
+        ),
+    )?;
+    let mut a = Agent::spawn_in(&info, &key, &dir)?;
+    assert!(a.blobs.queued().is_empty());
+    a.online().await?;
+    tokio::time::timeout(T, async {
+        while server_have(&probe.conn, blob, 100).await?.is_some() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::Ok(())
+    })
+    .await
+    .context("резерв так и не отменили")??;
+    assert!(a.blobs.pending_aborts().is_empty());
+
+    probe.drop_link().await;
+    drop(a.local);
+    a.task.await??;
     server.shutdown().await
 }

@@ -55,7 +55,9 @@ pub struct Service {
     blobs: Option<Arc<Blobs>>,
     /// Настройка `file_upload_limit_mb`, меняется без перезапуска.
     upload_limit_mb: Arc<AtomicU64>,
-    _watcher: Watcher,
+    /// Слежение за буфером. Его обработчик держит копию `local_tx`, поэтому
+    /// `shutdown` снимает его первым: иначе канал движка не закроется.
+    watcher: Option<Watcher>,
 }
 
 impl Service {
@@ -255,7 +257,7 @@ impl Service {
             on_event,
             blobs,
             upload_limit_mb,
-            _watcher: watcher,
+            watcher: Some(watcher),
         })
     }
 
@@ -334,6 +336,11 @@ impl Service {
     /// чтобы следующий сервис (например, после входа в другую группу) не
     /// работал с той же очередью загрузок параллельно со старым.
     pub async fn shutdown(mut self) {
+        // Сначала слежение: вместе с ним уходит его копия отправителя, и
+        // после `local_tx` канал движка закрывается по-настоящему. Иначе
+        // движок не узнает о закрытии и до штатного выхода (finish, close)
+        // не дойдёт: его снимет только abort ниже.
+        drop(self.watcher.take());
         drop(self.local_tx.take());
         if let Some(mut e) = self.engine.take() {
             let wait = std::time::Duration::from_secs(3);
