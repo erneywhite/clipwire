@@ -121,52 +121,6 @@ fn read_consistent<T>(mut seq: impl FnMut() -> u32, mut read: impl FnMut() -> T)
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::Cell;
-
-    #[test]
-    fn consistent_read_retries_while_clipboard_changes() {
-        // Буфер не менялся — первое чтение.
-        let reads = Cell::new(0);
-        let got = read_consistent(
-            || 7,
-            || {
-                reads.set(reads.get() + 1);
-                "a"
-            },
-        );
-        assert_eq!((got, reads.get()), (Some("a"), 1));
-
-        // Сменился во время первого чтения — второе чтение берётся.
-        let n = Cell::new(0u32);
-        let seq = || {
-            n.set(n.get() + 1);
-            // 1 (до) и 2 (после) — не совпали; 3 и 3 — совпали.
-            if n.get() <= 2 { n.get() } else { 3 }
-        };
-        let reads = Cell::new(0);
-        let got = read_consistent(seq, || {
-            reads.set(reads.get() + 1);
-            reads.get()
-        });
-        assert_eq!(got, Some(2));
-
-        // Меняется всё время — после трёх попыток пропускаем.
-        let n = Cell::new(0u32);
-        let reads = Cell::new(0);
-        let got = read_consistent(
-            || {
-                n.set(n.get() + 1);
-                n.get()
-            },
-            || reads.set(reads.get() + 1),
-        );
-        assert_eq!((got, reads.get()), (None, 3));
-    }
-}
-
 #[cfg(windows)]
 pub use win::Watcher;
 
@@ -628,5 +582,51 @@ impl Watcher {
         _on_change: impl FnMut(clipwire_core::Content, Option<String>) + Send + 'static,
     ) -> Result<Self> {
         anyhow::bail!("слежение за буфером на этой ОС ещё не реализовано")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn consistent_read_retries_while_clipboard_changes() {
+        // Буфер не менялся — первое чтение.
+        let reads = Cell::new(0);
+        let got = read_consistent(
+            || 7,
+            || {
+                reads.set(reads.get() + 1);
+                "a"
+            },
+        );
+        assert_eq!((got, reads.get()), (Some("a"), 1));
+
+        // Сменился во время первого чтения — второе чтение берётся.
+        let n = Cell::new(0u32);
+        let seq = || {
+            n.set(n.get() + 1);
+            // 1 (до) и 2 (после) — не совпали; 3 и 3 — совпали.
+            if n.get() <= 2 { n.get() } else { 3 }
+        };
+        let reads = Cell::new(0);
+        let got = read_consistent(seq, || {
+            reads.set(reads.get() + 1);
+            reads.get()
+        });
+        assert_eq!(got, Some(2));
+
+        // Меняется всё время — после трёх попыток пропускаем.
+        let n = Cell::new(0u32);
+        let reads = Cell::new(0);
+        let got = read_consistent(
+            || {
+                n.set(n.get() + 1);
+                n.get()
+            },
+            || reads.set(reads.get() + 1),
+        );
+        assert_eq!((got, reads.get()), (None, 3));
     }
 }
