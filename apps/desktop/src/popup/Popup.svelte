@@ -5,6 +5,8 @@
   import { applyTheme } from '../lib/theme'
   import { ago, bytesLabel, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
   import EntryRow from '../lib/EntryRow.svelte'
+  import LinkCard from './LinkCard.svelte'
+  import { openUrl } from '@tauri-apps/plugin-opener'
 
   let query = $state('')
   let tab = $state<'all' | 'pinned'>('all')
@@ -280,18 +282,19 @@
           </button>
         </div>
       {:else}
-      {#if preview.entry.html}
+      {#if preview.entry.html || isUrl(preview.entry.text)}
         <div class="seg" role="tablist" aria-label="Вид">
-          <button role="tab" aria-selected={richView} onclick={() => (richView = true)}>Форматирование</button>
+          <button role="tab" aria-selected={richView} onclick={() => (richView = true)}>
+            {isUrl(preview.entry.text) ? 'Карточка' : 'Форматирование'}
+          </button>
           <button role="tab" aria-selected={!richView} onclick={() => (richView = false)}>Текст</button>
         </div>
       {/if}
-      {#if preview.entry.html && richView}
+      {#if isUrl(preview.entry.text) && richView}
+        <LinkCard url={preview.entry.text.trim()} />
+      {:else if preview.entry.html && richView}
         <iframe class="rich-view" sandbox="" title="Текст с форматированием" srcdoc={richDoc(preview.entry.html)}></iframe>
       {:else}
-        {#if isUrl(preview.entry.text)}
-          <p class="note">Карточки ссылок появятся в следующей версии</p>
-        {/if}
         <textarea
           bind:this={editor}
           bind:value={draft}
@@ -314,7 +317,9 @@
           <button onclick={saveDraft}>Сохранить в истории</button>
           <button onclick={() => preview && (draft = preview.entry.text)}>Отменить правку</button>
         {:else}
-          {#if preview.entry.rich}
+          {#if isUrl(preview.entry.text)}
+            <button onclick={() => preview && openUrl(preview.entry.text.trim())}>Открыть в браузере</button>
+          {:else if preview.entry.rich}
             <button onclick={() => paste(preview?.entry, undefined, true)}>Без форматирования</button>
           {/if}
           <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
@@ -529,11 +534,7 @@
     max-height: 100%;
     object-fit: contain;
   }
-  .note {
-    margin: 0;
-    color: var(--c-muted);
-    font-size: var(--text-s);
-  }
+
   .actions {
     display: flex;
     gap: var(--space-2);

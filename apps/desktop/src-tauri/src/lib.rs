@@ -3,6 +3,7 @@
 
 mod commands;
 mod editor;
+mod link;
 mod popup;
 mod settings_window;
 mod tray;
@@ -240,6 +241,10 @@ pub fn run() {
         )
         .init();
 
+    // TLS для карточек ссылок (reqwest без встроенного провайдера). Если провайдер
+    // уже поставил кто-то другой, это не ошибка.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Состояние создаётся до приложения: окна грузятся параллельно с setup и
     // сразу спрашивают статус и настройки, состояние к этому моменту уже должно быть.
     let state = match load_state() {
@@ -261,6 +266,7 @@ pub fn run() {
     builder
         .manage(state)
         .manage(popup::PopupState::default())
+        .manage(link::LinkCache::default())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -296,6 +302,7 @@ pub fn run() {
             commands::history_update,
             editor::editor_open,
             editor::editor_save,
+            link::link_preview,
         ])
         .setup(|app| {
             let hide_from_capture = app

@@ -51,6 +51,17 @@ export interface Entry {
   html: string | null
 }
 
+export interface LinkCard {
+  status: 'ok' | 'off' | 'one_time' | 'failed'
+  url: string
+  site: string
+  title: string | null
+  description: string | null
+  /** data URL — окно само в сеть не ходит. */
+  image: string | null
+  error: string | null
+}
+
 export type Status =
   | { kind: 'unconfigured' }
   | { kind: 'local' }
@@ -85,4 +96,5 @@ export const api = {
   deviceInfo: () => invoke<DeviceInfo>('device_info'),
   copyQuietly: (text: string) => invoke<void>('copy_quietly', { text }),
   editImage: (id: string) => invoke<void>('editor_open', { id }),
+  linkPreview: (url: string) => invoke<LinkCard>('link_preview', { url }),
 }
