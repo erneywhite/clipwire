@@ -432,7 +432,9 @@ impl Service {
         if let Some(c) = self.copier.take() {
             c.cancel();
         }
-        drop(self.watcher.take());
+        // Присваивание, а не drop(): на других ОС у заглушки Watcher нет Drop,
+        // и clippy ругается на drop. На Windows это сразу останавливает поток.
+        self.watcher = None;
         if let Some(mut e) = self.engine.take() {
             let wait = std::time::Duration::from_secs(3);
             if tokio::time::timeout(wait, &mut e).await.is_err() {
