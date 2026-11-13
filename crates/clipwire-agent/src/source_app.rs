@@ -24,10 +24,7 @@ pub fn lookup(exe_path: &str) -> Option<SourceApp> {
     }
     let (description, icon_png) = platform::read(exe_path);
     let app = SourceApp {
-        name: description
-            .map(|d| d.trim().to_string())
-            .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| stem(&exe).to_string()),
+        name: display_name(description.as_deref(), &exe),
         exe,
         icon_png: icon_png.unwrap_or_default(),
     };
@@ -45,6 +42,17 @@ pub fn file_name(path: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Имя для показа: описание из ресурсов exe, а если его нет — имя файла.
+/// У части программ (например, «Ножницы» из Microsoft Store) в описании
+/// записано само имя файла «SnippingTool.exe» — тогда без расширения.
+fn display_name(description: Option<&str>, exe: &str) -> String {
+    let d = description.map(str::trim).unwrap_or_default();
+    if d.is_empty() {
+        return stem(exe).to_string();
+    }
+    stem(d).to_string()
 }
 
 /// Имя без расширения `.exe` (в любом регистре).
@@ -250,6 +258,16 @@ mod tests {
         assert_eq!(stem("Telegram.EXE"), "Telegram");
         assert_eq!(stem("gedit"), "gedit");
         assert_eq!(stem("ё.exe"), "ё");
+        assert_eq!(
+            display_name(Some("Telegram Desktop"), "Telegram.exe"),
+            "Telegram Desktop"
+        );
+        assert_eq!(
+            display_name(Some("SnippingTool.exe"), "SnippingTool.exe"),
+            "SnippingTool"
+        );
+        assert_eq!(display_name(Some("  "), "app.exe"), "app");
+        assert_eq!(display_name(None, "app.exe"), "app");
     }
 
     #[test]

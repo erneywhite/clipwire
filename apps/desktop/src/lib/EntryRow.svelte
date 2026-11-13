@@ -144,7 +144,12 @@
         }}
         ondblclick={(e) => e.stopPropagation()}
       >
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l-1 7 3 3H7l3-3z" /><path d="M12 13v8" /></svg>
+        <!-- Булавка наклонена, как принято: игла смотрит вниз-влево. -->
+        <svg viewBox="0 0 24 24" aria-hidden="true"
+          ><g transform="rotate(45 12 12)"
+            ><path d="M8.5 3.5h7M10 3.5v5.2L7 12h10l-3-3.3V3.5" /><path d="M12 12v8.5" /></g
+          ></svg
+        >
       </button>
     {/if}
   </span>
