@@ -4,6 +4,7 @@
 //! трогаем (переход по ним может сжечь код входа или сброса пароля).
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -63,6 +64,15 @@ pub async fn link_preview(app: AppHandle, url: String) -> LinkCard {
     if looks_one_time(&parsed) {
         return LinkCard {
             status: "one_time",
+            ..base
+        };
+    }
+    // Ссылка на свою машину или локальную сеть: карточка не нужна, а запрос
+    // туда может что-то сделать на роутере или в локальном сервисе.
+    if let Err(e) = check_target(&parsed) {
+        return LinkCard {
+            status: "failed",
+            error: Some(e),
             ..base
         };
     }
@@ -130,17 +140,187 @@ fn host_label(u: &Url) -> String {
         .to_string()
 }
 
+/// Сколько редиректов проходить.
+const MAX_REDIRECTS: usize = 5;
+
 fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(TIMEOUT)
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(reqwest::redirect::Policy::custom(
+                |attempt| match redirect_verdict(attempt.url(), attempt.previous().len()) {
+                    Redirect::Follow => attempt.follow(),
+                    Redirect::Stop => attempt.stop(),
+                    Redirect::Refuse(e) => attempt.error(e),
+                },
+            ))
+            // Имена резолвим сами и отдаём клиенту только публичные адреса:
+            // подключение идёт ровно к проверенному IP, и DNS rebinding
+            // (сначала публичный адрес, при подключении — 127.0.0.1) не
+            // проходит.
+            .dns_resolver(PublicResolver)
+            // Через прокси имя резолвит уже прокси, и проверка выше теряет
+            // смысл. Карточки ссылок — необязательная мелочь, без прокси.
+            .no_proxy()
             // Многие сайты отдают og-теги только «браузеру».
             .user_agent("Mozilla/5.0 (compatible; Clipwire link preview)")
             .build()
             .expect("HTTP-клиент собирается")
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Redirect {
+    Follow,
+    /// Не идти дальше: отдать как есть ответ с редиректом (карточка не
+    /// соберётся, но и одноразовая ссылка не сгорит).
+    Stop,
+    Refuse(String),
+}
+
+/// Что делать с очередным редиректом на `url`, когда пройдено `hops`.
+fn redirect_verdict(url: &Url, hops: usize) -> Redirect {
+    if hops >= MAX_REDIRECTS {
+        return Redirect::Refuse("слишком много редиректов".into());
+    }
+    if let Err(e) = check_target(url) {
+        return Redirect::Refuse(e);
+    }
+    // Короткая ссылка может вести на вход или сброс пароля.
+    if looks_one_time(url) {
+        return Redirect::Stop;
+    }
+    Redirect::Follow
+}
+
+/// Куда можно ходить за карточкой: http(s) на публичный адрес. Имя хоста
+/// здесь проверяется только на `localhost`; адреса имён проверяет
+/// [`PublicResolver`] при подключении.
+fn check_target(u: &Url) -> Result<(), String> {
+    if !matches!(u.scheme(), "http" | "https") {
+        return Err("Это не веб-ссылка".into());
+    }
+    // `Url` уже привёл адрес к обычному виду (`http://2130706433/` —
+    // это 127.0.0.1), IPv6 в host_str — в квадратных скобках.
+    let ok = match u.host_str() {
+        Some(h) => match h
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+        {
+            Ok(ip) => is_public_ip(ip),
+            Err(_) => !is_local_name(h),
+        },
+        None => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err("Ссылка ведёт на этот компьютер или в локальную сеть".into())
+    }
+}
+
+/// `localhost` и его поддомены: их резолвит сама ОС, мимо DNS.
+fn is_local_name(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    h == "localhost" || h.ends_with(".localhost")
+}
+
+/// Публичный адрес: не loopback, не частная сеть, не link-local, не CGNAT,
+/// не ULA, не «любой» адрес, не multicast и не служебные диапазоны.
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        IpAddr::V6(v6) => {
+            // IPv4 внутри IPv6 (::ffff:a.b.c.d, NAT64 64:ff9b::/96, 6to4
+            // 2002::/16) проверяем как IPv4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_v4(v4);
+            }
+            let s = v6.segments();
+            if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+                return is_public_v4(Ipv4Addr::new(
+                    (s[6] >> 8) as u8,
+                    s[6] as u8,
+                    (s[7] >> 8) as u8,
+                    s[7] as u8,
+                ));
+            }
+            if s[0] == 0x2002 {
+                return is_public_v4(Ipv4Addr::new(
+                    (s[1] >> 8) as u8,
+                    s[1] as u8,
+                    (s[2] >> 8) as u8,
+                    s[2] as u8,
+                ));
+            }
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // ULA fc00::/7
+                || (s[0] & 0xfe00) == 0xfc00
+                // link-local fe80::/10 и старый site-local fec0::/10
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xffc0) == 0xfec0
+                // IPv4-совместимые ::a.b.c.d (устарели) и прочее в ::/96
+                || s[..6] == [0, 0, 0, 0, 0, 0]
+                // документация 2001:db8::/32
+                || (s[0] == 0x2001 && s[1] == 0x0db8))
+        }
+    }
+}
+
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        // 0.0.0.0/8 — «эта сеть»
+        || a == 0
+        // CGNAT 100.64.0.0/10
+        || (a == 100 && (b & 0xc0) == 64)
+        // 192.0.0.0/24 — служебные адреса IETF
+        || (a == 192 && b == 0 && ip.octets()[2] == 0)
+        // 198.18.0.0/15 — стенды для замеров
+        || (a == 198 && (b & 0xfe) == 18)
+        // 240.0.0.0/4 — зарезервировано
+        || a >= 240)
+}
+
+/// Резолвер, который отдаёт клиенту только публичные адреса имени.
+struct PublicResolver;
+
+impl reqwest::dns::Resolve for PublicResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = public_addrs(&host).await?;
+            let addrs: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// Адреса имени без локальных. Ни одного публичного — ошибка.
+async fn public_addrs(
+    host: &str,
+) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+    if is_local_name(host) {
+        return Err("имя указывает на этот компьютер".into());
+    }
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 0))
+        .await?
+        .filter(|a| is_public_ip(a.ip()))
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("у {host} нет публичных адресов").into());
+    }
+    Ok(addrs)
 }
 
 /// Прочитать тело не больше `max` байт.
@@ -175,7 +355,8 @@ async fn fetch(url: &Url) -> anyhow::Result<(Meta, Url)> {
 }
 
 async fn fetch_image(url: &Url) -> anyhow::Result<String> {
-    anyhow::ensure!(matches!(url.scheme(), "http" | "https"), "не http");
+    // Адрес картинки берётся со страницы: проверяем так же, как ссылку.
+    check_target(url).map_err(anyhow::Error::msg)?;
     let resp = client().get(url.clone()).send().await?;
     anyhow::ensure!(resp.status().is_success(), "картинка: {}", resp.status());
     // SVG не берём: в нём бывают скрипты, а растровая картинка есть почти всегда.
@@ -225,6 +406,11 @@ const ONE_TIME: &[&str] = &[
     "sig",
     "ticket",
     "nonce",
+    "key",
+    "secret",
+    "invite",
+    "jwt",
+    "share",
 ];
 
 pub fn looks_one_time(u: &Url) -> bool {
@@ -410,6 +596,11 @@ mod tests {
             "https://b.s3.amazonaws.com/f.zip?X-Amz-Signature=abc&X-Amz-Expires=60",
             "https://example.com/verify?email=a@b.c",
             "https://example.com/cb#access_token=xyz",
+            "https://api.example.com/v1?key=abc",
+            "https://example.com/s/secret/abc",
+            "https://chat.example.com/invite/abc",
+            "https://example.com/cb?jwt=eyJ",
+            "https://drive.example.com/share/abc",
         ] {
             assert!(looks_one_time(&u(s)), "{s}");
         }
@@ -421,6 +612,124 @@ mod tests {
         ] {
             assert!(!looks_one_time(&u(s)), "{s}");
         }
+    }
+
+    #[test]
+    fn local_addresses_are_refused() {
+        for s in [
+            "http://127.0.0.1/",
+            "http://127.1.2.3:8080/x",
+            "http://2130706433/",
+            "http://0x7f000001/",
+            "http://localhost:3000/",
+            "http://LOCALHOST./",
+            "http://app.localhost/",
+            "http://10.0.0.1/",
+            "http://172.16.5.4/",
+            "http://192.168.1.1/admin",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.64.0.1/",
+            "http://100.127.255.255/",
+            "http://0.0.0.0/",
+            "http://224.0.0.1/",
+            "http://255.255.255.255/",
+            "http://[::1]/",
+            "http://[::]/",
+            "http://[fd00::1]/",
+            "http://[fc12::1]/",
+            "http://[fe80::1]/",
+            "http://[ff02::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::ffff:192.168.0.1]/",
+            "http://[64:ff9b::a00:1]/",
+            "http://[2002:c0a8:101::1]/",
+            "ftp://example.com/",
+        ] {
+            assert!(check_target(&u(s)).is_err(), "{s}");
+        }
+        for s in [
+            "https://example.com/",
+            "http://93.184.215.14/",
+            "http://100.128.0.1/",
+            "http://172.32.0.1/",
+            "http://[2606:4700::1111]/",
+            "http://localhost.example.com/",
+        ] {
+            assert!(check_target(&u(s)).is_ok(), "{s}");
+        }
+    }
+
+    #[test]
+    fn redirects_are_checked_at_every_hop() {
+        assert_eq!(
+            redirect_verdict(&u("https://example.com/page"), 0),
+            Redirect::Follow
+        );
+        assert!(matches!(
+            redirect_verdict(&u("http://127.0.0.1/admin"), 1),
+            Redirect::Refuse(_)
+        ));
+        assert!(matches!(
+            redirect_verdict(&u("http://localhost/"), 1),
+            Redirect::Refuse(_)
+        ));
+        assert!(matches!(
+            redirect_verdict(&u("http://[fd00::1]/"), 1),
+            Redirect::Refuse(_)
+        ));
+        assert!(matches!(
+            redirect_verdict(&u("file:///etc/passwd"), 1),
+            Redirect::Refuse(_)
+        ));
+        // Короткая ссылка ведёт на сброс пароля — дальше не идём.
+        assert_eq!(
+            redirect_verdict(&u("https://example.com/reset?token=abc"), 1),
+            Redirect::Stop
+        );
+        assert!(matches!(
+            redirect_verdict(&u("https://example.com/"), MAX_REDIRECTS),
+            Redirect::Refuse(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolver_drops_local_addresses() {
+        // localhost — без сети; IP-литерал резолвится в себя же.
+        assert!(public_addrs("localhost").await.is_err());
+        assert!(public_addrs("127.0.0.1").await.is_err());
+        assert!(public_addrs("192.168.0.10").await.is_err());
+        let ok = public_addrs("93.184.215.14").await.unwrap();
+        assert_eq!(ok.len(), 1);
+    }
+
+    /// Запрос к локальному серверу не уходит: ни напрямую, ни через имя.
+    #[tokio::test]
+    async fn fetch_does_not_reach_local_server() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let hits = hits.clone();
+            tokio::spawn(async move {
+                while let Ok((_s, _)) = listener.accept().await {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+        // Имя, которое резолвится в 127.0.0.1, — как при DNS rebinding.
+        for s in [
+            format!("http://localhost:{port}/"),
+            format!("http://lvh.me:{port}/"),
+        ] {
+            assert!(fetch(&u(&s)).await.is_err(), "{s}");
+        }
+        assert!(
+            fetch_image(&u(&format!("http://127.0.0.1:{port}/a.png")))
+                .await
+                .is_err()
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

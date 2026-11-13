@@ -14,11 +14,11 @@ pub fn write_text(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Прочитать текст из буфера ОС, если там текст.
-/// Записать картинку (PNG) в буфер ОС.
-pub fn write_image(png: &[u8]) -> Result<()> {
+/// Записать картинку (PNG) в буфер ОС. `width` и `height` — размеры из
+/// элемента: PNG с другими настоящими размерами не пишем.
+pub fn write_image(png: &[u8], width: u32, height: u32) -> Result<()> {
     use anyhow::Context;
-    let img = crate::image::decode_png(png)?;
+    let img = crate::image::decode_png_sized(png, width, height)?;
     let (w, h) = img.dimensions();
     let raw = img.into_raw();
     with_retry(|c| {
@@ -36,7 +36,7 @@ pub fn write_image(png: &[u8]) -> Result<()> {
 pub fn write(content: &clipwire_core::Content) -> Result<()> {
     match content {
         clipwire_core::Content::Text(t) => write_text(t),
-        clipwire_core::Content::Image { png, .. } => write_image(png),
+        clipwire_core::Content::Image { png, width, height } => write_image(png, *width, *height),
         #[cfg(windows)]
         clipwire_core::Content::Rich { text, html, rtf } => {
             win::write_rich(text, html.as_deref(), rtf.as_deref())
@@ -103,6 +103,70 @@ pub fn read_text() -> Option<String> {
     }
 }
 
+/// Сколько раз перечитывать буфер, если он менялся во время чтения.
+const CONSISTENT_ATTEMPTS: usize = 3;
+
+/// Прочитать буфер согласованно: номер версии буфера (`seq`) до чтения и
+/// после должен совпасть, иначе части результата могут относиться к разному
+/// содержимому. До [`CONSISTENT_ATTEMPTS`] попыток, потом `None` — пропустить.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn read_consistent<T>(mut seq: impl FnMut() -> u32, mut read: impl FnMut() -> T) -> Option<T> {
+    for _ in 0..CONSISTENT_ATTEMPTS {
+        let before = seq();
+        let v = read();
+        if seq() == before {
+            return Some(v);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn consistent_read_retries_while_clipboard_changes() {
+        // Буфер не менялся — первое чтение.
+        let reads = Cell::new(0);
+        let got = read_consistent(
+            || 7,
+            || {
+                reads.set(reads.get() + 1);
+                "a"
+            },
+        );
+        assert_eq!((got, reads.get()), (Some("a"), 1));
+
+        // Сменился во время первого чтения — второе чтение берётся.
+        let n = Cell::new(0u32);
+        let seq = || {
+            n.set(n.get() + 1);
+            // 1 (до) и 2 (после) — не совпали; 3 и 3 — совпали.
+            if n.get() <= 2 { n.get() } else { 3 }
+        };
+        let reads = Cell::new(0);
+        let got = read_consistent(seq, || {
+            reads.set(reads.get() + 1);
+            reads.get()
+        });
+        assert_eq!(got, Some(2));
+
+        // Меняется всё время — после трёх попыток пропускаем.
+        let n = Cell::new(0u32);
+        let reads = Cell::new(0);
+        let got = read_consistent(
+            || {
+                n.set(n.get() + 1);
+                n.get()
+            },
+            || reads.set(reads.get() + 1),
+        );
+        assert_eq!((got, reads.get()), (None, 3));
+    }
+}
+
 #[cfg(windows)]
 pub use win::Watcher;
 
@@ -114,8 +178,9 @@ mod win {
     use clipwire_core::Content;
     use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::DataExchange::{
-        AddClipboardFormatListener, CloseClipboard, GetClipboardData, IsClipboardFormatAvailable,
-        OpenClipboard, RegisterClipboardFormatW, RemoveClipboardFormatListener,
+        AddClipboardFormatListener, CloseClipboard, GetClipboardData, GetClipboardSequenceNumber,
+        IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+        RemoveClipboardFormatListener,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
@@ -217,26 +282,21 @@ mod win {
                 // SAFETY: указатель положен в create_window и живёт до drop_ctx;
                 // всё в одном потоке, поэтому &mut без гонок.
                 if let Some(ctx) = unsafe { ptr.as_mut() } {
-                    if ctx.formats.excluded(hwnd) {
-                        tracing::debug!("буфер помечен как приватный, пропускаю");
-                    } else if let Some(files) = read_files() {
-                        // Проводник кладёт файлы списком путей (CF_HDROP).
-                        (ctx.on_change)(Content::Files(files), owner_exe());
-                    } else if let Some(text) = super::read_text()
-                        && !text.is_empty()
-                    {
-                        // Если в буфере и текст, и картинка (Excel, редакторы),
-                        // берём текст: он и есть то, что человек копировал.
-                        // Рядом с текстом бывает HTML и RTF — забираем и их.
-                        let (html, rtf) = read_rich();
-                        let content = if html.is_some() || rtf.is_some() {
-                            Content::Rich { text, html, rtf }
-                        } else {
-                            Content::Text(text)
-                        };
-                        (ctx.on_change)(content, owner_exe());
-                    } else if let Some(img) = super::read_image() {
-                        (ctx.on_change)(img, owner_exe());
+                    // Метки, содержимое и владельца читаем несколькими
+                    // открытиями буфера. Если между ними буфер сменился (менеджер
+                    // паролей положил пароль сразу после обычного текста),
+                    // метки могли относиться к одному содержимому, а прочитали
+                    // другое. Поэтому сверяем номер версии буфера до и после.
+                    let seq = || unsafe { GetClipboardSequenceNumber() };
+                    match super::read_consistent(seq, || snapshot(ctx, hwnd)) {
+                        Some(Snapshot::Content(content, owner)) => {
+                            (ctx.on_change)(content, owner);
+                        }
+                        Some(Snapshot::Excluded) => {
+                            tracing::debug!("буфер помечен как приватный, пропускаю");
+                        }
+                        Some(Snapshot::Empty) => {}
+                        None => tracing::debug!("буфер менялся во время чтения, пропускаю"),
                     }
                 }
                 LRESULT(0)
@@ -247,6 +307,44 @@ mod win {
             }
             _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
         }
+    }
+
+    /// Что лежит в буфере.
+    enum Snapshot {
+        /// Содержимое и exe владельца буфера.
+        Content(Content, Option<String>),
+        /// Помечено как приватное (или метку не удалось прочитать).
+        Excluded,
+        /// Ничего, что мы умеем брать.
+        Empty,
+    }
+
+    /// Один проход чтения буфера: метки исключения, содержимое, владелец.
+    fn snapshot(ctx: &Ctx, hwnd: HWND) -> Snapshot {
+        if ctx.formats.excluded(hwnd) {
+            return Snapshot::Excluded;
+        }
+        let content = if let Some(files) = read_files() {
+            // Проводник кладёт файлы списком путей (CF_HDROP).
+            Content::Files(files)
+        } else if let Some(text) = super::read_text()
+            && !text.is_empty()
+        {
+            // Если в буфере и текст, и картинка (Excel, редакторы),
+            // берём текст: он и есть то, что человек копировал.
+            // Рядом с текстом бывает HTML и RTF — забираем и их.
+            let (html, rtf) = read_rich();
+            if html.is_some() || rtf.is_some() {
+                Content::Rich { text, html, rtf }
+            } else {
+                Content::Text(text)
+            }
+        } else if let Some(img) = super::read_image() {
+            img
+        } else {
+            return Snapshot::Empty;
+        };
+        Snapshot::Content(content, owner_exe())
     }
 
     fn create_window(ctx: Box<Ctx>) -> Result<HWND> {
@@ -444,10 +542,12 @@ mod win {
             if available(self.exclude_monitor) || available(self.viewer_ignore) {
                 return true;
             }
-            // Эти два формата — DWORD: 0 означает «нельзя».
+            // Эти два формата — DWORD: 0 означает «нельзя». Метка есть, но не
+            // прочиталась (буфер не открылся, данных нет) — считаем
+            // содержимое приватным: лучше не отправить, чем отправить пароль.
             [self.can_history, self.can_cloud]
                 .into_iter()
-                .any(|f| available(f) && read_dword(hwnd, f) == Some(0))
+                .any(|f| available(f) && read_dword(hwnd, f).is_none_or(|v| v == 0))
         }
     }
 

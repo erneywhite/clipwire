@@ -29,6 +29,14 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// `blob` («есть только на устройстве»), чтобы один элемент не держал всю
 /// синхронизацию в цикле переподключений.
 pub const MAX_RESERVE_ATTEMPTS: u32 = 3;
+/// Насколько id элемента может опережать часы этого устройства, чтобы по нему
+/// двигался курсор. Курсор «из будущего» заставил бы пропускать все новые
+/// элементы до той даты: их id меньше курсора.
+pub const MAX_CURSOR_AHEAD: Duration = Duration::from_secs(5 * 60);
+/// В буфер ОС идут только элементы, скопированные не раньше этого. Старше —
+/// только в историю: запоздалая доставка не должна внезапно подменить то,
+/// что человек скопировал у себя.
+pub const FRESH_FOR_CLIPBOARD: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -89,6 +97,15 @@ impl Engine {
         notify: Notify,
     ) -> Self {
         let device = DeviceId(*SecretKey::from_bytes(&state.device_key).public().as_bytes());
+        // Курсор с диска мог попасть «в будущее» (элемент с часами вперёд у
+        // старой версии): с таким курсором ничего нового не принималось бы.
+        let cursor = cursor.filter(|c| {
+            let ok = !ahead_of_clock(*c, now_ms());
+            if !ok {
+                tracing::warn!("курсор из будущего, сбрасываю");
+            }
+            ok
+        });
         Self {
             state,
             device,
@@ -228,37 +245,28 @@ impl Engine {
         addr: EndpointAddr,
         local: &mut mpsc::Receiver<Content>,
     ) -> Result<()> {
-        // Пока идёт подключение, следим за relay: если он отказал по токену,
-        // ждать таймаута бессмысленно, iroh будет повторять с тем же токеном вечно.
-        let conn = tokio::select! {
-            r = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN)) => {
-                match r {
-                    Ok(c) => c?,
-                    Err(_) => bail!("таймаут подключения{}", relay_hint(ep)),
+        let conn = connect(ep, addr.clone()).await?;
+        let key = self.state.invite.group_key.clone();
+        let (conn, mut send, mut recv) = match join(&conn, &key, Some(&self.token())).await {
+            Ok((send, recv)) => (conn, send, recv),
+            Err(JoinFail::Other(e)) => return Err(e),
+            Err(first) => {
+                // Старый сервер не знает `JoinWithToken`: кадр не разбирается,
+                // и сервер просто рвёт соединение. Повторяем один раз обычным
+                // `Join` по новому соединению.
+                tracing::info!("вход с токеном не прошёл ({first}), пробую обычный вход");
+                let conn = connect(ep, addr).await?;
+                match join(&conn, &key, None).await {
+                    Ok((send, recv)) => (conn, send, recv),
+                    // Если на первый вход сервер отказал внятно, его причина
+                    // понятнее второй.
+                    Err(second) => match first {
+                        JoinFail::Refused(e) => bail!("сервер отказал: {e}"),
+                        _ => bail!("{second}"),
+                    },
                 }
             }
-            reason = relay_denied(ep) => bail!("relay отказал в доступе: {reason}"),
         };
-        let (mut send, mut recv) = conn.open_bi().await?;
-        let key = self.state.invite.group_key.clone();
-        write_msg(
-            &mut send,
-            &ClientMsg::Join {
-                group_id: key.group_id(),
-                join_secret: key.join_secret(),
-            },
-        )
-        .await?;
-
-        match tokio::time::timeout(CONNECT_TIMEOUT, read_msg(&mut recv))
-            .await
-            .context("сервер не ответил на вход")??
-        {
-            Some(ServerMsg::Joined) => {}
-            Some(ServerMsg::Error(e)) => bail!("сервер отказал: {e}"),
-            Some(other) => bail!("неожиданный ответ сервера: {other:?}"),
-            None => bail!("сервер закрыл соединение"),
-        }
         // История идёт по элементу; таймаут на каждый, а не на всю: с
         // картинками она может качаться дольше CONNECT_TIMEOUT.
         let mut history = Vec::new();
@@ -300,15 +308,7 @@ impl Engine {
                     }
                 },
                 msg = read_msg::<_, ServerMsg>(&mut recv) => match msg? {
-                    Some(ServerMsg::Deliver(sealed)) => {
-                        if sealed.origin == self.device || self.cursor.is_some_and(|c| sealed.id <= c) {
-                            continue;
-                        }
-                        match key.open(&sealed) {
-                            Ok(item) => self.accept(item),
-                            Err(e) => tracing::warn!("элемент не расшифровался, пропускаю: {e}"),
-                        }
-                    }
+                    Some(ServerMsg::Deliver(sealed)) => self.deliver(&sealed),
                     Some(ServerMsg::Backfill(sealed)) => {
                         if sealed.origin == self.device {
                             continue;
@@ -329,30 +329,64 @@ impl Engine {
     /// История группы при входе. В буфер идёт только самый свежий чужой
     /// элемент, которого ещё не видели, и только если курсор уже есть: при
     /// первом входе буфер не перезатираем. Остальное новое — в историю.
+    /// Курсор двигается только по элементам, которые расшифровались: мусор с
+    /// чужим id не должен его сдвинуть.
     fn apply_history(&mut self, history: Vec<(clipwire_core::SealedItem, bool)>) {
-        let plan = plan_history(&history, self.cursor, self.device);
         let key = self.state.invite.group_key.clone();
-        let mut items = Vec::new();
-        let mut current = None;
-        for (i, (sealed, _)) in history.iter().enumerate() {
-            if !plan.history.contains(&i) && plan.current != Some(i) {
+        let (cursor, now) = (self.cursor, now_ms());
+        let mut newest: Option<ItemId> = None;
+        // Расшифрованные элементы для истории и их флаг `backfill`.
+        let mut items: Vec<(Item, bool)> = Vec::new();
+        for (sealed, backfill) in &history {
+            let unseen = cursor.is_none_or(|c| sealed.id > c);
+            let wanted = wanted_from_history(sealed, *backfill, cursor, self.device);
+            if !wanted && !unseen {
                 continue;
             }
             match key.open(sealed) {
-                Ok(item) if plan.current == Some(i) => current = Some(item),
-                Ok(item) => items.push(item),
+                Ok(item) => {
+                    // Id из будущего не в счёт: иначе он перекрыл бы
+                    // настоящий самый свежий, а курсор по нему не встанет.
+                    if unseen && !ahead_of_clock(item.id, now) {
+                        newest = newest.max(Some(item.id));
+                    }
+                    if wanted {
+                        items.push((item, *backfill));
+                    }
+                }
                 Err(e) => tracing::warn!("элемент из истории не расшифровался: {e}"),
             }
         }
+        // В буфер — самый свежий обычный элемент (не первый вход).
+        let current = cursor
+            .and_then(|_| items.iter().rposition(|(_, backfill)| !backfill))
+            .map(|i| items.remove(i).0);
+        let items: Vec<Item> = items.into_iter().map(|(item, _)| item).collect();
         if !items.is_empty() {
             self.emit(Event::History(items));
         }
         if let Some(item) = current {
             self.accept(item);
         }
-        if let Some(max) = history.iter().map(|(s, _)| s.id).max() {
+        if let Some(max) = newest {
             self.set_cursor(max);
         }
+    }
+
+    /// Элемент, который сервер разослал сейчас.
+    fn deliver(&mut self, sealed: &clipwire_core::SealedItem) {
+        if sealed.origin == self.device || self.cursor.is_some_and(|c| sealed.id <= c) {
+            return;
+        }
+        match self.state.invite.group_key.open(sealed) {
+            Ok(item) => self.accept(item),
+            Err(e) => tracing::warn!("элемент не расшифровался, пропускаю: {e}"),
+        }
+    }
+
+    /// Токен сервера для входа (тот же, что у relay).
+    fn token(&self) -> String {
+        self.state.invite.server.relay_token.clone()
     }
 
     /// Отправить локальную историю в группу. Отправленное убирается из очереди
@@ -378,13 +412,28 @@ impl Engine {
         Ok(())
     }
 
+    /// Чужой элемент для буфера. Скопированный давно (запоздалая доставка
+    /// или старый элемент, выданный за новый) идёт только в историю: время
+    /// копирования лежит под шифрованием, сервер его не подделает.
     fn accept(&mut self, item: Item) {
         let id = item.id;
-        self.emit(Event::Incoming(item));
+        if is_fresh(&item, now_ms()) {
+            self.emit(Event::Incoming(item));
+        } else {
+            tracing::info!("элемент скопирован давно, кладу только в историю");
+            self.emit(Event::History(vec![item]));
+        }
         self.set_cursor(id);
     }
 
+    /// Сдвинуть курсор вперёд. Id «из будущего» (часы источника спешат или
+    /// id подделан) курсор не двигает: иначе все новые элементы до той даты
+    /// считались бы уже виденными.
     fn set_cursor(&mut self, id: ItemId) {
+        if ahead_of_clock(id, now_ms()) {
+            tracing::warn!("id элемента из будущего, курсор не двигаю");
+            return;
+        }
         if self.cursor.is_none_or(|c| id > c) {
             self.cursor = Some(id);
             self.emit(Event::Cursor(id));
@@ -471,39 +520,116 @@ impl Engine {
     }
 }
 
-/// Что сделать с историей группы при входе: индексы элементов для истории и
-/// индекс элемента для буфера.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct HistoryPlan {
-    history: Vec<usize>,
-    current: Option<usize>,
-}
-
-fn plan_history(
-    history: &[(clipwire_core::SealedItem, bool)],
+/// Брать ли элемент истории группы при входе: чужой и ещё не виденный.
+/// Обычные элементы не новее курсора уже были у нас. Чужую локальную историю
+/// берём всегда: её id старые, курсор про неё ничего не говорит, а повтор
+/// отсеет история по содержимому.
+fn wanted_from_history(
+    s: &clipwire_core::SealedItem,
+    backfill: bool,
     cursor: Option<ItemId>,
     me: DeviceId,
-) -> HistoryPlan {
-    let mut plan = HistoryPlan::default();
-    // В буфер — самый свежий обычный элемент новее курсора (не первый вход).
-    if let Some(c) = cursor {
-        plan.current = history
-            .iter()
-            .rposition(|(s, backfill)| !backfill && s.id > c && s.origin != me);
-    }
-    for (i, (s, backfill)) in history.iter().enumerate() {
-        if s.origin == me || plan.current == Some(i) {
-            continue;
+) -> bool {
+    let seen = !backfill && cursor.is_some_and(|c| s.id <= c);
+    s.origin != me && !seen
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Id опережает часы больше чем на [`MAX_CURSOR_AHEAD`] (или времени в нём
+/// нет вовсе).
+fn ahead_of_clock(id: ItemId, now_ms: u64) -> bool {
+    id.ms()
+        .is_none_or(|ms| ms > now_ms.saturating_add(MAX_CURSOR_AHEAD.as_millis() as u64))
+}
+
+/// Скопирован не раньше [`FRESH_FOR_CLIPBOARD`] назад. Время из будущего
+/// (часы источника спешат) считается свежим.
+fn is_fresh(item: &Item, now_ms: u64) -> bool {
+    item.created_at_ms
+        .saturating_add(FRESH_FOR_CLIPBOARD.as_millis() as u64)
+        >= now_ms
+}
+
+/// Подключиться к серверу. Пока идёт подключение, следим за relay: если он
+/// отказал по токену, ждать таймаута бессмысленно, iroh будет повторять с тем
+/// же токеном вечно.
+async fn connect(ep: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
+    tokio::select! {
+        r = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN)) => {
+            match r {
+                Ok(c) => Ok(c?),
+                Err(_) => bail!("таймаут подключения{}", relay_hint(ep)),
+            }
         }
-        // Обычные элементы не новее курсора уже были у нас. Чужую локальную
-        // историю берём всегда: её id старые, курсор про неё ничего не говорит,
-        // а повтор отсеет история по содержимому.
-        let seen = !backfill && cursor.is_some_and(|c| s.id <= c);
-        if !seen {
-            plan.history.push(i);
+        reason = relay_denied(ep) => bail!("relay отказал в доступе: {reason}"),
+    }
+}
+
+/// Почему не удался вход в группу.
+#[derive(Debug)]
+enum JoinFail {
+    /// Сервер ответил ошибкой.
+    Refused(String),
+    /// Сервер закрыл соединение, не ответив: так старый сервер встречает
+    /// сообщение, которого не знает.
+    Closed(String),
+    /// Всё остальное: таймаут, неожиданный ответ. Повторять другим входом
+    /// смысла нет.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for JoinFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinFail::Refused(e) => write!(f, "сервер отказал: {e}"),
+            JoinFail::Closed(e) => write!(f, "сервер закрыл соединение: {e}"),
+            JoinFail::Other(e) => write!(f, "{e:#}"),
         }
     }
-    plan
+}
+
+/// Открыть основной поток и войти в группу: с токеном (`JoinWithToken`) или
+/// без (`Join`, для старого сервера). Возвращает поток после `Joined`.
+async fn join(
+    conn: &Connection,
+    key: &clipwire_core::GroupKey,
+    token: Option<&str>,
+) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), JoinFail> {
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| JoinFail::Closed(e.to_string()))?;
+    let msg = match token {
+        Some(t) => ClientMsg::JoinWithToken {
+            group_id: key.group_id(),
+            join_secret: key.join_secret(),
+            token: t.to_string(),
+        },
+        None => ClientMsg::Join {
+            group_id: key.group_id(),
+            join_secret: key.join_secret(),
+        },
+    };
+    write_msg(&mut send, &msg)
+        .await
+        .map_err(|e| JoinFail::Closed(e.to_string()))?;
+    let reply = tokio::time::timeout(CONNECT_TIMEOUT, read_msg(&mut recv))
+        .await
+        .map_err(|_| JoinFail::Other(anyhow::anyhow!("сервер не ответил на вход")))?;
+    match reply {
+        Ok(Some(ServerMsg::Joined)) => Ok((send, recv)),
+        Ok(Some(ServerMsg::Error(e))) => Err(JoinFail::Refused(e)),
+        Ok(Some(other)) => Err(JoinFail::Other(anyhow::anyhow!(
+            "неожиданный ответ сервера: {other:?}"
+        ))),
+        Ok(None) => Err(JoinFail::Closed("без ответа".into())),
+        Err(e) => Err(JoinFail::Closed(e.to_string())),
+    }
 }
 
 /// Ждёт, пока relay откажет в доступе, и возвращает причину.
@@ -536,10 +662,18 @@ fn relay_hint(ep: &Endpoint) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clipwire_core::{GroupKey, SealedItem};
+    use clipwire_core::{GroupKey, Invite, SealedItem, ServerInfo};
 
-    fn sealed(origin: u8, ms: u64) -> SealedItem {
+    /// 1 января 2099 года.
+    const Y2099: u64 = 4_070_908_800_000;
+
+    fn key() -> GroupKey {
         GroupKey([1; 32])
+    }
+
+    /// Элемент с устройства `origin`, скопированный в `ms`; текст — это `ms`.
+    fn sealed(origin: u8, ms: u64) -> SealedItem {
+        key()
             .seal(&Item::backdated(
                 DeviceId([origin; 32]),
                 Content::Text(ms.to_string()),
@@ -548,40 +682,152 @@ mod tests {
             .unwrap()
     }
 
+    fn engine(cursor: Option<ItemId>) -> (Engine, mpsc::UnboundedReceiver<Event>) {
+        let state = AgentState {
+            invite: Invite {
+                server: ServerInfo {
+                    server_id: [0; 32],
+                    relay_url: "http://unused".into(),
+                    relay_token: "tok".into(),
+                },
+                group_key: key(),
+            },
+            device_key: [9; 32],
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Engine::new(state, "тест".into(), cursor, tx, Arc::new(|| {})),
+            rx,
+        )
+    }
+
+    /// Тексты из событий: что ушло в буфер и что — только в историю.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Event>) -> (Vec<String>, Vec<String>) {
+        let text = |i: &Item| match &i.content {
+            Content::Text(t) => t.clone(),
+            _ => String::new(),
+        };
+        let (mut clip, mut hist) = (Vec::new(), Vec::new());
+        while let Ok(e) = rx.try_recv() {
+            match e {
+                Event::Incoming(i) => clip.push(text(&i)),
+                Event::History(items) => hist.extend(items.iter().map(text)),
+                _ => {}
+            }
+        }
+        (clip, hist)
+    }
+
+    fn texts(ms: &[u64]) -> Vec<String> {
+        ms.iter().map(u64::to_string).collect()
+    }
+
     #[test]
     fn first_join_takes_everything_into_history_but_not_clipboard() {
-        let h = vec![
-            (sealed(2, 10), false),
-            (sealed(2, 20), true),
-            (sealed(1, 30), false),
-        ];
-        let plan = plan_history(&h, None, DeviceId([1; 32]));
-        assert_eq!(
-            plan,
-            HistoryPlan {
-                history: vec![0, 1],
-                current: None
-            }
-        );
+        let now = now_ms();
+        let (mut e, mut rx) = engine(None);
+        let own = key()
+            .seal(&Item::backdated(
+                e.device(),
+                Content::Text("своё".into()),
+                now - 1000,
+            ))
+            .unwrap();
+        e.apply_history(vec![
+            (sealed(2, now - 3000), false),
+            (sealed(2, now - 2000), true),
+            (own.clone(), false),
+        ]);
+        let (clip, hist) = drain(&mut rx);
+        assert!(clip.is_empty());
+        assert_eq!(hist, texts(&[now - 3000, now - 2000]));
+        assert_eq!(e.cursor, Some(own.id));
     }
 
     #[test]
     fn rejoin_applies_newest_unseen_and_keeps_backfill() {
-        let h = vec![
-            (sealed(2, 10), false), // уже видели
-            (sealed(3, 15), true),  // чужая локальная история — старая, но берём
-            (sealed(2, 30), false), // пропущено
-            (sealed(2, 40), false), // самое свежее — в буфер
-            (sealed(3, 50), true),  // локальная история в буфер не идёт
-        ];
-        let cursor = Some(h[0].0.id);
-        let plan = plan_history(&h, cursor, DeviceId([1; 32]));
-        assert_eq!(
-            plan,
-            HistoryPlan {
-                history: vec![1, 2, 4],
-                current: Some(3)
-            }
-        );
+        let now = now_ms();
+        let seen = sealed(2, now - 10_000);
+        let (mut e, mut rx) = engine(Some(seen.id));
+        e.apply_history(vec![
+            (seen, false),                   // уже видели
+            (sealed(3, now - 50_000), true), // чужая локальная история — старая, но берём
+            (sealed(2, now - 3000), false),  // пропущено
+            (sealed(2, now - 2000), false),  // самое свежее — в буфер
+            (sealed(3, now - 1000), true),   // локальная история в буфер не идёт
+        ]);
+        let (clip, hist) = drain(&mut rx);
+        assert_eq!(clip, texts(&[now - 2000]));
+        assert_eq!(hist, texts(&[now - 50_000, now - 3000, now - 1000]));
+    }
+
+    #[test]
+    fn item_from_2099_does_not_block_next_items() {
+        let now = now_ms();
+        let before = sealed(2, now - 60_000);
+        let (mut e, mut rx) = engine(Some(before.id));
+        let future = sealed(2, Y2099);
+        // Мусор с id ещё дальше в будущем: не расшифровывается.
+        let mut junk = sealed(2, Y2099 + 1000);
+        junk.ciphertext[0] ^= 1;
+        let normal = sealed(2, now - 1000);
+        e.apply_history(vec![
+            (normal.clone(), false),
+            (future, false),
+            (junk, false),
+        ]);
+        // Сам элемент из будущего принят, но курсор остался на настоящем.
+        let (clip, hist) = drain(&mut rx);
+        assert_eq!(clip, texts(&[Y2099]));
+        assert_eq!(hist, texts(&[now - 1000]));
+        assert_eq!(e.cursor, Some(normal.id));
+
+        // Следующий элемент приходит как обычно.
+        let next = sealed(2, now_ms());
+        e.deliver(&next);
+        let (clip, _) = drain(&mut rx);
+        assert_eq!(clip.len(), 1);
+        assert_eq!(e.cursor, Some(next.id));
+
+        // Сразу разосланный элемент из будущего курсор тоже не двигает.
+        e.deliver(&sealed(2, Y2099 + 5000));
+        assert_eq!(e.cursor, Some(next.id));
+    }
+
+    #[test]
+    fn cursor_from_future_is_reset_on_start() {
+        let (e, _rx) = engine(Some(ItemId::at_ms(Y2099)));
+        assert_eq!(e.cursor, None);
+        // Небольшая разница часов допустима.
+        let soon = ItemId::at_ms(now_ms() + 60_000);
+        let (e, _rx) = engine(Some(soon));
+        assert_eq!(e.cursor, Some(soon));
+    }
+
+    #[test]
+    fn stale_item_goes_only_to_history() {
+        let now = now_ms();
+        let (mut e, mut rx) = engine(None);
+        let old = now - FRESH_FOR_CLIPBOARD.as_millis() as u64 - 60_000;
+        e.deliver(&sealed(2, old));
+        let fresh = now - 60_000;
+        e.deliver(&sealed(2, fresh));
+        let (clip, hist) = drain(&mut rx);
+        assert_eq!(clip, texts(&[fresh]));
+        assert_eq!(hist, texts(&[old]));
+    }
+
+    #[test]
+    fn freshness_and_clock_checks() {
+        let now = 1_000_000_000_000;
+        let i = |ms| Item::backdated(DeviceId([2; 32]), Content::Text(String::new()), ms);
+        assert!(is_fresh(&i(now), now));
+        assert!(is_fresh(&i(now + 3_600_000), now));
+        assert!(is_fresh(&i(now - 9 * 60_000), now));
+        assert!(!is_fresh(&i(now - 11 * 60_000), now));
+        assert!(!ahead_of_clock(ItemId::at_ms(now + 4 * 60_000), now));
+        assert!(ahead_of_clock(ItemId::at_ms(now + 6 * 60_000), now));
+        // UUID без времени — не v7, курсор по нему не двигаем.
+        assert!(ahead_of_clock(ItemId(uuid::Uuid::nil()), now));
     }
 }

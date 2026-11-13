@@ -384,10 +384,8 @@ pub fn signature_matches(kind: &str, h: &[u8]) -> bool {
         "pdf" => h.starts_with(b"%PDF-"),
         "video" => bmff || ogg || h.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]),
         "audio" => {
-            // Кадр MP3 или ADTS (AAC) без заголовка: 11 единичных бит синхронизации.
-            let sync = h.len() >= 2 && h[0] == 0xFF && h[1] & 0xE0 == 0xE0;
             bmff || ogg
-                || sync
+                || mpeg_frame(h)
                 || h.starts_with(b"ID3")
                 || h.starts_with(b"fLaC")
                 || h.starts_with(b"ADIF")
@@ -395,6 +393,35 @@ pub fn signature_matches(kind: &str, h: &[u8]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Файл начинается с кадра MP3 или ADTS (AAC) без заголовка. Мало 11 бит
+/// синхронизации: под них подходит и метка UTF-16 `FF FE` у текста. Поэтому
+/// проверяем и поля заголовка кадра.
+fn mpeg_frame(h: &[u8]) -> bool {
+    if h.len() < 3 || h[0] != 0xFF {
+        return false;
+    }
+    let (b1, b2) = (h[1], h[2]);
+    // FF FE — UTF-16 LE, FF FF — заливка; настоящие кадры так не начинаются.
+    if b1 == 0xFE || b1 == 0xFF || b1 & 0xE0 != 0xE0 {
+        return false;
+    }
+    // ADTS: 1111 V00P — синхронизация 12 бит, слой всегда 00.
+    if b1 & 0xF6 == 0xF0 {
+        // Индекс частоты 13–15 не бывает.
+        return (b2 >> 2) & 0x0F < 13;
+    }
+    // MPEG audio: 111V VLLP. Версия 01 и слой 00 зарезервированы.
+    let version = (b1 >> 3) & 0b11;
+    let layer = (b1 >> 1) & 0b11;
+    if version == 0b01 || layer == 0b00 {
+        return false;
+    }
+    // Битрейт 1111 и частота 11 — недопустимые значения.
+    let bitrate = b2 >> 4;
+    let rate = (b2 >> 2) & 0b11;
+    bitrate != 0x0F && rate != 0b11
 }
 
 /// Начало файла как текст, если это текст: без нулевых байтов и в основном
@@ -746,6 +773,26 @@ mod tests {
         assert!(!signature_matches("audio", b"RIFF\x24\0\0\0AVI LIST"));
         assert!(!signature_matches("audio", b"<svg onload=x>"));
         assert!(!signature_matches("none", b"%PDF-1.7"));
+    }
+
+    #[test]
+    fn mp3_sync_is_checked_strictly() {
+        // MPEG-1 Layer III, 128 кбит/с, 44,1 кГц; MPEG-2 Layer III; ADTS AAC.
+        assert!(signature_matches("audio", &[0xFF, 0xFB, 0x90, 0x64]));
+        assert!(signature_matches("audio", &[0xFF, 0xF3, 0x48, 0xC4]));
+        assert!(signature_matches("audio", &[0xFF, 0xF1, 0x50, 0x80]));
+        // UTF-16 LE текст «<html» и заливка FF.
+        assert!(!signature_matches("audio", b"\xFF\xFE<\0h\0t\0m\0l\0"));
+        assert!(!signature_matches("audio", &[0xFF, 0xFF, 0xFF, 0xFF]));
+        // Зарезервированная версия, слой 00 вне ADTS, плохой битрейт и частота.
+        assert!(!signature_matches("audio", &[0xFF, 0xEB, 0x90, 0x00]));
+        assert!(!signature_matches("audio", &[0xFF, 0xE0, 0x90, 0x00]));
+        assert!(!signature_matches("audio", &[0xFF, 0xFB, 0xF0, 0x00]));
+        assert!(!signature_matches("audio", &[0xFF, 0xFB, 0x9C, 0x00]));
+        // ADTS с несуществующей частотой.
+        assert!(!signature_matches("audio", &[0xFF, 0xF1, 0x3C, 0x80]));
+        // Слишком коротко для проверки.
+        assert!(!signature_matches("audio", &[0xFF, 0xFB]));
     }
 
     #[test]

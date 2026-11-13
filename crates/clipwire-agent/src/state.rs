@@ -77,8 +77,9 @@ impl Paths {
         write_atomic(&self.state(), &crate::secret::protect(&plain)?)
     }
 
-    /// Выход из группы: ключ, курсор, очередь загрузок и архивы папок в
-    /// outbox (всё это уходило в старую группу, в новой им не место).
+    /// Выход из группы: ключ, курсор, очередь загрузок, архивы папок в
+    /// outbox (всё это уходило в старую группу, в новой им не место) и кэш
+    /// скачанных файлов группы: на диске не должно оставаться её следов.
     pub fn reset(&self) -> Result<()> {
         let uploads = self.dir.join(crate::blobs::UPLOADS_FILE);
         for p in [self.state(), self.cursor(), uploads] {
@@ -88,12 +89,16 @@ impl Paths {
                 Err(e) => return Err(e).with_context(|| format!("не удалился {}", p.display())),
             }
         }
-        let outbox = crate::blobs::outbox_dir(&self.dir);
-        match std::fs::remove_dir_all(&outbox) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e).with_context(|| format!("не удалился {}", outbox.display()));
+        for dir in [
+            crate::blobs::outbox_dir(&self.dir),
+            crate::blobs::files_dir(&self.dir),
+        ] {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("не удалился {}", dir.display()));
+                }
             }
         }
         Ok(())
@@ -169,8 +174,11 @@ mod tests {
         std::fs::write(dir.join("uploads.json"), b"[]").unwrap();
         std::fs::create_dir_all(dir.join("outbox")).unwrap();
         std::fs::write(dir.join("outbox").join("a.tar"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("files").join("ab12")).unwrap();
+        std::fs::write(dir.join("files").join("ab12").join("отчёт.pdf"), b"x").unwrap();
         paths.reset().unwrap();
         assert!(!dir.join("outbox").exists());
+        assert!(!dir.join("files").exists());
         assert!(paths.load().unwrap().is_none());
         assert!(paths.load_cursor().is_none());
         assert!(!dir.join("uploads.json").exists());

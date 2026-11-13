@@ -312,6 +312,14 @@ async fn files_go_to_cache_on_other_device() -> Result<()> {
     assert_eq!(std::fs::read(&got[1])?, b"");
     for p in &got {
         assert!(!part_of(p).exists(), "{} остался .part", p.display());
+        // Скачанное с другого устройства помечено как файл из интернета.
+        #[cfg(windows)]
+        {
+            let mut ads = p.as_os_str().to_owned();
+            ads.push(":Zone.Identifier");
+            let zone = std::fs::read_to_string(ads)?;
+            assert!(zone.contains("ZoneId=3"), "{zone}");
+        }
     }
     // Финальные события о скачивании — Done с полным размером.
     let mut done = Vec::new();
@@ -1147,6 +1155,16 @@ async fn folders_go_through_server_and_directly() -> Result<()> {
         );
         assert!(p.is_dir());
         assert_eq!(tree(p), tree(orig), "{}", f.name);
+        // Каждый файл распакованной папки помечен как файл из интернета.
+        #[cfg(windows)]
+        for (rel, data) in tree(p) {
+            if data.is_some() {
+                let mut ads = p.join(&rel).into_os_string();
+                ads.push(":Zone.Identifier");
+                let zone = std::fs::read_to_string(&ads).unwrap_or_default();
+                assert!(zone.contains("ZoneId=3"), "{rel}: {zone}");
+            }
+        }
         // Архив после распаковки удалён, «уже скачано» видно по папке.
         let mut tar = p.as_os_str().to_owned();
         tar.push(".tar");
