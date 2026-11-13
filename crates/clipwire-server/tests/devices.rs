@@ -345,7 +345,7 @@ async fn rekey_moves_group_to_new_key() -> Result<()> {
         let card = old.open_card(e.device, &e.card)?;
         envelopes.push((
             e.device,
-            seal_rekey(&new, e.device, &card.rekey_pub, old.group_id())?,
+            seal_rekey(&new, &old, &r.key, e.device, &card.rekey_pub)?,
         ));
     }
     assert_eq!(envelopes.len(), 2);
@@ -400,7 +400,7 @@ async fn rekey_moves_group_to_new_key() -> Result<()> {
     // B на связи: получает свой пакет и открывает новый ключ.
     match cb.next().await? {
         ServerMsg::Rekeyed { envelope } => {
-            assert_eq!(open_rekey(&b.key, old.group_id(), &envelope)?, new)
+            assert_eq!(open_rekey(&b.key, &old, &envelope)?.key, new)
         }
         other => panic!("ждали Rekeyed, пришло {other:?}"),
     }
@@ -420,7 +420,7 @@ async fn rekey_moves_group_to_new_key() -> Result<()> {
     let mut cd = Client::connect(&d, &info, &relay).await?;
     match cd.join_plain(&old).await? {
         ServerMsg::Rekeyed { envelope } => {
-            assert_eq!(open_rekey(&d.key, old.group_id(), &envelope)?, new)
+            assert_eq!(open_rekey(&d.key, &old, &envelope)?.key, new)
         }
         other => panic!("ждали Rekeyed, пришло {other:?}"),
     }

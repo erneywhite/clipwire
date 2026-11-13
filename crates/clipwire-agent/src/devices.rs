@@ -132,13 +132,14 @@ pub fn plan_rekey(
 /// Пакеты нового ключа для `Rekey`.
 pub fn seal_envelopes(
     new_key: &GroupKey,
-    old: GroupId,
+    old_key: &GroupKey,
+    device_key: &[u8; 32],
     plan: &RekeyPlan,
 ) -> Result<Vec<(DeviceId, Vec<u8>)>> {
     plan.recipients
         .iter()
         .map(|(d, public)| {
-            seal_rekey(new_key, *d, public, old)
+            seal_rekey(new_key, old_key, device_key, *d, public)
                 .map(|e| (*d, e))
                 .context("пакет нового ключа не собрался")
         })
@@ -349,9 +350,11 @@ mod tests {
             ],
             skipped: Vec::new(),
         };
-        let env = seal_envelopes(&new, old.group_id(), &plan).unwrap();
-        assert_eq!(open_rekey(&dev(2), old.group_id(), &env[1].1).unwrap(), new);
-        assert!(open_rekey(&dev(1), old.group_id(), &env[1].1).is_err());
+        let env = seal_envelopes(&new, &old, &dev(9), &plan).unwrap();
+        let got = open_rekey(&dev(2), &old, &env[1].1).unwrap();
+        assert_eq!(got.key, new);
+        assert_eq!(got.initiator, device_id(&dev(9)));
+        assert!(open_rekey(&dev(1), &old, &env[1].1).is_err());
     }
 
     fn state(group: u8) -> AgentState {

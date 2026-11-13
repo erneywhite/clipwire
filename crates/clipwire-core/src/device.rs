@@ -32,6 +32,8 @@ const INFO_CARD_KEY: &[u8] = b"clipwire/v1/card-key";
 const INFO_REKEY_SECRET: &[u8] = b"clipwire/v1/rekey-secret";
 const INFO_REKEY_WRAP: &[u8] = b"clipwire/v1/rekey-wrap";
 const SIGN_CARD: &[u8] = b"clipwire/v1/device-card\0";
+const SIGN_REKEY: &[u8] = b"clipwire/v1/rekey\0";
+const INFO_REKEY_BIND: &[u8] = b"clipwire/v1/rekey-bind";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DeviceError {
@@ -172,31 +174,62 @@ impl GroupKey {
     }
 }
 
-fn wrap_key(
-    shared: &[u8; 32],
-    eph: &[u8; 32],
-    to: DeviceId,
-    old: GroupId,
-    new: GroupId,
-) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(Some(eph), shared);
+/// Секрет текущей группы, который замешивается в ключ обёртки пакета: без
+/// текущего ключа группы пакет не собрать. Так исключённое устройство, не
+/// знающее нового ключа, не подделает следующую смену ключа даже в сговоре
+/// с сервером.
+fn rekey_bind(old_key: &GroupKey) -> [u8; 32] {
+    derive(&old_key.0, INFO_REKEY_BIND)
+}
+
+fn wrap_key(shared: &[u8; 32], eph: &[u8; 32], old_key: &GroupKey, ctx: &[u8]) -> [u8; 32] {
+    let mut ikm = shared.to_vec();
+    ikm.extend_from_slice(&rekey_bind(old_key));
+    let hk = Hkdf::<Sha256>::new(Some(eph), &ikm);
     let mut info = INFO_REKEY_WRAP.to_vec();
-    info.extend_from_slice(&to.0);
-    info.extend_from_slice(&old.0);
-    info.extend_from_slice(&new.0);
+    info.extend_from_slice(ctx);
     let mut k = [0u8; 32];
     hk.expand(&info, &mut k)
         .expect("32 байта — допустимая длина");
     k
 }
 
+/// Контекст пакета: кому, из какой группы, в какую, кто меняет ключ.
+fn rekey_ctx(to: DeviceId, old: GroupId, new: GroupId, initiator: DeviceId) -> Vec<u8> {
+    let mut v = Vec::with_capacity(128);
+    v.extend_from_slice(&to.0);
+    v.extend_from_slice(&old.0);
+    v.extend_from_slice(&new.0);
+    v.extend_from_slice(&initiator.0);
+    v
+}
+
+/// Длина заголовка пакета: эфемерный ключ, id новой группы, инициатор, подпись.
+const REKEY_HEAD: usize = 32 + 32 + 32 + 64;
+
+/// Новый ключ группы из пакета и устройство, которое его выпустило.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rekey {
+    pub key: GroupKey,
+    /// Кто сменил ключ. Подпись пакета проверена этим id; получатель должен
+    /// ещё убедиться, что это устройство его группы (по карточкам), и
+    /// показать человеку, кто сменил ключ.
+    pub initiator: DeviceId,
+}
+
 /// Упаковать новый ключ группы для устройства `to` по его ключу из карточки.
-/// Пакет привязан к старой и новой группе: в другом месте он не откроется.
+///
+/// Пакет привязан к текущему ключу группы `old_key` (без него ключ обёртки не
+/// получить), к старой и новой группе, к адресату и подписан ключом
+/// устройства-инициатора `initiator_key`.
+///
+/// Формат: `eph_pub (32) | id новой группы (32) | инициатор (32) | подпись (64) | шифротекст`.
 pub fn seal_rekey(
     new_key: &GroupKey,
+    old_key: &GroupKey,
+    initiator_key: &[u8; 32],
     to: DeviceId,
     to_rekey_pub: &[u8; 32],
-    old: GroupId,
 ) -> Result<Vec<u8>, DeviceError> {
     let eph_secret: [u8; 32] = random()?;
     let eph_pub = MontgomeryPoint::mul_base_clamped(eph_secret).to_bytes();
@@ -206,47 +239,69 @@ pub fn seal_rekey(
     if shared == [0u8; 32] {
         return Err(DeviceError::Seal);
     }
-    let new = new_key.group_id();
-    let key = wrap_key(&shared, &eph_pub, to, old, new);
-    let mut aad = to.0.to_vec();
-    aad.extend_from_slice(&old.0);
-    aad.extend_from_slice(&new.0);
-    let mut out = eph_pub.to_vec();
+    let (old, new) = (old_key.group_id(), new_key.group_id());
+    let initiator = device_id(initiator_key);
+    let ctx = rekey_ctx(to, old, new, initiator);
+    let key = wrap_key(&shared, &eph_pub, old_key, &ctx);
+    let sealed = seal_with(&key, &ctx, &new_key.0)?;
+    let mut signed = SIGN_REKEY.to_vec();
+    signed.extend_from_slice(&ctx);
+    signed.extend_from_slice(&eph_pub);
+    signed.extend_from_slice(&sealed);
+    let sig = SigningKey::from_bytes(initiator_key)
+        .sign(&signed)
+        .to_bytes();
+    let mut out = Vec::with_capacity(REKEY_HEAD + sealed.len());
+    out.extend_from_slice(&eph_pub);
     out.extend_from_slice(&new.0);
-    out.extend(seal_with(&key, &aad, &new_key.0)?);
+    out.extend_from_slice(&initiator.0);
+    out.extend_from_slice(&sig);
+    out.extend_from_slice(&sealed);
     Ok(out)
 }
 
-/// Открыть пакет, адресованный этому устройству. Возвращает новый ключ
-/// группы; проверяет, что его `group_id` совпадает с указанным в пакете.
+/// Открыть пакет, адресованный этому устройству: нужен свой ключ устройства и
+/// текущий ключ группы. Проверяет подпись инициатора и то, что `group_id`
+/// нового ключа совпадает с указанным в пакете.
 pub fn open_rekey(
     device_key: &[u8; 32],
-    old: GroupId,
+    old_key: &GroupKey,
     envelope: &[u8],
-) -> Result<GroupKey, DeviceError> {
-    if envelope.len() < 64 {
+) -> Result<Rekey, DeviceError> {
+    if envelope.len() < REKEY_HEAD + 24 + 16 {
         return Err(DeviceError::Open);
     }
     let eph_pub: [u8; 32] = envelope[..32].try_into().expect("32 байта");
     let new = GroupId(envelope[32..64].try_into().expect("32 байта"));
+    let initiator = DeviceId(envelope[64..96].try_into().expect("32 байта"));
+    let sig: [u8; 64] = envelope[96..160].try_into().expect("64 байта");
+    let sealed = &envelope[REKEY_HEAD..];
     let me = device_id(device_key);
+    let ctx = rekey_ctx(me, old_key.group_id(), new, initiator);
+
+    let mut signed = SIGN_REKEY.to_vec();
+    signed.extend_from_slice(&ctx);
+    signed.extend_from_slice(&eph_pub);
+    signed.extend_from_slice(sealed);
+    VerifyingKey::from_bytes(&initiator.0)
+        .map_err(|_| DeviceError::BadSignature)?
+        .verify_strict(&signed, &ed25519_dalek::Signature::from_bytes(&sig))
+        .map_err(|_| DeviceError::BadSignature)?;
+
     let shared = MontgomeryPoint(eph_pub)
         .mul_clamped(rekey_secret(device_key))
         .to_bytes();
     if shared == [0u8; 32] {
         return Err(DeviceError::Open);
     }
-    let key = wrap_key(&shared, &eph_pub, me, old, new);
-    let mut aad = me.0.to_vec();
-    aad.extend_from_slice(&old.0);
-    aad.extend_from_slice(&new.0);
-    let raw = open_with(&key, &aad, &envelope[64..])?;
+    let key = wrap_key(&shared, &eph_pub, old_key, &ctx);
+    let raw = open_with(&key, &ctx, sealed)?;
     let k: [u8; 32] = raw.as_slice().try_into().map_err(|_| DeviceError::Decode)?;
     let gk = GroupKey(k);
     if gk.group_id() != new {
         return Err(DeviceError::Open);
     }
-    Ok(gk)
+    Ok(Rekey { key: gk, initiator })
 }
 
 #[cfg(test)]
@@ -283,20 +338,37 @@ mod tests {
 
     #[test]
     fn rekey_reaches_only_addressee() {
-        let old = GroupKey([3; 32]).group_id();
+        let old_key = GroupKey([3; 32]);
         let new_key = GroupKey::generate().unwrap();
-        let (a, b) = ([1u8; 32], [2u8; 32]);
-        let env = seal_rekey(&new_key, device_id(&a), &rekey_public(&a), old).unwrap();
-        assert_eq!(open_rekey(&a, old, &env).unwrap(), new_key);
+        let (a, b, r) = ([1u8; 32], [2u8; 32], [5u8; 32]);
+        let env = seal_rekey(&new_key, &old_key, &r, device_id(&a), &rekey_public(&a)).unwrap();
+        let got = open_rekey(&a, &old_key, &env).unwrap();
+        assert_eq!(got.key, new_key);
+        assert_eq!(got.initiator, device_id(&r));
         // Чужое устройство пакет не откроет.
-        assert!(open_rekey(&b, old, &env).is_err());
-        // Пакет для другой старой группы не подходит.
-        assert!(open_rekey(&a, GroupKey([9; 32]).group_id(), &env).is_err());
-        // Подменённый id новой группы ломает расшифровку.
-        let mut bad = env.clone();
-        bad[40] ^= 1;
-        assert!(open_rekey(&a, old, &bad).is_err());
-        assert!(open_rekey(&a, old, &env[..50]).is_err());
+        assert!(open_rekey(&b, &old_key, &env).is_err());
+        // С другим текущим ключом группы пакет не открывается.
+        assert!(open_rekey(&a, &GroupKey([9; 32]), &env).is_err());
+        // Подмена id новой группы, инициатора, подписи или шифротекста ломает пакет.
+        for at in [40usize, 70, 120, 200] {
+            let mut bad = env.clone();
+            bad[at] ^= 1;
+            assert!(open_rekey(&a, &old_key, &bad).is_err(), "байт {at}");
+        }
+        assert!(open_rekey(&a, &old_key, &env[..150]).is_err());
+    }
+
+    #[test]
+    fn rekey_without_current_group_key_is_rejected() {
+        // Исключённое устройство X знает rekey_pub получателя по старым
+        // карточкам, но не знает текущего ключа группы: его пакет не откроется,
+        // даже если подписан честно его ключом.
+        let current = GroupKey([3; 32]);
+        let stale = GroupKey([4; 32]);
+        let x_new = GroupKey::generate().unwrap();
+        let (a, x) = ([1u8; 32], [6u8; 32]);
+        let forged = seal_rekey(&x_new, &stale, &x, device_id(&a), &rekey_public(&a)).unwrap();
+        assert!(open_rekey(&a, &current, &forged).is_err());
     }
 
     #[test]

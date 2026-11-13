@@ -341,8 +341,11 @@ impl Engine {
     fn rotated(&mut self, envelope: Option<Vec<u8>>) -> anyhow::Error {
         let old = self.state.invite.group_key.group_id();
         self.terminal = true;
-        let key = envelope.and_then(|e| match open_rekey(&self.state.device_key, old, &e) {
-            Ok(k) => Some(k),
+        let old_key = self.state.invite.group_key.clone();
+        // shortcut: инициатор смены ключа (k.initiator) пока не сверяется с
+        // известными карточками и не показывается человеку — следующий шаг.
+        let key = envelope.and_then(|e| match open_rekey(&self.state.device_key, &old_key, &e) {
+            Ok(k) => Some(k.key),
             Err(err) => {
                 tracing::warn!("пакет нового ключа не открылся: {err}");
                 None
@@ -600,7 +603,8 @@ impl Engine {
             }
         }
 
-        let envelopes = crate::devices::seal_envelopes(&new_key, old, &plan)?;
+        let envelopes =
+            crate::devices::seal_envelopes(&new_key, &old_key, &self.state.device_key, &plan)?;
         write_msg(
             send,
             &ClientMsg::Rekey {
