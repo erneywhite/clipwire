@@ -1083,9 +1083,18 @@ mod tests {
         let busy = Arc::new(AtomicBool::new(false));
         let root = tmp();
         let (tx, rx) = std::sync::mpsc::channel();
-        assert!(spawn_read(&busy, root.clone(), 1024, move |_| {
-            let _ = tx.send(crate::activity::VIRTUAL_READS.get());
-        }));
+        // Номер версии буфера не тот: чтение прервётся сразу, но страж
+        // активности держится до вызова `done`.
+        let seq = unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+        assert!(spawn_read(
+            &busy,
+            root.clone(),
+            1024,
+            seq.wrapping_add(1),
+            move |_| {
+                let _ = tx.send(crate::activity::VIRTUAL_READS.get());
+            }
+        ));
         let during = rx.recv_timeout(Duration::from_secs(60)).unwrap();
         assert!(during >= 1, "чтение виртуальных файлов не отмечено");
         let _ = std::fs::remove_dir_all(&root);
