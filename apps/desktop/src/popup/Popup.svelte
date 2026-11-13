@@ -467,7 +467,7 @@
                 </label>
                 <span class="fmeta">
                   {f.is_dir ? (f.size > 0 ? `папка · ${bytesLabel(f.size)}` : 'папка') : bytesLabel(f.size)}{#if isGone(f)}
-                    · файла нет на месте{:else if onlyThere(f)}
+                    · {f.is_dir ? 'папки' : 'файла'} нет на месте{:else if onlyThere(f)}
                     · есть только на устройстве «{device}»{:else if fp}
                     · {progressLabel(fp)}{:else if canDownload(f)}
                     · {fetchLabel(f, device)}{/if}

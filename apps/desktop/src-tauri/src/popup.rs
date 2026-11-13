@@ -221,6 +221,10 @@ pub async fn popup_paste(
             None => return Err("Элемента уже нет в истории".into()),
         }
     };
+    // Наверх истории поднимается исходная запись целиком: если отдать туда
+    // выбранное подмножество, add() перезапишет запись с тем же id, и
+    // невыбранные файлы пропадут из истории.
+    let full = entry.clone();
     let (entry, partial) = select_files(entry, files.as_deref())?;
     // Файлы: в буфер всегда идут пути на этом компьютере, чего здесь нет —
     // скачивается в кэш. Если хоть один путь не исходный (чужая запись или
@@ -244,7 +248,7 @@ pub async fn popup_paste(
             return Ok(());
         }
         put_quietly(&app, &clipwire_core::Content::Files(files))?;
-        crate::files::bump(&app, &entry);
+        crate::files::bump(&app, &full);
         return_and_paste(&app, "popup", paste).await;
         return Ok(());
     }
