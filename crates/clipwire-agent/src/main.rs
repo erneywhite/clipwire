@@ -151,6 +151,7 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
 
 /// Синхронизация с буфером ОС без интерфейса, до Ctrl+C.
 fn run(state: AgentState, paths: Paths) -> Result<()> {
+    use clipwire_agent::blobs::TransferState;
     use clipwire_agent::service::{Service, UiEvent};
     use clipwire_agent::sync::Status;
     use std::sync::Arc;
@@ -171,6 +172,9 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
         settings.device_name,
         Arc::new(Mutex::new(history)),
         Arc::new(Mutex::new(settings.ignored_apps)),
+        Arc::new(std::sync::atomic::AtomicU64::new(
+            settings.file_upload_limit_mb,
+        )),
         Arc::new(|e| match e {
             UiEvent::Status(Status::Online) => eprintln!("на связи"),
             UiEvent::Status(Status::Offline(r)) => eprintln!("нет связи: {r}"),
@@ -178,6 +182,15 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
             UiEvent::Copied(_) => eprintln!("отправлено скопированное"),
             UiEvent::Received(_) => eprintln!("получено с другого устройства"),
             UiEvent::HistoryMerged(n) => eprintln!("в историю добавлено с других устройств: {n}"),
+            UiEvent::Transfer(t) => match t.state {
+                TransferState::Active => {}
+                TransferState::Done => eprintln!("файл {} передан", t.blob),
+                TransferState::Failed => eprintln!(
+                    "файл {} не передан: {}",
+                    t.blob,
+                    t.error.unwrap_or_default()
+                ),
+            },
         }),
     )?;
     eprintln!("синхронизация буфера запущена, Ctrl+C — выход");

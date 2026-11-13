@@ -119,20 +119,56 @@ pub struct EntryDto {
 #[derive(Debug, Clone, Serialize)]
 pub struct FileDto {
     pub name: String,
+    /// Путь на устройстве-источнике.
     pub path: String,
     pub size: u64,
     pub is_dir: bool,
-    /// Файл ещё на месте.
+    /// `local_path` существует.
     pub exists: bool,
+    /// Файл в хранилище сервера (32 hex), `None` — только на источнике.
+    pub blob: Option<String>,
+    /// Путь на этом компьютере: исходный у своей записи, путь в кэше у
+    /// скачанного чужого файла.
+    pub local_path: Option<String>,
+    /// Запись с другого устройства.
+    pub remote: bool,
+}
+
+/// Где файл записи лежит на этом компьютере, если лежит.
+pub fn local_file(
+    local: bool,
+    f: &clipwire_core::FileRef,
+    files_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if local {
+        let p = std::path::PathBuf::from(&f.path);
+        p.exists().then_some(p)
+    } else {
+        clipwire_agent::blobs::cached_file(files_dir, f)
+    }
+}
+
+fn file_dto(local: bool, f: &clipwire_core::FileRef, files_dir: &std::path::Path) -> FileDto {
+    let local_path = local_file(local, f, files_dir);
+    FileDto {
+        name: f.name.clone(),
+        path: f.path.clone(),
+        size: f.size,
+        is_dir: f.is_dir,
+        exists: local_path.is_some(),
+        blob: f.blob.map(|b| b.hex()),
+        local_path: local_path.map(|p| p.to_string_lossy().into_owned()),
+        remote: !local,
+    }
 }
 
 /// Полная картинка файла-картинки для предпросмотра и редактора (data URL).
-fn file_image_url(f: &clipwire_core::FileRef) -> Option<String> {
+fn file_image_url(f: &clipwire_core::FileRef, path: &std::path::Path) -> Option<String> {
     let mime = clipwire_agent::image::image_mime(&f.name)?;
     if f.size > clipwire_agent::image::MAX_IMAGE_FILE {
         return None;
     }
-    let bytes = std::fs::read(&f.path).ok()?;
+    let bytes = std::fs::read(path).ok()?;
     Some(format!(
         "data:{mime};base64,{}",
         data_encoding::BASE64.encode(&bytes)
@@ -149,7 +185,7 @@ fn png_url(png: &[u8]) -> String {
     )
 }
 
-fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool) -> EntryDto {
+fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool, files_dir: &std::path::Path) -> EntryDto {
     let (kind, text, width, height, image) = match &e.content {
         Content::Text(t) | Content::Rich { text: t, .. } => ("text", t.as_str(), 0, 0, None),
         Content::Image { width, height, png } => ("image", "", *width, *height, Some(png)),
@@ -165,16 +201,7 @@ fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool) -> EntryDto {
         _ => ("other", "", 0, 0, None),
     };
     let files: Vec<FileDto> = match &e.content {
-        Content::Files(f) => f
-            .iter()
-            .map(|f| FileDto {
-                name: f.name.clone(),
-                path: f.path.clone(),
-                size: f.size,
-                is_dir: f.is_dir,
-                exists: std::path::Path::new(&f.path).exists(),
-            })
-            .collect(),
+        Content::Files(f) => f.iter().map(|f| file_dto(e.local, f, files_dir)).collect(),
         _ => Vec::new(),
     };
     let (rich, html) = match &e.content {
@@ -208,7 +235,9 @@ fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool) -> EntryDto {
         thumb: thumb.map(png_url),
         image: match (&e.content, full) {
             (_, false) => None,
-            (Content::Files(f), true) if f.len() == 1 && f[0].width > 0 => file_image_url(&f[0]),
+            (Content::Files(f), true) if f.len() == 1 && f[0].width > 0 => {
+                local_file(e.local, &f[0], files_dir).and_then(|p| file_image_url(&f[0], &p))
+            }
             (_, true) => image.map(|p| png_url(p)),
         },
         rich,
@@ -217,7 +246,7 @@ fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool) -> EntryDto {
     }
 }
 
-fn parse_id(id: &str) -> CmdResult<ItemId> {
+pub fn parse_id(id: &str) -> CmdResult<ItemId> {
     id.parse()
         .map(ItemId)
         .map_err(|_| "Неверный id элемента".to_string())
@@ -230,19 +259,21 @@ pub fn history_list(
     pinned_only: bool,
     limit: usize,
 ) -> Vec<EntryDto> {
+    let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
     h.list(&query, pinned_only, limit.min(500))
         .into_iter()
-        .map(|e| to_dto(e, h.thumb(e.id), false))
+        .map(|e| to_dto(e, h.thumb(e.id), false, &files_dir))
         .collect()
 }
 
 #[tauri::command]
 pub fn history_get(state: State<'_, AppState>, id: String) -> CmdResult<EntryDto> {
     let id = parse_id(&id)?;
+    let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
     h.get(id)
-        .map(|e| to_dto(e, h.thumb(e.id), true))
+        .map(|e| to_dto(e, h.thumb(e.id), true, &files_dir))
         .ok_or_else(|| "Элемента уже нет в истории".into())
 }
 
@@ -313,6 +344,10 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
     settings.save(&state.paths.dir).map_err(err)?;
     *state.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings.clone();
     *state.ignored_apps.lock().unwrap_or_else(|e| e.into_inner()) = settings.ignored_apps.clone();
+    state.upload_limit_mb.store(
+        settings.file_upload_limit_mb,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     if old.popup_hotkey != settings.popup_hotkey
         && let Err(e) = crate::popup::register_hotkey(&app)

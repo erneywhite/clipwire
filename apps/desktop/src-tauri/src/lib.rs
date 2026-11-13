@@ -27,6 +27,8 @@ pub struct AppState {
     pub history: Arc<Mutex<History>>,
     /// Список игнорируемых программ, общий с сервисом: меняется без перезапуска.
     pub ignored_apps: Arc<Mutex<Vec<String>>>,
+    /// Настройка `file_upload_limit_mb`, общая с сервисом.
+    pub upload_limit_mb: Arc<std::sync::atomic::AtomicU64>,
     pub service: Mutex<Option<Service>>,
     /// Сервис уже пытались запустить. До этого статус — «подключение», а не ошибка.
     pub service_attempted: std::sync::atomic::AtomicBool,
@@ -111,10 +113,14 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
         device_name,
         state.history.clone(),
         state.ignored_apps.clone(),
+        state.upload_limit_mb.clone(),
         std::sync::Arc::new(move |e| match e {
             UiEvent::Status(_) => publish_status(&handle),
             UiEvent::Copied(_) | UiEvent::Received(_) | UiEvent::HistoryMerged(_) => {
                 let _ = handle.emit("clipwire://history-changed", ());
+            }
+            UiEvent::Transfer(t) => {
+                let _ = handle.emit("clipwire://transfer", &t);
             }
         }),
     )?;
@@ -129,6 +135,7 @@ fn load_state() -> anyhow::Result<AppState> {
     let history = History::open(&paths.dir)?;
     Ok(AppState {
         ignored_apps: Arc::new(Mutex::new(settings.ignored_apps.clone())),
+        upload_limit_mb: Arc::new(settings.file_upload_limit_mb.into()),
         settings: Mutex::new(settings),
         history: Arc::new(Mutex::new(history)),
         service: Mutex::new(None),
@@ -305,6 +312,8 @@ pub fn run() {
             editor::editor_save,
             link::link_preview,
             files::file_preview,
+            files::files_download,
+            files::transfers,
         ])
         .setup(|app| {
             let hide_from_capture = app
