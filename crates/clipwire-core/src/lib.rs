@@ -8,6 +8,7 @@ pub mod blob;
 pub mod crypto;
 pub mod invite;
 pub mod item;
+pub mod p2p;
 pub mod proto;
 
 pub use blob::BlobId;

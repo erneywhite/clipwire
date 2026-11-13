@@ -32,6 +32,32 @@ pub struct Entry {
     pub pinned: bool,
 }
 
+/// `Entry` с содержимым прошлой версии (см. `clipwire_core::item::legacy`).
+#[derive(Deserialize)]
+struct EntryV2 {
+    id: ItemId,
+    origin: DeviceId,
+    device_name: String,
+    local: bool,
+    content: clipwire_core::item::legacy::ContentV2,
+    seen_ms: i64,
+    pinned: bool,
+}
+
+impl From<EntryV2> for Entry {
+    fn from(e: EntryV2) -> Self {
+        Entry {
+            id: e.id,
+            origin: e.origin,
+            device_name: e.device_name,
+            local: e.local,
+            content: e.content.into(),
+            seen_ms: e.seen_ms,
+            pinned: e.pinned,
+        }
+    }
+}
+
 pub struct History {
     conn: Connection,
     cipher: XChaCha20Poly1305,
@@ -142,7 +168,15 @@ impl History {
     }
 
     fn decrypt(&self, nonce: &[u8], data: &[u8]) -> Result<Entry> {
-        Ok(postcard::from_bytes(&self.open_blob(nonce, data)?)?)
+        let plain = self.open_blob(nonce, data)?;
+        match postcard::from_bytes::<Entry>(&plain) {
+            Ok(e) => Ok(e),
+            // Запись прошлой версии: в новом виде её байтов не хватает (у файлов
+            // теперь больше полей), читаем по-старому и переводим.
+            Err(err) => postcard::from_bytes::<EntryV2>(&plain)
+                .map(Entry::from)
+                .map_err(|_| err.into()),
+        }
     }
 
     fn open_blob(&self, nonce: &[u8], data: &[u8]) -> Result<Vec<u8>> {
@@ -497,6 +531,8 @@ mod tests {
             height: 0,
             modified_ms: 0,
             blob: None,
+            blob_size: 0,
+            p2p: false,
         };
         let e = local_entry(
             DeviceId([1; 32]),
@@ -508,6 +544,93 @@ mod tests {
         assert_eq!(h.list("СМЕТА", false, 5).len(), 1);
         assert_eq!(h.list("файл", false, 5).len(), 1);
         assert_eq!(h.list("текст", false, 5).len(), 1);
+    }
+
+    #[test]
+    fn entry_of_previous_version_is_read_and_converted() {
+        // Запись в виде части 2–3: у файла ещё нет blob_size и p2p.
+        #[derive(Serialize)]
+        struct FileV2 {
+            name: String,
+            path: String,
+            size: u64,
+            is_dir: bool,
+            width: u32,
+            height: u32,
+            modified_ms: u64,
+            blob: Option<clipwire_core::BlobId>,
+        }
+        #[derive(Serialize)]
+        #[allow(dead_code)]
+        enum ContentV2 {
+            Text(String),
+            Image {
+                width: u32,
+                height: u32,
+                png: Vec<u8>,
+            },
+            Rich {
+                text: String,
+                html: Option<String>,
+                rtf: Option<Vec<u8>>,
+            },
+            Files(Vec<FileV2>),
+        }
+        #[derive(Serialize)]
+        struct EntryV2Out {
+            id: ItemId,
+            origin: DeviceId,
+            device_name: String,
+            local: bool,
+            content: ContentV2,
+            seen_ms: i64,
+            pinned: bool,
+        }
+        let blob = clipwire_core::BlobId([5; 16]);
+        let old = EntryV2Out {
+            id: ItemId::new(),
+            origin: DeviceId([1; 32]),
+            device_name: "ПК".into(),
+            local: true,
+            content: ContentV2::Files(vec![FileV2 {
+                name: "отчёт.pdf".into(),
+                path: r"C:\отчёт.pdf".into(),
+                size: 1234,
+                is_dir: false,
+                width: 0,
+                height: 0,
+                modified_ms: 7,
+                blob: Some(blob),
+            }]),
+            seen_ms: 42,
+            pinned: true,
+        };
+        let dir = std::env::temp_dir().join(format!("clipwire-legacy-{}", Uuid::now_v7()));
+        {
+            let h = History::open(&dir).unwrap();
+            let (nonce, data) = h.seal_blob(&postcard::to_stdvec(&old).unwrap()).unwrap();
+            h.conn
+                .execute(
+                    "INSERT INTO entries (id, seen_ms, pinned, nonce, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![&old.id.as_bytes()[..], 42i64, true, &nonce[..], data],
+                )
+                .unwrap();
+        }
+        let h = History::open(&dir).unwrap();
+        let e = h.get(old.id).expect("старая запись прочиталась");
+        assert!(e.pinned);
+        assert_eq!(e.seen_ms, 42);
+        match &e.content {
+            Content::Files(f) => {
+                assert_eq!(f[0].name, "отчёт.pdf");
+                assert_eq!(f[0].blob, Some(blob));
+                assert_eq!(f[0].blob_size, 1234);
+                assert!(!f[0].p2p);
+            }
+            other => panic!("ждали файлы, пришло {other:?}"),
+        }
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

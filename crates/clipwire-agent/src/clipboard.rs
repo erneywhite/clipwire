@@ -367,6 +367,8 @@ mod win {
                         .map_or(0, |d| d.as_millis() as u64),
                     // Хранилище назначает сервис, когда решает отправлять файл.
                     blob: None,
+                    blob_size: 0,
+                    p2p: false,
                 }
             })
             .collect();

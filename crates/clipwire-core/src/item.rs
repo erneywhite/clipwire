@@ -89,9 +89,81 @@ pub struct FileRef {
     /// Время изменения файла (мс Unix): загрузчик сверяет его, чтобы не
     /// отправить файл, изменившийся после копирования.
     pub modified_ms: u64,
-    /// Файл в хранилище сервера. `None` — папка, файл больше порога или
-    /// локальный режим: тогда есть только путь на устройстве-источнике.
+    /// Как файл передаётся. `None` — никак (локальный режим или передача
+    /// отключена): есть только путь на устройстве-источнике. Иначе — id
+    /// потока частей: через хранилище сервера или напрямую (`p2p`).
     pub blob: Option<crate::blob::BlobId>,
+    /// Размер передаваемого потока (открытый текст): у файла равен `size`,
+    /// у папки — размер её архива (tar без сжатия). 0, если `blob` нет.
+    pub blob_size: u64,
+    /// Файл больше порога: на сервер не загружается, его берут напрямую с
+    /// устройства-источника по `clipwire-p2p/1`, пока оно в сети.
+    pub p2p: bool,
+}
+
+/// Форматы прошлых версий: история на диске хранит элементы в postcard, а он
+/// не умеет пропускать недостающие поля. Чтобы записи пережили обновление,
+/// история пробует прочитать запись в прежнем виде и переводит её в новый.
+pub mod legacy {
+    use serde::Deserialize;
+
+    use super::{Content, FileRef};
+
+    /// `FileRef` до полей `blob_size` и `p2p` (передача через сервер, ноябрь 2026).
+    #[derive(Deserialize)]
+    pub struct FileRefV2 {
+        pub name: String,
+        pub path: String,
+        pub size: u64,
+        pub is_dir: bool,
+        pub width: u32,
+        pub height: u32,
+        pub modified_ms: u64,
+        pub blob: Option<crate::blob::BlobId>,
+    }
+
+    /// `Content` с `FileRefV2`. Порядок вариантов совпадает с `Content`.
+    #[derive(Deserialize)]
+    pub enum ContentV2 {
+        Text(String),
+        Image {
+            width: u32,
+            height: u32,
+            png: Vec<u8>,
+        },
+        Rich {
+            text: String,
+            html: Option<String>,
+            rtf: Option<Vec<u8>>,
+        },
+        Files(Vec<FileRefV2>),
+    }
+
+    impl From<ContentV2> for Content {
+        fn from(c: ContentV2) -> Self {
+            match c {
+                ContentV2::Text(t) => Content::Text(t),
+                ContentV2::Image { width, height, png } => Content::Image { width, height, png },
+                ContentV2::Rich { text, html, rtf } => Content::Rich { text, html, rtf },
+                ContentV2::Files(f) => Content::Files(
+                    f.into_iter()
+                        .map(|f| FileRef {
+                            blob_size: if f.blob.is_some() { f.size } else { 0 },
+                            name: f.name,
+                            path: f.path,
+                            size: f.size,
+                            is_dir: f.is_dir,
+                            width: f.width,
+                            height: f.height,
+                            modified_ms: f.modified_ms,
+                            blob: f.blob,
+                            p2p: false,
+                        })
+                        .collect(),
+                ),
+            }
+        }
+    }
 }
 
 // Картинку не печатаем байтами в отладочный вывод: это мегабайты в логе.

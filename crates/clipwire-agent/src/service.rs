@@ -397,6 +397,8 @@ pub fn assign_blobs(content: Content, limit_mb: u64) -> Content {
         } else {
             BlobId::random().ok()
         };
+        f.blob_size = if f.blob.is_some() { f.size } else { 0 };
+        f.p2p = false;
     }
     Content::Files(files)
 }
@@ -436,6 +438,8 @@ mod tests {
             height: 0,
             modified_ms: 42,
             blob: None,
+            blob_size: 0,
+            p2p: false,
         }
     }
 

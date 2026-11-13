@@ -451,6 +451,8 @@ mod tests {
             height: 0,
             modified_ms: 0,
             blob: None,
+            blob_size: 0,
+            p2p: false,
         };
         local_entry(
             DeviceId([1; 32]),

@@ -416,6 +416,8 @@ mod tests {
             height: 0,
             modified_ms: 1,
             blob: Some(blob),
+            blob_size: 3,
+            p2p: false,
         };
         let dir = Path::new(r"D:\state\files");
         let cached = cache_path(dir, blob, &f.name);
@@ -467,6 +469,8 @@ mod tests {
             height: 0,
             modified_ms: 1,
             blob,
+            blob_size: if blob.is_some() { 3 } else { 0 },
+            p2p: false,
         }
     }
 

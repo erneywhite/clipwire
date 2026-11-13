@@ -163,6 +163,8 @@ fn make_file(dir: &Path, name: &str, size: u64) -> (Vec<u8>, FileRef) {
         height: 0,
         modified_ms,
         blob: Some(BlobId::random().unwrap()),
+        blob_size: size,
+        p2p: false,
     };
     (data, f)
 }

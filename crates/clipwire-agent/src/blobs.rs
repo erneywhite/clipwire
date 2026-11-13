@@ -1516,6 +1516,8 @@ mod tests {
             height: 0,
             modified_ms: 7,
             blob: None,
+            blob_size: 0,
+            p2p: false,
         };
         assert!(UploadJob::from_file(&f).is_none());
         f.blob = Some(BlobId([3; 16]));
