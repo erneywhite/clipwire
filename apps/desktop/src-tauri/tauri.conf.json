@@ -70,7 +70,11 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'"
+      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost; media-src asset: http://asset.localhost; frame-src asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'",
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      }
     }
   },
   "bundle": {
@@ -102,7 +106,8 @@
         "uninstallerHeaderImage": "installer/header.bmp",
         "sidebarImage": "installer/sidebar.bmp",
         "startMenuFolder": "Clipwire",
-        "displayLanguageSelector": false
+        "displayLanguageSelector": false,
+        "installerHooks": "installer/hooks.nsh"
       }
     },
     "createUpdaterArtifacts": true

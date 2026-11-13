@@ -62,6 +62,12 @@ export interface FileInfo {
   exists: boolean
 }
 
+export interface FilePreview {
+  kind: 'text' | 'pdf' | 'video' | 'audio' | 'none'
+  text: string | null
+  truncated: boolean
+}
+
 export interface LinkCard {
   status: 'ok' | 'off' | 'one_time' | 'failed'
   url: string
@@ -108,4 +114,5 @@ export const api = {
   copyQuietly: (text: string) => invoke<void>('copy_quietly', { text }),
   editImage: (id: string) => invoke<void>('editor_open', { id }),
   linkPreview: (url: string) => invoke<LinkCard>('link_preview', { url }),
+  filePreview: (path: string) => invoke<FilePreview>('file_preview', { path }),
 }

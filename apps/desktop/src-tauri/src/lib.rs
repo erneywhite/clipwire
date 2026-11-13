@@ -3,6 +3,7 @@
 
 mod commands;
 mod editor;
+mod files;
 mod link;
 mod popup;
 mod settings_window;
@@ -303,6 +304,7 @@ pub fn run() {
             editor::editor_open,
             editor::editor_save,
             link::link_preview,
+            files::file_preview,
         ])
         .setup(|app| {
             let hide_from_capture = app

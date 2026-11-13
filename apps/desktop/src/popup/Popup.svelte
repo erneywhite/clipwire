@@ -6,6 +6,7 @@
   import { ago, bytesLabel, filesMeta, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
   import EntryRow from '../lib/EntryRow.svelte'
   import LinkCard from './LinkCard.svelte'
+  import FilePreview from './FilePreview.svelte'
   import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 
   let query = $state('')
@@ -291,6 +292,8 @@
           <div class="image-view">
             <img src={preview.entry.image} alt={preview.entry.files[0]?.name} draggable="false" />
           </div>
+        {:else if preview.entry.files.length === 1 && !preview.entry.files[0].is_dir}
+          <FilePreview file={preview.entry.files[0]} />
         {:else}
           <ul class="file-list">
             {#each preview.entry.files as f (f.path)}
