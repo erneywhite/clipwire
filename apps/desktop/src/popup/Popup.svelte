@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
-  import { api, type Entry, type Settings, type Transfer } from '../lib/api'
+  import { api, type Entry, type FileInfo, type Settings, type Transfer } from '../lib/api'
   import { applyTheme } from '../lib/theme'
   import { ago, bytesLabel, filesMeta, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
-  import { canDownload, entryProgress, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
+  import { canDownload, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import EntryRow from '../lib/EntryRow.svelte'
   import LinkCard from './LinkCard.svelte'
@@ -42,6 +42,17 @@
   /** Имя устройства, откуда пришла запись. */
   function deviceOf(e: Entry): string {
     return e.local ? 'Это устройство' : e.device_name || 'Другое устройство'
+  }
+
+  /**
+   * «Показать в папке»: файл выделяется в своей папке, а папка открывается
+   * сама: у скачанной папки родитель — служебный кэш, смотреть там нечего.
+   */
+  function showInFolder(f: FileInfo) {
+    const p = f.local_path
+    if (!p) return
+    const done = f.is_dir ? api.folderOpen(p) : revealItemInDir(p)
+    done.catch((e) => (error = String(e)))
   }
 
   /** Есть файлы с другого устройства, которые надо сначала скачать. */
@@ -432,7 +443,7 @@
       {:else if preview.entry.kind === 'files'}
         {@const entry = preview.entry}
         {@const device = deviceOf(entry)}
-        {@const single = !entry.image && entry.files.length === 1 && !entry.files[0].is_dir}
+        {@const single = !entry.image && entry.files.length === 1}
         {@const progress = entryProgress(entry.files, transfers)}
         {#if entry.image}
           <div class="image-view">
@@ -455,11 +466,11 @@
                   <span>{f.name}</span>
                 </label>
                 <span class="fmeta">
-                  {f.is_dir ? 'папка' : bytesLabel(f.size)}{#if isGone(f)}
+                  {f.is_dir ? (f.size > 0 ? `папка · ${bytesLabel(f.size)}` : 'папка') : bytesLabel(f.size)}{#if isGone(f)}
                     · файла нет на месте{:else if onlyThere(f)}
                     · есть только на устройстве «{device}»{:else if fp}
                     · {progressLabel(fp)}{:else if canDownload(f)}
-                    · {f.remote ? 'не скачан' : 'нет на месте, копия на сервере'}{/if}
+                    · {fetchLabel(f, device)}{/if}
                 </span>
                 {#if isHere(f)}
                   <span class="fpath">{f.local_path}</span>
@@ -492,7 +503,7 @@
             </button>
           {/if}
           {#if isHere(entry.files[0])}
-            <button onclick={() => entry.files[0].local_path && revealItemInDir(entry.files[0].local_path).catch((e) => (error = String(e)))}>Показать в папке</button>
+            <button onclick={() => showInFolder(entry.files[0])}>Показать в папке</button>
           {/if}
           <button onclick={() => togglePin(entry).then(openPreview)}>
             {entry.pinned ? 'Открепить' : 'Закрепить'}

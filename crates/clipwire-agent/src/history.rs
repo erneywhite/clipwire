@@ -320,6 +320,21 @@ impl History {
         self.entries.iter().find(|e| e.id == id)
     }
 
+    /// Файл или папка своей записи, который другие устройства берут напрямую
+    /// (`p2p`) по этому `blob`. Чужие записи и файлы через сервер — `None`.
+    pub fn local_p2p_file(&self, blob: clipwire_core::BlobId) -> Option<clipwire_core::FileRef> {
+        self.entries
+            .iter()
+            .filter(|e| e.local)
+            .find_map(|e| match &e.content {
+                Content::Files(files) => files
+                    .iter()
+                    .find(|f| f.p2p && f.blob == Some(blob))
+                    .cloned(),
+                _ => None,
+            })
+    }
+
     /// Список для окна вставки: новые первыми, поиск без учёта регистра.
     pub fn list(&self, query: &str, pinned_only: bool, limit: usize) -> Vec<&Entry> {
         let q = query.trim().to_lowercase();

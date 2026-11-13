@@ -3,11 +3,12 @@
 //! Используется и приложением (Tauri), и консольным `clipwire-agent run`.
 //! Наружу отдаёт события для интерфейса и простые команды (пауза, запись в буфер).
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use clipwire_core::{BlobId, Content, DeviceId, Item};
+use clipwire_core::{BlobId, Content, DeviceId, FileRef, Item};
 use tokio::sync::mpsc;
 
 use crate::blobs::{Blobs, Transfer};
@@ -46,18 +47,83 @@ pub struct Service {
     invite: String,
     /// Устройство в группе и синхронизируется (иначе работает только локально).
     synced: bool,
-    local_tx: Option<mpsc::Sender<Content>>,
+    /// Отправка копирований (держит отправителя в канал движка).
+    copier: Option<Copier>,
     engine: Option<tokio::task::JoinHandle<Result<()>>>,
-    history: Arc<Mutex<History>>,
-    device_name: String,
-    on_event: UiCallback,
     /// Передача файлов; только в группе.
     blobs: Option<Arc<Blobs>>,
-    /// Настройка `file_upload_limit_mb`, меняется без перезапуска.
-    upload_limit_mb: Arc<AtomicU64>,
-    /// Слежение за буфером. Его обработчик держит копию `local_tx`, поэтому
+    /// Слежение за буфером. Его обработчик держит свою копию `copier`, поэтому
     /// `shutdown` снимает его первым: иначе канал движка не закроется.
     watcher: Option<Watcher>,
+}
+
+/// Копирование на этом устройстве: решить, как передаются файлы, отправить
+/// в группу, записать в историю и сообщить интерфейсу.
+#[derive(Clone)]
+struct Copier {
+    tx: Option<mpsc::Sender<Content>>,
+    history: Arc<Mutex<History>>,
+    device: DeviceId,
+    device_name: String,
+    on_event: UiCallback,
+    blobs: Option<Arc<Blobs>>,
+    /// Настройка `file_upload_limit_mb`, меняется без перезапуска.
+    limit_mb: Arc<AtomicU64>,
+    rt: tokio::runtime::Handle,
+}
+
+impl Copier {
+    /// `send` — отправить в группу (не пауза). Папки обходятся и
+    /// архивируются в фоне: обработчик буфера ОС ждать этого не должен.
+    /// Такой элемент попадает в историю и в группу, когда архив готов.
+    // shortcut: элемент с папкой встаёт в историю, когда готов архив, а не
+    // в момент копирования; скопированное за это время может оказаться ниже.
+    // Если станет заметно — заводить запись сразу и обновлять её по id.
+    fn dispatch(&self, content: Content, send: bool) {
+        let send = send && self.tx.is_some();
+        let prepare = send && self.blobs.is_some();
+        let limit = self.limit_mb.load(Ordering::Relaxed);
+        if prepare && needs_scan(&content, limit) {
+            let me = self.clone();
+            self.rt.spawn_blocking(move || {
+                let content = me.prepare(content, limit);
+                me.finish(content, true);
+            });
+            return;
+        }
+        let content = if prepare {
+            self.prepare(content, limit)
+        } else {
+            content
+        };
+        self.finish(content, send);
+    }
+
+    fn prepare(&self, content: Content, limit_mb: u64) -> Content {
+        let Some(b) = &self.blobs else {
+            return content;
+        };
+        let p = assign_blobs(content, limit_mb, b.outbox());
+        for (blob, reason) in p.failed {
+            tracing::warn!("папка не отправится: {reason}");
+            b.report_failed(blob, 0, reason);
+        }
+        p.content
+    }
+
+    fn finish(&self, content: Content, send: bool) {
+        if send
+            && let Some(tx) = &self.tx
+            && tx.try_send(content.clone()).is_err()
+        {
+            tracing::warn!("очередь отправки переполнена, копирование не ушло в группу");
+        }
+        record(
+            &self.history,
+            local_entry(self.device, &self.device_name, content.clone()),
+        );
+        (self.on_event)(UiEvent::Copied(content));
+    }
 }
 
 impl Service {
@@ -127,6 +193,26 @@ impl Service {
             }
         };
         let local_tx = synced.then_some(local_tx);
+        // Другие устройства просят напрямую только то, что есть в своей
+        // истории с `p2p`.
+        if let Some(b) = &blobs {
+            let h = history.clone();
+            b.set_p2p_sources(Arc::new(move |blob| {
+                h.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .local_p2p_file(blob)
+            }));
+        }
+        let copier = Copier {
+            tx: local_tx,
+            history: history.clone(),
+            device,
+            device_name: device_name.clone(),
+            on_event: on_event.clone(),
+            blobs: blobs.clone(),
+            limit_mb: upload_limit_mb,
+            rt: rt.clone(),
+        };
 
         // События движка.
         {
@@ -208,12 +294,7 @@ impl Service {
 
         // Изменения буфера ОС.
         let watcher = {
-            let (paused, guard, tx) = (paused.clone(), guard.clone(), local_tx.clone());
-            let history = history.clone();
-            let device_name = device_name.clone();
-            let on_event = on_event.clone();
-            let blobs = blobs.clone();
-            let upload_limit_mb = upload_limit_mb.clone();
+            let (paused, guard, copier) = (paused.clone(), guard.clone(), copier.clone());
             Watcher::start(move |content, owner| {
                 if paused.load(Ordering::Relaxed) {
                     return;
@@ -229,17 +310,7 @@ impl Service {
                 }
                 // Загрузки в очередь ставит движок, когда элемент на самом деле
                 // уходит в группу (см. `Engine::push`).
-                let content = match &blobs {
-                    Some(_) => prepare_files(content, &upload_limit_mb),
-                    None => content,
-                };
-                if let Some(tx) = &tx
-                    && tx.try_send(content.clone()).is_err()
-                {
-                    tracing::warn!("очередь отправки переполнена, копирование пропущено");
-                }
-                record(&history, local_entry(device, &device_name, content.clone()));
-                on_event(UiEvent::Copied(content));
+                copier.dispatch(content, true);
             })?
         };
 
@@ -250,13 +321,9 @@ impl Service {
             device,
             invite,
             synced,
-            local_tx,
+            copier: Some(copier),
             engine,
-            history,
-            device_name,
-            on_event,
             blobs,
-            upload_limit_mb,
             watcher: Some(watcher),
         })
     }
@@ -311,23 +378,9 @@ impl Service {
     pub fn copy(&self, content: Content) -> Result<()> {
         self.guard.wrote(&content);
         clipboard::write(&content)?;
-        let send = !self.paused() && self.local_tx.is_some();
-        let content = if send {
-            prepare_files(content, &self.upload_limit_mb)
-        } else {
-            content
-        };
-        if send
-            && let Some(tx) = &self.local_tx
-            && tx.try_send(content.clone()).is_err()
-        {
-            tracing::warn!("очередь отправки переполнена, копирование не ушло в группу");
+        if let Some(c) = &self.copier {
+            c.dispatch(content, !self.paused());
         }
-        record(
-            &self.history,
-            local_entry(self.device, &self.device_name, content.clone()),
-        );
-        (self.on_event)(UiEvent::Copied(content));
         Ok(())
     }
 
@@ -341,7 +394,7 @@ impl Service {
         // движок не узнает о закрытии и до штатного выхода (finish, close)
         // не дойдёт: его снимет только abort ниже.
         drop(self.watcher.take());
-        drop(self.local_tx.take());
+        drop(self.copier.take());
         if let Some(mut e) = self.engine.take() {
             let wait = std::time::Duration::from_secs(3);
             if tokio::time::timeout(wait, &mut e).await.is_err() {
@@ -376,31 +429,100 @@ fn sendable_backfill(c: &Content) -> bool {
     !matches!(c, Content::Files(_))
 }
 
-/// Назначить скопированным файлам `blob` (см. [`assign_blobs`]).
-fn prepare_files(content: Content, limit_mb: &AtomicU64) -> Content {
-    assign_blobs(content, limit_mb.load(Ordering::Relaxed))
+/// Как передаётся файл или папка (таблица в `docs/files-transfer.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Никак: порог 0 (в локальном режиме решение вообще не принимается).
+    None,
+    /// Через хранилище сервера.
+    Server,
+    /// Напрямую с этого устройства (`p2p`).
+    Direct,
 }
 
-/// Файлам (не папкам) не больше `limit_mb` МБ назначается новый случайный
-/// `blob`, остальным он снимается. Прежний `blob` (из истории или прошлого
-/// копирования тех же файлов) никогда не переиспользуется: файл мог
-/// измениться так, что размер и время изменения остались прежними, и тогда
-/// докачка склеила бы старые части на сервере с новыми.
-pub fn assign_blobs(content: Content, limit_mb: u64) -> Content {
-    let Content::Files(mut files) = content else {
-        return content;
-    };
-    let limit = limit_mb.saturating_mul(1024 * 1024);
-    for f in &mut files {
-        f.blob = if f.is_dir || limit_mb == 0 || f.size > limit {
-            None
-        } else {
-            BlobId::random().ok()
-        };
-        f.blob_size = if f.blob.is_some() { f.size } else { 0 };
-        f.p2p = false;
+/// Решение по размеру: у файла — его размер, у папки — сумма файлов внутри.
+pub fn route(size: u64, limit_mb: u64) -> Route {
+    if limit_mb == 0 {
+        Route::None
+    } else if size <= limit_mb.saturating_mul(1024 * 1024) {
+        Route::Server
+    } else {
+        Route::Direct
     }
-    Content::Files(files)
+}
+
+/// Нужен ли обход папок (долгий, не для потока буфера ОС).
+fn needs_scan(content: &Content, limit_mb: u64) -> bool {
+    limit_mb > 0 && matches!(content, Content::Files(f) if f.iter().any(|f| f.is_dir))
+}
+
+/// Результат [`assign_blobs`]: элемент для отправки и папки, которые не
+/// отправятся (`blob` для события передачи и причина).
+#[derive(Debug)]
+pub struct Prepared {
+    pub content: Content,
+    pub failed: Vec<(BlobId, String)>,
+}
+
+/// Решить для каждого файла и папки, как он передаётся ([`route`]), и
+/// назначить новый случайный `blob`. Папка обходится с пределами, ей
+/// ставится размер содержимого и размер архива (`blob_size`); папка до порога
+/// сразу архивируется в `outbox`. Не прошла по пределам или архив не
+/// собрался — папка не передаётся и попадает в `failed`.
+///
+/// Прежний `blob` (из истории или прошлого копирования тех же файлов)
+/// никогда не переиспользуется: файл мог измениться так, что размер и время
+/// изменения остались прежними, и тогда докачка склеила бы старые части на
+/// сервере с новыми. Блокирующая для папок: звать не из потока буфера ОС.
+pub fn assign_blobs(content: Content, limit_mb: u64, outbox: &Path) -> Prepared {
+    let Content::Files(mut files) = content else {
+        return Prepared {
+            content,
+            failed: Vec::new(),
+        };
+    };
+    let mut failed = Vec::new();
+    for f in &mut files {
+        f.blob = None;
+        f.blob_size = 0;
+        f.p2p = false;
+        if limit_mb == 0 {
+            continue;
+        }
+        let Ok(blob) = BlobId::random() else {
+            continue;
+        };
+        if !f.is_dir {
+            f.p2p = route(f.size, limit_mb) == Route::Direct;
+            f.blob = Some(blob);
+            f.blob_size = f.size;
+            continue;
+        }
+        if let Err(reason) = prepare_folder(f, blob, limit_mb, outbox) {
+            failed.push((blob, format!("«{}»: {reason}", f.name)));
+        }
+    }
+    Prepared {
+        content: Content::Files(files),
+        failed,
+    }
+}
+
+/// Папка: обход, размер архива и для папки до порога — сам архив.
+fn prepare_folder(f: &mut FileRef, blob: BlobId, limit_mb: u64, outbox: &Path) -> Result<()> {
+    let scan = crate::folder::scan_dir(Path::new(&f.path)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    f.size = scan.bytes;
+    let tar = crate::folder::tar_size(&scan.entries)?;
+    let r = route(scan.bytes, limit_mb);
+    if r == Route::Server {
+        let len =
+            crate::folder::build_archive(&scan.entries, &crate::blobs::outbox_path(outbox, blob))?;
+        anyhow::ensure!(len == tar, "архив папки собрался не того размера");
+    }
+    f.blob = Some(blob);
+    f.blob_size = tar;
+    f.p2p = r == Route::Direct;
+    Ok(())
 }
 
 fn record(history: &Mutex<History>, entry: Entry) {
@@ -443,48 +565,115 @@ mod tests {
         }
     }
 
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("clipwire-service-{tag}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn files(p: Prepared) -> Vec<FileRef> {
+        match p.content {
+            Content::Files(f) => f,
+            other => panic!("ждали файлы, пришло {other:?}"),
+        }
+    }
+
     #[test]
-    fn blobs_go_to_small_files_only() {
+    fn route_follows_the_table() {
         let mb = 1024 * 1024;
+        assert_eq!(route(0, 5), Route::Server);
+        assert_eq!(route(5 * mb, 5), Route::Server);
+        assert_eq!(route(5 * mb + 1, 5), Route::Direct);
+        assert_eq!(route(1, 0), Route::None);
+        assert_eq!(route(u64::MAX, u64::MAX), Route::Server);
+    }
+
+    #[test]
+    fn files_get_blobs_by_size() {
+        let mb = 1024 * 1024;
+        let outbox = tmp("outbox");
         let c = Content::Files(vec![
             file("C:\\a.txt", 10, false),
-            file("C:\\dir", 0, true),
             file("C:\\big.iso", 5 * mb + 1, false),
             file("C:\\edge.bin", 5 * mb, false),
         ]);
-        let out = assign_blobs(c.clone(), 5);
+        let p = assign_blobs(c.clone(), 5, &outbox);
+        assert!(p.failed.is_empty());
+        let out = Content::Files(files(p));
         let Content::Files(f) = &out else { panic!() };
-        assert!(f[0].blob.is_some());
-        assert!(f[1].blob.is_none());
-        assert!(f[2].blob.is_none());
-        assert!(f[3].blob.is_some());
+        // До порога — через сервер, больше — напрямую; blob есть у всех.
+        assert!(f.iter().all(|f| f.blob.is_some() && f.blob_size == f.size));
+        assert_eq!(
+            f.iter().map(|f| f.p2p).collect::<Vec<_>>(),
+            [false, true, false]
+        );
         let jobs: Vec<_> = f.iter().filter_map(UploadJob::from_file).collect();
-        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs.len(), 2, "большой файл на сервер не грузится");
         assert_eq!(jobs[0].blob, f[0].blob.unwrap());
         assert_eq!(jobs[0].path, "C:\\a.txt");
         assert_eq!(jobs[0].modified_ms, 42);
+        assert_eq!(jobs[1].path, "C:\\edge.bin");
         // Хэш (защита от петель, поиск в истории) от blob не зависит.
         assert_eq!(out.hash(), c.hash());
 
-        // 0 — ничего не загружать, даже если blob уже был.
-        let Content::Files(f0) = assign_blobs(out.clone(), 0) else {
-            panic!()
-        };
-        assert!(f0.iter().all(|f| f.blob.is_none()));
+        // 0 — ничего не передавать, даже напрямую и даже если blob уже был.
+        let f0 = files(assign_blobs(out.clone(), 0, &outbox));
+        assert!(
+            f0.iter()
+                .all(|f| f.blob.is_none() && f.blob_size == 0 && !f.p2p)
+        );
 
-        // Повтор того же содержимого (в том числе с уже назначенным blob)
-        // всегда получает новые blob.
-        let Content::Files(g) = assign_blobs(out.clone(), 5) else {
-            panic!()
-        };
-        assert!(g[0].blob.is_some() && g[0].blob != f[0].blob);
-        assert!(g[3].blob.is_some() && g[3].blob != f[3].blob);
+        // Повтор того же содержимого всегда получает новые blob.
+        let g = files(assign_blobs(out.clone(), 5, &outbox));
+        assert!(
+            g.iter()
+                .zip(f)
+                .all(|(g, f)| g.blob.is_some() && g.blob != f.blob)
+        );
 
         // Не файлы не трогаем.
-        assert_eq!(
-            assign_blobs(Content::Text("x".into()), 5),
-            Content::Text("x".into())
-        );
+        let t = assign_blobs(Content::Text("x".into()), 5, &outbox);
+        assert_eq!(t.content, Content::Text("x".into()));
+        let _ = std::fs::remove_dir_all(outbox);
+    }
+
+    #[test]
+    fn folders_get_archive_size_and_route() {
+        let d = tmp("folders");
+        let outbox = d.join("outbox");
+        let small = d.join("маленькая");
+        std::fs::create_dir_all(small.join("вложенная")).unwrap();
+        std::fs::write(small.join("a.txt"), "привет").unwrap();
+        std::fs::write(small.join("вложенная/b.bin"), vec![1u8; 1000]).unwrap();
+        let big = d.join("большая");
+        std::fs::create_dir_all(&big).unwrap();
+        std::fs::write(big.join("c.bin"), vec![2u8; 1024 * 1024 + 1]).unwrap();
+        let p = |path: &std::path::Path| file(&path.to_string_lossy(), 0, true);
+        let c = Content::Files(vec![p(&small), p(&big), p(&d.join("нет такой"))]);
+
+        let out = assign_blobs(c, 1, &outbox);
+        assert_eq!(out.failed.len(), 1, "несуществующая папка не передаётся");
+        let f = files(out);
+        // Папка до порога: размер содержимого, архив уже в outbox.
+        assert_eq!(f[0].size, "привет".len() as u64 + 1000);
+        assert!(!f[0].p2p);
+        let ar = crate::blobs::outbox_path(&outbox, f[0].blob.unwrap());
+        assert_eq!(std::fs::metadata(&ar).unwrap().len(), f[0].blob_size);
+        assert!(f[0].blob_size > f[0].size);
+        // Больше порога: напрямую, размер архива известен, а архива ещё нет.
+        assert!(f[1].p2p && f[1].blob.is_some());
+        assert_eq!(f[1].size, 1024 * 1024 + 1);
+        assert!(f[1].blob_size > f[1].size);
+        assert!(!crate::blobs::outbox_path(&outbox, f[1].blob.unwrap()).exists());
+        assert!(f[2].blob.is_none() && f[2].blob_size == 0);
+
+        // Порог 0 — папки даже не обходятся.
+        let z = files(assign_blobs(Content::Files(vec![p(&small)]), 0, &outbox));
+        assert!(z[0].blob.is_none());
+        assert!(!needs_scan(&Content::Files(vec![p(&small)]), 0));
+        assert!(needs_scan(&Content::Files(vec![p(&small)]), 1));
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

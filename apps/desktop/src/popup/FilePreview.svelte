@@ -4,11 +4,13 @@
   // к нему Rust открывает только для файлов из истории и с подходящей сигнатурой.
   // Файл с другого устройства показывается так же, когда скачан (по пути в
   // кэше); пока не скачан — карточка с кнопкой «Скачать». Так же и свой файл,
-  // который пропал с места, но есть на сервере.
+  // который пропал с места, но есть на сервере. Файл больше порога и папка
+  // приходят напрямую с устройства-источника, папка — архивом, который
+  // распаковывается в кэш; скачанная папка показывается карточкой с путём.
   import { convertFileSrc } from '@tauri-apps/api/core'
   import { api, type FileInfo, type FilePreview } from '../lib/api'
   import { bytesLabel } from '../lib/format'
-  import { canDownload, entryProgress, isHere, progressLabel, type TransferMap } from '../lib/transfer'
+  import { canDownload, entryProgress, isDirect, isHere, progressLabel, type TransferMap } from '../lib/transfer'
 
   let {
     file,
@@ -82,8 +84,10 @@
   <div class="box muted">
     <span class="name">{file.name}</span>
     {#if canDownload(file)}
-      {#if file.remote}
-        <span>Файл на устройстве «{device}» · {bytesLabel(file.size)}</span>
+      {#if isDirect(file)}
+        <span>{file.is_dir ? 'Папка · ' : ''}напрямую с устройства «{device}» · {bytesLabel(file.size)}</span>
+      {:else if file.remote}
+        <span>{file.is_dir ? 'Папка' : 'Файл'} на устройстве «{device}» · {bytesLabel(file.size)}</span>
       {:else}
         <span>Файла нет на месте, копия есть на сервере · {bytesLabel(file.size)}</span>
       {/if}
@@ -101,7 +105,14 @@
     {/if}
   </div>
 {:else if !here}
-  <div class="box muted">Файла нет на месте: его переместили или удалили.</div>
+  <div class="box muted">{file.is_dir ? 'Папки' : 'Файла'} нет на месте: {file.is_dir ? 'её' : 'его'} переместили или удалили.</div>
+{:else if file.is_dir}
+  <div class="box muted">
+    <svg class="folder" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" /></svg>
+    <span class="name">{file.name}</span>
+    <span>Папка{file.size > 0 ? ` · ${bytesLabel(file.size)}` : ''}</span>
+    <span class="path">{path}</span>
+  </div>
 {:else if failed}
   <div class="box muted">{failed}</div>
 {:else if !info}
@@ -190,6 +201,16 @@
   }
   .name {
     overflow-wrap: anywhere;
+  }
+  .folder {
+    align-self: center;
+    width: 40px;
+    height: 40px;
+    fill: none;
+    stroke: var(--c-muted);
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
   .muted .name {
     color: var(--c-text);

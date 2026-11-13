@@ -1,10 +1,11 @@
-//! Передача файлов через хранилище сервера: очередь загрузок, загрузка и
-//! скачивание по частям, кэш скачанного и события прогресса.
+//! Передача файлов: через хранилище сервера (очередь загрузок, загрузка и
+//! скачивание по частям) и напрямую с устройства-источника ([`crate::p2p`]),
+//! кэш скачанного и события прогресса.
 //!
 //! Протокол и форматы — `docs/files-transfer.md`. Один файл — один
-//! двунаправленный поток на соединении движка. Функции [`upload_blob`] и
+//! двунаправленный поток на соединении. Функции [`upload_blob`] и
 //! [`download_blob`] работают с одним файлом и годятся для сквозных тестов;
-//! [`Blobs`] держит очередь, кэш и соединение для сервиса.
+//! [`Blobs`] держит очередь, кэш, outbox архивов папок и соединения для сервиса.
 
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
@@ -16,8 +17,9 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use clipwire_core::blob::{BlobKey, CHUNK, chunk_count, chunk_len};
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{BlobChunk, BlobFail, BlobReply, BlobRequest};
-use clipwire_core::{BlobId, Content, FileRef, GroupKey};
+use clipwire_core::{BlobId, Content, DeviceId, FileRef, GroupKey};
 use iroh::endpoint::Connection;
+use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, watch};
@@ -50,10 +52,47 @@ pub fn cache_path(files_dir: &Path, blob: BlobId, name: &str) -> PathBuf {
     files_dir.join(blob.hex()).join(sanitize_name(name))
 }
 
-/// Скачанный файл из кэша, если он уже есть.
+/// Скачанный файл из кэша, если он уже есть. У папки — распакованная папка
+/// `<files>/<blob hex>/<имя>/` (архив рядом лежит, только пока качается).
 pub fn cached_file(files_dir: &Path, f: &FileRef) -> Option<PathBuf> {
     let p = cache_path(files_dir, f.blob?, &f.name);
-    p.is_file().then_some(p)
+    let ready = if f.is_dir { p.is_dir() } else { p.is_file() };
+    ready.then_some(p)
+}
+
+/// Каталог архивов папок для отправки: `<state dir>/outbox`.
+pub fn outbox_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("outbox")
+}
+
+/// Архив папки в outbox: `<outbox>/<blob hex>.tar`.
+pub fn outbox_path(outbox: &Path, blob: BlobId) -> PathBuf {
+    outbox.join(format!("{}.tar", blob.hex()))
+}
+
+/// Архивы в outbox старше этого удаляются при старте сервиса.
+pub const OUTBOX_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// Удалить из outbox архивы (и недособранные `.tmp`) старше `max_age`.
+/// Возвращает, сколько удалено.
+pub fn clean_outbox(outbox: &Path, max_age: Duration) -> usize {
+    let Ok(dir) = std::fs::read_dir(outbox) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut n = 0;
+    for e in dir.flatten() {
+        let old = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= max_age);
+        if old && std::fs::remove_file(e.path()).is_ok() {
+            n += 1;
+        }
+    }
+    n
 }
 
 fn part_path(dest: &Path) -> PathBuf {
@@ -308,13 +347,18 @@ pub struct UploadJob {
     /// Когда задание поставлено в очередь, мс Unix.
     #[serde(default)]
     pub queued_ms: u64,
+    /// `path` — архив папки в outbox: после загрузки (или окончательного
+    /// отказа) его надо удалить.
+    #[serde(default)]
+    pub outbox: bool,
 }
 
 impl UploadJob {
-    /// Задание для файла с назначенным `blob`; у папок и файлов без `blob` — нет.
-    /// Группу и время ставит [`Blobs::enqueue`].
+    /// Задание для файла с назначенным `blob`, который идёт через сервер. У
+    /// папок (их задание даёт [`Blobs::upload_job`]), файлов без `blob` и
+    /// файлов для прямой передачи — нет. Группу и время ставит [`Blobs::enqueue`].
     pub fn from_file(f: &FileRef) -> Option<Self> {
-        if f.is_dir {
+        if f.is_dir || f.p2p {
             return None;
         }
         Some(Self {
@@ -324,6 +368,7 @@ impl UploadJob {
             modified_ms: f.modified_ms,
             group: String::new(),
             queued_ms: 0,
+            outbox: false,
         })
     }
 }
@@ -920,6 +965,44 @@ pub struct Blobs {
     /// Резервы, которые надо отменить на сервере (`Abort`), и номер
     /// соединения, на котором отмена последний раз не дошла (0 — не пробовали).
     to_abort: Mutex<Vec<(BlobId, u64)>>,
+    /// Архивы папок для отправки.
+    outbox: PathBuf,
+    /// Где искать то, что просят напрямую: файл своей истории с `p2p`.
+    sources: Mutex<Option<P2pSources>>,
+    /// Эндпоинт движка и relay сервера: через них идут прямые подключения.
+    endpoint: watch::Sender<Option<(Endpoint, RelayUrl)>>,
+    /// Прямые соединения с устройствами-источниками, уже прошедшие проверку.
+    p2p_conns: tokio::sync::Mutex<HashMap<DeviceId, Connection>>,
+    /// Замки сборки архивов папок для прямой передачи.
+    building: Mutex<HashMap<BlobId, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+/// Поиск файла для прямой отдачи по `blob`: локальная запись истории, у
+/// файла которой `p2p = true`. Сервис ищет в своей истории.
+pub type P2pSources = Arc<dyn Fn(BlobId) -> Option<FileRef> + Send + Sync>;
+
+/// Пока жив, эндпоинт движка доступен прямым скачиваниям.
+pub struct EndpointGuard(Arc<Blobs>);
+
+impl Drop for EndpointGuard {
+    fn drop(&mut self) {
+        self.0.endpoint.send_replace(None);
+    }
+}
+
+/// Замок по blob из карты слабых ссылок: общий для всех, кто его держит или ждёт.
+fn blob_lock(
+    map: &Mutex<HashMap<BlobId, Weak<tokio::sync::Mutex<()>>>>,
+    blob: BlobId,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(l) = map.get(&blob).and_then(Weak::upgrade) {
+        return l;
+    }
+    map.retain(|_, w| w.strong_count() > 0);
+    let l = Arc::new(tokio::sync::Mutex::new(()));
+    map.insert(blob, Arc::downgrade(&l));
+    l
 }
 
 /// Пока жив, соединение доступно загрузкам и скачиваниям.
@@ -936,6 +1019,11 @@ impl Blobs {
         let group = group_hex(&key);
         let mut queue = UploadQueue::load(state_dir, &group);
         let to_abort = queue.take_expired().into_iter().map(|b| (b, 0)).collect();
+        let outbox = outbox_dir(state_dir);
+        let cleaned = clean_outbox(&outbox, OUTBOX_MAX_AGE);
+        if cleaned > 0 {
+            tracing::info!(cleaned, "из outbox удалены архивы старше суток");
+        }
         Arc::new(Self {
             key,
             files_dir: files_dir(state_dir),
@@ -946,6 +1034,201 @@ impl Blobs {
             downloads: Mutex::new(HashMap::new()),
             group,
             to_abort: Mutex::new(to_abort),
+            outbox,
+            sources: Mutex::new(None),
+            endpoint: watch::Sender::new(None),
+            p2p_conns: tokio::sync::Mutex::new(HashMap::new()),
+            building: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub(crate) fn key(&self) -> &GroupKey {
+        &self.key
+    }
+
+    /// Каталог архивов папок для отправки.
+    pub fn outbox(&self) -> &Path {
+        &self.outbox
+    }
+
+    /// Откуда брать файлы, которые другие устройства просят напрямую.
+    pub fn set_p2p_sources(&self, sources: P2pSources) {
+        *self.sources.lock().unwrap_or_else(|e| e.into_inner()) = Some(sources);
+    }
+
+    /// Движок поднял эндпоинт: прямые скачивания идут через него, пока жив страж.
+    pub fn attach_endpoint(self: &Arc<Self>, ep: Endpoint, relay: RelayUrl) -> EndpointGuard {
+        self.endpoint.send_replace(Some((ep, relay)));
+        EndpointGuard(self.clone())
+    }
+
+    /// Сообщить в событиях передачи, что файл не отправится (например,
+    /// папка не прошла по пределам обхода).
+    pub fn report_failed(&self, blob: BlobId, total: u64, reason: String) {
+        self.transfers
+            .finish(blob, Direction::Up, total, Err(reason));
+    }
+
+    /// Задание загрузки на сервер: файл как есть, папка — её архив в outbox.
+    /// Файлы и папки для прямой передачи (`p2p`) и без `blob` — без задания.
+    pub fn upload_job(&self, f: &FileRef) -> Option<UploadJob> {
+        if !f.is_dir {
+            return UploadJob::from_file(f);
+        }
+        let blob = f.blob?;
+        if f.p2p {
+            return None;
+        }
+        let path = outbox_path(&self.outbox, blob);
+        let (size, modified_ms) = file_stamp(&path).unwrap_or((f.blob_size, 0));
+        Some(UploadJob {
+            blob,
+            path: path.to_string_lossy().into_owned(),
+            size,
+            modified_ms,
+            group: String::new(),
+            queued_ms: 0,
+            outbox: true,
+        })
+    }
+
+    /// Файл для прямой отдачи: есть в своей истории с `p2p`, на месте и не
+    /// изменился. Для папки — её архив в outbox (собирается при первом запросе).
+    pub(crate) async fn p2p_open(&self, blob: BlobId) -> Result<crate::p2p::Source, BlobFail> {
+        let lookup = self
+            .sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let f = lookup
+            .and_then(|l| l(blob))
+            .filter(|f| f.p2p && f.blob == Some(blob))
+            .ok_or(BlobFail::NotFound)?;
+        if f.is_dir {
+            let path = self.ensure_archive(&f).await?;
+            return Ok(crate::p2p::Source {
+                path,
+                size: f.blob_size,
+                stamp: None,
+            });
+        }
+        let path = PathBuf::from(&f.path);
+        match file_stamp(&path) {
+            Ok(stamp) if stamp == (f.size, f.modified_ms) && f.size == f.blob_size => {
+                Ok(crate::p2p::Source {
+                    path,
+                    size: f.blob_size,
+                    stamp: Some(stamp),
+                })
+            }
+            _ => Err(BlobFail::Cancelled),
+        }
+    }
+
+    /// Архив папки для прямой передачи: готовый из outbox или собранный
+    /// заново. Папка изменилась с копирования (другой размер содержимого или
+    /// архива) — `Cancelled`.
+    // shortcut: изменение папки замечается по суммарному размеру и размеру
+    // архива, правка файла без смены размера пройдёт незамеченной. Сверять
+    // время изменения каждого файла, если понадобится строже.
+    async fn ensure_archive(&self, f: &FileRef) -> Result<PathBuf, BlobFail> {
+        let blob = f.blob.ok_or(BlobFail::NotFound)?;
+        let dest = outbox_path(&self.outbox, blob);
+        let lock = blob_lock(&self.building, blob);
+        let _g = lock.lock().await;
+        if file_stamp(&dest).is_ok_and(|(len, _)| len == f.blob_size) {
+            return Ok(dest);
+        }
+        let (src, want_bytes, want_tar, out) =
+            (PathBuf::from(&f.path), f.size, f.blob_size, dest.clone());
+        let built = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let scan = crate::folder::scan_dir(&src).map_err(|e| anyhow!("{e}"))?;
+            ensure!(
+                scan.bytes == want_bytes && crate::folder::tar_size(&scan.entries)? == want_tar,
+                "папка изменилась после копирования"
+            );
+            crate::folder::build_archive(&scan.entries, &out)
+        })
+        .await;
+        match built {
+            Ok(Ok(len)) if len == f.blob_size => Ok(dest),
+            Ok(Ok(_)) => {
+                let _ = std::fs::remove_file(&dest);
+                Err(BlobFail::Cancelled)
+            }
+            Ok(Err(e)) => {
+                tracing::info!(path = %f.path, "архив папки не собрался: {e:#}");
+                Err(BlobFail::Cancelled)
+            }
+            Err(e) => Err(BlobFail::Internal(e.to_string())),
+        }
+    }
+
+    /// Прямое соединение с устройством `origin` (уже проверенное, если есть).
+    // shortcut: подключения идут по очереди через один замок, даже к разным
+    // устройствам. Замок на каждое устройство — если вставка из нескольких
+    // источников сразу окажется медленной.
+    async fn p2p_conn(&self, origin: DeviceId) -> Result<Connection> {
+        let mut rx = self.endpoint.subscribe();
+        let (ep, relay) = tokio::time::timeout(WAIT_CONN, async {
+            loop {
+                if let Some(v) = rx.borrow_and_update().clone() {
+                    return v;
+                }
+                if rx.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("сеть ещё не поднялась, попробуйте позже"))?;
+        if origin.0 == *ep.id().as_bytes() {
+            return Err(crate::p2p::P2pError::OwnDevice.into());
+        }
+        let mut conns = self.p2p_conns.lock().await;
+        if let Some(c) = conns.get(&origin)
+            && c.close_reason().is_none()
+        {
+            return Ok(c.clone());
+        }
+        let addr = EndpointAddr::new(PublicKey::from_bytes(&origin.0)?).with_relay_url(relay);
+        let conn = crate::p2p::connect(&ep, addr, &self.key).await?;
+        conns.insert(origin, conn.clone());
+        Ok(conn)
+    }
+
+    /// Скачать напрямую с устройства-источника в `dest`.
+    async fn download_p2p(
+        &self,
+        origin: DeviceId,
+        blob: BlobId,
+        size: u64,
+        dest: &Path,
+    ) -> Result<PathBuf> {
+        if tokio::fs::try_exists(dest).await.unwrap_or(false) {
+            return Ok(dest.to_path_buf());
+        }
+        let conn = self.p2p_conn(origin).await?;
+        let (mut send, mut recv) = match conn.open_bi().await {
+            Ok(s) => s,
+            Err(_) => {
+                // Соединение из кэша успело умереть: одно новое подключение.
+                self.p2p_conns.lock().await.remove(&origin);
+                self.p2p_conn(origin).await?.open_bi().await?
+            }
+        };
+        download_stream(&mut send, &mut recv, &self.key, blob, size, dest, |done| {
+            self.transfers.progress(blob, Direction::Down, done, size)
+        })
+        .await
+        .map_err(|e| match e.downcast_ref::<BlobFail>() {
+            Some(BlobFail::NotFound) => {
+                anyhow!("на устройстве-источнике этого файла уже нет в истории")
+            }
+            Some(BlobFail::Cancelled) => {
+                anyhow!("файл на устройстве-источнике изменился или пропал после копирования")
+            }
+            _ => e,
         })
     }
 
@@ -1056,40 +1339,63 @@ impl Blobs {
     }
 
     /// Скачать файл записи в кэш (или взять уже скачанный). Одновременные
-    /// запросы одного файла качают его один раз.
-    pub async fn download(&self, f: &FileRef) -> Result<PathBuf> {
+    /// запросы одного файла качают его один раз. `origin` — устройство,
+    /// с которого запись: файлы с `p2p` берутся напрямую с него, остальные —
+    /// с сервера. Папка приходит архивом, распаковывается в
+    /// `<files>/<blob hex>/<имя>/`, и возвращается путь этой папки.
+    pub async fn download(&self, f: &FileRef, origin: DeviceId) -> Result<PathBuf> {
         let blob = f
             .blob
-            .ok_or_else(|| anyhow!("файл «{}» не загружался на сервер", f.name))?;
-        let dest = cache_path(&self.files_dir, blob, &f.name);
-        if dest.is_file() {
-            return Ok(dest);
+            .ok_or_else(|| anyhow!("файл «{}» не передавался с устройства", f.name))?;
+        if let Some(p) = cached_file(&self.files_dir, f) {
+            return Ok(p);
         }
         let lock = self.download_lock(blob);
         let _g = lock.lock().await;
-        if dest.is_file() {
-            return Ok(dest);
+        if let Some(p) = cached_file(&self.files_dir, f) {
+            return Ok(p);
         }
+        let dest = cache_path(&self.files_dir, blob, &f.name);
+        // Папка качается архивом рядом с будущей папкой.
+        let target = if f.is_dir {
+            crate::folder::with_suffix(&dest, ".tar")
+        } else {
+            dest.clone()
+        };
+        let size = f.blob_size;
         // Повторять Get на NotFound не нужно: источник резервирует файл на
         // сервере до того, как элемент уйдёт в группу, и сервер сам ждёт
         // первых частей. NotFound значит, что файла правда нет.
         let res = async {
-            let conn = self
-                .wait_conn(WAIT_CONN)
-                .await
-                .ok_or_else(|| anyhow!("нет связи с сервером"))?;
-            let size = f.size;
-            download_blob(&conn, &self.key, blob, size, &dest, |done| {
-                self.transfers.progress(blob, Direction::Down, done, size)
+            let got = if f.p2p {
+                self.download_p2p(origin, blob, size, &target).await?
+            } else {
+                let conn = self
+                    .wait_conn(WAIT_CONN)
+                    .await
+                    .ok_or_else(|| anyhow!("нет связи с сервером"))?;
+                download_blob(&conn, &self.key, blob, size, &target, |done| {
+                    self.transfers.progress(blob, Direction::Down, done, size)
+                })
+                .await?
+            };
+            if !f.is_dir {
+                return Ok(got);
+            }
+            let (archive, out) = (got, dest.clone());
+            tokio::task::spawn_blocking(move || {
+                crate::folder::unpack_archive(&archive, &out)?;
+                let _ = std::fs::remove_file(&archive);
+                anyhow::Ok(out)
             })
-            .await
+            .await?
         }
         .await
         .with_context(|| format!("«{}» не скачался", f.name));
         self.transfers.finish(
             blob,
             Direction::Down,
-            f.size,
+            size,
             res.as_ref().map(|_| ()).map_err(|e| format!("{e:#}")),
         );
         res
@@ -1097,14 +1403,7 @@ impl Blobs {
 
     /// Замок скачивания файла: общий для всех, кто качает его сейчас или ждёт.
     fn download_lock(&self, blob: BlobId) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(l) = map.get(&blob).and_then(Weak::upgrade) {
-            return l;
-        }
-        map.retain(|_, w| w.strong_count() > 0);
-        let l = Arc::new(tokio::sync::Mutex::new(()));
-        map.insert(blob, Arc::downgrade(&l));
-        l
+        blob_lock(&self.downloads, blob)
     }
 
     /// Перед отправкой элемента с файлами: зарезервировать на сервере все его
@@ -1131,7 +1430,7 @@ impl Blobs {
         };
         let mut tasks = tokio::task::JoinSet::new();
         for (i, f) in files.iter().enumerate() {
-            if let Some(job) = UploadJob::from_file(f) {
+            if let Some(job) = self.upload_job(f) {
                 let conn = conn.clone();
                 tasks.spawn(async move {
                     let res = reserve_blob(&conn, job.blob, job.size).await;
@@ -1172,13 +1471,14 @@ impl Blobs {
         ))
     }
 
-    /// Скачать все файлы по порядку. Первая ошибка прерывает.
+    /// Скачать все файлы записи с устройства `origin` по порядку. Первая
+    /// ошибка прерывает.
     // shortcut: файлы качаются по одному; параллельно — если окажется, что
     // много мелких файлов вставляются медленно.
-    pub async fn download_all(&self, files: &[FileRef]) -> Result<Vec<PathBuf>> {
+    pub async fn download_all(&self, files: &[FileRef], origin: DeviceId) -> Result<Vec<PathBuf>> {
         let mut out = Vec::with_capacity(files.len());
         for f in files {
-            out.push(self.download(f).await?);
+            out.push(self.download(f, origin).await?);
         }
         Ok(out)
     }
@@ -1281,6 +1581,10 @@ impl Blobs {
         {
             tracing::warn!("очередь загрузок не сохранилась: {e:#}");
         }
+        // Архив папки больше не нужен: он на сервере или туда уже не попадёт.
+        if !retry && job.outbox {
+            let _ = std::fs::remove_file(&job.path);
+        }
         let res = res.map_err(|e| {
             if retry {
                 format!("{e}. Отправка продолжится после переподключения")
@@ -1360,6 +1664,35 @@ mod tests {
     }
 
     #[test]
+    fn cached_folder_is_a_directory() {
+        let dir = tmp("cachedir");
+        let blob = BlobId([6; 16]);
+        let mut f = FileRef {
+            name: "Папка".into(),
+            path: "C:\\Папка".into(),
+            size: 0,
+            is_dir: true,
+            width: 0,
+            height: 0,
+            modified_ms: 0,
+            blob: Some(blob),
+            blob_size: 1024,
+            p2p: true,
+        };
+        let p = cache_path(&dir, blob, &f.name);
+        // Архив рядом ещё не значит «скачано».
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(crate::folder::with_suffix(&p, ".tar"), "x").unwrap();
+        assert!(cached_file(&dir, &f).is_none());
+        std::fs::create_dir_all(&p).unwrap();
+        assert_eq!(cached_file(&dir, &f), Some(p.clone()));
+        // Файл с тем же путём папкой не считается.
+        f.is_dir = false;
+        assert!(cached_file(&dir, &f).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn cache_path_is_inside_blob_dir() {
         let blob = BlobId([0xab; 16]);
         let p = cache_path(Path::new("/s/files"), blob, "..\\..\\evil.exe");
@@ -1381,6 +1714,7 @@ mod tests {
             modified_ms: 1000 + b as u64,
             group: "aa".into(),
             queued_ms: now,
+            outbox: false,
         };
         let mut q = UploadQueue::load(&dir, "aa");
         assert!(q.jobs().is_empty());
@@ -1415,6 +1749,7 @@ mod tests {
             modified_ms: 1,
             group: group.into(),
             queued_ms,
+            outbox: false,
         };
         let mut q = UploadQueue::load_at(&dir, "aa", now);
         q.push([
@@ -1524,6 +1859,60 @@ mod tests {
         assert_eq!(UploadJob::from_file(&f).unwrap().modified_ms, 7);
         f.is_dir = true;
         assert!(UploadJob::from_file(&f).is_none());
+        // Файл для прямой передачи на сервер не грузится.
+        f.is_dir = false;
+        f.p2p = true;
+        assert!(UploadJob::from_file(&f).is_none());
+    }
+
+    #[test]
+    fn folder_job_points_to_outbox_archive() {
+        let dir = tmp("folderjob");
+        let b = Blobs::new(GroupKey([1; 32]), &dir, Arc::new(|_| {}));
+        let blob = BlobId([4; 16]);
+        let ar = outbox_path(b.outbox(), blob);
+        std::fs::create_dir_all(b.outbox()).unwrap();
+        std::fs::write(&ar, vec![0u8; 2048]).unwrap();
+        let mut f = FileRef {
+            name: "папка".into(),
+            path: "C:\\папка".into(),
+            size: 100,
+            is_dir: true,
+            width: 0,
+            height: 0,
+            modified_ms: 1,
+            blob: Some(blob),
+            blob_size: 2048,
+            p2p: false,
+        };
+        let job = b.upload_job(&f).unwrap();
+        assert!(job.outbox);
+        assert_eq!(PathBuf::from(&job.path), ar);
+        assert_eq!(job.size, 2048);
+        assert_eq!((job.size, job.modified_ms), file_stamp(&ar).unwrap());
+        f.p2p = true;
+        assert!(b.upload_job(&f).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn old_outbox_archives_are_cleaned() {
+        let dir = tmp("outbox");
+        let fresh = dir.join("fresh.tar");
+        let old = dir.join("old.tar");
+        std::fs::write(&fresh, "x").unwrap();
+        std::fs::write(&old, "x").unwrap();
+        let day_ago = std::time::SystemTime::now() - Duration::from_secs(25 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(day_ago)
+            .unwrap();
+        assert_eq!(clean_outbox(&dir, OUTBOX_MAX_AGE), 1);
+        assert!(fresh.exists() && !old.exists());
+        assert_eq!(clean_outbox(&dir.join("нет"), OUTBOX_MAX_AGE), 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1724,6 +2113,7 @@ mod tests {
             modified_ms: modified,
             group: String::new(),
             queued_ms: 0,
+            outbox: false,
         };
         let key = GroupKey([2; 32]);
         let mut store = FakeStore {
@@ -1834,6 +2224,7 @@ mod tests {
             modified_ms: modified,
             group: String::new(),
             queued_ms: 0,
+            outbox: false,
         };
         job.size += 1;
         let (a, _b) = tokio::io::duplex(64);

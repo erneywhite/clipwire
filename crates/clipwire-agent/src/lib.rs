@@ -3,9 +3,11 @@
 
 pub mod blobs;
 pub mod clipboard;
+pub mod folder;
 pub mod history;
 pub mod image;
 pub mod loopguard;
+pub mod p2p;
 pub mod secret;
 pub mod service;
 pub mod settings;

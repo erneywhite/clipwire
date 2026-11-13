@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{ALPN, ClientMsg, ServerMsg};
 use clipwire_core::{Content, DeviceId, Item, ItemId};
@@ -131,6 +132,22 @@ impl Engine {
     /// снять (`abort`), загрузчик снимается вместе с ней, и следующий движок
     /// не столкнётся со старым на одной очереди загрузок.
     pub async fn run(self, local: mpsc::Receiver<Content>) -> Result<()> {
+        let server = &self.state.invite.server;
+        let url: RelayUrl = server
+            .relay_url
+            .parse()
+            .with_context(|| format!("кривой адрес relay {}", server.relay_url))?;
+        // Один эндпоинт и для сервера, и для прямых соединений устройств
+        // группы: входящие принимаются только с ALPN `clipwire-p2p/1`.
+        let ep = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&self.state.device_key))
+            .relay_mode(RelayMode::Custom(
+                RelayMap::from_iter([url.clone()]).with_auth_token(server.relay_token.clone()),
+            ))
+            .alpns(vec![P2P_ALPN.to_vec()])
+            .bind()
+            .await
+            .context("не поднялся iroh-эндпоинт")?;
         let uploads = self.blobs.clone();
         let uploader = async move {
             if let Some(b) = uploads {
@@ -140,26 +157,35 @@ impl Engine {
             // продолжает работать без него.
             std::future::pending::<()>().await
         };
+        // Прямые соединения: отдача своих файлов и скачивание чужих.
+        let _endpoint = self
+            .blobs
+            .as_ref()
+            .map(|b| b.attach_endpoint(ep.clone(), url.clone()));
+        let p2p = {
+            let (ep, blobs) = (ep.clone(), self.blobs.clone());
+            async move {
+                if let Some(b) = blobs {
+                    crate::p2p::serve(ep, b).await;
+                }
+                // Приём кончается вместе с эндпоинтом; закрывает его сессия.
+                std::future::pending::<()>().await
+            }
+        };
         tokio::select! {
-            r = self.run_sessions(local) => r,
+            r = self.run_sessions(ep, url, local) => r,
             () = uploader => Ok(()),
+            () = p2p => Ok(()),
         }
     }
 
-    async fn run_sessions(mut self, mut local: mpsc::Receiver<Content>) -> Result<()> {
+    async fn run_sessions(
+        mut self,
+        ep: Endpoint,
+        url: RelayUrl,
+        mut local: mpsc::Receiver<Content>,
+    ) -> Result<()> {
         let server = &self.state.invite.server;
-        let url: RelayUrl = server
-            .relay_url
-            .parse()
-            .with_context(|| format!("кривой адрес relay {}", server.relay_url))?;
-        let ep = Endpoint::builder(presets::Minimal)
-            .secret_key(SecretKey::from_bytes(&self.state.device_key))
-            .relay_mode(RelayMode::Custom(
-                RelayMap::from_iter([url.clone()]).with_auth_token(server.relay_token.clone()),
-            ))
-            .bind()
-            .await
-            .context("не поднялся iroh-эндпоинт")?;
         let addr = EndpointAddr::new(PublicKey::from_bytes(&server.server_id)?).with_relay_url(url);
 
         let mut backoff = Duration::from_secs(1);

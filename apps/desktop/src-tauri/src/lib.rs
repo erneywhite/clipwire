@@ -313,6 +313,7 @@ pub fn run() {
             link::link_preview,
             files::file_preview,
             files::files_download,
+            files::folder_open,
             files::transfers,
         ])
         .setup(|app| {
