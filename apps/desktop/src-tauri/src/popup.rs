@@ -210,7 +210,7 @@ pub async fn popup_paste(
             None => return Err("Элемента уже нет в истории".into()),
         }
     };
-    paste_content(&app, &content, into_active).await
+    paste_content(&app, content, into_active).await
 }
 
 /// Вставить произвольный текст: изменённый в предпросмотре вариант.
@@ -220,38 +220,49 @@ pub async fn popup_paste_text(
     text: String,
     into_active: Option<bool>,
 ) -> Result<(), String> {
-    paste_content(&app, &clipwire_core::Content::Text(text), into_active).await
+    paste_content(&app, clipwire_core::Content::Text(text), into_active).await
 }
 
-/// Положить содержимое в буфер и, если включено, вставить в окно, которое было
-/// активным до показа.
+/// Положить содержимое в буфер (оно уходит и в группу, и наверх истории) и,
+/// если включено, вставить в окно, которое было активным до показа.
 async fn paste_content(
     app: &AppHandle,
-    content: &clipwire_core::Content,
+    content: clipwire_core::Content,
     into_active: Option<bool>,
 ) -> Result<(), String> {
+    let paste = into_active.unwrap_or_else(|| paste_into_active(app));
+    copy(app, content)?;
+    return_and_paste(app, "popup", paste).await;
+    Ok(())
+}
+
+/// Настройка «вставлять в активное окно».
+pub fn paste_into_active(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .paste_into_active
+}
+
+/// Скопировать как пользователь: буфер, история, группа.
+pub fn copy(app: &AppHandle, content: clipwire_core::Content) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let paste = into_active.unwrap_or_else(|| {
-        state
-            .settings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .paste_into_active
-    });
-
-    // В буфер «тихо»: выбор из истории не должен заново уходить на все устройства.
-    {
-        let svc = state.service.lock().unwrap_or_else(|e| e.into_inner());
-        match svc.as_ref() {
-            Some(s) => s.put_content_quietly(content),
-            None => clipwire_agent::clipboard::write(content),
-        }
-        .map_err(|e| format!("{e:#}"))?;
+    let svc = state.service.lock().unwrap_or_else(|e| e.into_inner());
+    match svc.as_ref() {
+        Some(s) => s.copy(content),
+        // Сервис ещё не поднялся: хотя бы в буфер.
+        None => clipwire_agent::clipboard::write(&content),
     }
+    .map_err(|e| format!("{e:#}"))
+}
 
-    // Порядок важен: вернуть фокус прежнему окну, пока окно вставки ещё
-    // активно. Если сначала спрятать окно, Windows отдаст фокус кому-то ещё,
-    // и SetForegroundWindow из фонового процесса молча откажет.
+/// Спрятать окно `label` и, если `paste`, вернуть фокус окну, которое было
+/// активным до окна вставки, и нажать там Ctrl+V.
+pub async fn return_and_paste(app: &AppHandle, label: &str, paste: bool) {
+    // Порядок важен: вернуть фокус прежнему окну, пока наше ещё активно.
+    // Если сначала спрятать окно, Windows отдаст фокус кому-то ещё, и
+    // SetForegroundWindow из фонового процесса молча откажет.
     #[cfg(windows)]
     let focused = paste && {
         let prev = *app
@@ -261,7 +272,9 @@ async fn paste_content(
             .unwrap_or_else(|e| e.into_inner());
         win::focus(prev)
     };
-    hide(app);
+    if let Some(w) = app.get_webview_window(label) {
+        let _ = w.hide();
+    }
     #[cfg(windows)]
     if focused {
         // Окну нужно мгновение, чтобы принять фокус, иначе Ctrl+V уйдёт в никуда.
@@ -270,7 +283,6 @@ async fn paste_content(
     }
     #[cfg(not(windows))]
     let _ = paste;
-    Ok(())
 }
 
 #[cfg(windows)]

@@ -2,6 +2,7 @@
 //! синхронизации из `clipwire-agent`.
 
 mod commands;
+mod editor;
 mod popup;
 mod settings_window;
 mod tray;
@@ -193,7 +194,7 @@ pub async fn stop_service(app: &AppHandle) {
 /// и оно всплывало пустым прямоугольником. Окну вставки защита выставляется
 /// в момент показа (`popup::show`).
 pub fn apply_capture_protection(app: &AppHandle, on: bool) {
-    for label in ["settings", "popup"] {
+    for label in ["settings", "popup", "editor"] {
         if let Some(w) = app.get_webview_window(label)
             && (label == "settings" || w.is_visible().unwrap_or(false))
         {
@@ -212,7 +213,7 @@ pub fn apply_window_background(app: &AppHandle, hex: &str) {
         return;
     }
     let color = tauri::window::Color((v >> 16) as u8, (v >> 8) as u8, v as u8, 255);
-    for label in ["settings", "popup", "preview"] {
+    for label in ["settings", "popup", "preview", "editor"] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.set_background_color(Some(color));
         }
@@ -293,6 +294,8 @@ pub fn run() {
             settings_window::size_preview_hide,
             settings_window::settings_toggle_maximize,
             commands::history_update,
+            editor::editor_open,
+            editor::editor_save,
         ])
         .setup(|app| {
             let hide_from_capture = app
@@ -304,7 +307,7 @@ pub fn run() {
             // Окно вставки создаётся вместе с приложением, но показываться должно
             // только по горячей клавише. Прячем явно: на некоторых сборках WebView2
             // скрытое окно без рамки всплывало пустым белым прямоугольником.
-            for label in ["popup", "preview"] {
+            for label in ["popup", "preview", "editor"] {
                 if let Some(p) = app.get_webview_window(label) {
                     let _ = p.hide();
                 }

@@ -53,6 +53,20 @@
         "focusable": false,
         "shadow": true,
         "backgroundColor": "#1c1e22"
+      },
+      {
+        "label": "editor",
+        "title": "Clipwire — редактор",
+        "url": "index.html",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 640,
+        "minHeight": 420,
+        "visible": false,
+        "center": true,
+        "decorations": false,
+        "shadow": true,
+        "backgroundColor": "#1c1e22"
       }
     ],
     "security": {

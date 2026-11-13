@@ -44,6 +44,9 @@ pub struct Service {
     synced: bool,
     local_tx: Option<mpsc::Sender<Content>>,
     engine: Option<tokio::task::JoinHandle<Result<()>>>,
+    history: Arc<Mutex<History>>,
+    device_name: String,
+    on_event: UiCallback,
     _watcher: Watcher,
 }
 
@@ -183,6 +186,8 @@ impl Service {
         let watcher = {
             let (paused, guard, tx) = (paused.clone(), guard.clone(), local_tx.clone());
             let history = history.clone();
+            let device_name = device_name.clone();
+            let on_event = on_event.clone();
             Watcher::start(move |content, owner| {
                 if paused.load(Ordering::Relaxed) {
                     return;
@@ -215,6 +220,9 @@ impl Service {
             synced,
             local_tx,
             engine,
+            history,
+            device_name,
+            on_event,
             _watcher: watcher,
         })
     }
@@ -253,10 +261,29 @@ impl Service {
         self.put_content_quietly(&Content::Text(text.to_string()))
     }
 
-    /// То же для любого содержимого (картинка из истории).
+    /// То же для любого содержимого.
     pub fn put_content_quietly(&self, content: &Content) -> Result<()> {
         self.guard.wrote(content);
         clipboard::write(content)
+    }
+
+    /// Скопировать как будто пользователем: в буфер, в историю (наверх) и в
+    /// группу. Так работают вставка из истории и сохранение из редактора.
+    pub fn copy(&self, content: Content) -> Result<()> {
+        self.guard.wrote(&content);
+        clipboard::write(&content)?;
+        if !self.paused()
+            && let Some(tx) = &self.local_tx
+            && tx.try_send(content.clone()).is_err()
+        {
+            tracing::warn!("очередь отправки переполнена, копирование не ушло в группу");
+        }
+        record(
+            &self.history,
+            local_entry(self.device, &self.device_name, content.clone()),
+        );
+        (self.on_event)(UiEvent::Copied(content));
+        Ok(())
     }
 
     /// Остановить: слежение снимается, движок дошлёт очередь и закроется.

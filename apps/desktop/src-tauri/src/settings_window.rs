@@ -61,12 +61,10 @@ pub fn size_preview(app: AppHandle, width: f64, height: f64) {
     }
 }
 
-/// Развернуть или восстановить окно настроек (своя полоса заголовка).
+/// Развернуть или восстановить окно, из которого вызвано (своя полоса
+/// заголовка у настроек и редактора).
 #[tauri::command]
-pub fn settings_toggle_maximize(app: AppHandle) -> bool {
-    let Some(w) = app.get_webview_window("settings") else {
-        return false;
-    };
+pub fn settings_toggle_maximize(w: tauri::WebviewWindow) -> bool {
     let maximized = w.is_maximized().unwrap_or(false);
     let res = if maximized {
         w.unmaximize()

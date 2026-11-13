@@ -1,8 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Права окон настроек и вставки",
-  "windows": ["settings", "popup", "preview"],
+  "description": "Права окон настроек, вставки и редактора",
+  "windows": [
+    "settings",
+    "popup",
+    "preview",
+    "editor"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-hide",
@@ -19,7 +24,14 @@
     "updater:default",
     {
       "identifier": "opener:allow-open-url",
-      "allow": [{ "url": "https://*" }, { "url": "http://*" }]
+      "allow": [
+        {
+          "url": "https://*"
+        },
+        {
+          "url": "http://*"
+        }
+      ]
     },
     "process:allow-restart",
     "autostart:allow-enable",

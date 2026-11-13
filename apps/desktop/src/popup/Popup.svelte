@@ -81,6 +81,17 @@
     await api.preview(false)
   }
 
+  /** Открыть картинку в редакторе: стрелки, текст, размытие. */
+  async function edit(entry: Entry | undefined) {
+    if (!entry || entry.kind !== 'image') return
+    await closePreview()
+    try {
+      await api.editImage(entry.id)
+    } catch (e) {
+      error = String(e)
+    }
+  }
+
   async function togglePin(entry: Entry | undefined) {
     if (!entry) return
     await api.pin(entry.id, !entry.pinned)
@@ -143,7 +154,10 @@
         }
         return
     }
-    if ((e.ctrlKey || e.metaKey) && e.code === 'KeyP') {
+    if ((e.ctrlKey || e.metaKey) && e.code === 'KeyE') {
+      e.preventDefault()
+      edit(current)
+    } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyP') {
       e.preventDefault()
       togglePin(current)
     } else if (e.shiftKey && e.key === 'Delete') {
@@ -234,7 +248,11 @@
     <footer class="hints">
       <span><kbd>↵</kbd> вставить</span>
       <span><kbd>␣</kbd> просмотр</span>
-      <span><kbd>Ctrl P</kbd> закрепить</span>
+      {#if current?.kind === 'image'}
+        <span><kbd>Ctrl E</kbd> изменить</span>
+      {:else}
+        <span><kbd>Ctrl P</kbd> закрепить</span>
+      {/if}
       <span><kbd>Esc</kbd></span>
     </footer>
   </section>
@@ -252,6 +270,7 @@
         </div>
         <div class="actions">
           <button class="primary" onclick={() => paste(preview?.entry)}>Вставить</button>
+          <button onclick={() => edit(preview?.entry)}>Изменить</button>
           <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
             {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
           </button>

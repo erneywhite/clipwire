@@ -4,6 +4,7 @@
   import { invoke } from '@tauri-apps/api/core'
   import { getCurrentWindow } from '@tauri-apps/api/window'
 
+  let { title = 'Clipwire' }: { title?: string } = $props()
   const win = getCurrentWindow()
   let maximized = $state(false)
 
@@ -27,7 +28,7 @@
       <circle class="dot" cx="72" cy="64" r="16" />
       <circle class="dot" cx="164" cy="182" r="16" />
     </svg>
-    Clipwire
+    {title}
   </span>
   <div class="controls">
     <button aria-label="Свернуть" onclick={() => win.minimize()}>

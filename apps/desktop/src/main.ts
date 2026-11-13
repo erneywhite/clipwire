@@ -3,6 +3,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import Settings from './settings/Settings.svelte'
 import Popup from './popup/Popup.svelte'
 import Preview from './settings/Preview.svelte'
+import Editor from './editor/Editor.svelte'
 import './styles/base.css'
 
 // Это приложение, а не браузер: своё контекстное меню только в полях ввода,
@@ -36,6 +37,7 @@ document.addEventListener(
 // Одна сборка фронтенда на все окна: что рисовать, решает метка окна.
 const label = getCurrentWindow().label
 const target = document.getElementById('app')!
-const app = mount(label === 'popup' ? Popup : label === 'preview' ? Preview : Settings, { target })
+const view = { popup: Popup, preview: Preview, editor: Editor }[label] ?? Settings
+const app = mount(view, { target })
 
 export default app

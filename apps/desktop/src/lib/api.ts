@@ -79,4 +79,5 @@ export const api = {
   leaveGroup: () => invoke<void>('leave_group'),
   deviceInfo: () => invoke<DeviceInfo>('device_info'),
   copyQuietly: (text: string) => invoke<void>('copy_quietly', { text }),
+  editImage: (id: string) => invoke<void>('editor_open', { id }),
 }
