@@ -31,6 +31,17 @@ pub enum UiEvent {
     /// Прогресс загрузки или скачивания файла (не чаще раза в 200 мс на файл
     /// плюс финальное).
     Transfer(Transfer),
+    /// Ключ группы `old` сменили с другого устройства, `key` — новый.
+    /// Сервис больше не синхронизируется: сохранить ключ
+    /// (`devices::adopt_key`) и перезапустить.
+    Rekeyed {
+        old: clipwire_core::GroupId,
+        key: clipwire_core::GroupKey,
+    },
+    /// Это устройство исключили из группы `old` (`devices::leave_excluded`).
+    Excluded {
+        old: clipwire_core::GroupId,
+    },
 }
 
 pub type UiCallback = Arc<dyn Fn(UiEvent) + Send + Sync>;
@@ -55,6 +66,8 @@ pub struct Service {
     /// Слежение за буфером. Его обработчик держит свою копию `copier`; канал
     /// движка у всех копий забирает `Copier::cancel` в `shutdown`.
     watcher: Option<Watcher>,
+    /// Команды движку: устройства группы и смена ключа. Только в группе.
+    controller: Option<crate::devices::Controller>,
 }
 
 /// Копирование на этом устройстве: решить, как передаются файлы, отправить
@@ -202,8 +215,11 @@ impl Service {
                 Arc::new(move |t| on_event(UiEvent::Transfer(t))),
             )
         });
+        let mut controller = None;
         let (device, engine) = match state {
             Some(state) => {
+                let (ctl_tx, ctl_rx) = mpsc::channel(8);
+                let group_key = state.invite.group_key.clone();
                 let local_history = if backfill {
                     local_backfill(&history.lock().unwrap_or_else(|e| e.into_inner()))
                 } else {
@@ -217,8 +233,10 @@ impl Service {
                     Arc::new(|| {}),
                 )
                 .with_backfill(local_history)
-                .with_blobs(blobs.clone().expect("в группе передача файлов есть"));
+                .with_blobs(blobs.clone().expect("в группе передача файлов есть"))
+                .with_control(ctl_rx);
                 let device = engine.device();
+                controller = Some(crate::devices::Controller::new(ctl_tx, group_key, device));
                 (device, Some(rt.spawn(engine.run(local_rx))))
             }
             None => {
@@ -322,6 +340,8 @@ impl Service {
                                 on_event(UiEvent::HistoryMerged(added));
                             }
                         }
+                        Event::Rekeyed { old, key } => on_event(UiEvent::Rekeyed { old, key }),
+                        Event::Excluded { old } => on_event(UiEvent::Excluded { old }),
                     }
                 }
             });
@@ -360,11 +380,17 @@ impl Service {
             engine,
             blobs,
             watcher: Some(watcher),
+            controller,
         })
     }
 
     pub fn device(&self) -> DeviceId {
         self.device
+    }
+
+    /// Устройства группы и смена ключа. `None` в локальном режиме.
+    pub fn controller(&self) -> Option<crate::devices::Controller> {
+        self.controller.clone()
     }
 
     pub fn status(&self) -> Status {

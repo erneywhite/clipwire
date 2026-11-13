@@ -142,6 +142,9 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
                     eprintln!("в истории группы новых элементов: {}", items.len())
                 }
                 Event::Cursor(_) => {}
+                // Отладочный режим ничего не сохраняет: только сообщает.
+                Event::Rekeyed { .. } => eprintln!("ключ группы сменён на другом устройстве"),
+                Event::Excluded { .. } => eprintln!("это устройство удалили из группы"),
             }
         }
         task.await??;
@@ -191,6 +194,22 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
                     t.error.unwrap_or_default()
                 ),
             },
+            UiEvent::Rekeyed { old, key } => {
+                match Paths::resolve()
+                    .and_then(|p| clipwire_agent::devices::adopt_key(&p, old, key))
+                {
+                    Ok(_) => eprintln!("ключ группы сменён, перезапустите clipwire-agent run"),
+                    Err(e) => eprintln!("новый ключ группы не сохранился: {e:#}"),
+                }
+            }
+            UiEvent::Excluded { old } => {
+                match Paths::resolve()
+                    .and_then(|p| clipwire_agent::devices::leave_excluded(&p, old))
+                {
+                    Ok(_) => eprintln!("это устройство удалили из группы"),
+                    Err(e) => eprintln!("выйти из группы не удалось: {e:#}"),
+                }
+            }
         }),
     )?;
     eprintln!("синхронизация буфера запущена, Ctrl+C — выход");

@@ -2,6 +2,7 @@
 //! синхронизации из `clipwire-agent`.
 
 mod commands;
+mod devices;
 mod editor;
 mod files;
 mod link;
@@ -122,6 +123,8 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
             UiEvent::Transfer(t) => {
                 let _ = handle.emit("clipwire://transfer", &t);
             }
+            UiEvent::Rekeyed { old, key } => devices::on_rekeyed(&handle, old, key),
+            UiEvent::Excluded { old } => devices::on_excluded(&handle, old),
         }),
     )?;
     *state.service.lock().unwrap_or_else(|e| e.into_inner()) = Some(service);
@@ -309,6 +312,9 @@ pub fn run() {
             commands::save_settings,
             commands::leave_group,
             commands::device_info,
+            devices::devices_list,
+            devices::device_remove,
+            devices::group_rekey,
             commands::copy_quietly,
             commands::set_window_background,
             popup::popup_preview,

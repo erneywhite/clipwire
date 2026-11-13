@@ -10,6 +10,7 @@
   import { fromEvent, label as hotkeyLabel } from '../lib/hotkey'
   import Toggle from './Toggle.svelte'
   import TitleBar from './TitleBar.svelte'
+  import Devices from './Devices.svelte'
 
   type Section = 'general' | 'sync' | 'privacy' | 'keys' | 'about'
   const sections: { id: Section; title: string; icon: string }[] = [
@@ -304,6 +305,19 @@
         s = e.payload
         applyTheme(e.payload.theme, e.payload.mode)
       }),
+      // Смена ключа группы: старый код приглашения больше не действует.
+      listen<{ by_me: boolean }>('clipwire://group-rekeyed', (e) => {
+        invite = ''
+        createdInvite = ''
+        if (!e.payload.by_me) flash('Ключ группы сменён на другом устройстве')
+        refresh()
+      }),
+      listen('clipwire://group-excluded', () => {
+        invite = ''
+        createdInvite = ''
+        notice = 'Это устройство удалили из группы. Clipwire работает только здесь, история осталась.'
+        refresh()
+      }),
     ]
     Promise.all(unlisten).then(refresh)
     return () => unlisten.forEach((p) => p.then((f) => f()))
@@ -468,6 +482,8 @@
               <button onclick={async () => (invite = await api.inviteCode())}>Показать код</button>
             {/if}
           </div>
+
+          <Devices onRekeyed={() => ((invite = ''), (createdInvite = ''))} />
 
           <h2>Отключить</h2>
           <div class="card pad">

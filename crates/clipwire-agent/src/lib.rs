@@ -3,6 +3,7 @@
 
 pub mod blobs;
 pub mod clipboard;
+pub mod devices;
 pub mod folder;
 pub mod history;
 pub mod image;
