@@ -29,6 +29,13 @@ pub const EMIT_EVERY: Duration = Duration::from_millis(200);
 /// Сколько скачивание ждёт соединения, если его сейчас нет (приложение только
 /// что запустилось или переподключается).
 const WAIT_CONN: Duration = Duration::from_secs(10);
+/// Сколько скачивание ждёт, пока файл появится на сервере. Элемент с файлами
+/// уходит в группу раньше, чем источник начнёт загрузку (а она может ещё и
+/// стоять в очереди за другими файлами), так что вставка сразу после
+/// копирования иначе получила бы «файла нет на сервере».
+pub const WAIT_UPLOAD: Duration = Duration::from_secs(10);
+/// Как часто спрашивать сервер, не появился ли файл.
+const POLL_UPLOAD: Duration = Duration::from_millis(500);
 /// Через сколько повторить загрузку после временной ошибки на том же соединении.
 pub const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Предел длины имени в кэше (в символах): с запасом под `.part` и под
@@ -659,7 +666,9 @@ where
         Some(BlobReply::GetReady { size: s, .. }) => {
             bail!("на сервере файл другого размера: {s} байт вместо {size}")
         }
-        Some(BlobReply::Error(f)) => bail!("{f}"),
+        // Отказ сервера уходит как есть: по нему [`Blobs::download`] отличает
+        // ещё не начатую загрузку (`NotFound`) от прочих ошибок.
+        Some(BlobReply::Error(f)) => return Err(f.into()),
         Some(other) => bail!("неожиданный ответ сервера: {other:?}"),
         None => bail!("сервер закрыл поток"),
     }
@@ -671,7 +680,7 @@ where
                 w.write_chunk(&bkey, c.index, &c.data).await?;
                 progress(w.done_bytes());
             }
-            Some(BlobReply::Error(f)) => bail!("{f}"),
+            Some(BlobReply::Error(f)) => return Err(f.into()),
             Some(other) => bail!("неожиданное сообщение при скачивании: {other:?}"),
             None => bail!("сервер оборвал передачу файла"),
         }
@@ -818,15 +827,27 @@ impl Blobs {
             return Ok(dest);
         }
         let res = async {
-            let conn = self
-                .wait_conn(WAIT_CONN)
-                .await
-                .ok_or_else(|| anyhow!("нет связи с сервером"))?;
-            let size = f.size;
-            download_blob(&conn, &self.key, blob, size, &dest, |done| {
-                self.transfers.progress(blob, Direction::Down, done, size)
-            })
-            .await
+            let started = Instant::now();
+            loop {
+                let conn = self
+                    .wait_conn(WAIT_CONN)
+                    .await
+                    .ok_or_else(|| anyhow!("нет связи с сервером"))?;
+                let size = f.size;
+                let res = download_blob(&conn, &self.key, blob, size, &dest, |done| {
+                    self.transfers.progress(blob, Direction::Down, done, size)
+                })
+                .await;
+                match res {
+                    Err(e)
+                        if matches!(e.downcast_ref(), Some(BlobFail::NotFound))
+                            && started.elapsed() < WAIT_UPLOAD =>
+                    {
+                        tokio::time::sleep(POLL_UPLOAD).await;
+                    }
+                    other => return other,
+                }
+            }
         }
         .await
         .with_context(|| format!("«{}» не скачался", f.name));
