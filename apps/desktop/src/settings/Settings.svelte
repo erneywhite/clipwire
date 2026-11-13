@@ -582,6 +582,19 @@
           <div class="kv"><span>Исходный код</span><button class="link" onclick={() => openUrl('https://github.com/erneywhite/clipwire')}>github.com/erneywhite/clipwire</button></div>
           <div class="kv"><span>Лицензия</span><span>AGPL-3.0</span></div>
         </div>
+        <div class="card pad donate">
+          <div>
+            <p class="donate-title">Нравится Clipwire?</p>
+            <p class="hint">Программа бесплатная. Если она экономит вам время, можно угостить автора кофе: это правда помогает её развивать.</p>
+          </div>
+          <button class="kofi" onclick={() => openUrl('https://ko-fi.com/erneywhite')}>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path class="cup" d="M4 7h12v6a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5zM16 9h1.5a2.5 2.5 0 0 1 0 5H16" />
+              <path class="heart" d="M10 15.2 7.6 12.9a1.5 1.5 0 0 1 2.4-1.8 1.5 1.5 0 0 1 2.4 1.8z" />
+            </svg>
+            Buy me a coffee
+          </button>
+        </div>
         <h2>Обновления</h2>
         <div class="card pad">
           {#if updateState === 'available' && update}
@@ -605,6 +618,59 @@
 {/if}
 
 <style>
+  .donate {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+  }
+  .donate p {
+    margin: 0;
+  }
+  .donate-title {
+    font-weight: 600;
+    margin-bottom: var(--space-1) !important;
+  }
+  /* Кнопка Ko-fi в одном виде во всех темах, как на других проектах автора. */
+  .kofi {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: 9px 16px;
+    border: 0;
+    border-radius: var(--radius-m);
+    background: #b58cf7;
+    color: #fff;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease-out);
+  }
+  .kofi:hover {
+    background: #a374ef;
+  }
+  .kofi:focus-visible {
+    outline: 2px solid var(--c-accent);
+    outline-offset: 2px;
+  }
+  .kofi svg {
+    width: 22px;
+    height: 22px;
+    flex: none;
+    border-radius: 50%;
+    background: #fff;
+    padding: 2px;
+  }
+  .kofi .cup {
+    fill: none;
+    stroke: #29abe0;
+    stroke-width: 1.8;
+    stroke-linejoin: round;
+  }
+  .kofi .heart {
+    fill: #ff5e5b;
+  }
   .window {
     display: flex;
     flex-direction: column;
