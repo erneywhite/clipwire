@@ -169,13 +169,17 @@ impl History {
 
     fn decrypt(&self, nonce: &[u8], data: &[u8]) -> Result<Entry> {
         let plain = self.open_blob(nonce, data)?;
-        match postcard::from_bytes::<Entry>(&plain) {
-            Ok(e) => Ok(e),
-            // Запись прошлой версии: в новом виде её байтов не хватает (у файлов
-            // теперь больше полей), читаем по-старому и переводим.
-            Err(err) => postcard::from_bytes::<EntryV2>(&plain)
-                .map(Entry::from)
-                .map_err(|_| err.into()),
+        // Запись прошлой версии читается по-старому и переводится. Новый вид
+        // принимаем, только если он съел все байты: запись старого формата с
+        // несколькими файлами иначе могла бы разобраться со сдвинутыми полями.
+        let err = match postcard::take_from_bytes::<Entry>(&plain) {
+            Ok((e, [])) => return Ok(e),
+            Ok(_) => postcard::Error::DeserializeBadEncoding,
+            Err(e) => e,
+        };
+        match postcard::take_from_bytes::<EntryV2>(&plain) {
+            Ok((e, [])) => Ok(e.into()),
+            _ => Err(err.into()),
         }
     }
 
