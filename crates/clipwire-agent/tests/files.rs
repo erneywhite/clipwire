@@ -593,7 +593,8 @@ impl Agent {
 async fn engine_uploads_and_other_device_downloads() -> Result<()> {
     let (server, info) = start_server(8 * 1024 * 1024).await?;
     let key = GroupKey::generate()?;
-    let mut a = Agent::spawn(&info, &key)?;
+    let dir_a = tmp("agent-a");
+    let mut a = Agent::spawn_in(&info, &key, &dir_a)?;
     let mut b = Agent::spawn(&info, &key)?;
     a.online().await?;
     b.online().await?;
@@ -628,6 +629,16 @@ async fn engine_uploads_and_other_device_downloads() -> Result<()> {
     }
     assert!(a.blobs.queued().is_empty());
     assert!(a.blobs.transfers().is_empty());
+    // Завершённые загрузки помнятся, в том числе после перезапуска
+    // (новый `Blobs` на том же каталоге). Скачанное — не своя загрузка.
+    assert!(a.blobs.is_uploaded(f.blob.unwrap()));
+    assert!(!b.blobs.is_uploaded(f.blob.unwrap()));
+    let (restarted, _) = blobs(&key, &dir_a);
+    assert!(restarted.is_uploaded(f.blob.unwrap()));
+    assert!(restarted.is_uploaded(small.blob.unwrap()));
+    // После смены ключа группы журнал не действует.
+    let (other, _) = blobs(&GroupKey::generate()?, &dir_a);
+    assert!(!other.is_uploaded(f.blob.unwrap()));
 
     probe.drop_link().await;
     drop(a.local);

@@ -7,6 +7,7 @@
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { api, type DeviceInfo, type Retention, type Settings, type Status, type Theme } from '../lib/api'
   import { applyTheme } from '../lib/theme'
+  import { bytesLabel } from '../lib/format'
   import { fromEvent, label as hotkeyLabel } from '../lib/hotkey'
   import Toggle from './Toggle.svelte'
   import TitleBar from './TitleBar.svelte'
@@ -51,6 +52,9 @@
   let invite = $state('')
   let confirmLeave = $state(false)
   let confirmClear = $state(false)
+  // Кэш скачанных файлов: размер, null — ещё не знаем.
+  let cacheBytes = $state<number | null>(null)
+  let cacheBusy = $state(false)
 
   // Клавиши
   let recording = $state(false)
@@ -137,6 +141,36 @@
     createdInvite = ''
     await refresh()
   }
+
+  async function loadCacheSize() {
+    try {
+      cacheBytes = await api.cacheSize()
+    } catch {
+      cacheBytes = null
+    }
+  }
+
+  async function clearCache() {
+    cacheBusy = true
+    try {
+      const r = await api.cacheClear()
+      cacheBytes = r.size
+      flash(
+        r.failed > 0
+          ? `Удалено не всё: ${r.failed} — файлы открыты в другой программе`
+          : 'Кэш скачанного очищен',
+      )
+    } catch (e) {
+      error = String(e)
+    } finally {
+      cacheBusy = false
+    }
+  }
+
+  // Размер кэша — при каждом открытии раздела: он меняется от скачиваний и чистки.
+  $effect(() => {
+    if (section === 'sync') loadCacheSize()
+  })
 
   async function clearHistory() {
     await api.clear(true)
@@ -351,6 +385,12 @@
         <h1>Основные</h1>
         <div class="card">
           <Toggle label="Запускать при входе в систему" checked={autostart} onchange={toggleAutostart} />
+          <Toggle
+            label="Звук при копировании"
+            hint="Короткий щелчок, когда в историю попадает новое: скопированное здесь или пришедшее с другого устройства."
+            checked={s.sound_on_receive}
+            onchange={(v) => save({ sound_on_receive: v })}
+          />
         </div>
 
         <h2>Оформление</h2>
@@ -464,8 +504,17 @@
             </label>
             <p class="hint">
               Скопированные файлы такого размера сразу уходят на сервер зашифрованными, и другие устройства
-              вставляют их, даже когда этот компьютер выключен. 0 — не загружать. Крупные файлы и папки
-              остальные устройства видят в истории, но получить их пока не могут.
+              вставляют их, даже когда этот компьютер выключен. 0 — не загружать. Файлы крупнее порога
+              другие устройства берут напрямую с этого компьютера, пока он в сети.
+            </p>
+            <div class="cache">
+              <span>Скачанные файлы занимают <span class="mono">{cacheBytes === null ? '—' : bytesLabel(cacheBytes)}</span></span>
+              <button disabled={cacheBusy || !cacheBytes} onclick={clearCache}>Очистить кэш скачанного</button>
+            </div>
+            <p class="hint">
+              Здесь лежат файлы, скачанные с других устройств и с сервера. Копия удаляется сама, когда
+              удаляется её запись в истории. Очистка не трогает то, что скачивается прямо сейчас; удалённое
+              скачается заново при вставке.
             </p>
           </div>
 
@@ -900,6 +949,14 @@
   button.danger {
     border-color: var(--c-danger);
     color: var(--c-danger);
+  }
+  .cache {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+    margin-top: var(--space-3);
   }
   .buttons,
   .confirm {

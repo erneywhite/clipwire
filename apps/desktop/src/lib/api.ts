@@ -78,6 +78,14 @@ export interface Entry {
   html: string | null
   /** Скопированные файлы и папки. */
   files: FileInfo[]
+  /** Приложение, из которого скопировано; null — неизвестно. */
+  source_app: SourceApp | null
+}
+
+export interface SourceApp {
+  name: string
+  /** Иконка 32×32 — data URL PNG. */
+  icon: string | null
 }
 
 export interface FileInfo {
@@ -100,6 +108,16 @@ export interface FileInfo {
   local_path: string | null
   /** Запись пришла с другого устройства. */
   remote: boolean
+  /** Файл этого устройства уже на сервере (загружен за последние сутки, в том числе до перезапуска). */
+  uploaded: boolean
+}
+
+export interface CacheCleared {
+  removed: number
+  /** Не удалились: файл открыт в другой программе. */
+  failed: number
+  /** Сколько кэш занимает после чистки, байт. */
+  size: number
 }
 
 /** Передача одного файла: событие clipwire://transfer и ответ transfers(). */
@@ -166,6 +184,10 @@ export const api = {
   deviceRemove: (deviceId: string) => invoke<RekeyResult>('device_remove', { deviceId }),
   groupRekey: () => invoke<RekeyResult>('group_rekey'),
   copyQuietly: (text: string) => invoke<void>('copy_quietly', { text }),
+  /** Сколько места занимает кэш скачанных файлов, байт. */
+  cacheSize: () => invoke<number>('cache_size'),
+  /** Удалить скачанные копии, кроме тех, что качаются сейчас. */
+  cacheClear: () => invoke<CacheCleared>('cache_clear'),
   editImage: (id: string) => invoke<void>('editor_open', { id }),
   linkPreview: (url: string) => invoke<LinkCard>('link_preview', { url }),
   filePreview: (path: string) => invoke<FilePreview>('file_preview', { path }),

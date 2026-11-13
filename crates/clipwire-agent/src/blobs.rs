@@ -50,10 +50,8 @@ pub fn files_dir(state_dir: &Path) -> PathBuf {
 }
 
 /// Где лежит (или будет лежать) скачанный файл: `<files>/<blob hex>/<имя>`.
-// shortcut: кэш скачанного чистится только при выходе из группы
-// (`Paths::reset`). Чистить вместе с историей по сроку хранения (удалять папки
-// blob, на которые не ссылается ни одна запись), когда дойдут руки до настроек
-// места на диске.
+/// Копии, на которые не ссылается ни одна запись истории, удаляет
+/// [`crate::cache::prune`].
 pub fn cache_path(files_dir: &Path, blob: BlobId, name: &str) -> PathBuf {
     files_dir.join(blob.hex()).join(sanitize_name(name))
 }
@@ -1125,6 +1123,8 @@ pub struct Blobs {
     p2p_conns: tokio::sync::Mutex<HashMap<DeviceId, (Connection, Arc<crate::p2p::Usage>)>>,
     /// Замки сборки архивов папок для прямой передачи.
     building: Mutex<HashMap<BlobId, Weak<tokio::sync::Mutex<()>>>>,
+    /// Завершённые загрузки (переживают перезапуск, см. [`crate::uploaded`]).
+    uploaded: Mutex<crate::uploaded::UploadedLog>,
 }
 
 /// Поиск файла для прямой отдачи по `blob`: локальная запись истории, у
@@ -1174,7 +1174,10 @@ impl Blobs {
         if cleaned > 0 {
             tracing::info!(cleaned, "из outbox удалены архивы старше суток");
         }
+        let uploaded =
+            crate::uploaded::UploadedLog::load(state_dir, &group, crate::history::now_ms());
         Arc::new(Self {
+            uploaded: Mutex::new(uploaded),
             key,
             files_dir: files_dir(state_dir),
             queue: Mutex::new(queue),
@@ -1497,6 +1500,26 @@ impl Blobs {
 
     pub fn files_dir(&self) -> &Path {
         &self.files_dir
+    }
+
+    /// Файл этого устройства уже загружен на сервер (за последние сутки,
+    /// в том числе до перезапуска).
+    pub fn is_uploaded(&self, blob: BlobId) -> bool {
+        self.uploaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(blob, crate::history::now_ms())
+    }
+
+    /// Файлы, которые качаются в кэш прямо сейчас (или ждут своей очереди).
+    pub fn downloading(&self) -> std::collections::HashSet<BlobId> {
+        self.downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, w)| w.strong_count() > 0)
+            .map(|(b, _)| *b)
+            .collect()
     }
 
     /// Текущие передачи — для начального состояния окна.
@@ -1881,7 +1904,13 @@ impl Blobs {
         .await;
         let retry = res.as_ref().err().is_some_and(UploadError::retry);
         match &res {
-            Ok(()) => tracing::info!(path = %job.path, "файл загружен на сервер"),
+            Ok(()) => {
+                tracing::info!(path = %job.path, "файл загружен на сервер");
+                let mut log = self.uploaded.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = log.mark(job.blob, crate::history::now_ms()) {
+                    tracing::warn!("журнал загрузок не сохранился: {e:#}");
+                }
+            }
             Err(e) if retry => tracing::info!(path = %job.path, "загрузка прервалась: {e}"),
             Err(e) => tracing::warn!(path = %job.path, "файл не загрузился: {e}"),
         }

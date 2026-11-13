@@ -1,6 +1,7 @@
 //! Приложение Clipwire: трей, окно вставки и окно настроек поверх движка
 //! синхронизации из `clipwire-agent`.
 
+mod cache;
 mod commands;
 mod devices;
 mod editor;
@@ -8,6 +9,7 @@ mod files;
 mod link;
 mod popup;
 mod settings_window;
+mod sound;
 mod tray;
 mod updates;
 
@@ -125,6 +127,17 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
             }
             UiEvent::Rekeyed { old, key } => devices::on_rekeyed(&handle, old, key),
             UiEvent::Excluded { old } => devices::on_excluded(&handle, old),
+            UiEvent::NewEntry => {
+                let on = handle
+                    .state::<AppState>()
+                    .settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .sound_on_receive;
+                if on {
+                    sound::play_copy();
+                }
+            }
         }),
     )?;
     *state.service.lock().unwrap_or_else(|e| e.into_inner()) = Some(service);
@@ -158,7 +171,8 @@ fn load_state() -> anyhow::Result<AppState> {
     })
 }
 
-/// Раз в час и на старте удаляет историю старше срока хранения.
+/// Раз в час и на старте удаляет историю старше срока хранения и копии
+/// скачанного, на которые больше не ссылается ни одна запись.
 fn spawn_pruner(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -183,6 +197,7 @@ fn spawn_pruner(app: AppHandle) {
                 }
                 Err(e) => tracing::warn!("очистка истории не удалась: {e:#}"),
             }
+            cache::prune_later(&app);
         }
     });
 }
@@ -332,6 +347,8 @@ pub fn run() {
             files::files_download,
             files::folder_open,
             files::transfers,
+            cache::cache_size,
+            cache::cache_clear,
         ])
         .setup(|app| {
             let hide_from_capture = app

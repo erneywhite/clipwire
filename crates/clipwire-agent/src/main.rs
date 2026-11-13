@@ -166,6 +166,12 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
     let settings = Settings::load(&paths.dir);
     let mut history = History::open(&paths.dir)?;
     history.prune(settings.retention, clipwire_agent::history::now_ms())?;
+    // Копии скачанного, на которые больше не ссылается ни одна запись.
+    clipwire_agent::cache::prune(
+        &clipwire_agent::blobs::files_dir(&paths.dir),
+        &history.blobs(),
+        &Default::default(),
+    );
     let rt = tokio::runtime::Runtime::new()?;
     let service = Service::start(
         rt.handle(),
@@ -185,6 +191,7 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
             UiEvent::Copied(_) => eprintln!("отправлено скопированное"),
             UiEvent::Received(_) => eprintln!("получено с другого устройства"),
             UiEvent::HistoryMerged(n) => eprintln!("в историю добавлено с других устройств: {n}"),
+            UiEvent::NewEntry => {}
             UiEvent::Transfer(t) => match t.state {
                 TransferState::Active => {}
                 TransferState::Done => eprintln!("файл {} передан", t.blob),

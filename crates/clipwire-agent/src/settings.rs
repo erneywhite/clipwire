@@ -65,6 +65,8 @@ pub struct Settings {
     pub popup_height: u32,
     /// Сочетание для окна вставки в формате плагина global-shortcut.
     pub popup_hotkey: String,
+    /// Звук, когда в историю попадает новое: скопированное здесь или
+    /// пришедшее с другого устройства. Имя поля прежнее, смысл шире.
     pub sound_on_receive: bool,
     /// Загружать карточки ссылок (og:-теги) по пробелу.
     pub link_previews: bool,
@@ -89,7 +91,7 @@ impl Default for Settings {
             popup_width: 380,
             popup_height: 520,
             popup_hotkey: "CommandOrControl+Shift+V".into(),
-            sound_on_receive: false,
+            sound_on_receive: true,
             link_previews: true,
             hide_from_capture: false,
             ignored_apps: vec![
@@ -155,6 +157,10 @@ mod tests {
         assert_eq!(s.file_upload_limit_mb, 100);
         let s: Settings = serde_json::from_str(r#"{"file_upload_limit_mb":0}"#).unwrap();
         assert_eq!(s.file_upload_limit_mb, 0);
+        // Звук по умолчанию включён, выключенный в файле остаётся выключенным.
+        assert!(s.sound_on_receive);
+        let s: Settings = serde_json::from_str(r#"{"sound_on_receive":false}"#).unwrap();
+        assert!(!s.sound_on_receive);
     }
 
     #[test]

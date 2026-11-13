@@ -2,6 +2,7 @@
   // Строка элемента истории. Общая для окна вставки и для превью в настройках,
   // чтобы превью выглядело ровно как настоящее окно.
   import type { Entry } from './api'
+  import AppTag from './AppTag.svelte'
   import { ago, bytesLabel, filesLabel, filesMeta, isUrl, looksLikeCode, sizeLabel } from './format'
   import { allUploaded, entryProgress, isDirect, isGone, progressLabel, type TransferMap } from './transfer'
 
@@ -37,9 +38,9 @@
   // скачать. Пропал только свой файл без копии на сервере.
   const gone = $derived(item.files.some(isGone))
   const device = $derived(item.local ? 'Это устройство' : item.device_name || 'Другое устройство')
+  // Мета после устройства и приложения-источника (его иконка — отдельным элементом).
   const meta = $derived(
     [
-      device,
       ago(item.seen_ms),
       kind === 'image'
         ? `${item.width}×${item.height} · ${bytesLabel(item.bytes)}`
@@ -48,6 +49,7 @@
           : sizeLabel(item.chars, item.lines),
       ...(item.rich ? [item.rich] : []),
       ...(progress ? [progressLabel(progress)] : []),
+      // По журналу загрузок (переживает перезапуск) и по событиям этого запуска.
       ...(!progress && kind === 'files' && allUploaded(item.files, transfers) ? ['↑ на сервере'] : []),
       // Файл больше порога ждёт на источнике: его скачают, только пока оно в сети.
       ...(!progress && kind === 'files' && item.files.some(isDirect) ? [`напрямую с устройства «${device}»`] : []),
@@ -107,7 +109,9 @@
     {:else}
       <span class="text" class:mono={kind === 'code'}>{item.text}</span>
     {/if}
-    <span class="meta" class:failed={!!progress?.error}>{meta}</span>
+    <span class="meta" class:failed={!!progress?.error}
+      >{device}{#if item.source_app}&nbsp;· <AppTag app={item.source_app} />{/if} · {meta}</span
+    >
     {#if progress}
       <span
         class="bar"
