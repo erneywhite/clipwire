@@ -406,7 +406,7 @@
     {:else}
       <ul class="list" bind:this={listEl} role="listbox" aria-label="История буфера">
         {#each items as item, i (item.id)}
-          <EntryRow {item} {transfers} index={i} selected={i === sel} onselect={() => (sel = i)} onpaste={() => paste(item)} />
+          <EntryRow {item} {transfers} index={i} selected={i === sel} onselect={() => (sel = i)} onpaste={() => paste(item)} onpin={() => togglePin(item)} />
         {/each}
       </ul>
     {/if}

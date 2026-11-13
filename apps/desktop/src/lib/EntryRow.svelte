@@ -12,6 +12,7 @@
     selected = false,
     onselect,
     onpaste,
+    onpin,
     transfers = {},
   }: {
     item: Entry
@@ -21,6 +22,8 @@
     transfers?: TransferMap
     onselect?: () => void
     onpaste?: () => void
+    /** Закрепить или открепить кликом по булавке. */
+    onpin?: () => void
   } = $props()
 
   const kind = $derived(
@@ -126,8 +129,25 @@
       </span>
     {/if}
   </span>
-  {#if index < 9}<kbd class="num">{index + 1}</kbd>{/if}
-  {#if item.pinned}<span class="pin" aria-label="Закреплено">●</span>{/if}
+  <span class="side">
+    {#if index < 9}<kbd class="num">{index + 1}</kbd>{/if}
+    {#if onpin || item.pinned}
+      <button
+        class="pin"
+        class:on={item.pinned}
+        title={item.pinned ? 'Открепить (Ctrl+P)' : 'Закрепить (Ctrl+P)'}
+        aria-label={item.pinned ? 'Открепить' : 'Закрепить'}
+        aria-pressed={item.pinned}
+        onclick={(e) => {
+          e.stopPropagation()
+          onpin?.()
+        }}
+        ondblclick={(e) => e.stopPropagation()}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l-1 7 3 3H7l3-3z" /><path d="M12 13v8" /></svg>
+      </button>
+    {/if}
+  </span>
 </li>
 
 <style>
@@ -250,11 +270,55 @@
   li:hover .num {
     opacity: 1;
   }
+  .side {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+  }
   .pin {
-    position: absolute;
-    left: 4px;
-    top: 6px;
-    font-size: 7px;
+    width: 22px;
+    height: 22px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-s);
+    background: transparent;
+    color: var(--c-muted);
+    cursor: default;
+    opacity: 0;
+    transition: opacity var(--dur-fast) var(--ease-out);
+  }
+  .pin svg {
+    width: 15px;
+    height: 15px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+  }
+  li:hover .pin,
+  li.sel .pin,
+  .pin:focus-visible {
+    opacity: 1;
+  }
+  .pin:hover {
+    background: var(--c-hover);
+    color: var(--c-text);
+  }
+  /* Закреплённое видно всегда: булавка залита акцентом. */
+  .pin.on {
+    opacity: 1;
     color: var(--c-accent);
+  }
+  .pin.on svg path:first-child {
+    fill: currentColor;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pin {
+      transition: none;
+    }
   }
 </style>
