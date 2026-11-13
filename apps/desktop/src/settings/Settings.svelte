@@ -9,7 +9,7 @@
   import { applyTheme } from '../lib/theme'
   import * as fmt from '../lib/format'
   import { bytesLabel } from '../lib/format'
-  import { devicesLabel, historyLabel, serverFilesLabel, serverItemsLabel, storageLabel } from '../lib/overview'
+  import { devicesLabel, historyLabel, lastSyncLabel, linkLabel, quotaLabel, serverFilesLabel, serverItemsLabel, storageLabel } from '../lib/overview'
   import { fromEvent, label as hotkeyLabel } from '../lib/hotkey'
   import Toggle from './Toggle.svelte'
   import TitleBar from './TitleBar.svelte'
@@ -721,7 +721,7 @@
 
         <h2>В окне вставки</h2>
         <div class="card">
-          {#each [['↑ ↓', 'выбрать'], ['Enter, двойной клик', 'вставить'], ['Ctrl + 1…9', 'вставить элемент по номеру'], ['Пробел', 'предпросмотр (при пустом поиске)'], ['Ctrl + P', 'закрепить'], ['Shift + Delete', 'удалить из истории'], ['Tab', 'История ↔ Закреплённое'], ['Esc', 'закрыть']] as [k, v] (k)}
+          {#each [['↑ ↓', 'выбрать'], ['Enter, двойной клик', 'вставить'], ['Ctrl + 1…9', 'вставить элемент по номеру'], ['Пробел', 'предпросмотр (при пустом поиске)'], ['Ctrl + P', 'закрепить'], ['Delete', 'удалить из истории (при пустом поиске)'], ['Shift + Delete', 'удалить, когда в поиске есть текст'], ['Правый клик, клавиша меню', 'действия с записью'], ['Tab', 'История ↔ Закреплённое'], ['Esc', 'закрыть']] as [k, v] (k)}
             <div class="kv"><span class="mono">{k}</span><span>{v}</span></div>
           {/each}
         </div>
@@ -765,6 +765,18 @@
             <span>Сервер</span>
             <span class="tone" data-tone={statusTone(status)}>{statusText(status)}</span>
           </div>
+          {#if configured && stats?.link}
+            <div class="kv">
+              <span>Связь</span>
+              <span>{linkLabel(stats.link)}</span>
+            </div>
+          {/if}
+          {#if configured && stats}
+            <div class="kv">
+              <span>Синхронизация</span>
+              <span>{lastSyncLabel(stats.last_sent_ms, stats.last_received_ms, fmt)}</span>
+            </div>
+          {/if}
           {#if configured}
             {@const storage = storageState ? storageLabel(storageState) : null}
             <div class="kv">
@@ -793,6 +805,13 @@
               <span>Файлы на сервере</span>
               <span>{stats?.server ? serverFilesLabel(stats.server, fmt) : '—'}</span>
             </div>
+            {#if stats?.server}
+              {@const q = quotaLabel(stats.server, fmt)}
+              <div class="kv">
+                <span>Место под файлы группы</span>
+                <span class="tone" data-tone={q.tone}>{q.text}</span>
+              </div>
+            {/if}
             <div class="kv">
               <span>Устройств в группе</span>
               {#if groupDevices}

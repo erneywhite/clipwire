@@ -5,6 +5,8 @@
 //! когда ключ сменился или устройство исключили. Сами сообщения серверу шлёт
 //! движок (`sync.rs`), команды ему передаются через [`Controller`].
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
 use clipwire_core::device::{DeviceCard, rekey_public, seal_rekey};
 use clipwire_core::proto::DeviceEntry;
@@ -322,6 +324,34 @@ pub enum Control {
     },
     /// Что лежит у группы на сервере (`GetStats`).
     Stats(oneshot::Sender<Result<clipwire_core::proto::GroupStats, String>>),
+    /// Как сейчас идёт связь с сервером.
+    Link(oneshot::Sender<Result<LinkInfo, String>>),
+}
+
+/// Путь до сервера: напрямую (UDP) или через relay, и задержка.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkInfo {
+    pub direct: bool,
+    pub rtt_ms: u64,
+}
+
+/// Когда последний раз элемент ушёл в группу и пришёл из неё (мс Unix, 0 —
+/// ещё не было с запуска). Движок пишет, интерфейс читает без запроса.
+#[derive(Debug, Default)]
+pub struct SyncTimes {
+    pub sent_ms: std::sync::atomic::AtomicI64,
+    pub received_ms: std::sync::atomic::AtomicI64,
+}
+
+impl SyncTimes {
+    pub fn mark_sent(&self) {
+        self.sent_ms
+            .store(crate::history::now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn mark_received(&self) {
+        self.received_ms
+            .store(crate::history::now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Итог смены ключа на этом устройстве.
@@ -339,6 +369,7 @@ pub struct Controller {
     pub(crate) tx: mpsc::Sender<Control>,
     pub(crate) key: GroupKey,
     pub(crate) device: DeviceId,
+    pub(crate) times: Arc<SyncTimes>,
 }
 
 const OFFLINE: &str = "Нет связи с сервером. Попробуйте, когда устройство будет в сети";
@@ -348,7 +379,37 @@ pub const OLD_SERVER_STATS: &str = "Сервер не сообщает эти ц
 
 impl Controller {
     pub fn new(tx: mpsc::Sender<Control>, key: GroupKey, device: DeviceId) -> Self {
-        Self { tx, key, device }
+        Self {
+            tx,
+            key,
+            device,
+            times: Arc::default(),
+        }
+    }
+
+    /// Времена отправки и получения от движка (`Engine::times`).
+    pub fn with_times(mut self, times: Arc<SyncTimes>) -> Self {
+        self.times = times;
+        self
+    }
+
+    /// Последняя отправка и последнее получение, мс Unix; 0 — не было.
+    pub fn last_sync(&self) -> (i64, i64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.times.sent_ms.load(Relaxed),
+            self.times.received_ms.load(Relaxed),
+        )
+    }
+
+    /// Как сейчас идёт связь с сервером.
+    pub async fn link(&self) -> Result<LinkInfo, String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Control::Link(reply))
+            .await
+            .map_err(|_| OFFLINE.to_string())?;
+        rx.await.map_err(|_| OFFLINE.to_string())?
     }
 
     pub fn device(&self) -> DeviceId {

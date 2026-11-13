@@ -305,7 +305,10 @@ impl Service {
                         b.storage().clone(),
                     ));
                 }
-                controller = Some(crate::devices::Controller::new(ctl_tx, group_key, device));
+                controller = Some(
+                    crate::devices::Controller::new(ctl_tx, group_key, device)
+                        .with_times(engine.times()),
+                );
                 (device, Some(rt.spawn(engine.run(local_rx))))
             }
             None => {

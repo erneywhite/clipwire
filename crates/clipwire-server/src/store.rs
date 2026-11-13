@@ -352,7 +352,8 @@ impl Store {
     }
 
     /// Что лежит у группы на сервере, без просроченного (до `not_before_ms`).
-    /// Файл считается, только если загружен целиком.
+    /// Файл считается, только если загружен целиком. Квоту (`quota`) знает
+    /// не база, а настройки сервера: её заполняет вызывающий.
     pub fn group_stats(&self, group: &GroupId, not_before_ms: i64) -> Result<GroupStats> {
         let conn = self.conn();
         let (items, item_bytes): (i64, i64) = conn.query_row(
@@ -375,11 +376,21 @@ impl Store {
                 file_bytes += size;
             }
         }
+        drop(stmt);
+        // Та же формула sealed_size, что при проверке квоты в `blob_begin`.
+        let quota_used: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size + MAX(1, (size + ?3 - 1) / ?3) * ?4), 0)
+             FROM blobs WHERE group_id = ?1 AND created_ms >= ?2",
+            params![&group.0[..], not_before_ms, CHUNK as i64, OVERHEAD as i64],
+            |r| r.get(0),
+        )?;
         Ok(GroupStats {
             items: items as u64,
             item_bytes: item_bytes as u64,
             files,
             file_bytes,
+            quota_used: quota_used as u64,
+            quota: 0,
         })
     }
 

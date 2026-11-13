@@ -3,7 +3,7 @@ import type { GroupDevice, GroupStats, StorageState } from './api'
 import type * as format from './format'
 
 /** Функции из `format.ts`, параметром — как в `devices.ts`, ради тестов в Node. */
-export type Fmt = Pick<typeof format, 'bytesLabel' | 'plural'>
+export type Fmt = Pick<typeof format, 'ago' | 'bytesLabel' | 'plural'>
 
 export type Tone = 'ok' | 'warn' | 'error'
 
@@ -24,6 +24,34 @@ export function serverItemsLabel(s: GroupStats, { bytesLabel, plural }: Fmt): st
 export function serverFilesLabel(s: GroupStats, { bytesLabel, plural }: Fmt): string {
   if (s.files === 0) return 'Нет'
   return `${s.files} ${plural(s.files, ['файл', 'файла', 'файлов'])} · ${bytesLabel(s.file_bytes)}`
+}
+
+/** «1,2 ГБ из 2,0 ГБ (60 %)». Тон предупреждает, когда место кончается. */
+export function quotaLabel(s: GroupStats, { bytesLabel }: Fmt): { text: string; tone: Tone } {
+  if (s.quota <= 0) return { text: '—', tone: 'ok' }
+  const pct = Math.min(100, Math.round((s.quota_used / s.quota) * 100))
+  const tone: Tone = pct >= 95 ? 'error' : pct >= 80 ? 'warn' : 'ok'
+  return { text: `${bytesLabel(s.quota_used)} из ${bytesLabel(s.quota)} (${pct} %)`, tone }
+}
+
+/** «Напрямую · 12 мс», «Через relay · 48 мс». */
+export function linkLabel(link: { direct: boolean; rtt_ms: number }): string {
+  const how = link.direct ? 'Напрямую' : 'Через relay'
+  return link.rtt_ms > 0 ? `${how} · ${link.rtt_ms} мс` : how
+}
+
+/** «отправлено 5 мин назад, получено сейчас»; с запуска ничего — «С запуска не было». */
+export function lastSyncLabel(sent: number, received: number, { ago }: Fmt, now = Date.now()): string {
+  const when = (ms: number) => {
+    const a = ago(ms, now)
+    return a === 'сейчас' ? 'только что' : /^\d/.test(a) ? `${a} назад` : a
+  }
+  const parts: string[] = []
+  if (sent) parts.push(`отправлено ${when(sent)}`)
+  if (received) parts.push(`получено ${when(received)}`)
+  if (!parts.length) return 'С запуска не было'
+  const text = parts.join(', ')
+  return text[0].toUpperCase() + text.slice(1)
 }
 
 /** «3, в сети 2». Это устройство считается в сети: список пришёл через сервер. */

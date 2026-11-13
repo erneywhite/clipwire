@@ -253,11 +253,83 @@
 
   async function remove(entry: Entry | undefined) {
     if (!entry) return
-    await api.remove(entry.id)
+    closeMenu()
+    // Удаляемая запись открыта в предпросмотре — закрыть его.
+    if (preview?.entry.id === entry.id) await closePreview()
+    try {
+      await api.remove(entry.id)
+    } catch (e) {
+      error = String(e)
+    }
     await load()
   }
 
+  // Меню по правому клику: координаты в окне и запись, к которой оно.
+  let menu = $state<{ x: number; y: number; entry: Entry } | null>(null)
+  let menuEl: HTMLElement | undefined = $state()
+
+  async function openMenu(entry: Entry, x: number, y: number, keyboard = false) {
+    menu = { entry, x, y }
+    await tick()
+    if (!menuEl) return
+    // Прижать к краям окна: оно маленькое, меню у нижних строк иначе уедет.
+    const r = menuEl.getBoundingClientRect()
+    const nx = Math.max(4, Math.min(x, window.innerWidth - r.width - 4))
+    const ny = y + r.height > window.innerHeight - 4 ? Math.max(4, y - r.height) : y
+    menu = { entry, x: nx, y: ny }
+    if (keyboard) menuEl.querySelector<HTMLButtonElement>('button')?.focus()
+  }
+
+  function closeMenu() {
+    if (!menu) return
+    menu = null
+    input?.focus()
+  }
+
+  /** Пункт меню: закрыть меню, потом действие. */
+  function act(fn: () => unknown) {
+    closeMenu()
+    fn()
+  }
+
+  /** Стрелки внутри меню переходят между пунктами, Esc и Tab закрывают. */
+  function menuKey(e: KeyboardEvent) {
+    const buttons = [...(menuEl?.querySelectorAll<HTMLButtonElement>('button') ?? [])]
+    const i = buttons.indexOf(document.activeElement as HTMLButtonElement)
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      const d = e.key === 'ArrowDown' ? 1 : -1
+      buttons[(i + d + buttons.length) % buttons.length]?.focus()
+    } else if (e.key === 'Escape' || e.key === 'Tab') {
+      closeMenu()
+    } else {
+      return
+    }
+    e.preventDefault()
+    e.stopPropagation()
+  }
+
+  /** Меню для выбранной строки с клавиатуры (клавиша меню или Shift+F10). */
+  function menuForCurrent() {
+    if (!current) return
+    const row = listEl?.querySelector<HTMLElement>(`[data-i="${sel}"]`)
+    const r = row?.getBoundingClientRect()
+    openMenu(current, r ? r.left + 24 : 24, r ? r.bottom - 6 : 60, true)
+  }
+
   async function onKey(e: KeyboardEvent) {
+    // Открытое меню обрабатывает клавиши само (menuKey); Esc мимо него — закрыть.
+    if (menu) {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        closeMenu()
+      }
+      return
+    }
+    if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+      e.preventDefault()
+      menuForCurrent()
+      return
+    }
     // В редакторе предпросмотра клавиши работают как в обычном поле ввода,
     // кроме двух: Ctrl+Enter вставляет изменённый текст, Esc возвращает к списку.
     if (e.target === editor) {
@@ -315,7 +387,9 @@
     } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyP') {
       e.preventDefault()
       togglePin(current)
-    } else if (e.shiftKey && e.key === 'Delete') {
+    } else if (e.key === 'Delete' && (e.shiftKey || query === '')) {
+      // При пустом поиске Delete удаляет запись; с текстом в поиске он стирает
+      // символ, тогда удаление — Shift+Delete.
       e.preventDefault()
       remove(current)
     } else if ((e.ctrlKey || e.metaKey) && /^Digit[1-9]$/.test(e.code)) {
@@ -406,7 +480,7 @@
     {:else}
       <ul class="list" bind:this={listEl} role="listbox" aria-label="История буфера">
         {#each items as item, i (item.id)}
-          <EntryRow {item} {transfers} index={i} selected={i === sel} onselect={() => (sel = i)} onpaste={() => paste(item)} onpin={() => togglePin(item)} />
+          <EntryRow {item} {transfers} index={i} selected={i === sel} onselect={() => (sel = i)} onpaste={() => paste(item)} onpin={() => togglePin(item)} onremove={() => remove(item)} onmenu={(x, y) => openMenu(item, x, y)} />
         {/each}
       </ul>
     {/if}
@@ -419,7 +493,7 @@
       {:else}
         <span><kbd>Ctrl P</kbd> закрепить</span>
       {/if}
-      <span><kbd>Esc</kbd></span>
+      <span><kbd>Del</kbd> удалить</span>
     </footer>
   </section>
 
@@ -440,6 +514,7 @@
           <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
             {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
           </button>
+          <button class="danger" onclick={() => remove(preview?.entry)}>Удалить</button>
         </div>
       {:else if preview.entry.kind === 'files'}
         {@const entry = preview.entry}
@@ -509,6 +584,7 @@
           <button onclick={() => togglePin(entry).then(openPreview)}>
             {entry.pinned ? 'Открепить' : 'Закрепить'}
           </button>
+          <button class="danger" onclick={() => remove(entry)}>Удалить</button>
         </div>
       {:else}
       {#if preview.entry.html || isUrl(preview.entry.text)}
@@ -554,6 +630,7 @@
           <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
             {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
           </button>
+          <button class="danger" onclick={() => remove(preview?.entry)}>Удалить</button>
         {/if}
       </div>
       {/if}
@@ -561,7 +638,87 @@
   {/if}
 </div>
 
+{#if menu}
+  {@const m = menu.entry}
+  <!-- Подложка ловит клик мимо меню: он только закрывает меню. -->
+  <div
+    class="menu-backdrop"
+    role="presentation"
+    onmousedown={closeMenu}
+    oncontextmenu={(e) => {
+      e.preventDefault()
+      closeMenu()
+    }}
+  ></div>
+  <div class="menu" role="menu" tabindex="-1" bind:this={menuEl} style:left="{menu.x}px" style:top="{menu.y}px" onkeydown={menuKey}>
+    <button role="menuitem" onclick={() => act(() => paste(m))}>Вставить<kbd>Enter</kbd></button>
+    {#if m.kind === 'text' && m.rich}
+      <button role="menuitem" onclick={() => act(() => paste(m, undefined, true))}>Без форматирования<kbd>Shift Enter</kbd></button>
+    {/if}
+    <button role="menuitem" onclick={() => act(openPreview)}>Просмотр<kbd>Пробел</kbd></button>
+    {#if editable(m)}
+      <button role="menuitem" onclick={() => act(() => edit(m))}>Изменить<kbd>Ctrl E</kbd></button>
+    {/if}
+    {#if m.kind === 'text' && isUrl(m.text)}
+      <button role="menuitem" onclick={() => act(() => openUrl(m.text.trim()))}>Открыть в браузере</button>
+    {/if}
+    {#if m.kind === 'files' && m.files[0]?.local_path}
+      <button role="menuitem" onclick={() => act(() => showInFolder(m.files[0]))}>Показать в папке</button>
+    {/if}
+    <button role="menuitem" onclick={() => act(() => togglePin(m))}>{m.pinned ? 'Открепить' : 'Закрепить'}<kbd>Ctrl P</kbd></button>
+    <hr />
+    <button role="menuitem" class="danger" onclick={() => remove(m)}>Удалить<kbd>Del</kbd></button>
+  </div>
+{/if}
+
 <style>
+  .menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+  }
+  .menu {
+    position: fixed;
+    z-index: 11;
+    min-width: 200px;
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+    background: var(--c-surface);
+    border: 1px solid var(--c-border);
+    border-radius: var(--radius-m);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 0.28);
+  }
+  .menu button {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--space-4);
+    padding: 6px 10px;
+    border: 0;
+    border-radius: var(--radius-s);
+    background: none;
+    color: var(--c-text);
+    font: inherit;
+    text-align: left;
+    cursor: default;
+  }
+  .menu button:hover,
+  .menu button:focus-visible {
+    background: var(--c-hover);
+    outline: none;
+  }
+  .menu button.danger {
+    color: var(--c-danger);
+  }
+  .menu kbd {
+    color: var(--c-muted);
+  }
+  .menu hr {
+    border: 0;
+    border-top: 1px solid var(--c-border);
+    margin: 4px 2px;
+  }
   .frame {
     display: flex;
     height: 100vh;
@@ -836,6 +993,9 @@
   }
   .actions button:hover {
     background: var(--c-hover);
+  }
+  .actions button.danger {
+    color: var(--c-danger);
   }
   .actions button.primary {
     background: var(--c-accent);

@@ -326,7 +326,8 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         write_msg(&mut send, &ServerMsg::GroupConfig(config)).await?;
                     }
                     Some(ClientMsg::GetStats) => {
-                        let stats = shared.store.group_stats(&group, shared.not_before_ms())?;
+                        let mut stats = shared.store.group_stats(&group, shared.not_before_ms())?;
+                        stats.quota = shared.limits.blob_quota;
                         write_msg(&mut send, &ServerMsg::Stats(stats)).await?;
                     }
                     Some(ClientMsg::ListDevices) => {

@@ -55,6 +55,9 @@ export interface GroupStats {
   /** Файлы, загруженные целиком. */
   files: number
   file_bytes: number
+  /** Занято в счёт квоты группы (зашифрованный размер всех файлов). */
+  quota_used: number
+  quota: number
 }
 
 /** Счётчики раздела «О программе» (`stats_overview`). */
@@ -64,6 +67,11 @@ export interface StatsOverview {
   /** null — устройство не в группе или сервер не ответил (см. server_error). */
   server: GroupStats | null
   server_error: string | null
+  /** Путь до сервера, null — нет связи. */
+  link: { direct: boolean; rtt_ms: number } | null
+  /** Мс Unix, 0 — с запуска не было. */
+  last_sent_ms: number
+  last_received_ms: number
 }
 
 /** Итог смены ключа группы. */

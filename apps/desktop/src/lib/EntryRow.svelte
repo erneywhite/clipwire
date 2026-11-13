@@ -13,6 +13,8 @@
     onselect,
     onpaste,
     onpin,
+    onremove,
+    onmenu,
     transfers = {},
   }: {
     item: Entry
@@ -24,6 +26,10 @@
     onpaste?: () => void
     /** Закрепить или открепить кликом по булавке. */
     onpin?: () => void
+    /** Удалить из истории кликом по корзине. */
+    onremove?: () => void
+    /** Правый клик: меню действий в этой точке окна. */
+    onmenu?: (x: number, y: number) => void
   } = $props()
 
   const kind = $derived(
@@ -67,6 +73,12 @@
   class:sel={selected}
   onclick={onselect}
   ondblclick={onpaste}
+  oncontextmenu={(e) => {
+    if (!onmenu) return
+    e.preventDefault()
+    onselect?.()
+    onmenu(e.clientX, e.clientY)
+  }}
   onkeydown={() => {}}
 >
   <span class="glyph" aria-hidden="true">
@@ -131,6 +143,23 @@
   </span>
   <span class="side">
     {#if index < 9}<kbd class="num">{index + 1}</kbd>{/if}
+    <span class="acts">
+    {#if onremove}
+      <button
+        class="pin remove"
+        title="Удалить из истории (Delete)"
+        aria-label="Удалить из истории"
+        onclick={(e) => {
+          e.stopPropagation()
+          onremove?.()
+        }}
+        ondblclick={(e) => e.stopPropagation()}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true"
+          ><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12M10.5 11v5M13.5 11v5" /></svg
+        >
+      </button>
+    {/if}
     {#if onpin || item.pinned}
       <button
         class="pin"
@@ -152,6 +181,7 @@
         >
       </button>
     {/if}
+    </span>
   </span>
 </li>
 
@@ -278,8 +308,13 @@
   .side {
     display: flex;
     flex-direction: column;
-    align-items: center;
+    align-items: flex-end;
     gap: 4px;
+  }
+  /* Корзина и булавка в ряд: третьей строкой они раздули бы каждую запись. */
+  .acts {
+    display: flex;
+    gap: 2px;
   }
   .pin {
     width: 22px;
@@ -312,6 +347,9 @@
   .pin:hover {
     background: var(--c-hover);
     color: var(--c-text);
+  }
+  .remove:hover {
+    color: var(--c-danger);
   }
   /* Закреплённое видно всегда: булавка залита акцентом. */
   .pin.on {

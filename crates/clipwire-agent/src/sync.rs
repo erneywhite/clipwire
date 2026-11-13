@@ -177,6 +177,8 @@ pub struct Engine {
     stats_waiters: VecDeque<tokio::sync::oneshot::Sender<Result<GroupStats, String>>>,
     /// Сервер выбрал [`ALPN_4`]: знает `GetStats`.
     stats_supported: bool,
+    /// Когда последний раз элемент ушёл и пришёл (для «О программе»).
+    times: Arc<crate::devices::SyncTimes>,
     /// Ключ группы сменён (здесь или на другом устройстве) или устройство
     /// исключено: больше не подключаться, ждать, пока движок снимут.
     terminal: bool,
@@ -245,6 +247,7 @@ impl Engine {
             devices_waiters: VecDeque::new(),
             stats_waiters: VecDeque::new(),
             stats_supported: false,
+            times: Arc::default(),
             terminal: false,
             card_check: None,
             cards_off_until: None,
@@ -286,6 +289,11 @@ impl Engine {
 
     pub fn device(&self) -> DeviceId {
         self.device
+    }
+
+    /// Времена отправки и получения, для `Controller::with_times`.
+    pub fn times(&self) -> Arc<crate::devices::SyncTimes> {
+        self.times.clone()
     }
 
     /// Отправлять ли карточки сейчас.
@@ -716,6 +724,9 @@ impl Engine {
                         write_msg(&mut send, &ClientMsg::ListDevices).await?;
                         self.devices_waiters.push_back(Some(reply));
                     }
+                    Control::Link(reply) => {
+                        let _ = reply.send(Ok(link_info(&conn)));
+                    }
                     Control::Stats(reply) => {
                         if self.stats_supported {
                             write_msg(&mut send, &ClientMsg::GetStats).await?;
@@ -1055,7 +1066,10 @@ impl Engine {
             return;
         }
         match self.state.invite.group_key.open(sealed) {
-            Ok(item) => self.accept(item, FRESH_LIVE),
+            Ok(item) => {
+                self.times.mark_received();
+                self.accept(item, FRESH_LIVE)
+            }
             Err(e) => tracing::warn!("элемент не расшифровался, пропускаю: {e}"),
         }
     }
@@ -1219,6 +1233,7 @@ impl Engine {
         }
         self.reserve_failures = 0;
         self.pending_reserved = false;
+        self.times.mark_sent();
         // Загрузки — только для элемента, который действительно ушёл.
         if let Some(b) = &self.blobs {
             b.enqueue(jobs);
@@ -1363,6 +1378,16 @@ async fn next_control(c: &mut Option<mpsc::Receiver<Control>>) -> Control {
     std::future::pending().await
 }
 
+/// Выбранный путь соединения: напрямую или через relay, и его задержка.
+fn link_info(conn: &Connection) -> crate::devices::LinkInfo {
+    let paths = conn.paths();
+    let selected = paths.iter().find(|p| p.is_selected());
+    crate::devices::LinkInfo {
+        direct: selected.as_ref().is_some_and(|p| p.is_ip()),
+        rtt_ms: selected.map_or(0, |p| p.rtt().as_millis() as u64),
+    }
+}
+
 /// Ответить на команду отказом с этим текстом.
 fn refuse_control(ctl: Control, why: &str) {
     match ctl {
@@ -1376,6 +1401,9 @@ fn refuse_control(ctl: Control, why: &str) {
             let _ = reply.send(Err(why.to_string()));
         }
         Control::Stats(reply) => {
+            let _ = reply.send(Err(why.to_string()));
+        }
+        Control::Link(reply) => {
             let _ = reply.send(Err(why.to_string()));
         }
     }

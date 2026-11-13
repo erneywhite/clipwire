@@ -73,6 +73,18 @@ pub struct StatsDto {
     pub server: Option<clipwire_core::proto::GroupStats>,
     /// Почему цифр сервера нет: нет связи, старый сервер.
     pub server_error: Option<String>,
+    /// Путь до сервера, если есть связь.
+    pub link: Option<LinkDto>,
+    /// Последняя отправка и последнее получение с запуска, мс; 0 — не было.
+    pub last_sent_ms: i64,
+    pub last_received_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkDto {
+    /// Напрямую по UDP; иначе через relay.
+    pub direct: bool,
+    pub rtt_ms: u64,
 }
 
 #[tauri::command]
@@ -82,19 +94,28 @@ pub async fn stats_overview(app: AppHandle) -> StatsDto {
         let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
         (h.len(), h.pinned_len())
     };
-    let (server, server_error) = match controller(&app) {
-        Err(_) => (None, None),
-        Ok(ctl) => match ctl.server_stats().await {
-            Ok(s) => (Some(s), None),
-            Err(e) => (None, Some(e)),
-        },
-    };
-    StatsDto {
+    let mut dto = StatsDto {
         history_total,
         history_pinned,
-        server,
-        server_error,
+        server: None,
+        server_error: None,
+        link: None,
+        last_sent_ms: 0,
+        last_received_ms: 0,
+    };
+    if let Ok(ctl) = controller(&app) {
+        (dto.last_sent_ms, dto.last_received_ms) = ctl.last_sync();
+        let (stats, link) = tokio::join!(ctl.server_stats(), ctl.link());
+        match stats {
+            Ok(s) => dto.server = Some(s),
+            Err(e) => dto.server_error = Some(e),
+        }
+        dto.link = link.ok().map(|l| LinkDto {
+            direct: l.direct,
+            rtt_ms: l.rtt_ms,
+        });
     }
+    dto
 }
 
 /// Устройства группы: это устройство первым, дальше по имени.

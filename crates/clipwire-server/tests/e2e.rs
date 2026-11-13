@@ -1214,7 +1214,13 @@ async fn new_alpn_and_group_stats() -> Result<()> {
     a.join(&key).await?;
     write_msg(&mut a.send, &ClientMsg::GetStats).await?;
     match a.next().await? {
-        ServerMsg::Stats(s) => assert_eq!(s, GroupStats::default()),
+        ServerMsg::Stats(s) => assert_eq!(
+            s,
+            GroupStats {
+                quota: 64 * 1024 * 1024,
+                ..GroupStats::default()
+            }
+        ),
         other => anyhow::bail!("ждали Stats, пришло {other:?}"),
     }
     a.push_text(&key, "раз").await?;
@@ -1228,6 +1234,7 @@ async fn new_alpn_and_group_stats() -> Result<()> {
             assert!(s.item_bytes > 0);
             assert_eq!(s.files, 1);
             assert_eq!(s.file_bytes, data.len() as u64);
+            assert_eq!(s.quota_used, sealed_size(data.len() as u64));
         }
         other => anyhow::bail!("ждали Stats, пришло {other:?}"),
     }
