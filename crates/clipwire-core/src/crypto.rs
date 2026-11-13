@@ -135,13 +135,53 @@ impl GroupKey {
                 },
             )
             .map_err(|_| CryptoError::Open)?;
-        let item: Item = postcard::from_bytes(&plain)?;
+        let item = decode_item(&plain)?;
         // Открытые поля должны совпадать с зашифрованными. AAD это уже
         // гарантирует, проверка страхует от ошибки в коде отправителя.
         if item.id != sealed.id || item.origin != sealed.origin {
             return Err(CryptoError::Open);
         }
         Ok(item)
+    }
+}
+
+/// `Item` с содержимым прошлой версии (см. [`crate::item::legacy`]): так
+/// запечатаны элементы клиентов до части 4, они лежат в истории сервера.
+#[derive(Deserialize)]
+struct ItemV2 {
+    id: ItemId,
+    origin: DeviceId,
+    device_name: String,
+    created_at_ms: u64,
+    content: crate::item::legacy::ContentV2,
+}
+
+impl From<ItemV2> for Item {
+    fn from(i: ItemV2) -> Self {
+        Item {
+            id: i.id,
+            origin: i.origin,
+            device_name: i.device_name,
+            created_at_ms: i.created_at_ms,
+            content: i.content.into(),
+        }
+    }
+}
+
+/// Разобрать элемент: сначала в нынешнем виде, затем в прошлом. postcard не
+/// пропускает недостающие поля, а `content` у `Item` последнее: старый
+/// файловый элемент в новом виде либо не дочитывается, либо (при нескольких
+/// файлах) читается со сдвигом и оставляет хвост. Поэтому нынешний вид
+/// принимается, только если он съел все байты.
+fn decode_item(plain: &[u8]) -> Result<Item, CryptoError> {
+    let err = match postcard::take_from_bytes::<Item>(plain) {
+        Ok((item, [])) => return Ok(item),
+        Ok(_) => postcard::Error::DeserializeBadEncoding,
+        Err(e) => e,
+    };
+    match postcard::take_from_bytes::<ItemV2>(plain) {
+        Ok((item, [])) => Ok(item.into()),
+        _ => Err(err.into()),
     }
 }
 
@@ -230,6 +270,101 @@ mod tests {
         assert_ne!(gid, key.0);
         // Значения детерминированы: на всех устройствах группы они одинаковые.
         assert_eq!(GroupKey([1; 32]).group_id().0, gid);
+    }
+
+    /// Файловый элемент, запечатанный клиентом до части 4 (у `FileRef` нет
+    /// `blob_size` и `p2p`), открывается новым кодом.
+    #[test]
+    fn item_sealed_in_old_format_opens() {
+        #[derive(Serialize)]
+        struct FileV2 {
+            name: String,
+            path: String,
+            size: u64,
+            is_dir: bool,
+            width: u32,
+            height: u32,
+            modified_ms: u64,
+            blob: Option<crate::blob::BlobId>,
+        }
+        #[derive(Serialize)]
+        #[allow(dead_code)]
+        enum ContentV2 {
+            Text(String),
+            Image {
+                width: u32,
+                height: u32,
+                png: Vec<u8>,
+            },
+            Rich {
+                text: String,
+                html: Option<String>,
+                rtf: Option<Vec<u8>>,
+            },
+            Files(Vec<FileV2>),
+        }
+        #[derive(Serialize)]
+        struct ItemV2Out {
+            id: ItemId,
+            origin: DeviceId,
+            device_name: String,
+            created_at_ms: u64,
+            content: ContentV2,
+        }
+        let blob = crate::blob::BlobId::random().unwrap();
+        let file = |name: &str, size, blob| FileV2 {
+            name: name.into(),
+            path: format!("C:\\{name}"),
+            size,
+            is_dir: false,
+            width: 0,
+            height: 0,
+            modified_ms: 7,
+            blob,
+        };
+        let old = ItemV2Out {
+            id: ItemId::new(),
+            origin: DeviceId([3; 32]),
+            device_name: "старый ПК".into(),
+            created_at_ms: 1234,
+            content: ContentV2::Files(vec![file("a.txt", 5, Some(blob)), file("b", 9, None)]),
+        };
+        let key = GroupKey([2; 32]);
+        let plain = postcard::to_stdvec(&old).unwrap();
+        let nonce = [1u8; 24];
+        let ciphertext = key
+            .cipher()
+            .encrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: &plain,
+                    aad: &aad(&old.id, &old.origin),
+                },
+            )
+            .unwrap();
+        let sealed = SealedItem {
+            id: old.id,
+            origin: old.origin,
+            nonce,
+            ciphertext,
+        };
+        let item = key.open(&sealed).unwrap();
+        assert_eq!(item.id, old.id);
+        assert_eq!(item.device_name, "старый ПК");
+        assert_eq!(item.created_at_ms, 1234);
+        let Content::Files(f) = item.content else {
+            panic!("ждали файлы");
+        };
+        assert_eq!(f.len(), 2);
+        assert_eq!(
+            (f[0].name.as_str(), f[0].blob, f[0].blob_size),
+            ("a.txt", Some(blob), 5)
+        );
+        assert_eq!(
+            (f[1].name.as_str(), f[1].blob, f[1].blob_size),
+            ("b", None, 0)
+        );
+        assert!(f.iter().all(|f| !f.p2p));
     }
 
     #[test]

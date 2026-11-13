@@ -52,8 +52,8 @@ pub struct Service {
     engine: Option<tokio::task::JoinHandle<Result<()>>>,
     /// Передача файлов; только в группе.
     blobs: Option<Arc<Blobs>>,
-    /// Слежение за буфером. Его обработчик держит свою копию `copier`, поэтому
-    /// `shutdown` снимает его первым: иначе канал движка не закроется.
+    /// Слежение за буфером. Его обработчик держит свою копию `copier`; канал
+    /// движка у всех копий забирает `Copier::cancel` в `shutdown`.
     watcher: Option<Watcher>,
 }
 
@@ -61,7 +61,11 @@ pub struct Service {
 /// в группу, записать в историю и сообщить интерфейсу.
 #[derive(Clone)]
 struct Copier {
-    tx: Option<mpsc::Sender<Content>>,
+    /// Канал движка, общий для всех копий: [`Copier::cancel`] забирает его,
+    /// и канал закрывается, даже пока фоновая задача с папкой держит копию.
+    tx: Arc<Mutex<Option<mpsc::Sender<Content>>>>,
+    /// Сервис снимается: копирования больше не отправляются и не пишутся.
+    cancelled: Arc<AtomicBool>,
     history: Arc<Mutex<History>>,
     device: DeviceId,
     device_name: String,
@@ -80,43 +84,73 @@ impl Copier {
     // в момент копирования; скопированное за это время может оказаться ниже.
     // Если станет заметно — заводить запись сразу и обновлять её по id.
     fn dispatch(&self, content: Content, send: bool) {
-        let send = send && self.tx.is_some();
+        if self.is_cancelled() {
+            return;
+        }
+        let send = send && self.tx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
         let prepare = send && self.blobs.is_some();
         let limit = self.limit_mb.load(Ordering::Relaxed);
         if prepare && needs_scan(&content, limit) {
             let me = self.clone();
             self.rt.spawn_blocking(move || {
-                let content = me.prepare(content, limit);
-                me.finish(content, true);
+                if let Some(content) = me.prepare(content, limit) {
+                    me.finish(content, true);
+                }
             });
             return;
         }
         let content = if prepare {
-            self.prepare(content, limit)
+            match self.prepare(content, limit) {
+                Some(c) => c,
+                None => return,
+            }
         } else {
             content
         };
         self.finish(content, send);
     }
 
-    fn prepare(&self, content: Content, limit_mb: u64) -> Content {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Сервис снимается: отметить отмену и отпустить канал движка.
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        drop(self.tx.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
+
+    /// `None` — сервис сняли, пока обходилась папка.
+    fn prepare(&self, content: Content, limit_mb: u64) -> Option<Content> {
         let Some(b) = &self.blobs else {
-            return content;
+            return Some(content);
         };
-        let p = assign_blobs(content, limit_mb, b.outbox());
+        let p = assign_blobs_until(content, limit_mb, b.outbox(), &self.cancelled)?;
         for (blob, reason) in p.failed {
             tracing::warn!("папка не отправится: {reason}");
             b.report_failed(blob, 0, reason);
         }
-        p.content
+        Some(p.content)
     }
 
     fn finish(&self, content: Content, send: bool) {
-        if send
-            && let Some(tx) = &self.tx
-            && tx.try_send(content.clone()).is_err()
-        {
-            tracing::warn!("очередь отправки переполнена, копирование не ушло в группу");
+        if send {
+            let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+            // Отмена проверяется под тем же замком, которым её берёт `cancel`:
+            // после снятия сервиса ничего не уходит и не пишется в историю.
+            if self.is_cancelled() {
+                drop(tx);
+                discard_outbox(self.blobs.as_deref(), &content);
+                return;
+            }
+            if let Some(tx) = tx.as_ref()
+                && tx.try_send(content.clone()).is_err()
+            {
+                tracing::warn!("очередь отправки переполнена, копирование не ушло в группу");
+                discard_outbox(self.blobs.as_deref(), &content);
+            }
+        } else if self.is_cancelled() {
+            return;
         }
         record(
             &self.history,
@@ -204,7 +238,8 @@ impl Service {
             }));
         }
         let copier = Copier {
-            tx: local_tx,
+            tx: Arc::new(Mutex::new(local_tx)),
+            cancelled: Arc::new(AtomicBool::new(false)),
             history: history.clone(),
             device,
             device_name: device_name.clone(),
@@ -389,12 +424,15 @@ impl Service {
     /// чтобы следующий сервис (например, после входа в другую группу) не
     /// работал с той же очередью загрузок параллельно со старым.
     pub async fn shutdown(mut self) {
-        // Сначала слежение: вместе с ним уходит его копия отправителя, и
-        // после `local_tx` канал движка закрывается по-настоящему. Иначе
-        // движок не узнает о закрытии и до штатного выхода (finish, close)
-        // не дойдёт: его снимет только abort ниже.
+        // Сначала отмена: она забирает отправителя у всех копий `Copier`
+        // (у слежения и у фоновой задачи с папкой), и канал движка
+        // закрывается по-настоящему. Иначе движок не узнает о закрытии и до
+        // штатного выхода (finish, close) не дойдёт: его снимет только abort
+        // ниже. Поздно закончившая папка после отмены никуда не пишет.
+        if let Some(c) = self.copier.take() {
+            c.cancel();
+        }
         drop(self.watcher.take());
-        drop(self.copier.take());
         if let Some(mut e) = self.engine.take() {
             let wait = std::time::Duration::from_secs(3);
             if tokio::time::timeout(wait, &mut e).await.is_err() {
@@ -440,7 +478,8 @@ pub enum Route {
     Direct,
 }
 
-/// Решение по размеру: у файла — его размер, у папки — сумма файлов внутри.
+/// Решение по размеру того, что передаётся: у файла — его размер, у папки —
+/// размер её архива (на сервере резервируется именно он).
 pub fn route(size: u64, limit_mb: u64) -> Route {
     if limit_mb == 0 {
         Route::None
@@ -466,23 +505,44 @@ pub struct Prepared {
 
 /// Решить для каждого файла и папки, как он передаётся ([`route`]), и
 /// назначить новый случайный `blob`. Папка обходится с пределами, ей
-/// ставится размер содержимого и размер архива (`blob_size`); папка до порога
-/// сразу архивируется в `outbox`. Не прошла по пределам или архив не
-/// собрался — папка не передаётся и попадает в `failed`.
+/// ставится размер содержимого и размер архива (`blob_size`), маршрут
+/// выбирается по размеру архива; папка до порога сразу архивируется в
+/// `outbox`. Не прошла по пределам или архив не собрался — папка не
+/// передаётся и попадает в `failed`.
 ///
 /// Прежний `blob` (из истории или прошлого копирования тех же файлов)
 /// никогда не переиспользуется: файл мог измениться так, что размер и время
 /// изменения остались прежними, и тогда докачка склеила бы старые части на
 /// сервере с новыми. Блокирующая для папок: звать не из потока буфера ОС.
 pub fn assign_blobs(content: Content, limit_mb: u64, outbox: &Path) -> Prepared {
+    assign_blobs_until(content, limit_mb, outbox, &AtomicBool::new(false))
+        .expect("без отмены результат есть всегда")
+}
+
+/// [`assign_blobs`] с отменой: `cancel` проверяется перед каждой папкой и
+/// между обходом и сборкой архива. Отменили — `None`, собранные архивы
+/// удалены.
+fn assign_blobs_until(
+    content: Content,
+    limit_mb: u64,
+    outbox: &Path,
+    cancel: &AtomicBool,
+) -> Option<Prepared> {
     let Content::Files(mut files) = content else {
-        return Prepared {
+        return Some(Prepared {
             content,
             failed: Vec::new(),
-        };
+        });
     };
     let mut failed = Vec::new();
+    let mut built = Vec::new();
     for f in &mut files {
+        if cancel.load(Ordering::SeqCst) {
+            for b in built {
+                let _ = std::fs::remove_file(crate::blobs::outbox_path(outbox, b));
+            }
+            return None;
+        }
         f.blob = None;
         f.blob_size = 0;
         f.p2p = false;
@@ -498,31 +558,60 @@ pub fn assign_blobs(content: Content, limit_mb: u64, outbox: &Path) -> Prepared 
             f.blob_size = f.size;
             continue;
         }
-        if let Err(reason) = prepare_folder(f, blob, limit_mb, outbox) {
-            failed.push((blob, format!("«{}»: {reason}", f.name)));
+        match prepare_folder(f, blob, limit_mb, outbox, cancel) {
+            Ok(true) => built.push(blob),
+            Ok(false) => {}
+            Err(reason) => failed.push((blob, format!("«{}»: {reason}", f.name))),
         }
     }
-    Prepared {
+    if cancel.load(Ordering::SeqCst) {
+        for b in built {
+            let _ = std::fs::remove_file(crate::blobs::outbox_path(outbox, b));
+        }
+        return None;
+    }
+    Some(Prepared {
         content: Content::Files(files),
         failed,
-    }
+    })
 }
 
 /// Папка: обход, размер архива и для папки до порога — сам архив.
-fn prepare_folder(f: &mut FileRef, blob: BlobId, limit_mb: u64, outbox: &Path) -> Result<()> {
+/// `Ok(true)` — архив собран в outbox. Отмена между обходом и сборкой —
+/// `Ok(false)` без архива (вызывающий сам увидит отмену).
+fn prepare_folder(
+    f: &mut FileRef,
+    blob: BlobId,
+    limit_mb: u64,
+    outbox: &Path,
+    cancel: &AtomicBool,
+) -> Result<bool> {
     let scan = crate::folder::scan_dir(Path::new(&f.path)).map_err(|e| anyhow::anyhow!("{e}"))?;
     f.size = scan.bytes;
     let tar = crate::folder::tar_size(&scan.entries)?;
-    let r = route(scan.bytes, limit_mb);
-    if r == Route::Server {
+    // По размеру архива: его сервер резервирует и с ним сравнивает предел.
+    let r = route(tar, limit_mb);
+    let mut built = false;
+    if r == Route::Server && !cancel.load(Ordering::SeqCst) {
         let len =
             crate::folder::build_archive(&scan.entries, &crate::blobs::outbox_path(outbox, blob))?;
-        anyhow::ensure!(len == tar, "архив папки собрался не того размера");
+        built = true;
+        if len != tar {
+            let _ = std::fs::remove_file(crate::blobs::outbox_path(outbox, blob));
+            anyhow::bail!("архив папки собрался не того размера");
+        }
     }
     f.blob = Some(blob);
     f.blob_size = tar;
     f.p2p = r == Route::Direct;
-    Ok(())
+    Ok(built)
+}
+
+/// Элемент не уйдёт в группу: архивы его папок в outbox больше не нужны.
+fn discard_outbox(blobs: Option<&Blobs>, content: &Content) {
+    if let (Some(b), Content::Files(files)) = (blobs, content) {
+        b.discard_outbox(files);
+    }
 }
 
 fn record(history: &Mutex<History>, entry: Entry) {
@@ -668,11 +757,66 @@ mod tests {
         assert!(!crate::blobs::outbox_path(&outbox, f[1].blob.unwrap()).exists());
         assert!(f[2].blob.is_none() && f[2].blob_size == 0);
 
+        // Содержимое ровно на пороге, а архив с заголовками больше: маршрут по
+        // архиву, иначе сервер отверг бы резерв и папка не ушла бы никуда.
+        let edge = d.join("на пороге");
+        std::fs::create_dir_all(&edge).unwrap();
+        std::fs::write(edge.join("d.bin"), vec![3u8; 1024 * 1024]).unwrap();
+        let e = files(assign_blobs(Content::Files(vec![p(&edge)]), 1, &outbox));
+        assert_eq!(e[0].size, 1024 * 1024);
+        assert!(e[0].blob_size > 1024 * 1024);
+        assert!(e[0].p2p, "архив больше порога — напрямую");
+        assert!(!crate::blobs::outbox_path(&outbox, e[0].blob.unwrap()).exists());
+
+        // Отмена: ничего не возвращается, собранные архивы удалены.
+        let stop = AtomicBool::new(true);
+        let before = std::fs::read_dir(&outbox).unwrap().count();
+        assert!(assign_blobs_until(Content::Files(vec![p(&small)]), 1, &outbox, &stop).is_none());
+        assert_eq!(std::fs::read_dir(&outbox).unwrap().count(), before);
+
         // Порог 0 — папки даже не обходятся.
         let z = files(assign_blobs(Content::Files(vec![p(&small)]), 0, &outbox));
         assert!(z[0].blob.is_none());
         assert!(!needs_scan(&Content::Files(vec![p(&small)]), 0));
         assert!(needs_scan(&Content::Files(vec![p(&small)]), 1));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// После `cancel` канал движка закрыт, хотя копии `Copier` ещё живы, а
+    /// поздний `finish` (папка дообходилась) не отправляет и не пишет историю.
+    #[tokio::test]
+    async fn cancelled_copier_closes_channel_and_drops_late_copies() {
+        let d = tmp("cancel");
+        let (tx, mut rx) = mpsc::channel(4);
+        let history = Arc::new(Mutex::new(History::open(&d).unwrap()));
+        let events = Arc::new(AtomicU64::new(0));
+        let seen = events.clone();
+        let c = Copier {
+            tx: Arc::new(Mutex::new(Some(tx))),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            history: history.clone(),
+            device: DeviceId([1; 32]),
+            device_name: "тест".into(),
+            on_event: Arc::new(move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }),
+            blobs: None,
+            limit_mb: Arc::new(AtomicU64::new(1)),
+            rt: tokio::runtime::Handle::current(),
+        };
+        c.finish(Content::Text("до".into()), true);
+        assert_eq!(rx.recv().await, Some(Content::Text("до".into())));
+        // Копия как у фоновой задачи с папкой.
+        let late = c.clone();
+        c.cancel();
+        assert_eq!(rx.recv().await, None, "канал закрыт, хотя копия жива");
+        late.finish(Content::Text("после".into()), true);
+        late.dispatch(Content::Text("ещё".into()), false);
+        let h = history.lock().unwrap();
+        assert_eq!(h.len(), 1);
+        assert!(h.find(&Content::Text("после".into())).is_none());
+        assert_eq!(events.load(Ordering::SeqCst), 1);
+        drop(h);
         let _ = std::fs::remove_dir_all(d);
     }
 

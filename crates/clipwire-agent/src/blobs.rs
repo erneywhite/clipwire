@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use clipwire_core::blob::{BlobKey, CHUNK, chunk_count, chunk_len};
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{BlobChunk, BlobFail, BlobReply, BlobRequest};
@@ -70,18 +70,29 @@ pub fn outbox_path(outbox: &Path, blob: BlobId) -> PathBuf {
     outbox.join(format!("{}.tar", blob.hex()))
 }
 
-/// Архивы в outbox старше этого удаляются при старте сервиса.
+/// Архивы в outbox старше этого удаляются при старте сервиса и потом
+/// раз в [`OUTBOX_CLEAN_EVERY`], пока работает движок.
 pub const OUTBOX_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+/// Как часто движок чистит outbox от старых архивов.
+pub const OUTBOX_CLEAN_EVERY: Duration = Duration::from_secs(3600);
 
 /// Удалить из outbox архивы (и недособранные `.tmp`) старше `max_age`.
 /// Возвращает, сколько удалено.
 pub fn clean_outbox(outbox: &Path, max_age: Duration) -> usize {
+    clean_outbox_except(outbox, max_age, &HashSet::new())
+}
+
+/// [`clean_outbox`], не трогая `keep` (архивы заданий в очереди загрузок).
+fn clean_outbox_except(outbox: &Path, max_age: Duration, keep: &HashSet<PathBuf>) -> usize {
     let Ok(dir) = std::fs::read_dir(outbox) else {
         return 0;
     };
     let now = std::time::SystemTime::now();
     let mut n = 0;
     for e in dir.flatten() {
+        if keep.contains(&e.path()) {
+            continue;
+        }
         let old = e
             .metadata()
             .ok()
@@ -881,8 +892,53 @@ pub async fn download_stream<W, R>(
     blob: BlobId,
     size: u64,
     dest: &Path,
-    mut progress: impl FnMut(u64) + Send,
+    progress: impl FnMut(u64) + Send,
 ) -> Result<PathBuf>
+where
+    W: AsyncWrite + Unpin + Send,
+    R: AsyncRead + Unpin + Send,
+{
+    get_stream(send, recv, key, blob, size, dest, progress, None)
+        .await
+        .map_err(GetError::into_inner)
+}
+
+/// Ошибка скачивания по потоку: до первого ответа источника или после.
+enum GetError {
+    /// Запрос не ушёл или ответа (`GetReady`) не было: поток или соединение
+    /// мертвы. По другому соединению стоит попробовать ещё раз.
+    NoReply(anyhow::Error),
+    /// Источник ответил (в том числе отказом) или сломалось что-то своё.
+    Failed(anyhow::Error),
+}
+
+impl GetError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::NoReply(e) | Self::Failed(e) => e,
+        }
+    }
+}
+
+impl From<anyhow::Error> for GetError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Failed(e)
+    }
+}
+
+/// [`download_stream`], различающая «ответа не было» ([`GetError::NoReply`]).
+/// `ready` — сколько ждать `GetReady` (`None` — сколько угодно).
+#[allow(clippy::too_many_arguments)]
+async fn get_stream<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    key: &GroupKey,
+    blob: BlobId,
+    size: u64,
+    dest: &Path,
+    mut progress: impl FnMut(u64) + Send,
+    ready: Option<Duration>,
+) -> Result<PathBuf, GetError>
 where
     W: AsyncWrite + Unpin + Send,
     R: AsyncRead + Unpin + Send,
@@ -894,7 +950,7 @@ where
         .await
         .with_context(|| format!("не открылся {}", dest.display()))?;
     if w.is_complete() {
-        return w.finish().await;
+        return Ok(w.finish().await?);
     }
     write_msg(
         send,
@@ -903,33 +959,48 @@ where
             from: w.next(),
         },
     )
-    .await?;
-    match read_msg::<_, BlobReply>(recv).await? {
+    .await
+    .map_err(|e| GetError::NoReply(e.into()))?;
+    let first = async {
+        match ready {
+            Some(t) => tokio::time::timeout(t, read_msg::<_, BlobReply>(recv))
+                .await
+                .map_err(|_| GetError::NoReply(anyhow!("источник не ответил за {t:?}")))?,
+            None => read_msg::<_, BlobReply>(recv).await,
+        }
+        .map_err(|e| GetError::NoReply(e.into()))
+    };
+    match first.await? {
+        None => return Err(GetError::NoReply(anyhow!("сервер закрыл поток"))),
         Some(BlobReply::GetReady { size: s, .. }) if s == size => {}
         Some(BlobReply::GetReady { size: s, .. }) => {
-            bail!("на сервере файл другого размера: {s} байт вместо {size}")
+            return Err(anyhow!("на сервере файл другого размера: {s} байт вместо {size}").into());
         }
         // Отказ сервера уходит как есть (`BlobFail` внутри anyhow): по нему
         // вызывающий может отличить «файла нет» от прочих ошибок.
-        Some(BlobReply::Error(f)) => return Err(f.into()),
-        Some(other) => bail!("неожиданный ответ сервера: {other:?}"),
-        None => bail!("сервер закрыл поток"),
+        Some(BlobReply::Error(f)) => return Err(anyhow::Error::from(f).into()),
+        Some(other) => return Err(anyhow!("неожиданный ответ сервера: {other:?}").into()),
     }
     let bkey = key.blob_key(blob);
     progress(w.done_bytes());
     while !w.is_complete() {
-        match read_msg::<_, BlobReply>(recv).await? {
+        match read_msg::<_, BlobReply>(recv)
+            .await
+            .map_err(anyhow::Error::from)?
+        {
             Some(BlobReply::Chunk(c)) => {
                 w.write_chunk(&bkey, c.index, &c.data).await?;
                 progress(w.done_bytes());
             }
-            Some(BlobReply::Error(f)) => return Err(f.into()),
-            Some(other) => bail!("неожиданное сообщение при скачивании: {other:?}"),
-            None => bail!("сервер оборвал передачу файла"),
+            Some(BlobReply::Error(f)) => return Err(anyhow::Error::from(f).into()),
+            Some(other) => {
+                return Err(anyhow!("неожиданное сообщение при скачивании: {other:?}").into());
+            }
+            None => return Err(anyhow!("сервер оборвал передачу файла").into()),
         }
     }
     let _ = send.shutdown().await;
-    w.finish().await
+    Ok(w.finish().await?)
 }
 
 /// Скачать один файл с сервера по соединению движка (новый поток) в `dest`.
@@ -971,8 +1042,9 @@ pub struct Blobs {
     sources: Mutex<Option<P2pSources>>,
     /// Эндпоинт движка и relay сервера: через них идут прямые подключения.
     endpoint: watch::Sender<Option<(Endpoint, RelayUrl)>>,
-    /// Прямые соединения с устройствами-источниками, уже прошедшие проверку.
-    p2p_conns: tokio::sync::Mutex<HashMap<DeviceId, Connection>>,
+    /// Прямые соединения с устройствами-источниками, уже прошедшие проверку,
+    /// и их потоки (простоявшее [`crate::p2p::REQUESTER_IDLE`] закрывается).
+    p2p_conns: tokio::sync::Mutex<HashMap<DeviceId, (Connection, Arc<crate::p2p::Usage>)>>,
     /// Замки сборки архивов папок для прямой передачи.
     building: Mutex<HashMap<BlobId, Weak<tokio::sync::Mutex<()>>>>,
 }
@@ -1092,6 +1164,31 @@ impl Blobs {
         })
     }
 
+    /// Элемент с этими файлами в группу не уйдёт (вытеснен, не влез в
+    /// очередь, сервис снят): удалить архивы его папок из outbox.
+    pub fn discard_outbox(&self, files: &[FileRef]) {
+        for f in files.iter().filter(|f| f.is_dir) {
+            if let Some(blob) = f.blob {
+                let _ = std::fs::remove_file(outbox_path(&self.outbox, blob));
+            }
+        }
+    }
+
+    /// Удалить из outbox архивы старше [`OUTBOX_MAX_AGE`], кроме архивов
+    /// заданий, которые ещё ждут загрузки.
+    pub fn clean_outbox(&self) -> usize {
+        let keep: HashSet<PathBuf> = self
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .jobs()
+            .iter()
+            .filter(|j| j.outbox)
+            .map(|j| PathBuf::from(&j.path))
+            .collect();
+        clean_outbox_except(&self.outbox, OUTBOX_MAX_AGE, &keep)
+    }
+
     /// Файл для прямой отдачи: есть в своей истории с `p2p`, на месте и не
     /// изменился. Для папки — её архив в outbox (собирается при первом запросе).
     pub(crate) async fn p2p_open(&self, blob: BlobId) -> Result<crate::p2p::Source, BlobFail> {
@@ -1134,14 +1231,17 @@ impl Blobs {
     async fn ensure_archive(&self, f: &FileRef) -> Result<PathBuf, BlobFail> {
         let blob = f.blob.ok_or(BlobFail::NotFound)?;
         let dest = outbox_path(&self.outbox, blob);
-        let lock = blob_lock(&self.building, blob);
-        let _g = lock.lock().await;
+        // Замок уходит в задачу сборки: если запрос бросят (получатель
+        // переподключился), сборка всё равно доработает под замком, и
+        // следующий запрос не начнёт вторую поверх того же `.tmp`.
+        let g = blob_lock(&self.building, blob).lock_owned().await;
         if file_stamp(&dest).is_ok_and(|(len, _)| len == f.blob_size) {
             return Ok(dest);
         }
         let (src, want_bytes, want_tar, out) =
             (PathBuf::from(&f.path), f.size, f.blob_size, dest.clone());
         let built = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let _g = g;
             let scan = crate::folder::scan_dir(&src).map_err(|e| anyhow!("{e}"))?;
             ensure!(
                 scan.bytes == want_bytes && crate::folder::tar_size(&scan.entries)? == want_tar,
@@ -1164,11 +1264,12 @@ impl Blobs {
         }
     }
 
-    /// Прямое соединение с устройством `origin` (уже проверенное, если есть).
+    /// Прямое соединение с устройством `origin` (уже проверенное, если есть),
+    /// страж открытого на нём потока и было ли оно в кэше.
     // shortcut: подключения идут по очереди через один замок, даже к разным
     // устройствам. Замок на каждое устройство — если вставка из нескольких
     // источников сразу окажется медленной.
-    async fn p2p_conn(&self, origin: DeviceId) -> Result<Connection> {
+    async fn p2p_conn(&self, origin: DeviceId) -> Result<(Connection, crate::p2p::InUse, bool)> {
         let mut rx = self.endpoint.subscribe();
         let (ep, relay) = tokio::time::timeout(WAIT_CONN, async {
             loop {
@@ -1186,18 +1287,67 @@ impl Blobs {
             return Err(crate::p2p::P2pError::OwnDevice.into());
         }
         let mut conns = self.p2p_conns.lock().await;
-        if let Some(c) = conns.get(&origin)
+        if let Some((c, usage)) = conns.get(&origin)
             && c.close_reason().is_none()
         {
-            return Ok(c.clone());
+            return Ok((c.clone(), usage.begin(), true));
         }
         let addr = EndpointAddr::new(PublicKey::from_bytes(&origin.0)?).with_relay_url(relay);
         let conn = crate::p2p::connect(&ep, addr, &self.key).await?;
-        conns.insert(origin, conn.clone());
-        Ok(conn)
+        let usage = crate::p2p::Usage::new();
+        let in_use = usage.begin();
+        crate::p2p::close_when_idle(conn.clone(), usage.clone(), crate::p2p::REQUESTER_IDLE);
+        conns.insert(origin, (conn.clone(), usage));
+        Ok((conn, in_use, false))
+    }
+
+    /// Убрать `conn` из кэша прямых соединений (если там ещё оно) и закрыть.
+    async fn forget_p2p(&self, origin: DeviceId, conn: &Connection) {
+        let mut conns = self.p2p_conns.lock().await;
+        if conns
+            .get(&origin)
+            .is_some_and(|(c, _)| c.stable_id() == conn.stable_id())
+        {
+            conns.remove(&origin);
+        }
+        conn.close(0u32.into(), b"stale");
+    }
+
+    /// Один запрос `Get` по прямому соединению. `ready` — см. [`get_stream`].
+    async fn get_p2p(
+        &self,
+        conn: &Connection,
+        blob: BlobId,
+        size: u64,
+        dest: &Path,
+        ready: Option<Duration>,
+    ) -> Result<PathBuf, GetError> {
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| GetError::NoReply(e.into()))?;
+        get_stream(
+            &mut send,
+            &mut recv,
+            &self.key,
+            blob,
+            size,
+            dest,
+            |done| self.transfers.progress(blob, Direction::Down, done, size),
+            ready,
+        )
+        .await
     }
 
     /// Скачать напрямую с устройства-источника в `dest`.
+    ///
+    /// Соединение из кэша может быть мёртвым, хотя выглядит живым: источник
+    /// перезапустился, а QUIC этого ещё не заметил (`open_bi` проходит, ответа
+    /// нет до idle timeout). Поэтому по нему `GetReady` ждём
+    /// [`crate::p2p::READY_TIMEOUT`], а не дождались или соединение сломалось
+    /// до первого ответа — убираем его из кэша и один раз повторяем по
+    /// новому. `PartWriter` продолжит с той же части. По новому соединению
+    /// `GetReady` ждём сколько угодно: источник может собирать архив папки.
     async fn download_p2p(
         &self,
         origin: DeviceId,
@@ -1208,28 +1358,28 @@ impl Blobs {
         if tokio::fs::try_exists(dest).await.unwrap_or(false) {
             return Ok(dest.to_path_buf());
         }
-        let conn = self.p2p_conn(origin).await?;
-        let (mut send, mut recv) = match conn.open_bi().await {
-            Ok(s) => s,
-            Err(_) => {
-                // Соединение из кэша успело умереть: одно новое подключение.
-                self.p2p_conns.lock().await.remove(&origin);
-                self.p2p_conn(origin).await?.open_bi().await?
+        let (conn, in_use, reused) = self.p2p_conn(origin).await?;
+        let ready = reused.then_some(crate::p2p::READY_TIMEOUT);
+        let res = match self.get_p2p(&conn, blob, size, dest, ready).await {
+            Err(GetError::NoReply(e)) if reused => {
+                tracing::info!("прямое соединение из кэша не ответило, подключаюсь заново: {e:#}");
+                drop(in_use);
+                self.forget_p2p(origin, &conn).await;
+                let (conn, _in_use, _) = self.p2p_conn(origin).await?;
+                self.get_p2p(&conn, blob, size, dest, None).await
             }
+            r => r,
         };
-        download_stream(&mut send, &mut recv, &self.key, blob, size, dest, |done| {
-            self.transfers.progress(blob, Direction::Down, done, size)
-        })
-        .await
-        .map_err(|e| match e.downcast_ref::<BlobFail>() {
-            Some(BlobFail::NotFound) => {
-                anyhow!("на устройстве-источнике этого файла уже нет в истории")
-            }
-            Some(BlobFail::Cancelled) => {
-                anyhow!("файл на устройстве-источнике изменился или пропал после копирования")
-            }
-            _ => e,
-        })
+        res.map_err(GetError::into_inner)
+            .map_err(|e| match e.downcast_ref::<BlobFail>() {
+                Some(BlobFail::NotFound) => {
+                    anyhow!("на устройстве-источнике этого файла уже нет в истории")
+                }
+                Some(BlobFail::Cancelled) => {
+                    anyhow!("файл на устройстве-источнике изменился или пропал после копирования")
+                }
+                _ => e,
+            })
     }
 
     /// Отменить резерв этих файлов на сервере при ближайшем соединении
@@ -1452,6 +1602,10 @@ impl Blobs {
                     let e = res.err().map_or_else(String::new, |e| e.to_string());
                     tracing::warn!(path = %job.path, "файл не отправится: {e}");
                     files[i].blob = None;
+                    // Архив папки на сервер уже не попадёт.
+                    if job.outbox {
+                        let _ = std::fs::remove_file(&job.path);
+                    }
                     self.transfers
                         .finish(job.blob, Direction::Up, job.size, Err(e));
                 }
@@ -1499,6 +1653,14 @@ impl Blobs {
         let mut failed_on: HashMap<BlobId, (u64, Instant)> = HashMap::new();
         let mut tasks = tokio::task::JoinSet::new();
         let mut aborts = tokio::task::JoinSet::new();
+        // Старые архивы (прямой передачи и брошенные) чистятся и на ходу, а
+        // не только при старте: агент может работать неделями. Первый раз —
+        // через час, при старте outbox уже почищен в `Blobs::new`.
+        let mut cleanup = tokio::time::interval_at(
+            tokio::time::Instant::now() + OUTBOX_CLEAN_EVERY,
+            OUTBOX_CLEAN_EVERY,
+        );
+        cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let (n, conn) = rx.borrow_and_update().clone();
             if let Some(conn) = conn {
@@ -1533,6 +1695,12 @@ impl Blobs {
                 r = rx.changed() => if r.is_err() { return },
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(RETRY_AFTER), if !failed_on.is_empty() => {}
+                _ = cleanup.tick() => {
+                    let cleaned = self.clean_outbox();
+                    if cleaned > 0 {
+                        tracing::info!(cleaned, "из outbox удалены архивы старше суток");
+                    }
+                }
                 Some(res) = aborts.join_next(), if !aborts.is_empty() => {
                     if let Ok((blob, n, Err(e))) = res {
                         tracing::info!(blob = %blob.hex(), "отмена резерва не дошла: {e}");

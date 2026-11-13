@@ -7,6 +7,7 @@
 //! `blob_size` известен сразу, а сам архив собирается позже, при первом
 //! запросе получателя, и сверяется с этим размером.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -283,27 +284,89 @@ pub fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Путь записи архива, безопасный для распаковки: только обычные
-/// компоненты (абсолютные пути, диски и `..` отвергаются), каждый очищен
-/// так же, как имя файла.
-fn safe_rel(path: &Path) -> Result<PathBuf> {
-    let mut out = PathBuf::new();
-    let mut depth = 0;
+/// Компоненты пути записи архива, безопасные для распаковки: только
+/// обычные (абсолютные пути, диски и `..` отвергаются), как есть, без очистки.
+fn safe_parts(path: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
     for c in path.components() {
         match c {
-            Component::Normal(s) => {
-                out.push(sanitize_name(&s.to_string_lossy()));
-                depth += 1;
-            }
+            Component::Normal(s) => out.push(s.to_string_lossy().into_owned()),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 bail!("в архиве запись с недопустимым путём: {}", path.display())
             }
         }
     }
-    ensure!(depth > 0, "в архиве запись с пустым путём");
-    ensure!(depth <= MAX_DEPTH, "в архиве слишком глубокая запись");
+    ensure!(!out.is_empty(), "в архиве запись с пустым путём");
+    ensure!(out.len() <= MAX_DEPTH, "в архиве слишком глубокая запись");
     Ok(out)
+}
+
+/// `name` с номером: `README.md` → `README (2).md`; у папки и у имени без
+/// расширения номер в конце.
+fn numbered(name: &str, n: usize, is_dir: bool) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !is_dir && !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{name} ({n})"),
+    }
+}
+
+/// Имена при распаковке. Каждый компонент очищается как имя файла, и разные
+/// записи архива могут совпасть: после очистки (`a:b` и `ab`) или по регистру
+/// (`README` и `readme` на Windows и macOS). Такая запись получает имя с
+/// номером, « (2)», « (3)»…, и не перезаписывает соседнюю.
+#[derive(Default)]
+struct Namer {
+    /// Папка архива (компоненты как есть) → куда она распакована.
+    dirs: HashMap<Vec<String>, PathBuf>,
+    /// Занятые пути от корня распаковки, в нижнем регистре.
+    taken: HashSet<String>,
+}
+
+impl Namer {
+    fn key(p: &Path) -> String {
+        p.to_string_lossy().replace('\\', "/").to_lowercase()
+    }
+
+    /// Занять свободное имя для `name` внутри `parent`.
+    fn claim(&mut self, parent: &Path, name: &str, is_dir: bool) -> PathBuf {
+        let clean = sanitize_name(name);
+        let mut n = 1;
+        loop {
+            let cand = if n == 1 {
+                parent.join(&clean)
+            } else {
+                parent.join(numbered(&clean, n, is_dir))
+            };
+            if self.taken.insert(Self::key(&cand)) {
+                return cand;
+            }
+            n += 1;
+        }
+    }
+
+    /// Путь папки по компонентам архива: та же папка — тот же путь.
+    fn dir(&mut self, parts: &[String]) -> PathBuf {
+        let Some((last, parent)) = parts.split_last() else {
+            return PathBuf::new();
+        };
+        if let Some(p) = self.dirs.get(parts) {
+            return p.clone();
+        }
+        let parent = self.dir(parent);
+        let p = self.claim(&parent, last, true);
+        self.dirs.insert(parts.to_vec(), p.clone());
+        p
+    }
+
+    /// Путь файла: всегда свободное имя, даже если такая запись уже была.
+    fn file(&mut self, parts: &[String]) -> PathBuf {
+        let Some((last, parent)) = parts.split_last() else {
+            return PathBuf::from("file");
+        };
+        let parent = self.dir(parent);
+        self.claim(&parent, last, false)
+    }
 }
 
 /// Распаковать архив в папку `dest`. Сначала во временную `<dest>.unpack`,
@@ -333,17 +396,18 @@ fn unpack_into(archive: &Path, dir: &Path) -> Result<()> {
     ar.set_preserve_permissions(false);
     ar.set_unpack_xattrs(false);
     ar.set_overwrite(true);
+    let mut names = Namer::default();
     let mut n = 0usize;
     for entry in ar.entries()? {
         let mut entry = entry?;
         n += 1;
         ensure!(n <= MAX_ENTRIES, "в архиве больше {MAX_ENTRIES} записей");
         let ty = entry.header().entry_type();
-        let rel = safe_rel(&entry.path()?)?;
-        let target = dir.join(rel);
+        let parts = safe_parts(&entry.path()?)?;
         match ty {
-            EntryType::Directory => std::fs::create_dir_all(&target)?,
+            EntryType::Directory => std::fs::create_dir_all(dir.join(names.dir(&parts)))?,
             EntryType::Regular | EntryType::Continuous => {
+                let target = dir.join(names.file(&parts));
                 if let Some(p) = target.parent() {
                     std::fs::create_dir_all(p)?;
                 }
@@ -562,6 +626,47 @@ mod tests {
         let out = d.join("out");
         unpack_archive(&ar, &out).unwrap();
         assert!(out.join("sub").join("_CON.txt").is_file());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Записи, совпавшие после очистки имени или по регистру, не
+    /// перезаписывают друг друга: следующая получает номер.
+    #[test]
+    fn unpack_keeps_colliding_names_apart() {
+        let d = tmp("collide");
+        let mut b = Builder::new(Vec::new());
+        let mut add = |path: &str, ty: EntryType, data: &[u8]| {
+            let mut h = Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_entry_type(ty);
+            b.append_data(&mut h, path, data).unwrap();
+        };
+        let f = EntryType::Regular;
+        add("README.md", f, b"1");
+        add("readme.md", f, b"2");
+        add("ab", f, b"3");
+        // `a:b` на Windows — путь с диском, поэтому другой запрещённый знак.
+        add("a*b", f, b"4");
+        add("README.md", f, b"5");
+        add("Sub/x.txt", f, b"6");
+        add("sub/x.txt", f, b"7");
+        add("Sub", EntryType::Directory, b"");
+        add("Sub/y.txt", f, b"8");
+        let ar = d.join("x.tar");
+        std::fs::write(&ar, b.into_inner().unwrap()).unwrap();
+        let out = d.join("out");
+        unpack_archive(&ar, &out).unwrap();
+        let read = |p: &str| std::fs::read_to_string(out.join(p)).unwrap();
+        assert_eq!(read("README.md"), "1");
+        assert_eq!(read("readme (2).md"), "2");
+        assert_eq!(read("ab"), "3");
+        assert_eq!(read("ab (2)"), "4");
+        assert_eq!(read("README (3).md"), "5");
+        // Папка `Sub` одна для всех своих записей, `sub` — другая.
+        assert_eq!(read("Sub/x.txt"), "6");
+        assert_eq!(read("Sub/y.txt"), "8");
+        assert_eq!(read("sub (2)/x.txt"), "7");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 7);
         let _ = std::fs::remove_dir_all(d);
     }
 }

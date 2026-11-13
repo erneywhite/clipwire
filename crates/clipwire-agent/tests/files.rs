@@ -15,11 +15,12 @@ use clipwire_agent::blobs::{
     Blobs, Direction, Transfer, TransferState, UploadError, UploadJob, abort_blob, cache_path,
     cached_file, download_blob, file_stamp, outbox_path, reserve_blob, upload_blob, upload_stream,
 };
-use clipwire_agent::p2p::P2pError;
+use clipwire_agent::p2p::{MAX_CONNS, P2pError};
 use clipwire_agent::service::assign_blobs;
 use clipwire_agent::state::{AgentState, random_key};
 use clipwire_agent::sync::{Engine, Event, Status};
 use clipwire_core::blob::{CHUNK, OVERHEAD, chunk_count, chunk_len};
+use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{
     ALPN, BlobChunk, BlobFail, BlobReply, BlobRequest, ClientMsg, ServerMsg, encode_frame,
@@ -476,12 +477,22 @@ impl Agent {
 
     /// Движок с каталогом состояния `dir` (там может уже лежать очередь загрузок).
     fn spawn_in(info: &ServerInfo, key: &GroupKey, dir: &Path) -> Result<Self> {
+        Self::spawn_as(info, key, dir, random_key()?)
+    }
+
+    /// Движок с заданным ключом устройства: тот же id, что у прежнего.
+    fn spawn_as(
+        info: &ServerInfo,
+        key: &GroupKey,
+        dir: &Path,
+        device_key: [u8; 32],
+    ) -> Result<Self> {
         let state = AgentState {
             invite: Invite {
                 server: info.clone(),
                 group_key: key.clone(),
             },
-            device_key: random_key()?,
+            device_key,
         };
         let (b, transfers) = blobs(key, dir);
         let (etx, events) = mpsc::unbounded_channel();
@@ -1165,5 +1176,140 @@ async fn folders_go_through_server_and_directly() -> Result<()> {
     a.task.await??;
     drop(b.local);
     b.task.await??;
+    server.shutdown().await
+}
+
+/// Источник упал, не закрыв соединений, и поднялся с тем же ключом
+/// устройства. Соединение в кэше получателя выглядит живым, но ответа по нему
+/// нет: получатель переподключается и скачивает, а не падает.
+#[tokio::test(flavor = "multi_thread")]
+async fn restarted_source_is_reconnected() -> Result<()> {
+    let (server, info) = start_server(1024 * 1024).await?;
+    let key = GroupKey::generate()?;
+    let device_key = random_key()?;
+    let mut a = Agent::spawn_as(&info, &key, &tmp("agent"), device_key)?;
+    let mut b = Agent::spawn(&info, &key)?;
+    a.online().await?;
+    b.online().await?;
+    let src = tmp("src");
+    let (d1, mut f1) = make_file(&src, "первый.bin", 5000);
+    let (d2, mut f2) = make_file(&src, "второй.bin", CHUNK as u64 * 3 / 2);
+    f1.p2p = true;
+    f2.p2p = true;
+    let origin = a.device;
+    serve_files(&a, &[f1.clone(), f2.clone()]);
+    // Первое скачивание оставляет проверенное соединение в кэше.
+    let p1 = tokio::time::timeout(T, b.blobs.download(&f1, origin)).await??;
+    assert_eq!(std::fs::read(&p1)?, d1);
+
+    // Задачу движка снимаем без штатного выхода: эндпоинт пропадает молча.
+    a.task.abort();
+    let _ = a.task.await;
+    drop(a.local);
+    let mut a2 = Agent::spawn_as(&info, &key, &tmp("agent"), device_key)?;
+    assert_eq!(a2.device, origin);
+    a2.online().await?;
+    serve_files(&a2, &[f1, f2.clone()]);
+
+    let started = std::time::Instant::now();
+    let p2 = tokio::time::timeout(T, b.blobs.download(&f2, origin)).await??;
+    assert_eq!(std::fs::read(&p2)?, d2);
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
+        "ждали {:?}",
+        started.elapsed()
+    );
+
+    for x in [a2, b] {
+        drop(x.local);
+        x.task.await??;
+    }
+    server.shutdown().await
+}
+
+/// Посторонний знает id устройства (и relay), но не ключ группы: сколько
+/// бы соединений он ни открыл без `Hello`, место проверки у него одно, его
+/// соединения закрываются через `HELLO_TIMEOUT`, а участник группы качает.
+#[tokio::test(flavor = "multi_thread")]
+async fn strangers_without_hello_do_not_block_members() -> Result<()> {
+    let (server, info) = start_server(1024 * 1024).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key)?;
+    let mut b = Agent::spawn(&info, &key)?;
+    a.online().await?;
+    b.online().await?;
+    let src = tmp("src");
+    let (data, mut f) = make_file(&src, "участнику.bin", 5000);
+    f.p2p = true;
+    serve_files(&a, std::slice::from_ref(&f));
+
+    let url: RelayUrl = info.relay_url.parse()?;
+    let stranger = Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Custom(
+            RelayMap::from_iter([url.clone()]).with_auth_token(info.relay_token.clone()),
+        ))
+        .bind()
+        .await?;
+    let addr = EndpointAddr::new(PublicKey::from_bytes(&a.device.0)?).with_relay_url(url);
+    let mut held = Vec::new();
+    for _ in 0..MAX_CONNS + 2 {
+        if let Ok(Ok(c)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            stranger.connect(addr.clone(), P2P_ALPN),
+        )
+        .await
+        {
+            held.push(c);
+        }
+    }
+    assert!(!held.is_empty(), "посторонний вообще не подключился");
+
+    let started = std::time::Instant::now();
+    let p = tokio::time::timeout(T, b.blobs.download(&f, a.device)).await??;
+    assert_eq!(std::fs::read(&p)?, data);
+    // Ни одно соединение постороннего не живёт дольше проверки.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for c in &held {
+            c.closed().await;
+        }
+    })
+    .await
+    .context("источник держит соединения без Hello")?;
+    assert!(started.elapsed() < Duration::from_secs(20));
+
+    stranger.close().await;
+    for x in [a, b] {
+        drop(x.local);
+        x.task.await??;
+    }
+    server.shutdown().await
+}
+
+/// Сервер окончательно отказал в резерве папки: она уходит без `blob`, а
+/// её архив не остаётся в outbox.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_folder_archive_leaves_outbox() -> Result<()> {
+    // Предел сервера меньше архива, порог клиента (1 МБ) — больше.
+    let (server, info) = start_server(2048).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key)?;
+    let mut b = Agent::spawn(&info, &key)?;
+    a.online().await?;
+    b.online().await?;
+    let dir = tmp("src").join("отказ");
+    make_folder(&dir, false);
+    let f = prepared_folder(&a, &dir, 1);
+    assert!(!f.p2p);
+    let archive = outbox_path(a.blobs.outbox(), f.blob.unwrap());
+    assert!(archive.is_file());
+    a.copy_files(vec![f.clone()]).await?;
+    let got = b.incoming_files().await?;
+    assert_eq!(got[0].blob, None, "отказанной папке blob снят");
+    assert!(!archive.exists(), "архив остался в outbox");
+
+    for x in [a, b] {
+        drop(x.local);
+        x.task.await??;
+    }
     server.shutdown().await
 }

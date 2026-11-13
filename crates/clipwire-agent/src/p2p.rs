@@ -10,9 +10,11 @@
 //! Протокол проверки и его ключ — `clipwire_core::p2p`, описание —
 //! `docs/files-transfer.md`, раздел «Прямая передача».
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clipwire_core::blob::chunk_count;
@@ -23,19 +25,34 @@ use clipwire_core::{DeviceId, GroupKey};
 use iroh::Endpoint;
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::blobs::{Blobs, file_stamp, read_chunk};
 
-/// Сколько ждать проверки участника (и первого кадра в потоке файла).
+/// Сколько ждать проверки участника целиком (и первого кадра в потоке файла).
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Источник: сколько ждать завершения входящего подключения и потом
+/// первого кадра `Hello`. Короткий, чтобы чужие не держали места проверки.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 /// Сколько получатель ждёт подключения к устройству-источнику.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Потоков файлов на одно входящее соединение одновременно.
 pub const MAX_STREAMS: usize = 4;
-/// Входящих прямых соединений одновременно.
+/// Входящих соединений на этапе проверки одновременно; с одного устройства
+/// (`remote_id`) — не больше одного.
+pub const MAX_PENDING: usize = 4;
+/// Проверенных входящих соединений одновременно. Нет места — вытесняется
+/// самое давно простаивающее.
 pub const MAX_CONNS: usize = 8;
+/// Источник снимает проверенное соединение без потоков дольше этого.
+pub const SOURCE_IDLE: Duration = Duration::from_secs(90);
+/// Получатель закрывает своё соединение с источником без потоков дольше этого.
+pub const REQUESTER_IDLE: Duration = Duration::from_secs(60);
+/// Сколько получатель ждёт `GetReady` по уже бывшему в деле соединению.
+/// Не дождался — соединение считается мёртвым (источник перезапустился, а
+/// QUIC ещё не заметил), и запрос повторяется по новому.
+pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Кадры проверки маленькие (id группы и два раза по 32 байта).
 const AUTH_FRAME_MAX: usize = 256;
 /// Первый кадр потока файла — запрос `Get`.
@@ -82,11 +99,29 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    let hello = read_msg_limited::<_, P2pMsg>(recv, AUTH_FRAME_MAX).await?;
+    auth_after_hello(send, recv, key, me, peer, hello).await
+}
+
+/// [`auth_source`], когда первый кадр (`Hello`) уже прочитан: источник
+/// ждёт его отдельно, с коротким [`HELLO_TIMEOUT`].
+async fn auth_after_hello<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    key: &GroupKey,
+    me: DeviceId,
+    peer: DeviceId,
+    hello: Option<P2pMsg>,
+) -> Result<bool>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     let peers = Peers {
         requester: peer,
         source: me,
     };
-    let rn = match read_msg_limited::<_, P2pMsg>(recv, AUTH_FRAME_MAX).await? {
+    let rn = match hello {
         Some(P2pMsg::Hello { group, nonce }) if group == key.group_id() => nonce,
         Some(P2pMsg::Hello { .. }) => {
             write_msg(send, &P2pMsg::Denied).await?;
@@ -195,25 +230,187 @@ pub async fn connect(
     Ok(conn)
 }
 
+/// Сколько потоков открыто на соединении и с какого момента их нет.
+/// Нужен обеим сторонам: простаивающие соединения закрываются.
+pub(crate) struct Usage {
+    active: AtomicUsize,
+    idle_since: Mutex<Instant>,
+}
+
+impl Usage {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            active: AtomicUsize::new(0),
+            idle_since: Mutex::new(Instant::now()),
+        })
+    }
+
+    /// Поток открыт; закрывается вместе с возвращённым стражем.
+    pub(crate) fn begin(self: &Arc<Self>) -> InUse {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        InUse(self.clone())
+    }
+
+    /// Сколько соединение простаивает; `None`, пока есть потоки.
+    pub(crate) fn idle_for(&self) -> Option<Duration> {
+        if self.active.load(Ordering::SeqCst) > 0 {
+            return None;
+        }
+        Some(
+            self.idle_since
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .elapsed(),
+        )
+    }
+}
+
+/// Открытый поток (см. [`Usage::begin`]).
+pub(crate) struct InUse(Arc<Usage>);
+
+impl Drop for InUse {
+    fn drop(&mut self) {
+        // Время — до уменьшения счётчика: кто увидит 0, увидит и свежее время.
+        *self.0.idle_since.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Закрыть соединение, когда оно простоит без потоков `idle` (или раньше,
+/// если его закроют). Получатель запускает это для своих соединений.
+pub(crate) fn close_when_idle(conn: Connection, usage: Arc<Usage>, idle: Duration) {
+    tokio::spawn(async move {
+        loop {
+            let wait = match usage.idle_for() {
+                Some(d) if d >= idle => {
+                    conn.close(0u32.into(), b"idle");
+                    return;
+                }
+                Some(d) => idle - d,
+                None => idle,
+            };
+            tokio::select! {
+                _ = conn.closed() => return,
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
+    });
+}
+
+/// Проверенные входящие соединения: не больше [`MAX_CONNS`].
+#[derive(Default)]
+struct Verified {
+    slots: Mutex<Vec<Slot>>,
+    next: AtomicU64,
+}
+
+struct Slot {
+    seq: u64,
+    conn: Connection,
+    usage: Arc<Usage>,
+}
+
+impl Verified {
+    /// Занять место. Мест нет — закрыть самое давно простаивающее; если
+    /// все заняты передачами, `None`.
+    fn admit(self: &Arc<Self>, conn: Connection, usage: Arc<Usage>) -> Option<SlotGuard> {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if slots.len() >= MAX_CONNS {
+            let idle: Vec<_> = slots.iter().map(|s| s.usage.idle_for()).collect();
+            let old = slots.remove(victim(&idle)?);
+            old.conn.close(3u32.into(), b"evicted");
+            tracing::info!("мест для прямых соединений нет, закрываю простаивающее");
+        }
+        let seq = self.next.fetch_add(1, Ordering::Relaxed);
+        slots.push(Slot { seq, conn, usage });
+        Some(SlotGuard(self.clone(), seq))
+    }
+
+    fn len(&self) -> usize {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+/// Кого вытеснить: самое давно простаивающее (`idle` — по [`Usage::idle_for`]).
+/// Все заняты передачами — никого.
+fn victim(idle: &[Option<Duration>]) -> Option<usize> {
+    idle.iter()
+        .enumerate()
+        .filter_map(|(i, d)| d.map(|d| (i, d)))
+        .max_by_key(|(_, d)| *d)
+        .map(|(i, _)| i)
+}
+
+/// Место в [`Verified`], освобождается при закрытии соединения.
+struct SlotGuard(Arc<Verified>, u64);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.0
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| s.seq != self.1);
+    }
+}
+
+/// Устройство, с которым сейчас идёт проверка: одно соединение на `remote_id`.
+struct Checking(Arc<Mutex<HashSet<DeviceId>>>, DeviceId);
+
+impl Checking {
+    fn claim(set: &Arc<Mutex<HashSet<DeviceId>>>, peer: DeviceId) -> Option<Self> {
+        set.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer)
+            .then(|| Self(set.clone(), peer))
+    }
+}
+
+impl Drop for Checking {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.1);
+    }
+}
+
+/// Общее для всех входящих соединений источника.
+struct Ctx {
+    blobs: Arc<Blobs>,
+    me: DeviceId,
+    checking: Arc<Mutex<HashSet<DeviceId>>>,
+    verified: Arc<Verified>,
+}
+
 /// Принимать прямые соединения на эндпоинте движка, пока он открыт.
-/// Не больше [`MAX_CONNS`] одновременно: лишние отклоняются сразу.
+///
+/// Места раздельные: на этапе проверки — [`MAX_PENDING`] (не больше одного
+/// с устройства, и `Hello` ждём [`HELLO_TIMEOUT`]), лишние отклоняются
+/// сразу. Место среди проверенных ([`MAX_CONNS`]) соединение получает
+/// только после `Accepted`. Так посторонний, знающий id устройства, но не
+/// ключ группы, не займёт места участников.
 pub async fn serve(ep: Endpoint, blobs: Arc<Blobs>) {
-    let me = DeviceId(*ep.id().as_bytes());
-    let limit = Arc::new(Semaphore::new(MAX_CONNS));
+    let ctx = Arc::new(Ctx {
+        blobs,
+        me: DeviceId(*ep.id().as_bytes()),
+        checking: Arc::default(),
+        verified: Arc::default(),
+    });
+    let pending = Arc::new(Semaphore::new(MAX_PENDING));
     let mut tasks = JoinSet::new();
     loop {
         tokio::select! {
             inc = ep.accept() => {
                 let Some(inc) = inc else { break };
-                let Ok(permit) = limit.clone().try_acquire_owned() else {
-                    tracing::info!("слишком много прямых соединений, отклоняю");
+                let Ok(permit) = pending.clone().try_acquire_owned() else {
+                    tracing::info!("слишком много непроверенных прямых соединений, отклоняю");
                     inc.refuse();
                     continue;
                 };
-                let blobs = blobs.clone();
+                let ctx = ctx.clone();
                 tasks.spawn(async move {
-                    let _permit = permit;
-                    if let Err(e) = handle(inc, &blobs, me).await {
+                    if let Err(e) = handle(inc, &ctx, permit).await {
                         tracing::info!("прямое соединение закрыто: {e:#}");
                     }
                 });
@@ -223,8 +420,8 @@ pub async fn serve(ep: Endpoint, blobs: Arc<Blobs>) {
     }
 }
 
-async fn handle(inc: Incoming, blobs: &Arc<Blobs>, me: DeviceId) -> Result<()> {
-    let conn = tokio::time::timeout(AUTH_TIMEOUT, inc)
+async fn handle(inc: Incoming, ctx: &Ctx, pending: OwnedSemaphorePermit) -> Result<()> {
+    let conn = tokio::time::timeout(HELLO_TIMEOUT, inc)
         .await
         .context("подключение не завершилось вовремя")??;
     if conn.alpn() != P2P_ALPN {
@@ -232,9 +429,20 @@ async fn handle(inc: Incoming, blobs: &Arc<Blobs>, me: DeviceId) -> Result<()> {
         bail!("чужой ALPN");
     }
     let peer = DeviceId(*conn.remote_id().as_bytes());
+    let Some(checking) = Checking::claim(&ctx.checking, peer) else {
+        conn.close(2u32.into(), b"busy");
+        bail!("с этого устройства уже идёт проверка");
+    };
+    let (blobs, me) = (&ctx.blobs, ctx.me);
     let auth = tokio::time::timeout(AUTH_TIMEOUT, async {
-        let (mut send, mut recv) = conn.accept_bi().await?;
-        let ok = auth_source(&mut send, &mut recv, blobs.key(), me, peer).await?;
+        let (mut send, mut recv, hello) = tokio::time::timeout(HELLO_TIMEOUT, async {
+            let (send, mut recv) = conn.accept_bi().await?;
+            let hello = read_msg_limited::<_, P2pMsg>(&mut recv, AUTH_FRAME_MAX).await?;
+            anyhow::Ok((send, recv, hello))
+        })
+        .await
+        .map_err(|_| anyhow!("Hello не пришёл за {HELLO_TIMEOUT:?}"))??;
+        let ok = auth_after_hello(&mut send, &mut recv, blobs.key(), me, peer, hello).await?;
         let _ = send.finish();
         anyhow::Ok(ok)
     })
@@ -256,16 +464,39 @@ async fn handle(inc: Incoming, blobs: &Arc<Blobs>, me: DeviceId) -> Result<()> {
             bail!("проверка участника не уложилась в {AUTH_TIMEOUT:?}");
         }
     }
+    // Проверка пройдена: место проверки освобождается, нужно место участника.
+    drop(checking);
+    drop(pending);
+    let usage = Usage::new();
+    let Some(_slot) = ctx.verified.admit(conn.clone(), usage.clone()) else {
+        conn.close(3u32.into(), b"busy");
+        bail!("все {MAX_CONNS} прямых соединений заняты передачами");
+    };
+    tracing::debug!(conns = ctx.verified.len(), "прямое соединение проверено");
     let streams = Arc::new(Semaphore::new(MAX_STREAMS));
     let mut tasks = JoinSet::new();
     loop {
         let permit = streams.clone().acquire_owned().await?;
-        let Ok((send, recv)) = conn.accept_bi().await else {
-            break;
+        // Без новых потоков дольше SOURCE_IDLE соединение снимается: иначе
+        // keep-alive iroh держал бы его (и место) вечно.
+        let wait = usage
+            .idle_for()
+            .map_or(SOURCE_IDLE, |d| SOURCE_IDLE.saturating_sub(d));
+        let (send, recv) = match tokio::time::timeout(wait, conn.accept_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                if usage.idle_for().is_some_and(|d| d >= SOURCE_IDLE) {
+                    conn.close(0u32.into(), b"idle");
+                    break;
+                }
+                continue;
+            }
         };
-        let blobs = blobs.clone();
+        let (blobs, in_use) = (blobs.clone(), usage.begin());
         tasks.spawn(async move {
             let _permit = permit;
+            let _in_use = in_use;
             if let Err(e) = serve_get(send, recv, &blobs).await {
                 tracing::info!("прямая отдача файла прервалась: {e:#}");
             }
@@ -387,6 +618,30 @@ mod tests {
         r.as_ref()
             .err()
             .and_then(|e| e.downcast_ref::<P2pError>().cloned())
+    }
+
+    #[test]
+    fn usage_tracks_streams_and_idle_time() {
+        let u = Usage::new();
+        assert!(u.idle_for().is_some());
+        let a = u.begin();
+        let b = u.begin();
+        assert_eq!(u.idle_for(), None);
+        drop(a);
+        assert_eq!(u.idle_for(), None, "один поток ещё открыт");
+        drop(b);
+        assert!(u.idle_for().unwrap() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn eviction_picks_longest_idle_and_spares_busy() {
+        let s = Duration::from_secs;
+        assert_eq!(
+            victim(&[Some(s(5)), None, Some(s(70)), Some(s(1))]),
+            Some(2)
+        );
+        assert_eq!(victim(&[None, None]), None);
+        assert_eq!(victim(&[]), None);
     }
 
     #[tokio::test]
