@@ -393,13 +393,17 @@ impl Engine {
 
     /// Новое копирование, пока нет связи, вытесняет неотправленное. Если
     /// отправка вытесненного уже начиналась, его резервы на сервере
-    /// отменяются при следующем соединении.
+    /// отменяются при следующем соединении. Архивы его папок из outbox
+    /// удаляются: загружать их некому.
     fn replace_pending(&mut self, c: Content) {
+        let reserved = std::mem::take(&mut self.pending_reserved);
         if let Some(old) = self.pending.replace(c)
-            && std::mem::take(&mut self.pending_reserved)
             && let (Some(b), Content::Files(files)) = (&self.blobs, &old)
         {
-            b.abort_later(files.iter().filter_map(|f| f.blob));
+            if reserved {
+                b.abort_later(files.iter().filter_map(|f| f.blob));
+            }
+            b.discard_outbox(files);
         }
         self.reserve_failures = 0;
     }
@@ -426,6 +430,9 @@ impl Engine {
         let c = c.fit(MAX_ITEM_BYTES);
         if c.len() > MAX_ITEM_BYTES {
             tracing::info!(len = c.len(), "слишком большой элемент, не отправляю");
+            if let (Some(b), Content::Files(files)) = (&self.blobs, &c) {
+                b.discard_outbox(files);
+            }
             return Ok(());
         }
         // Файлы сначала резервируются на сервере: получатель, вставивший
