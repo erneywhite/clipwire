@@ -81,6 +81,18 @@
     }
   }
 
+  /** Порог загрузки: целое число мегабайт, не меньше 0. Мусор в поле — вернуть прежнее. */
+  function saveUploadLimit(el: HTMLInputElement) {
+    if (!s) return
+    const v = Math.floor(Number(el.value))
+    if (el.value.trim() === '' || !Number.isFinite(v) || v < 0) {
+      el.value = String(s.file_upload_limit_mb)
+      return
+    }
+    el.value = String(v)
+    if (v !== s.file_upload_limit_mb) save({ file_upload_limit_mb: v })
+  }
+
   async function refresh() {
     status = await api.status()
     info = await api.deviceInfo()
@@ -420,6 +432,27 @@
               <span>Имя, которое видят остальные устройства</span>
               <input value={s.device_name} onchange={(e) => save({ device_name: e.currentTarget.value.trim() || s!.device_name })} />
             </label>
+          </div>
+
+          <h2>Файлы</h2>
+          <div class="card pad">
+            <label class="field">
+              <span>Загружать на сервер файлы до N МБ</span>
+              <input
+                class="num"
+                type="number"
+                min="0"
+                step="1"
+                inputmode="numeric"
+                value={s.file_upload_limit_mb}
+                onchange={(e) => saveUploadLimit(e.currentTarget)}
+              />
+            </label>
+            <p class="hint">
+              Скопированные файлы такого размера сразу уходят на сервер зашифрованными, и другие устройства
+              вставляют их, даже когда этот компьютер выключен. 0 — не загружать. Крупные файлы и папки
+              остальные устройства видят в истории, но получить их пока не могут.
+            </p>
           </div>
 
           <h2>Добавить устройство</h2>
@@ -820,6 +853,10 @@
   .field > span {
     font-size: var(--text-s);
     color: var(--c-muted);
+  }
+  .field input.num {
+    width: 12ch;
+    font-family: var(--font-mono);
   }
   .themes {
     display: grid;

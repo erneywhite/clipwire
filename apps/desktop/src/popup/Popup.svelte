@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
-  import { api, type Entry, type Settings } from '../lib/api'
+  import { api, type Entry, type Settings, type Transfer } from '../lib/api'
   import { applyTheme } from '../lib/theme'
   import { ago, bytesLabel, filesMeta, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
+  import { canDownload, entryProgress, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
   import EntryRow from '../lib/EntryRow.svelte'
   import LinkCard from './LinkCard.svelte'
   import FilePreview from './FilePreview.svelte'
@@ -25,6 +26,62 @@
   let listEl: HTMLUListElement | undefined = $state()
 
   const current = $derived(items[sel])
+
+  // Передачи файлов по blob: начальное состояние из transfers(), дальше события.
+  let transfers = $state<TransferMap>({})
+  // Запись, файлы которой сейчас качаются перед вставкой или по кнопке «Скачать».
+  let fetching = $state<string | null>(null)
+  let pasting = $state(false)
+
+  /** Имя устройства, откуда пришла запись. */
+  function deviceOf(e: Entry): string {
+    return e.local ? 'Это устройство' : e.device_name || 'Другое устройство'
+  }
+
+  /** Есть файлы с другого устройства, которые надо сначала скачать. */
+  function needsDownload(e: Entry | undefined): boolean {
+    return !!e && e.kind === 'files' && e.files.some(canDownload)
+  }
+
+  /** Скачать файлы записи. true — всё скачалось. */
+  async function download(entry: Entry): Promise<boolean> {
+    if (fetching) return false
+    fetching = entry.id
+    error = ''
+    try {
+      await api.filesDownload(entry.id)
+      return true
+    } catch (e) {
+      error = String(e)
+      return false
+    } finally {
+      fetching = null
+      // Пути в кэше появились — обновить строку и предпросмотр.
+      await load()
+      await refreshPreview()
+    }
+  }
+
+  async function refreshPreview() {
+    if (!preview) return
+    const id = preview.entry.id
+    try {
+      const entry = await api.get(id)
+      if (preview?.entry.id === id) preview = { ...preview, entry }
+    } catch {
+      // Запись успели удалить — предпросмотр закроет следующий load.
+    }
+  }
+
+  function onTransfer(t: Transfer) {
+    transfers[t.blob] = t
+    // Скачивание по кнопке ждёт download(); здесь — чужие скачивания, например
+    // начатые из другого окна, чтобы предпросмотр не остался на карточке.
+    if (t.direction === 'down' && t.state === 'done' && !fetching) {
+      load()
+      refreshPreview()
+    }
+  }
 
   async function load() {
     try {
@@ -49,7 +106,21 @@
   }
 
   async function paste(entry: Entry | undefined, intoActive?: boolean, plain?: boolean) {
-    if (!entry) return
+    if (!entry || pasting) return
+    // Файлы с другого устройства сначала скачиваются: окно остаётся открытым и
+    // показывает прогресс. popup_paste скачал бы и сам, но тогда до конца
+    // загрузки не видно, что происходит, а ошибка приходит уже после закрытия.
+    if (needsDownload(entry)) {
+      // shortcut: одно скачивание за раз, второе не встаёт в очередь; переделать, если будут жалобы.
+      if (fetching) {
+        error = fetching === entry.id ? 'Файлы ещё скачиваются' : 'Сначала дождитесь, пока скачаются файлы другой записи'
+        return
+      }
+      pasting = true
+      const ok = await download(entry)
+      pasting = false
+      if (!ok) return
+    }
     // Если это элемент из предпросмотра и его поправили — вставляем изменённый текст.
     const text = preview && preview.entry.id === entry.id && edited ? draft : null
     await closePreview()
@@ -191,6 +262,7 @@
     api.settings().then(applySettings)
     load()
     const unlisten = [
+      listen<Transfer>('clipwire://transfer', (e) => onTransfer(e.payload)),
       listen('clipwire://history-changed', () => load()),
       listen<Settings>('clipwire://settings-changed', (e) => applySettings(e.payload)),
       // Живое превью размера из настроек: ширина списка меняется вместе с окном.
@@ -207,6 +279,13 @@
         input?.focus()
       }),
     ]
+    // Начальные передачи — после подписки, и событие новее не затирается.
+    unlisten[0]
+      .then(() => api.transfers())
+      .then((list) => {
+        for (const t of list) if (!transfers[t.blob]) transfers[t.blob] = t
+      })
+      .catch(() => {})
     return () => unlisten.forEach((p) => p.then((f) => f()))
   })
 </script>
@@ -252,7 +331,7 @@
     {:else}
       <ul class="list" bind:this={listEl} role="listbox" aria-label="История буфера">
         {#each items as item, i (item.id)}
-          <EntryRow {item} index={i} selected={i === sel} onselect={() => (sel = i)} onpaste={() => paste(item)} />
+          <EntryRow {item} {transfers} index={i} selected={i === sel} onselect={() => (sel = i)} onpaste={() => paste(item)} />
         {/each}
       </ul>
     {/if}
@@ -288,34 +367,62 @@
           </button>
         </div>
       {:else if preview.entry.kind === 'files'}
-        {#if preview.entry.image}
+        {@const entry = preview.entry}
+        {@const device = deviceOf(entry)}
+        {@const single = !entry.image && entry.files.length === 1 && !entry.files[0].is_dir}
+        {@const progress = entryProgress(entry.files, transfers)}
+        {#if entry.image}
           <div class="image-view">
-            <img src={preview.entry.image} alt={preview.entry.files[0]?.name} draggable="false" />
+            <img src={entry.image} alt={entry.files[0]?.name} draggable="false" />
           </div>
-        {:else if preview.entry.files.length === 1 && !preview.entry.files[0].is_dir}
-          <FilePreview file={preview.entry.files[0]} />
+        {:else if single}
+          <FilePreview file={entry.files[0]} {device} {transfers} ondownload={() => download(entry)} />
         {:else}
           <ul class="file-list">
-            {#each preview.entry.files as f (f.path)}
-              <li class:gone={!f.exists}>
+            {#each entry.files as f (f.path)}
+              {@const fp = entryProgress([f], transfers)}
+              <li class:gone={!f.remote && !f.exists}>
                 <span class="fname">{f.name}</span>
-                <span class="fmeta">{f.is_dir ? 'папка' : bytesLabel(f.size)}{f.exists ? '' : ' · файла нет на месте'}</span>
-                <span class="fpath">{f.path}</span>
+                <span class="fmeta">
+                  {f.is_dir ? 'папка' : bytesLabel(f.size)}{#if !f.remote && !f.exists}
+                    · файла нет на месте{:else if onlyThere(f)}
+                    · есть только на устройстве «{device}»{:else if fp}
+                    · {progressLabel(fp)}{:else if canDownload(f)}
+                    · не скачан{/if}
+                </span>
+                {#if isHere(f)}
+                  <span class="fpath">{f.local_path}</span>
+                {/if}
               </li>
             {/each}
           </ul>
         {/if}
         <div class="preview-meta">
-          {preview.entry.files.length === 1 ? `${preview.entry.files[0].name} · ` : ''}{filesMeta(preview.entry.files, preview.entry.bytes, preview.entry.width, preview.entry.height)}
+          {entry.files.length === 1 ? `${entry.files[0].name} · ` : ''}{filesMeta(entry.files, entry.bytes, entry.width, entry.height)}{#if !single && progress}
+            · {progressLabel(progress)}{:else if entry.image && onlyThere(entry.files[0])}
+            · есть только на устройстве «{device}»{/if}
         </div>
         <div class="actions">
-          <button class="primary" onclick={() => paste(preview?.entry)}>Вставить</button>
-          {#if editable(preview.entry)}
-            <button onclick={() => edit(preview?.entry)}>Изменить</button>
+          <button class="primary" disabled={pasting} onclick={() => paste(entry)}>
+            {#if pasting && fetching === entry.id}
+              Скачивается{progress && !progress.error ? ` ${progress.percent}%` : '…'}
+            {:else}
+              Вставить
+            {/if}
+          </button>
+          {#if editable(entry)}
+            <button onclick={() => edit(entry)}>Изменить</button>
           {/if}
-          <button onclick={() => preview && revealItemInDir(preview.entry.files[0].path).catch((e) => (error = String(e)))}>Показать в папке</button>
-          <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
-            {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
+          {#if !single && entry.files.some(canDownload) && !pasting}
+            <button disabled={fetching === entry.id} onclick={() => download(entry)}>
+              {fetching === entry.id ? 'Скачивается…' : 'Скачать'}
+            </button>
+          {/if}
+          {#if isHere(entry.files[0])}
+            <button onclick={() => entry.files[0].local_path && revealItemInDir(entry.files[0].local_path).catch((e) => (error = String(e)))}>Показать в папке</button>
+          {/if}
+          <button onclick={() => togglePin(entry).then(openPreview)}>
+            {entry.pinned ? 'Открепить' : 'Закрепить'}
           </button>
         </div>
       {:else}
@@ -631,7 +738,11 @@
     border-color: var(--c-accent);
     color: var(--c-on-accent);
   }
-  .actions button:active {
+  .actions button:disabled {
+    opacity: 0.7;
+    cursor: default;
+  }
+  .actions button:active:not(:disabled) {
     transform: translateY(1px);
   }
 </style>

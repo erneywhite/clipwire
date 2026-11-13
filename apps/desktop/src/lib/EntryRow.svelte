@@ -3,6 +3,7 @@
   // чтобы превью выглядело ровно как настоящее окно.
   import type { Entry } from './api'
   import { ago, bytesLabel, filesLabel, filesMeta, isUrl, looksLikeCode, sizeLabel } from './format'
+  import { entryProgress, progressLabel, type TransferMap } from './transfer'
 
   let {
     item,
@@ -10,10 +11,13 @@
     selected = false,
     onselect,
     onpaste,
+    transfers = {},
   }: {
     item: Entry
     index: number
     selected?: boolean
+    /** Передачи файлов по blob — для полосы прогресса. */
+    transfers?: TransferMap
     onselect?: () => void
     onpaste?: () => void
   } = $props()
@@ -28,6 +32,9 @@
           : 'text',
   )
   const folder = $derived(item.files.length > 0 && item.files.every((f) => f.is_dir))
+  const progress = $derived(kind === 'files' ? entryProgress(item.files, transfers) : null)
+  // Файл с другого устройства, которого ещё нет здесь, не «пропал»: его можно скачать.
+  const gone = $derived(item.files.some((f) => !f.remote && !f.exists))
   const meta = $derived(
     [
       item.local ? 'Это устройство' : item.device_name || 'Другое устройство',
@@ -38,6 +45,7 @@
           ? filesMeta(item.files, item.bytes, item.width, item.height)
           : sizeLabel(item.chars, item.lines),
       ...(item.rich ? [item.rich] : []),
+      ...(progress ? [progressLabel(progress)] : []),
     ].join(' · '),
   )
 </script>
@@ -77,7 +85,7 @@
           style:--ratio={item.width && item.height ? item.width / item.height : 16 / 9}
         />
       {/if}
-      <span class="text" class:gone={item.files.some((f) => !f.exists)}>{filesLabel(item.files)}</span>
+      <span class="text" class:gone>{filesLabel(item.files)}</span>
     {:else if kind === 'image'}
       <!-- Картинка в списке крупно: по ней и узнают, что копировали. -->
       {#if item.thumb}
@@ -94,7 +102,20 @@
     {:else}
       <span class="text" class:mono={kind === 'code'}>{item.text}</span>
     {/if}
-    <span class="meta">{meta}</span>
+    <span class="meta" class:failed={!!progress?.error}>{meta}</span>
+    {#if progress}
+      <span
+        class="bar"
+        class:failed={!!progress.error}
+        role="progressbar"
+        aria-label={progressLabel(progress)}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={progress.percent}
+      >
+        <span style:width="{progress.percent}%"></span>
+      </span>
+    {/if}
   </span>
   {#if index < 9}<kbd class="num">{index + 1}</kbd>{/if}
   {#if item.pinned}<span class="pin" aria-label="Закреплено">●</span>{/if}
@@ -182,6 +203,32 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .meta.failed {
+    color: var(--c-danger);
+  }
+  /* Тонкая полоса под метой: сколько файлов уже передано. */
+  .bar {
+    display: block;
+    height: 2px;
+    margin-top: 1px;
+    border-radius: 1px;
+    background: var(--c-border);
+    overflow: hidden;
+  }
+  .bar > span {
+    display: block;
+    height: 100%;
+    background: var(--c-accent);
+    transition: width 200ms var(--ease-out);
+  }
+  .bar.failed > span {
+    background: var(--c-danger);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bar > span {
+      transition: none;
+    }
   }
   .num {
     font-family: var(--font-mono);
