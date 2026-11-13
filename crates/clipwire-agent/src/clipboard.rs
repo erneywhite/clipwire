@@ -121,6 +121,66 @@ fn read_consistent<T>(mut seq: impl FnMut() -> u32, mut read: impl FnMut() -> T)
     None
 }
 
+/// Каталог забранных «виртуальных» файлов (вложения Outlook и т. п.):
+/// `<state dir>/virtual`.
+pub fn virtual_dir(state_dir: &std::path::Path) -> std::path::PathBuf {
+    state_dir.join("virtual")
+}
+
+/// Проверка владельца буфера перед чтением виртуальных файлов.
+pub type AcceptVirtual = Box<dyn Fn(Option<&str>) -> bool + Send>;
+
+/// Настройки слежения за буфером, кроме колбэка.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct WatchOptions {
+    /// Куда забирать «виртуальные» файлы (вложения Outlook и т. п.), см.
+    /// `virtual_files`. Обычно `<state dir>/virtual`.
+    pub virtual_dir: std::path::PathBuf,
+    /// Порог загрузки файлов из настроек: он же предел общего размера
+    /// виртуальных файлов (0 — `virtual_files::FALLBACK_LIMIT_MB`).
+    pub limit_mb: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Брать ли виртуальные файлы от этой программы (путь exe владельца
+    /// буфера): проверяется до чтения, чтобы не писать на диск то, что всё
+    /// равно не уйдёт (пауза, игнорируемая программа).
+    pub accept_virtual: AcceptVirtual,
+}
+
+/// Описание локального файла или папки для элемента буфера: имя, размер,
+/// время изменения, у картинок — размеры в пикселях.
+#[cfg(windows)]
+pub(crate) fn local_file_ref(p: &std::path::Path) -> clipwire_core::FileRef {
+    let meta = std::fs::metadata(p).ok();
+    let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+    let (width, height) = if is_dir {
+        (0, 0)
+    } else {
+        crate::image::file_dimensions(p).unwrap_or((0, 0))
+    };
+    clipwire_core::FileRef {
+        name: p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.to_string_lossy().into_owned()),
+        path: p.to_string_lossy().into_owned(),
+        size: if is_dir {
+            0
+        } else {
+            meta.as_ref().map_or(0, |m| m.len())
+        },
+        is_dir,
+        width,
+        height,
+        modified_ms: meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as u64),
+        // Хранилище назначает сервис, когда решает отправлять файл.
+        blob: None,
+        blob_size: 0,
+        p2p: false,
+    }
+}
+
 #[cfg(windows)]
 pub use win::Watcher;
 
@@ -147,6 +207,8 @@ mod win {
     use windows::core::{HSTRING, w};
 
     const WM_STOP: u32 = WM_APP + 7;
+    /// Поток чтения виртуальных файлов закончил: результат в `Ctx::virt_rx`.
+    const WM_VIRTUAL_DONE: u32 = WM_APP + 8;
     const READ_TIMER: usize = 1;
     const READ_DELAY_MS: u32 = 60;
 
@@ -154,9 +216,20 @@ mod win {
     /// буфера, если удалось узнать.
     type Callback = Box<dyn FnMut(Content, Option<String>)>;
 
+    /// Результат чтения виртуальных файлов: пути верхнего уровня и владелец.
+    type VirtualResult = (Result<Vec<std::path::PathBuf>>, Option<String>);
+
     struct Ctx {
         formats: ExclusionFormats,
         on_change: Callback,
+        opts: super::WatchOptions,
+        /// Идёт чтение виртуальных файлов.
+        virt_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        virt_tx: std_mpsc::Sender<VirtualResult>,
+        virt_rx: std_mpsc::Receiver<VirtualResult>,
+        /// Номер версии буфера, виртуальные файлы которой уже забраны или
+        /// забираются: повторное уведомление о том же буфере их не дублирует.
+        virt_seq: u32,
     }
 
     /// Следит за буфером, пока жив. Колбэк вызывается в потоке слежения на
@@ -168,15 +241,22 @@ mod win {
 
     impl Watcher {
         pub fn start(
+            opts: super::WatchOptions,
             on_change: impl FnMut(Content, Option<String>) + Send + 'static,
         ) -> Result<Self> {
             let (tx, rx) = std_mpsc::channel::<Result<isize>>();
             let thread = std::thread::Builder::new()
                 .name("clipboard-watch".into())
                 .spawn(move || {
+                    let (virt_tx, virt_rx) = std_mpsc::channel();
                     let ctx = Box::new(Ctx {
                         formats: ExclusionFormats::register(),
                         on_change: Box::new(on_change),
+                        opts,
+                        virt_busy: Default::default(),
+                        virt_tx,
+                        virt_rx,
+                        virt_seq: 0,
                     });
                     let hwnd = match create_window(ctx) {
                         Ok(h) => h,
@@ -247,11 +327,31 @@ mod win {
                         Some(Snapshot::Content(content, owner)) => {
                             (ctx.on_change)(content, owner);
                         }
+                        Some(Snapshot::Virtual(owner)) => start_virtual(ctx, hwnd, owner),
                         Some(Snapshot::Excluded) => {
                             tracing::debug!("буфер помечен как приватный, пропускаю");
                         }
                         Some(Snapshot::Empty) => {}
                         None => tracing::debug!("буфер менялся во время чтения, пропускаю"),
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_VIRTUAL_DONE => {
+                let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Ctx;
+                // SAFETY: как в WM_TIMER.
+                if let Some(ctx) = unsafe { ptr.as_mut() } {
+                    while let Ok((res, owner)) = ctx.virt_rx.try_recv() {
+                        match res {
+                            Ok(paths) => {
+                                let files: Vec<_> =
+                                    paths.iter().map(|p| super::local_file_ref(p)).collect();
+                                (ctx.on_change)(Content::Files(files), owner);
+                            }
+                            Err(e) => {
+                                tracing::info!("виртуальные файлы из буфера пропущены: {e:#}")
+                            }
+                        }
                     }
                 }
                 LRESULT(0)
@@ -268,6 +368,9 @@ mod win {
     enum Snapshot {
         /// Содержимое и путь exe владельца буфера.
         Content(Content, Option<String>),
+        /// Виртуальные файлы (FileGroupDescriptorW без CF_HDROP): их читает
+        /// отдельный поток. Путь exe владельца буфера.
+        Virtual(Option<String>),
         /// Помечено как приватное (или метку не удалось прочитать).
         Excluded,
         /// Ничего, что мы умеем брать.
@@ -282,6 +385,10 @@ mod win {
         let content = if let Some(files) = read_files() {
             // Проводник кладёт файлы списком путей (CF_HDROP).
             Content::Files(files)
+        } else if raw_available(crate::virtual_files::descriptor_format()) {
+            // Outlook и другие источники без файлов на диске. Проверяем
+            // раньше текста: рядом с вложением бывает его имя текстом.
+            return Snapshot::Virtual(owner_exe());
         } else if let Some(text) = super::read_text()
             && !text.is_empty()
         {
@@ -300,6 +407,43 @@ mod win {
             return Snapshot::Empty;
         };
         Snapshot::Content(content, owner_exe())
+    }
+
+    fn raw_available(format: u32) -> bool {
+        format != 0 && unsafe { IsClipboardFormatAvailable(format) }.is_ok()
+    }
+
+    /// Начать чтение виртуальных файлов в отдельном потоке. Результат придёт
+    /// сообщением WM_VIRTUAL_DONE в поток слежения, и колбэк вызовется там.
+    fn start_virtual(ctx: &mut Ctx, hwnd: HWND, owner: Option<String>) {
+        let seq = unsafe { GetClipboardSequenceNumber() };
+        if seq == ctx.virt_seq {
+            tracing::debug!("виртуальные файлы этого буфера уже забраны");
+            return;
+        }
+        if !(ctx.opts.accept_virtual)(owner.as_deref()) {
+            return;
+        }
+        let limit = ctx.opts.limit_mb.load(std::sync::atomic::Ordering::Relaxed);
+        let max_bytes = crate::virtual_files::limit_bytes(limit);
+        let (tx, hwnd_raw) = (ctx.virt_tx.clone(), hwnd.0 as isize);
+        let started = crate::virtual_files::spawn_read(
+            &ctx.virt_busy,
+            ctx.opts.virtual_dir.clone(),
+            max_bytes,
+            move |res| {
+                if tx.send((res, owner)).is_ok() {
+                    let hwnd = HWND(hwnd_raw as *mut _);
+                    let _ =
+                        unsafe { PostMessageW(Some(hwnd), WM_VIRTUAL_DONE, WPARAM(0), LPARAM(0)) };
+                }
+            },
+        );
+        if started {
+            ctx.virt_seq = seq;
+        } else {
+            tracing::info!("виртуальные файлы пропущены: прошлое чтение ещё не закончилось");
+        }
     }
 
     fn create_window(ctx: Box<Ctx>) -> Result<HWND> {
@@ -390,41 +534,7 @@ mod win {
             raw::get_file_list_path(&mut out).ok()?;
             out
         };
-        let files: Vec<_> = paths
-            .into_iter()
-            .map(|p| {
-                let meta = std::fs::metadata(&p).ok();
-                let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
-                let (width, height) = if is_dir {
-                    (0, 0)
-                } else {
-                    crate::image::file_dimensions(&p).unwrap_or((0, 0))
-                };
-                clipwire_core::FileRef {
-                    name: p
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.to_string_lossy().into_owned()),
-                    path: p.to_string_lossy().into_owned(),
-                    size: if is_dir {
-                        0
-                    } else {
-                        meta.as_ref().map_or(0, |m| m.len())
-                    },
-                    is_dir,
-                    width,
-                    height,
-                    modified_ms: meta
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_millis() as u64),
-                    // Хранилище назначает сервис, когда решает отправлять файл.
-                    blob: None,
-                    blob_size: 0,
-                    p2p: false,
-                }
-            })
-            .collect();
+        let files: Vec<_> = paths.iter().map(|p| super::local_file_ref(p)).collect();
         (!files.is_empty()).then_some(files)
     }
 
@@ -594,6 +704,7 @@ pub struct Watcher;
 #[cfg(not(windows))]
 impl Watcher {
     pub fn start(
+        _opts: WatchOptions,
         _on_change: impl FnMut(clipwire_core::Content, Option<String>) + Send + 'static,
     ) -> Result<Self> {
         anyhow::bail!("слежение за буфером на этой ОС ещё не реализовано")

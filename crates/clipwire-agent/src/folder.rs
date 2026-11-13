@@ -316,7 +316,7 @@ fn numbered(name: &str, n: usize, is_dir: bool) -> String {
 /// (`README` и `readme` на Windows и macOS). Такая запись получает имя с
 /// номером, « (2)», « (3)»…, и не перезаписывает соседнюю.
 #[derive(Default)]
-struct Namer {
+pub(crate) struct Namer {
     /// Папка архива (компоненты как есть) → куда она распакована.
     dirs: HashMap<Vec<String>, PathBuf>,
     /// Занятые пути от корня распаковки, в нижнем регистре.
@@ -346,7 +346,7 @@ impl Namer {
     }
 
     /// Путь папки по компонентам архива: та же папка — тот же путь.
-    fn dir(&mut self, parts: &[String]) -> PathBuf {
+    pub(crate) fn dir(&mut self, parts: &[String]) -> PathBuf {
         let Some((last, parent)) = parts.split_last() else {
             return PathBuf::new();
         };
@@ -360,7 +360,7 @@ impl Namer {
     }
 
     /// Путь файла: всегда свободное имя, даже если такая запись уже была.
-    fn file(&mut self, parts: &[String]) -> PathBuf {
+    pub(crate) fn file(&mut self, parts: &[String]) -> PathBuf {
         let Some((last, parent)) = parts.split_last() else {
             return PathBuf::from("file");
         };

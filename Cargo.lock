@@ -984,6 +984,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

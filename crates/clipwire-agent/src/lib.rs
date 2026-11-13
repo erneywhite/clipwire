@@ -19,3 +19,5 @@ pub mod state;
 pub mod storage;
 pub mod sync;
 pub mod uploaded;
+#[cfg(windows)]
+pub mod virtual_files;
