@@ -13,8 +13,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clipwire_agent::blobs::{
     Blobs, Direction, Transfer, TransferState, UploadError, UploadJob, abort_blob, cache_path,
-    download_blob, file_stamp, reserve_blob, upload_blob, upload_stream,
+    cached_file, download_blob, file_stamp, outbox_path, reserve_blob, upload_blob, upload_stream,
 };
+use clipwire_agent::p2p::P2pError;
+use clipwire_agent::service::assign_blobs;
 use clipwire_agent::state::{AgentState, random_key};
 use clipwire_agent::sync::{Engine, Event, Status};
 use clipwire_core::blob::{CHUNK, OVERHEAD, chunk_count, chunk_len};
@@ -22,7 +24,7 @@ use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{
     ALPN, BlobChunk, BlobFail, BlobReply, BlobRequest, ClientMsg, ServerMsg, encode_frame,
 };
-use clipwire_core::{BlobId, Content, FileRef, GroupKey, Invite, ServerInfo};
+use clipwire_core::{BlobId, Content, DeviceId, FileRef, GroupKey, Invite, ServerInfo};
 use clipwire_server::Config;
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
@@ -30,6 +32,8 @@ use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, oneshot};
 
 const T: Duration = Duration::from_secs(30);
+/// Устройство-источник для файлов через сервер: для них `origin` не нужен.
+const SERVER_ONLY: DeviceId = DeviceId([0; 32]);
 
 fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("clipwire-files-{tag}-{}", uuid::Uuid::now_v7()));
@@ -296,7 +300,9 @@ async fn files_go_to_cache_on_other_device() -> Result<()> {
     let state_b = tmp("b");
     let (bb, mut events) = blobs(&key, &state_b);
     let _guard = bb.attach(b.conn.clone());
-    let got = bb.download_all(&[big.clone(), empty.clone()]).await?;
+    let got = bb
+        .download_all(&[big.clone(), empty.clone()], SERVER_ONLY)
+        .await?;
     assert_eq!(
         got[0],
         cache_path(bb.files_dir(), big.blob.unwrap(), &big.name)
@@ -320,12 +326,12 @@ async fn files_go_to_cache_on_other_device() -> Result<()> {
 
     // Уже скачанный файл берётся из кэша даже без связи.
     drop(_guard);
-    assert_eq!(bb.download(&big).await?, got[0]);
+    assert_eq!(bb.download(&big, SERVER_ONLY).await?, got[0]);
 
     // Файла, которого нет на сервере, — понятная ошибка.
     let _guard = bb.attach(b.conn.clone());
     let (_, missing) = make_file(&src, "нет.bin", 10);
-    let err = bb.download(&missing).await.unwrap_err();
+    let err = bb.download(&missing, SERVER_ONLY).await.unwrap_err();
     assert!(format!("{err:#}").contains("нет на сервере"), "{err:#}");
 
     a.drop_link().await;
@@ -460,6 +466,7 @@ struct Agent {
     blobs: Arc<Blobs>,
     transfers: mpsc::UnboundedReceiver<Transfer>,
     task: tokio::task::JoinHandle<Result<()>>,
+    device: DeviceId,
 }
 
 impl Agent {
@@ -481,6 +488,7 @@ impl Agent {
         let (local, lrx) = mpsc::channel(16);
         let engine =
             Engine::new(state, "тест".into(), None, etx, Arc::new(|| {})).with_blobs(b.clone());
+        let device = engine.device();
         let task = tokio::spawn(engine.run(lrx));
         Ok(Self {
             local,
@@ -488,6 +496,7 @@ impl Agent {
             blobs: b,
             transfers,
             task,
+            device,
         })
     }
 
@@ -578,7 +587,7 @@ async fn engine_uploads_and_other_device_downloads() -> Result<()> {
                 .is_some()
         );
     }
-    let got = tokio::time::timeout(T, b.blobs.download_all(&files)).await??;
+    let got = tokio::time::timeout(T, b.blobs.download_all(&files, SERVER_ONLY)).await??;
     assert_eq!(std::fs::read(&got[0])?, data);
     assert_eq!(std::fs::read(&got[1])?, std::fs::read(&small.path)?);
 
@@ -620,7 +629,7 @@ async fn reserve_refusal_strips_blob_and_skips_upload() -> Result<()> {
     assert_eq!(got[0].blob, None);
     assert_eq!(got[0].name, f.name);
     assert_eq!(got[1].blob, small.blob);
-    let paths = b.blobs.download_all(&got[1..]).await?;
+    let paths = b.blobs.download_all(&got[1..], SERVER_ONLY).await?;
     assert_eq!(std::fs::read(&paths[0])?, small_data);
 
     let t = a.upload_ends(&[blob]).await?.remove(0);
@@ -780,10 +789,13 @@ async fn engine_aborts_changed_file() -> Result<()> {
         anyhow::Ok(())
     })
     .await??;
-    let err = tokio::time::timeout(Duration::from_secs(5), b.blobs.download(&got[0]))
-        .await
-        .context("скачивание отменённого файла зависло")?
-        .unwrap_err();
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        b.blobs.download(&got[0], SERVER_ONLY),
+    )
+    .await
+    .context("скачивание отменённого файла зависло")?
+    .unwrap_err();
     assert!(format!("{err:#}").contains("нет на сервере"), "{err:#}");
 
     probe.drop_link().await;
@@ -827,7 +839,7 @@ async fn reserve_timeout_keeps_item_until_reconnect() -> Result<()> {
 
     let got = b.incoming_files().await?;
     assert_eq!(got, vec![f.clone()], "элемент ушёл с тем же blob");
-    let paths = tokio::time::timeout(T, b.blobs.download_all(&got)).await??;
+    let paths = tokio::time::timeout(T, b.blobs.download_all(&got, SERVER_ONLY)).await??;
     assert_eq!(std::fs::read(&paths[0])?, data);
     let ok = a.upload_ends(&[blob]).await?.remove(0);
     assert_eq!(ok.state, TransferState::Done, "{ok:?}");
@@ -881,5 +893,277 @@ async fn expired_upload_job_is_aborted_on_first_connection() -> Result<()> {
     probe.drop_link().await;
     drop(a.local);
     a.task.await??;
+    server.shutdown().await
+}
+
+// ------------------------------------------------- часть 4: напрямую и папки
+
+/// «История» источника для прямой отдачи: какие файлы он отдаёт.
+fn serve_files(a: &Agent, files: &[FileRef]) {
+    let list = files.to_vec();
+    a.blobs.set_p2p_sources(Arc::new(move |blob| {
+        list.iter().find(|f| f.p2p && f.blob == Some(blob)).cloned()
+    }));
+}
+
+fn p2p_error(e: &anyhow::Error) -> Option<P2pError> {
+    e.chain()
+        .find_map(|c| c.downcast_ref::<P2pError>().cloned())
+}
+
+/// Содержимое папки: пути от корня и байты файлов (у папок — `None`).
+fn tree(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let rel = e
+                .path()
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if e.file_type().unwrap().is_dir() {
+                out.push((rel, None));
+                stack.push(e.path());
+            } else {
+                out.push((rel, Some(std::fs::read(e.path()).unwrap())));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn make_folder(root: &Path, big: bool) {
+    std::fs::create_dir_all(root.join("вложенная/ещё")).unwrap();
+    std::fs::create_dir_all(root.join("пустая")).unwrap();
+    std::fs::write(root.join("заметка.txt"), "привет из папки").unwrap();
+    let n = if big { CHUNK * 3 / 2 } else { 5000 };
+    let data: Vec<u8> = (0..n).map(|i| (i * 7 % 253) as u8).collect();
+    std::fs::write(root.join("вложенная/данные.bin"), data).unwrap();
+    std::fs::write(root.join("вложенная/ещё").join("д".repeat(70)), b"x").unwrap();
+}
+
+/// Папка так же, как её готовит сервис при копировании.
+fn prepared_folder(a: &Agent, path: &Path, limit_mb: u64) -> FileRef {
+    let (_, modified_ms) = file_stamp(path).unwrap();
+    let f = FileRef {
+        name: path.file_name().unwrap().to_string_lossy().into_owned(),
+        path: path.to_string_lossy().into_owned(),
+        size: 0,
+        is_dir: true,
+        width: 0,
+        height: 0,
+        modified_ms,
+        blob: None,
+        blob_size: 0,
+        p2p: false,
+    };
+    let p = assign_blobs(Content::Files(vec![f]), limit_mb, a.blobs.outbox());
+    assert!(p.failed.is_empty(), "{:?}", p.failed);
+    match p.content {
+        Content::Files(mut f) => f.remove(0),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn big_file_goes_directly_and_strangers_are_denied() -> Result<()> {
+    let (server, info) = start_server(1024 * 1024).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key)?;
+    let mut b = Agent::spawn(&info, &key)?;
+    a.online().await?;
+    b.online().await?;
+    let probe = Device::join(&info, &key).await?;
+
+    let src = tmp("src");
+    // Больше предела сервера: через сервер такой файл не прошёл бы.
+    let (data, mut f) = make_file(&src, "большой напрямую.bin", CHUNK as u64 * 5 / 2);
+    f.p2p = true;
+    serve_files(&a, std::slice::from_ref(&f));
+    a.copy_files(vec![f.clone()]).await?;
+
+    let got = b.incoming_files().await?;
+    assert_eq!(
+        got,
+        vec![f.clone()],
+        "blob не снят: резерва на сервере не было"
+    );
+    // На сервер файл не резервировался и не грузится.
+    assert_eq!(
+        server_have(&probe.conn, f.blob.unwrap(), f.size).await?,
+        None
+    );
+    assert!(a.blobs.queued().is_empty());
+
+    let paths = tokio::time::timeout(T, b.blobs.download_all(&got, a.device)).await??;
+    assert_eq!(
+        paths[0],
+        cache_path(b.blobs.files_dir(), f.blob.unwrap(), &f.name)
+    );
+    assert_eq!(std::fs::read(&paths[0])?, data);
+    assert!(!part_of(&paths[0]).exists());
+    let mut done = false;
+    while let Ok(t) = b.transfers.try_recv() {
+        if t.state == TransferState::Done && t.blob == f.blob.unwrap().hex() {
+            assert_eq!(t.direction, Direction::Down);
+            assert_eq!(t.done, f.size);
+            done = true;
+        }
+    }
+    assert!(done, "нет финального события скачивания");
+    // Второй раз — из кэша.
+    assert_eq!(b.blobs.download(&got[0], a.device).await?, paths[0]);
+
+    // Неизвестный источнику blob — понятная ошибка, а не зависание.
+    let (_, mut unknown) = make_file(&src, "не отдаётся.bin", 100);
+    unknown.p2p = true;
+    let err = tokio::time::timeout(T, b.blobs.download(&unknown, a.device))
+        .await?
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("уже нет в истории"), "{err:#}");
+
+    // Файл изменился после копирования — источник не отдаёт его.
+    let (_, mut changed) = make_file(&src, "изменится.bin", 1000);
+    changed.p2p = true;
+    serve_files(&a, &[f.clone(), changed.clone()]);
+    std::fs::write(&changed.path, "другое")?;
+    let err = tokio::time::timeout(T, b.blobs.download(&changed, a.device))
+        .await?
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("изменился"), "{err:#}");
+
+    // Устройство с чужим ключом группы (на том же сервере и relay) получает отказ.
+    let other = GroupKey::generate()?;
+    let mut c = Agent::spawn(&info, &other)?;
+    c.online().await?;
+    let err = tokio::time::timeout(T, c.blobs.download(&f, a.device))
+        .await?
+        .unwrap_err();
+    assert_eq!(p2p_error(&err), Some(P2pError::Denied), "{err:#}");
+    assert!(cached_file(c.blobs.files_dir(), &f).is_none());
+
+    probe.drop_link().await;
+    for x in [a, b, c] {
+        drop(x.local);
+        x.task.await??;
+    }
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_source_gives_clear_error() -> Result<()> {
+    let (server, info) = start_server(1024 * 1024).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key)?;
+    let mut b = Agent::spawn(&info, &key)?;
+    a.online().await?;
+    b.online().await?;
+    let src = tmp("src");
+    let (_, mut f) = make_file(&src, "без источника.bin", 1000);
+    f.p2p = true;
+    serve_files(&a, std::slice::from_ref(&f));
+    a.copy_files(vec![f.clone()]).await?;
+    let got = b.incoming_files().await?;
+
+    // Источник выключили до вставки.
+    let origin = a.device;
+    drop(a.local);
+    a.task.await??;
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(Duration::from_secs(40), b.blobs.download(&got[0], origin))
+        .await?
+        .unwrap_err();
+    assert_eq!(p2p_error(&err), Some(P2pError::Offline), "{err:#}");
+    assert!(format!("{err:#}").contains("не в сети"), "{err:#}");
+    assert!(started.elapsed() < Duration::from_secs(30));
+    let failed = b
+        .blobs
+        .transfers()
+        .into_iter()
+        .find(|t| t.blob == f.blob.unwrap().hex())
+        .expect("неудача видна в списке передач");
+    assert_eq!(failed.state, TransferState::Failed);
+
+    drop(b.local);
+    b.task.await??;
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn folders_go_through_server_and_directly() -> Result<()> {
+    let (server, info) = start_server(8 * 1024 * 1024).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key)?;
+    let mut b = Agent::spawn(&info, &key)?;
+    a.online().await?;
+    b.online().await?;
+    let src = tmp("src");
+
+    // Папка до порога (1 МБ): архив сразу в outbox, уходит через сервер.
+    let small = src.join("маленькая папка");
+    make_folder(&small, false);
+    let fs = prepared_folder(&a, &small, 1);
+    assert!(!fs.p2p && fs.blob.is_some());
+    let archive = outbox_path(a.blobs.outbox(), fs.blob.unwrap());
+    assert!(archive.is_file());
+    // Папка больше порога: напрямую, архив соберётся по первому запросу.
+    let big = src.join("большая папка");
+    make_folder(&big, true);
+    let fb = prepared_folder(&a, &big, 1);
+    assert!(fb.p2p && fb.blob.is_some());
+    let lazy = outbox_path(a.blobs.outbox(), fb.blob.unwrap());
+    assert!(!lazy.exists());
+    serve_files(&a, &[fs.clone(), fb.clone()]);
+
+    a.copy_files(vec![fs.clone(), fb.clone()]).await?;
+    let got = b.incoming_files().await?;
+    assert_eq!(got, vec![fs.clone(), fb.clone()]);
+    // Пока не скачано, в кэше ничего нет.
+    assert!(
+        got.iter()
+            .all(|f| cached_file(b.blobs.files_dir(), f).is_none())
+    );
+
+    let paths = tokio::time::timeout(T, b.blobs.download_all(&got, a.device)).await??;
+    for (p, f, orig) in [(&paths[0], &fs, &small), (&paths[1], &fb, &big)] {
+        assert_eq!(
+            *p,
+            cache_path(b.blobs.files_dir(), f.blob.unwrap(), &f.name)
+        );
+        assert!(p.is_dir());
+        assert_eq!(tree(p), tree(orig), "{}", f.name);
+        // Архив после распаковки удалён, «уже скачано» видно по папке.
+        let mut tar = p.as_os_str().to_owned();
+        tar.push(".tar");
+        assert!(!PathBuf::from(tar).exists());
+        assert_eq!(cached_file(b.blobs.files_dir(), f).as_ref(), Some(p));
+    }
+    // У источника архив большой папки собрался лениво в outbox.
+    assert_eq!(std::fs::metadata(&lazy)?.len(), fb.blob_size);
+
+    // Архив маленькой папки удаляется после загрузки на сервер.
+    let ends = a.upload_ends(&[fs.blob.unwrap()]).await?;
+    assert_eq!(ends[0].state, TransferState::Done, "{:?}", ends[0]);
+    assert!(!archive.exists(), "архив остался в outbox");
+
+    // Папка изменилась после копирования: прямая отдача отказывает.
+    let changed = src.join("меняется");
+    make_folder(&changed, true);
+    let fc = prepared_folder(&a, &changed, 1);
+    serve_files(&a, std::slice::from_ref(&fc));
+    std::fs::write(changed.join("новый.txt"), "добавили")?;
+    let err = tokio::time::timeout(T, b.blobs.download(&fc, a.device))
+        .await?
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("изменился"), "{err:#}");
+
+    drop(a.local);
+    a.task.await??;
+    drop(b.local);
+    b.task.await??;
     server.shutdown().await
 }

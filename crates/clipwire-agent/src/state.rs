@@ -77,8 +77,8 @@ impl Paths {
         write_atomic(&self.state(), &crate::secret::protect(&plain)?)
     }
 
-    /// Выход из группы: ключ, курсор и очередь загрузок (её файлы уходили в
-    /// старую группу, в новой им не место).
+    /// Выход из группы: ключ, курсор, очередь загрузок и архивы папок в
+    /// outbox (всё это уходило в старую группу, в новой им не место).
     pub fn reset(&self) -> Result<()> {
         let uploads = self.dir.join(crate::blobs::UPLOADS_FILE);
         for p in [self.state(), self.cursor(), uploads] {
@@ -86,6 +86,14 @@ impl Paths {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e).with_context(|| format!("не удалился {}", p.display())),
+            }
+        }
+        let outbox = crate::blobs::outbox_dir(&self.dir);
+        match std::fs::remove_dir_all(&outbox) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("не удалился {}", outbox.display()));
             }
         }
         Ok(())
@@ -159,7 +167,10 @@ mod tests {
         assert_eq!(paths.load_cursor(), Some(id));
 
         std::fs::write(dir.join("uploads.json"), b"[]").unwrap();
+        std::fs::create_dir_all(dir.join("outbox")).unwrap();
+        std::fs::write(dir.join("outbox").join("a.tar"), b"x").unwrap();
         paths.reset().unwrap();
+        assert!(!dir.join("outbox").exists());
         assert!(paths.load().unwrap().is_none());
         assert!(paths.load_cursor().is_none());
         assert!(!dir.join("uploads.json").exists());
