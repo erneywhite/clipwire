@@ -17,6 +17,11 @@ use crate::crypto::GroupKey;
 
 const INFO_CONFIG_KEY: &[u8] = b"clipwire/v1/group-config";
 const AAD_CONFIG: &[u8] = b"clipwire/v1/group-config\0";
+const INFO_META_KEY: &[u8] = b"clipwire/v1/blob-meta";
+const AAD_META: &[u8] = b"clipwire/v1/blob-meta\0";
+
+/// Предел запечатанной `meta` файла (сама она — десятки байт).
+pub const MAX_META_BYTES: usize = 256;
 
 /// Предел зашифрованных настроек группы (ключ SSH внутри может быть большим).
 pub const MAX_CONFIG_BYTES: usize = 16 * 1024;
@@ -45,6 +50,46 @@ pub struct GroupConfig {
     /// Сколько хранить части файлов во внешнем хранилище (часы). Чистят сами
     /// устройства; для S3 лучше ещё правило жизненного цикла в бакете.
     pub file_ttl_hours: u32,
+    /// Из группы исключили устройство, у которого были эти доступы к
+    /// хранилищу: их надо сменить у поставщика и сохранить заново. Ставит
+    /// устройство, сменившее ключ с исключением; снимается сохранением
+    /// настроек. Поле появилось после первого вида записи, тот читается
+    /// через [`GroupConfigV1`].
+    pub access_exposed: bool,
+}
+
+/// `GroupConfig` до поля `access_exposed`. postcard не умеет значений по
+/// умолчанию: новое поле стоит последним, старая запись в новом виде не
+/// дочитывается и тогда разбирается так. Старый клиент новую запись читает
+/// сам: лишний байт в конце `postcard::from_bytes` пропускает.
+#[derive(Deserialize)]
+struct GroupConfigV1 {
+    version: u64,
+    storage: StorageConfig,
+    file_ttl_hours: u32,
+}
+
+impl From<GroupConfigV1> for GroupConfig {
+    fn from(c: GroupConfigV1) -> Self {
+        Self {
+            version: c.version,
+            storage: c.storage,
+            file_ttl_hours: c.file_ttl_hours,
+            access_exposed: false,
+        }
+    }
+}
+
+/// Разобрать настройки: в нынешнем виде, если он съел все байты, иначе в
+/// прошлом.
+fn decode_config(plain: &[u8]) -> Result<GroupConfig, StorageConfigError> {
+    if let Ok((c, [])) = postcard::take_from_bytes::<GroupConfig>(plain) {
+        return Ok(c);
+    }
+    match postcard::take_from_bytes::<GroupConfigV1>(plain) {
+        Ok((c, [])) => Ok(c.into()),
+        _ => Err(StorageConfigError::Decode),
+    }
 }
 
 /// Где лежат части файлов группы.
@@ -115,6 +160,7 @@ impl Default for GroupConfig {
             version: 0,
             storage: StorageConfig::Server,
             file_ttl_hours: 24,
+            access_exposed: false,
         }
     }
 }
@@ -167,7 +213,76 @@ impl GroupKey {
                 },
             )
             .map_err(|_| StorageConfigError::Open)?;
-        postcard::from_bytes(&plain).map_err(|_| StorageConfigError::Decode)
+        decode_config(&plain)
+    }
+
+    fn meta_key(&self) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::new(None, &self.0);
+        let mut k = [0u8; 32];
+        hk.expand(INFO_META_KEY, &mut k)
+            .expect("32 байта — допустимая длина для HKDF-SHA256");
+        k
+    }
+
+    fn meta_aad(&self, blob: crate::BlobId) -> Vec<u8> {
+        let mut aad = AAD_META.to_vec();
+        aad.extend_from_slice(&self.group_id().0);
+        aad.extend_from_slice(&blob.0);
+        aad
+    }
+
+    /// Запечатать `meta` файла `blob`: `<nonce 24><шифротекст>`. AAD
+    /// привязывает её к группе и файлу: чужую `meta` под этим именем не
+    /// подложить, а без ключа группы не подделать `complete = true`.
+    pub fn seal_meta(
+        &self,
+        blob: crate::BlobId,
+        meta: &BlobMeta,
+    ) -> Result<Vec<u8>, StorageConfigError> {
+        let plain = postcard::to_stdvec(meta).map_err(|_| StorageConfigError::Seal)?;
+        let mut nonce = [0u8; 24];
+        getrandom::fill(&mut nonce).map_err(|_| StorageConfigError::Random)?;
+        let ct = XChaCha20Poly1305::new_from_slice(&self.meta_key())
+            .expect("ключ ровно 32 байта")
+            .encrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: &plain,
+                    aad: &self.meta_aad(blob),
+                },
+            )
+            .map_err(|_| StorageConfigError::Seal)?;
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    /// Открыть `meta` файла `blob`. Незапечатанная, чужая или подменённая —
+    /// [`StorageConfigError::Open`].
+    pub fn open_meta(
+        &self,
+        blob: crate::BlobId,
+        sealed: &[u8],
+    ) -> Result<BlobMeta, StorageConfigError> {
+        if sealed.len() < 24 + 16 || sealed.len() > MAX_META_BYTES {
+            return Err(StorageConfigError::Open);
+        }
+        let (nonce, ct) = sealed.split_at(24);
+        let nonce: [u8; 24] = nonce.try_into().expect("ровно 24 байта");
+        let plain = XChaCha20Poly1305::new_from_slice(&self.meta_key())
+            .expect("ключ ровно 32 байта")
+            .decrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: ct,
+                    aad: &self.meta_aad(blob),
+                },
+            )
+            .map_err(|_| StorageConfigError::Open)?;
+        match postcard::take_from_bytes::<BlobMeta>(&plain) {
+            Ok((m, [])) => Ok(m),
+            _ => Err(StorageConfigError::Decode),
+        }
     }
 }
 
@@ -191,8 +306,10 @@ fn group_hex(g: &crate::GroupId) -> String {
     g.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Сводка файла во внешнем хранилище (открытым текстом: в ней нет ничего,
-/// кроме размера и времени — то же, что видит сервер Clipwire).
+/// Сводка файла во внешнем хранилище. Секретов в ней нет, но `complete`
+/// решает, считать ли файл загруженным, поэтому она лежит запечатанной
+/// ключом группы ([`GroupKey::seal_meta`]): подделать её не могут ни
+/// хранилище, ни устройство, у которого остались доступы к нему.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobMeta {
     /// Размер открытого текста.
@@ -234,7 +351,59 @@ mod tests {
                 path_style: true,
             }),
             file_ttl_hours: 24,
+            access_exposed: true,
         }
+    }
+
+    #[test]
+    fn config_of_first_format_still_opens() {
+        #[derive(Serialize)]
+        struct V1 {
+            version: u64,
+            storage: StorageConfig,
+            file_ttl_hours: u32,
+        }
+        let c = s3();
+        let plain = postcard::to_stdvec(&V1 {
+            version: c.version,
+            storage: c.storage.clone(),
+            file_ttl_hours: c.file_ttl_hours,
+        })
+        .unwrap();
+        assert_eq!(
+            decode_config(&plain).unwrap(),
+            GroupConfig {
+                access_exposed: false,
+                ..c.clone()
+            }
+        );
+        // Новую запись старый клиент читает своим видом: лишний байт в конце
+        // `postcard::from_bytes` пропускает.
+        let new = postcard::to_stdvec(&c).unwrap();
+        let old: GroupConfigV1 = postcard::from_bytes(&new).unwrap();
+        assert_eq!(old.version, c.version);
+        assert_eq!(decode_config(&new).unwrap(), c);
+    }
+
+    #[test]
+    fn meta_is_sealed_and_bound_to_group_and_blob() {
+        let g = GroupKey([1; 32]);
+        let b = crate::BlobId([5; 16]);
+        let m = BlobMeta {
+            size: 10,
+            created_ms: 1,
+            complete: true,
+        };
+        let sealed = g.seal_meta(b, &m).unwrap();
+        assert!(sealed.len() <= MAX_META_BYTES);
+        assert_eq!(g.open_meta(b, &sealed).unwrap(), m);
+        // Другой файл, другая группа, подмена, открытый postcard — отказ.
+        assert!(g.open_meta(crate::BlobId([6; 16]), &sealed).is_err());
+        assert!(GroupKey([2; 32]).open_meta(b, &sealed).is_err());
+        let mut bad = sealed.clone();
+        bad[30] ^= 1;
+        assert!(g.open_meta(b, &bad).is_err());
+        assert!(g.open_meta(b, &postcard::to_stdvec(&m).unwrap()).is_err());
     }
 
     #[test]

@@ -316,7 +316,7 @@ async fn files_go_through_external_store() -> Result<()> {
     let store = DirStore::new(&shared);
     let meta = tokio::time::timeout(T, async {
         loop {
-            if let Some(m) = get_meta(&store, &key.group_id(), f.blob.unwrap()).await?
+            if let Some(m) = get_meta(&store, &key, f.blob.unwrap()).await?
                 && m.complete
             {
                 return anyhow::Ok(m);
@@ -348,7 +348,7 @@ impl ObjectStore for DownStore {
     fn put<'a>(&'a self, _: &'a str, _: Vec<u8>) -> StoreFuture<'a, ()> {
         Box::pin(async { Err(StoreError::Network("нет связи".into())) })
     }
-    fn get<'a>(&'a self, _: &'a str) -> StoreFuture<'a, Option<Vec<u8>>> {
+    fn get<'a>(&'a self, _: &'a str, _: u64) -> StoreFuture<'a, Option<Vec<u8>>> {
         Box::pin(async { Err(StoreError::Network("нет связи".into())) })
     }
     fn head<'a>(&'a self, _: &'a str) -> StoreFuture<'a, Option<ObjectInfo>> {
@@ -385,8 +385,9 @@ async fn unavailable_external_store_falls_back_to_server() -> Result<()> {
         .send(Content::Files(vec![f.clone()]).into())
         .await?;
     let item = b.incoming().await?;
-    assert!(
-        places(&item.ext).is_empty(),
+    assert_eq!(
+        places(&item.ext),
+        vec![(f.blob.unwrap(), BlobPlace::Server)],
         "файл должен уйти через сервер"
     );
     let Content::Files(files) = &item.content else {
@@ -412,4 +413,94 @@ async fn unavailable_external_store_falls_back_to_server() -> Result<()> {
     a.stop().await?;
     b.stop().await?;
     server.shutdown().await
+}
+
+/// Хранилище лежит у обоих: файл уходит через сервер с явной меткой
+/// `Server`, и получатель сразу берёт его с сервера, а не ждёт хранилище
+/// до 10 минут. Файл без метки (старый клиент) — тоже с сервера.
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_external_store_on_both_sides_falls_back_quickly() -> Result<()> {
+    let server_dir = tmp("server");
+    let (server, info) = start_server(&server_dir).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key, &tmp("a"))?;
+    let mut b = Agent::spawn(&info, &key, &tmp("b"))?;
+    a.blobs.storage().use_store(3, Arc::new(DownStore));
+    b.blobs.storage().use_store(3, Arc::new(DownStore));
+    a.online().await?;
+    b.online().await?;
+
+    let src = tmp("src");
+    let (data, f) = make_file(&src, "оба без хранилища.bin", CHUNK as u64 + 5);
+    a.local
+        .as_ref()
+        .unwrap()
+        .send(Content::Files(vec![f.clone()]).into())
+        .await?;
+    let item = b.incoming().await?;
+    assert_eq!(places(&item.ext), vec![(f.blob.unwrap(), BlobPlace::Server)]);
+    let Content::Files(files) = &item.content else {
+        unreachable!()
+    };
+    let got = tokio::time::timeout(
+        T,
+        b.blobs
+            .download_all_at(files, DeviceId([0; 32]), &places(&item.ext)),
+    )
+    .await
+    .context("получатель ждал недоступное хранилище")??;
+    assert_eq!(std::fs::read(&got[0])?, data);
+
+    // Без метки места: одна попытка во внешнем хранилище, затем сервер.
+    let mut c = Agent::spawn(&info, &key, &tmp("c"))?;
+    c.blobs.storage().use_store(3, Arc::new(DownStore));
+    c.online().await?;
+    let got = tokio::time::timeout(T, c.blobs.download_all(files, DeviceId([0; 32])))
+        .await
+        .context("файл без метки ждал недоступное хранилище")??;
+    assert_eq!(std::fs::read(&got[0])?, data);
+
+    for x in [&mut a, &mut b, &mut c] {
+        x.stop().await?;
+    }
+    server.shutdown().await
+}
+
+/// Источник положил файл по настройкам новее, чем есть у получателя:
+/// получатель дожидается настроек, а не идёт на сервер за «файла нет».
+/// Здесь без движков: у движка источника своя версия ушла бы на сервер и
+/// дошла бы до получателя раньше, чем он начнёт ждать.
+#[tokio::test(flavor = "multi_thread")]
+async fn receiver_waits_for_newer_settings() -> Result<()> {
+    let key = GroupKey::generate()?;
+    let shared = tmp("bucket");
+    let store = DirStore::new(&shared);
+    let src = tmp("src");
+    let (data, f) = make_file(&src, "новые настройки.bin", CHUNK as u64 + 5);
+    let mut job = clipwire_agent::blobs::UploadJob::from_file(&f).context("задание")?;
+    job.external = Some(7);
+    clipwire_agent::storage::external::upload(&store, &key, &job, |_| {})
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let b = Blobs::new(key.clone(), &tmp("b"), Arc::new(|_: Transfer| {}));
+    let p = vec![(f.blob.unwrap(), BlobPlace::External { config_version: 7 })];
+    let files = vec![f.clone()];
+    let paste = {
+        let b = b.clone();
+        tokio::spawn(async move { b.download_all_at(&files, DeviceId([0; 32]), &p).await })
+    };
+    // Движок получил просьбу запросить настройки заново.
+    tokio::time::timeout(T, b.storage().refresh_wanted()).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if paste.is_finished() {
+        bail!("получатель не дождался настроек: {:?}", paste.await?);
+    }
+    // Пока своих настроек версии 7 нет, во внешнее хранилище не ходим.
+    assert!(b.storage().external().is_none());
+    // Настройки дошли (здесь — подставлены напрямую).
+    b.storage().use_store(7, Arc::new(DirStore::new(&shared)));
+    let got = tokio::time::timeout(T, paste).await???;
+    assert_eq!(std::fs::read(&got[0])?, data);
+    Ok(())
 }

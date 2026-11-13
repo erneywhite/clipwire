@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clipwire_core::blob::{BlobKey, CHUNK, chunk_count, chunk_len};
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{BlobChunk, BlobFail, BlobReply, BlobRequest};
@@ -35,6 +35,9 @@ pub const EMIT_EVERY: Duration = Duration::from_millis(200);
 /// Сколько скачивание ждёт соединения, если его сейчас нет (приложение только
 /// что запустилось или переподключается).
 const WAIT_CONN: Duration = Duration::from_secs(10);
+/// Сколько ждать настроек хранилища группы, если файл лежит по настройкам
+/// новее своих (их только что сменили на другом устройстве).
+pub const CONFIG_WAIT: Duration = Duration::from_secs(30);
 /// Через сколько повторить загрузку после временной ошибки на том же соединении.
 pub const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Как часто продлевать на сервере резервы файлов, которые ждут загрузки в
@@ -1639,9 +1642,11 @@ impl Blobs {
     }
 
     /// То же с местом файла из `ext::BLOB_PLACES` записи. `Some(Server)` —
-    /// только сервер; `External` или `None` (метки нет: своя запись или
-    /// элемент старого клиента) — сначала текущее внешнее хранилище группы,
-    /// если оно выбрано, а если файла там нет — сервер.
+    /// только сервер. `External` — текущее внешнее хранилище группы: если у
+    /// источника настройки новее своих, сначала дождаться их (не дольше
+    /// [`CONFIG_WAIT`]); файла там нет — сервер. `None` (метки нет: своя
+    /// запись или элемент старого клиента) — одна попытка во внешнем
+    /// хранилище, при любой его ошибке — сервер.
     pub async fn download_at(
         &self,
         f: &FileRef,
@@ -1671,15 +1676,29 @@ impl Blobs {
         // сервере до того, как элемент уйдёт в группу, и сервер сам ждёт
         // первых частей. NotFound значит, что файла правда нет.
         let res = async {
-            let external = match place {
-                Some(BlobPlace::Server) => None,
-                _ => self.storage.external(),
+            use crate::storage::external::{GetError, Waits, download};
+            let (external, waits) = match place {
+                Some(BlobPlace::Server) => (None, Waits::default()),
+                Some(BlobPlace::External { config_version }) => {
+                    // Источник положил файл по настройкам новее наших:
+                    // старое хранилище или сервер его не знают.
+                    if self.storage.note_version(config_version)
+                        && !self
+                            .storage
+                            .wait_version(config_version, CONFIG_WAIT)
+                            .await
+                    {
+                        bail!(
+                            "настройки хранилища файлов группы ещё не пришли на это устройство, попробуйте вставить чуть позже"
+                        );
+                    }
+                    (self.storage.external(), Waits::default())
+                }
+                None => (self.storage.external(), Waits::untagged()),
             };
             let progress = |done| self.transfers.progress(blob, Direction::Down, done, size);
             let from_external = match (f.p2p, external) {
                 (false, Some((_, store))) => {
-                    use crate::storage::external::{GetError, Waits, download};
-                    let waits = Waits::default();
                     match download(
                         store.as_ref(),
                         &self.key,
@@ -1695,7 +1714,13 @@ impl Blobs {
                         // Файла во внешнем хранилище нет: его отправили через
                         // сервер (хранилище было недоступно) или раньше выбора.
                         Err(GetError::Gone) => None,
-                        Err(GetError::Failed(e)) => return Err(e),
+                        // Метки нет, а хранилище не отвечает: файл мог уйти
+                        // через сервер, там и искать.
+                        Err(GetError::Unavailable(e)) if place.is_none() => {
+                            tracing::info!(blob = %blob.hex(), "внешнее хранилище недоступно, беру файл с сервера: {e:#}");
+                            None
+                        }
+                        Err(GetError::Unavailable(e) | GetError::Failed(e)) => return Err(e),
                     }
                 }
                 _ => None,
@@ -1777,16 +1802,16 @@ impl Blobs {
                 let external = external.clone();
                 let name = f.name.clone();
                 let storage = self.storage.clone();
+                let key = self.key.clone();
                 tasks.spawn(async move {
                     // Во внешнем хранилище резерв — `meta` с `complete = false`.
                     // Не вышло — файл идёт через сервер, как раньше.
                     if let Some((version, store)) = external {
-                        let group = storage.group();
                         let res = tokio::time::timeout(
                             CONTROL_TIMEOUT,
                             crate::storage::external::reserve(
                                 store.as_ref(),
-                                &group,
+                                &key,
                                 job.blob,
                                 job.size,
                             ),
@@ -1844,13 +1869,22 @@ impl Blobs {
         }
         // Порядок заданий — как у файлов в элементе.
         jobs.sort_by_key(|(i, _)| *i);
-        let places: BlobPlaces = jobs
-            .iter()
-            .filter_map(|(_, j)| {
-                j.external
-                    .map(|v| (j.blob, BlobPlace::External { config_version: v }))
-            })
-            .collect();
+        // При внешнем хранилище метка есть у каждого файла: и у ушедших через
+        // сервер (хранилище не ответило) явная `Server`, иначе получатель
+        // искал бы их во внешнем хранилище, которое у него тоже лежит.
+        let places: BlobPlaces = if external.is_some() {
+            jobs.iter()
+                .map(|(_, j)| {
+                    let place = match j.external {
+                        Some(v) => BlobPlace::External { config_version: v },
+                        None => BlobPlace::Server,
+                    };
+                    (j.blob, place)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok((
             Content::Files(files),
             jobs.into_iter().map(|(_, j)| j).collect(),
@@ -1869,6 +1903,12 @@ impl Blobs {
         let mut done = 0;
         for job in self.queued() {
             if skip.contains(&job.blob) {
+                continue;
+            }
+            // Файл грузится во внешнее хранилище: резерв на сервере ему не
+            // нужен и только занял бы квоту. Если группа с тех пор вернулась
+            // на сервер, загрузка пойдёт туда, и резерв продлевается.
+            if job.external.is_some() && self.storage.external().is_some() {
                 continue;
             }
             let queued = self

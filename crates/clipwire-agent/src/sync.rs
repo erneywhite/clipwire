@@ -640,9 +640,22 @@ impl Engine {
             self.push(&conn, &mut send, c).await?;
         }
         self.send_backfill(&mut send).await?;
+        let storage = self.blobs.as_ref().map(|b| b.storage().clone());
 
         loop {
             tokio::select! {
+                // В элементе соседа настройки хранилища новее своих:
+                // спросить их у сервера заново.
+                _ = async {
+                    match &storage {
+                        Some(s) => s.refresh_wanted().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if self.config_supported && self.config_on() {
+                        write_msg(&mut send, &ClientMsg::GetGroupConfig).await?;
+                    }
+                }
                 c = local.recv() => match c {
                     Some(c) => self.push(&conn, &mut send, c).await?,
                     None => {
@@ -874,9 +887,13 @@ impl Engine {
         write_msg(&mut send2, &ClientMsg::PublishCard(card)).await?;
         // Настройки группы — в новую группу заново зашифрованными, до рассылки
         // пакетов. Только если сервер их знает (иначе он оборвёт соединение).
+        // При исключении устройства доступы к внешнему хранилищу остаются у
+        // него: настройки уходят с пометкой, интерфейс попросит их сменить.
         let storage = self.blobs.as_ref().map(|b| b.storage().clone());
         if self.config_supported
-            && let Some(sealed) = storage.as_ref().and_then(|s| s.seal_current(&new_key))
+            && let Some(sealed) = storage
+                .as_ref()
+                .and_then(|s| s.seal_for_rekey(&new_key, remove.is_some()))
         {
             write_msg(&mut send2, &ClientMsg::SetGroupConfig(sealed)).await?;
         }
@@ -938,9 +955,13 @@ impl Engine {
         if let Some((_, store)) = storage.as_ref().and_then(|s| s.external()) {
             tokio::spawn(async move {
                 let dir = clipwire_core::storage::group_dir(&old);
-                match store.delete_dir(&dir).await {
-                    Ok(()) => tracing::info!("файлы старой группы удалены из внешнего хранилища"),
-                    Err(e) => tracing::info!("файлы старой группы не удалились: {e}"),
+                let run = store.delete_dir(&dir);
+                match tokio::time::timeout(crate::group_config::CLEANUP_TIMEOUT, run).await {
+                    Ok(Ok(())) => {
+                        tracing::info!("файлы старой группы удалены из внешнего хранилища")
+                    }
+                    Ok(Err(e)) => tracing::info!("файлы старой группы не удалились: {e}"),
+                    Err(_) => tracing::info!("удаление файлов старой группы не уложилось в срок"),
                 }
             });
         }
@@ -975,6 +996,7 @@ impl Engine {
             }
             match key.open(sealed) {
                 Ok(item) => {
+                    self.note_places(&item);
                     // Id из будущего не в счёт: иначе он перекрыл бы
                     // настоящий самый свежий, а курсор по нему не встанет.
                     if unseen && !ahead_of_clock(item.id, now) {
@@ -1047,7 +1069,24 @@ impl Engine {
     /// (запоздалая доставка или старый элемент, выданный за новый), идёт
     /// только в историю: время копирования лежит под шифрованием, сервер его
     /// не подделает.
+    /// Версии настроек хранилища, по которым соседи положили файлы элемента:
+    /// новее своих — свои устарели ([`GroupStorage::note_version`]).
+    ///
+    /// [`GroupStorage::note_version`]: crate::group_config::GroupStorage::note_version
+    fn note_places(&self, item: &Item) {
+        let Some(b) = &self.blobs else { return };
+        if item.origin == self.device {
+            return;
+        }
+        for (_, p) in crate::storage::external::places(&item.ext) {
+            if let clipwire_core::storage::BlobPlace::External { config_version } = p {
+                b.storage().note_version(config_version);
+            }
+        }
+    }
+
     fn accept(&mut self, item: Item, window: Duration) {
+        self.note_places(&item);
         let id = item.id;
         if is_fresh(&item, now_ms(), window) {
             self.emit(Event::Incoming(item));

@@ -11,10 +11,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
-use clipwire_core::blob::chunk_count;
+use clipwire_core::blob::{CHUNK, OVERHEAD, chunk_count};
 use clipwire_core::item::ext;
 use clipwire_core::storage::{
-    BlobMeta, BlobPlace, BlobPlaces, StorageConfig, chunk_object, group_dir, meta_object,
+    BlobMeta, BlobPlace, BlobPlaces, MAX_META_BYTES, StorageConfig, chunk_object, group_dir,
+    meta_object,
 };
 use clipwire_core::{BlobId, Ext, GroupId, GroupKey};
 
@@ -30,6 +31,17 @@ pub const STALL: Duration = Duration::from_secs(10 * 60);
 /// считать, что файла во внешнем хранилище больше нет (SFTP переписывает
 /// `meta` через удаление, читающий может попасть между шагами).
 const META_GONE_AFTER: u32 = 3;
+/// Сколько раз подряд часть может не читаться, когда `HEAD` говорит, что она
+/// есть (рассинхрон кэша перед хранилищем или злое хранилище), прежде чем
+/// сдаться. Между попытками — обычная пауза [`POLL`].
+const UNREADABLE_AFTER: u32 = 3;
+/// Предел объекта части: шифротекст части не больше [`CHUNK`] открытого
+/// текста плюс накладные шифра.
+const MAX_CHUNK_OBJECT: u64 = (CHUNK + OVERHEAD) as u64;
+/// Запас чистки по сроку: объект удаляется, только если он старше срока ещё
+/// и на столько (часы хранилища и время изменения объектов идут с
+/// точностью до секунды, а у S3 — ещё и с задержкой записи).
+pub const CLEANUP_MARGIN_MS: u64 = 10 * 60 * 1000;
 
 /// Где лежат файлы элемента (`ext::BLOB_PLACES`); пусто — все на сервере.
 pub fn places(list: &[Ext]) -> BlobPlaces {
@@ -45,40 +57,47 @@ pub fn place_of(places: &BlobPlaces, blob: BlobId) -> Option<BlobPlace> {
     places.iter().find(|(b, _)| *b == blob).map(|(_, p)| *p)
 }
 
+/// `meta` файла: запечатана ключом группы ([`GroupKey::open_meta`]).
+/// Не открылась (открытый текст, чужая, подменённая) —
+/// [`StoreError::Corrupt`]: такой `meta` не верим.
 pub async fn get_meta(
     store: &dyn ObjectStore,
-    group: &GroupId,
+    key: &GroupKey,
     blob: BlobId,
 ) -> Result<Option<BlobMeta>, StoreError> {
-    match store.get(&meta_object(group, blob)).await? {
+    let name = meta_object(&key.group_id(), blob);
+    match store.get(&name, MAX_META_BYTES as u64).await? {
         None => Ok(None),
-        Some(raw) => postcard::from_bytes(&raw)
+        Some(raw) => key
+            .open_meta(blob, &raw)
             .map(Some)
-            .map_err(|_| StoreError::Other("meta файла не разобралась".into())),
+            .map_err(|e| StoreError::Corrupt(format!("meta файла: {e}"))),
     }
 }
 
 pub async fn put_meta(
     store: &dyn ObjectStore,
-    group: &GroupId,
+    key: &GroupKey,
     blob: BlobId,
     meta: &BlobMeta,
 ) -> Result<(), StoreError> {
-    let raw = postcard::to_stdvec(meta).map_err(|e| StoreError::Other(e.to_string()))?;
-    store.put(&meta_object(group, blob), raw).await
+    let raw = key
+        .seal_meta(blob, meta)
+        .map_err(|e| StoreError::Other(e.to_string()))?;
+    store.put(&meta_object(&key.group_id(), blob), raw).await
 }
 
 /// Завести файл до отправки элемента: `meta` с `complete = false`.
 /// Получатель, вставивший элемент сразу, ждёт частей, а не «файла нет».
 pub async fn reserve(
     store: &dyn ObjectStore,
-    group: &GroupId,
+    key: &GroupKey,
     blob: BlobId,
     size: u64,
 ) -> Result<(), StoreError> {
     put_meta(
         store,
-        group,
+        key,
         blob,
         &BlobMeta {
             size,
@@ -96,7 +115,9 @@ pub fn blob_dir(group: &GroupId, blob: BlobId) -> String {
 
 /// Загрузить файл задания во внешнее хранилище. Части, которые уже лежат
 /// там (докачка после обрыва), не перезаписываются: первая недостающая
-/// ищется по `HEAD`.
+/// ищется по `HEAD`. `meta` с `complete = true` верим, только если есть и
+/// последняя часть; `meta`, которая не открылась ключом группы, заводится
+/// заново.
 pub async fn upload(
     store: &dyn ObjectStore,
     key: &GroupKey,
@@ -110,10 +131,24 @@ pub async fn upload(
         .await
         .map_err(|_| UploadError::Missing)?;
     let count = chunk_count(job.size);
-    let meta = get_meta(store, &group, job.blob).await.map_err(ext)?;
+    let meta = match get_meta(store, key, job.blob).await {
+        Err(StoreError::Corrupt(e)) => {
+            tracing::warn!(blob = %job.blob.hex(), "meta во внешнем хранилище не наша, завожу заново: {e}");
+            None
+        }
+        r => r.map_err(ext)?,
+    };
     let mut start = 0;
+    let last_present = match &meta {
+        Some(m) if m.size == job.size && m.complete && count > 0 => store
+            .head(&chunk_object(&group, job.blob, count - 1))
+            .await
+            .map_err(ext)?
+            .is_some(),
+        _ => false,
+    };
     match meta {
-        Some(m) if m.size == job.size && m.complete => {
+        Some(m) if m.size == job.size && m.complete && last_present => {
             progress(job.size);
             return Ok(());
         }
@@ -128,9 +163,7 @@ pub async fn upload(
                 start += 1;
             }
         }
-        _ => reserve(store, &group, job.blob, job.size)
-            .await
-            .map_err(ext)?,
+        _ => reserve(store, key, job.blob, job.size).await.map_err(ext)?,
     }
     let bkey = key.blob_key(job.blob);
     progress(done_bytes(job.size, start));
@@ -153,7 +186,7 @@ pub async fn upload(
     check_stamp(job)?;
     put_meta(
         store,
-        &group,
+        key,
         job.blob,
         &BlobMeta {
             size: job.size,
@@ -171,6 +204,9 @@ pub enum GetError {
     /// Файла там нет (`meta` не нашлась): его могли отправить через сервер
     /// Clipwire, когда внешнее хранилище было недоступно.
     Gone,
+    /// Хранилище не ответило или отказало, пока искали `meta`: о файле
+    /// ничего не известно. Файл без метки места тогда берут с сервера.
+    Unavailable(anyhow::Error),
     Failed(anyhow::Error),
 }
 
@@ -185,6 +221,10 @@ impl From<anyhow::Error> for GetError {
 pub struct Waits {
     pub poll: Duration,
     pub stall: Duration,
+    /// Сколько пережидать временные ошибки хранилища, пока ищется `meta`.
+    /// Ноль — одна попытка: так качается файл без метки места, ему есть
+    /// куда идти дальше (сервер).
+    pub meta: Duration,
 }
 
 impl Default for Waits {
@@ -192,6 +232,17 @@ impl Default for Waits {
         Self {
             poll: POLL,
             stall: STALL,
+            meta: STALL,
+        }
+    }
+}
+
+impl Waits {
+    /// Для файла без метки места: одна попытка найти `meta`.
+    pub fn untagged() -> Self {
+        Self {
+            meta: Duration::ZERO,
+            ..Self::default()
         }
     }
 }
@@ -212,16 +263,16 @@ pub async fn download(
     }
     let group = key.group_id();
     let mut last_progress = Instant::now();
-    // Сводка файла; временные ошибки хранилища переждать в пределах STALL.
+    // Сводка файла; временные ошибки хранилища переждать в пределах `meta`.
     let meta = loop {
-        match get_meta(store, &group, blob).await {
+        match get_meta(store, key, blob).await {
             Ok(Some(m)) => break m,
             Ok(None) => return Err(GetError::Gone),
-            Err(e) if e.retryable() && last_progress.elapsed() < waits.stall => {
+            Err(e) if e.retryable() && last_progress.elapsed() < waits.meta => {
                 tracing::info!("хранилище не ответило, жду: {e}");
                 tokio::time::sleep(waits.poll).await;
             }
-            Err(e) => return Err(GetError::Failed(anyhow!("{e}"))),
+            Err(e) => return Err(GetError::Unavailable(anyhow!("{e}"))),
         }
     };
     if meta.size != size {
@@ -237,18 +288,22 @@ pub async fn download(
     let bkey = key.blob_key(blob);
     progress(w.done_bytes());
     let mut meta_missing = 0;
+    let mut unreadable = 0;
     while !w.is_complete() {
         let index = w.next();
-        let got = store.get(&chunk_object(&group, blob, index)).await;
+        let got = store
+            .get(&chunk_object(&group, blob, index), MAX_CHUNK_OBJECT)
+            .await;
         match got {
             Ok(Some(data)) => {
                 w.write_chunk(&bkey, index, &data).await?;
                 progress(w.done_bytes());
                 last_progress = Instant::now();
                 meta_missing = 0;
+                unreadable = 0;
                 continue;
             }
-            Ok(None) => match get_meta(store, &group, blob).await {
+            Ok(None) => match get_meta(store, key, blob).await {
                 Ok(None) => {
                     meta_missing += 1;
                     if meta_missing >= META_GONE_AFTER {
@@ -256,18 +311,28 @@ pub async fn download(
                     }
                 }
                 Ok(Some(m)) if m.complete => {
-                    // Между чтением части и `meta` загрузка могла закончиться.
-                    if store
+                    // Между чтением части и `meta` загрузка могла закончиться:
+                    // тогда часть уже есть, повторить после обычной паузы.
+                    // Хранилище, которое на HEAD говорит «есть», а на GET
+                    // «нет», не должно крутить цикл вечно.
+                    if !store
                         .head(&chunk_object(&group, blob, index))
                         .await
                         .is_ok_and(|h| h.is_some())
                     {
-                        continue;
+                        return Err(anyhow!(
+                            "часть {index} пропала из внешнего хранилища (удалена по сроку?)"
+                        )
+                        .into());
                     }
-                    return Err(anyhow!(
-                        "часть {index} пропала из внешнего хранилища (удалена по сроку?)"
-                    )
-                    .into());
+                    unreadable += 1;
+                    if unreadable >= UNREADABLE_AFTER {
+                        return Err(anyhow!(
+                            "часть {index} есть во внешнем хранилище, но не читается"
+                        )
+                        .into());
+                    }
+                    meta_missing = 0;
                 }
                 Ok(Some(_)) => meta_missing = 0,
                 Err(e) if e.retryable() => {}
@@ -342,7 +407,7 @@ pub async fn probe_store(store: &dyn ObjectStore, group: &GroupId) -> Result<(),
     let name = format!("{}/probe-{tag}", group_dir(group));
     let data = format!("clipwire probe {tag}").into_bytes();
     store.put(&name, data.clone()).await?;
-    let back = store.get(&name).await;
+    let back = store.get(&name, data.len() as u64).await;
     // Удаляем в любом случае, даже если чтение не удалось.
     let deleted = store.delete(&name).await;
     match back? {
@@ -361,10 +426,53 @@ pub async fn probe_store(store: &dyn ObjectStore, group: &GroupId) -> Result<(),
     Ok(())
 }
 
+/// «Сейчас» по часам хранилища: записать объект-отметку в папку группы,
+/// взять его время изменения и удалить. Время изменения остальных объектов
+/// ставят те же часы, поэтому сбитые часы устройства на чистку не влияют.
+/// `None` — хранилище время не сообщает.
+pub async fn store_clock(store: &dyn ObjectStore, group: &GroupId) -> Result<Option<u64>, StoreError> {
+    let mut rnd = [0u8; 16];
+    getrandom::fill(&mut rnd).map_err(|e| StoreError::Other(e.to_string()))?;
+    let name = format!("{}/probe-clock-{}", group_dir(group), super::sigv4::hex(&rnd));
+    store.put(&name, b"clipwire clock".to_vec()).await?;
+    let info = store.head(&name).await;
+    let deleted = store.delete(&name).await;
+    let t = info?.map(|i| i.modified_ms).filter(|&t| t > 0);
+    deleted?;
+    Ok(t)
+}
+
 /// Удалить из папки группы файлы, объекты которых не менялись дольше
-/// `ttl_hours`. Удаление идемпотентно, гонка устройств безвредна.
-/// Возвращает, сколько файлов удалено. `ttl_hours = 0` — без срока.
+/// `ttl_hours` (плюс [`CLEANUP_MARGIN_MS`]). «Сейчас» берётся по часам
+/// хранилища ([`store_clock`]), а не устройства: устройство со спешащими
+/// часами иначе удалило бы свежие файлы всей группы. Удаление идемпотентно,
+/// гонка устройств безвредна. Возвращает, сколько файлов удалено.
+/// `ttl_hours = 0` — без срока.
 pub async fn cleanup(
+    store: &dyn ObjectStore,
+    group: &GroupId,
+    ttl_hours: u32,
+) -> Result<usize, StoreError> {
+    if ttl_hours == 0 {
+        return Ok(0);
+    }
+    let Some(now) = store_clock(store, group).await? else {
+        tracing::info!("хранилище не сообщает время изменения объектов, чистка по сроку пропущена");
+        return Ok(0);
+    };
+    let local = crate::history::now_ms().max(0) as u64;
+    if now.abs_diff(local) > 3600 * 1000 {
+        tracing::warn!(
+            store_ms = now,
+            local_ms = local,
+            "часы устройства и хранилища расходятся больше чем на час; чистка идёт по часам хранилища"
+        );
+    }
+    cleanup_at(store, group, ttl_hours, now).await
+}
+
+/// То же, что [`cleanup`], с заданным «сейчас» по часам хранилища.
+pub async fn cleanup_at(
     store: &dyn ObjectStore,
     group: &GroupId,
     ttl_hours: u32,
@@ -392,7 +500,12 @@ pub async fn cleanup(
     let mut removed = 0;
     for (name, (modified, is_dir)) in newest {
         // Время 0 — хранилище его не дало: не трогаем.
-        if modified == 0 || modified.saturating_add(ttl_ms) > now_ms {
+        if modified == 0
+            || modified
+                .saturating_add(ttl_ms)
+                .saturating_add(CLEANUP_MARGIN_MS)
+                > now_ms
+        {
             continue;
         }
         if is_dir {
@@ -409,6 +522,7 @@ pub async fn cleanup(
 mod tests {
     use super::*;
     use crate::storage::dir::DirStore;
+    use crate::storage::{ObjectInfo, StoreFuture};
     use clipwire_core::blob::chunk_len;
 
     fn tmp(tag: &str) -> PathBuf {
@@ -445,7 +559,7 @@ mod tests {
         let blob = BlobId([9; 16]);
         let j = job(&src, blob);
         upload(&store, &key, &j, |_| {}).await.unwrap();
-        let meta = get_meta(&store, &g, blob).await.unwrap().unwrap();
+        let meta = get_meta(&store, &key, blob).await.unwrap().unwrap();
         assert!(meta.complete && meta.size == data.len() as u64);
         // Объекты лежат по раскладке docs/storage.md.
         for i in 0..3 {
@@ -493,7 +607,7 @@ mod tests {
         ));
         // Подмена части — ошибка расшифровки, а не мусор в файле.
         let mut bad = store
-            .get(&chunk_object(&g, blob, 1))
+            .get(&chunk_object(&g, blob, 1), u64::MAX)
             .await
             .unwrap()
             .unwrap();
@@ -524,14 +638,18 @@ mod tests {
         let blob = BlobId([1; 16]);
         let size = clipwire_core::blob::CHUNK as u64 + 10;
         let bkey = key.blob_key(blob);
-        reserve(store.as_ref(), &g, blob, size).await.unwrap();
+        reserve(store.as_ref(), &key, blob, size).await.unwrap();
         let waits = Waits {
             poll: Duration::from_millis(20),
-            stall: Duration::from_millis(400),
+            // С запасом: шифрование части в отладочной сборке под нагрузкой
+            // занимает сотни миллисекунд.
+            stall: Duration::from_millis(1500),
+            meta: Duration::from_millis(1500),
         };
         // Источник пишет части с паузой, читатель ждёт их.
         let writer = {
             let store = store.clone();
+            let key = key.clone();
             tokio::spawn(async move {
                 for i in 0..2u64 {
                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -541,7 +659,7 @@ mod tests {
                 }
                 put_meta(
                     store.as_ref(),
-                    &g,
+                    &key,
                     blob,
                     &BlobMeta {
                         size,
@@ -562,7 +680,7 @@ mod tests {
 
         // Брошенная загрузка: meta не закончена, частей нет — ошибка по сроку.
         let blob2 = BlobId([2; 16]);
-        reserve(store.as_ref(), &g, blob2, size).await.unwrap();
+        reserve(store.as_ref(), &key, blob2, size).await.unwrap();
         let t = Instant::now();
         let err = download(
             store.as_ref(),
@@ -575,10 +693,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(t.elapsed() >= Duration::from_millis(400));
+        assert!(t.elapsed() >= Duration::from_millis(1500));
         match err {
             GetError::Failed(e) => assert!(e.to_string().contains("остановилась"), "{e}"),
-            GetError::Gone => panic!("ждали ошибку по сроку"),
+            other => panic!("ждали ошибку по сроку, а не {other:?}"),
         }
         // Файла нет вовсе — Gone (получатель возьмёт его с сервера).
         assert!(matches!(
@@ -601,25 +719,34 @@ mod tests {
     async fn probe_and_cleanup() {
         let dir = tmp("probe");
         let store = DirStore::new(dir.join("store"));
-        let g = GroupId([7; 32]);
+        let key = GroupKey([7; 32]);
+        let g = key.group_id();
         probe_store(&store, &g).await.unwrap();
         assert!(store.list(&group_dir(&g)).await.unwrap().is_empty());
 
-        reserve(&store, &g, BlobId([1; 16]), 5).await.unwrap();
-        reserve(&store, &g, BlobId([2; 16]), 5).await.unwrap();
+        reserve(&store, &key, BlobId([1; 16]), 5).await.unwrap();
+        reserve(&store, &key, BlobId([2; 16]), 5).await.unwrap();
         let now = crate::history::now_ms() as u64;
-        // Свежие не трогаются.
-        assert_eq!(cleanup(&store, &g, 1, now).await.unwrap(), 0);
+        // Свежие не трогаются, в том числе по часам хранилища.
+        assert_eq!(cleanup_at(&store, &g, 1, now).await.unwrap(), 0);
+        assert_eq!(cleanup(&store, &g, 1).await.unwrap(), 0);
+        // Срок вышел, но запас ещё нет — не трогаются.
+        assert_eq!(
+            cleanup_at(&store, &g, 24, now + 24 * 3600 * 1000 + 1000)
+                .await
+                .unwrap(),
+            0
+        );
         // Через сутки с лишним — удаляются обе папки; срок 0 — без чистки.
         assert_eq!(
-            cleanup(&store, &g, 24, now + 25 * 3600 * 1000)
+            cleanup_at(&store, &g, 24, now + 25 * 3600 * 1000)
                 .await
                 .unwrap(),
             2
         );
         assert!(store.list(&group_dir(&g)).await.unwrap().is_empty());
-        reserve(&store, &g, BlobId([3; 16]), 5).await.unwrap();
-        assert_eq!(cleanup(&store, &g, 0, u64::MAX).await.unwrap(), 0);
+        reserve(&store, &key, BlobId([3; 16]), 5).await.unwrap();
+        assert_eq!(cleanup_at(&store, &g, 0, u64::MAX).await.unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -640,5 +767,222 @@ mod tests {
             Some(BlobPlace::External { config_version: 5 })
         );
         assert_eq!(place_of(&got, BlobId([2; 16])), None);
+    }
+
+    /// Хранилище поверх папки с подменами: часы впереди или позади на
+    /// `shift_ms`, части, которые на GET «нет», а на HEAD «есть».
+    struct Quirky {
+        inner: DirStore,
+        shift_ms: i64,
+        hide_parts: bool,
+    }
+
+    impl Quirky {
+        fn shift(mut o: ObjectInfo, by: i64) -> ObjectInfo {
+            o.modified_ms = (o.modified_ms as i64 + by).max(1) as u64;
+            o
+        }
+    }
+
+    impl ObjectStore for Quirky {
+        fn put<'a>(&'a self, name: &'a str, data: Vec<u8>) -> StoreFuture<'a, ()> {
+            self.inner.put(name, data)
+        }
+        fn get<'a>(
+            &'a self,
+            name: &'a str,
+            max: u64,
+        ) -> StoreFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move {
+                if self.hide_parts && !name.ends_with("/meta") {
+                    return Ok(None);
+                }
+                self.inner.get(name, max).await
+            })
+        }
+        fn head<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<ObjectInfo>> {
+            Box::pin(async move {
+                Ok(self
+                    .inner
+                    .head(name)
+                    .await?
+                    .map(|o| Self::shift(o, self.shift_ms)))
+            })
+        }
+        fn delete<'a>(&'a self, name: &'a str) -> StoreFuture<'a, ()> {
+            self.inner.delete(name)
+        }
+        fn list<'a>(&'a self, dir: &'a str) -> StoreFuture<'a, Vec<ObjectInfo>> {
+            Box::pin(async move {
+                Ok(self
+                    .inner
+                    .list(dir)
+                    .await?
+                    .into_iter()
+                    .map(|o| Self::shift(o, self.shift_ms))
+                    .collect())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_goes_by_store_clock_not_device_clock() {
+        // Часы хранилища отстают от устройства на двое суток (или, что то
+        // же, часы устройства спешат): по часам устройства свежие файлы
+        // выглядели бы старше суток.
+        let dir = tmp("clock");
+        let store = Quirky {
+            inner: DirStore::new(dir.join("store")),
+            shift_ms: -48 * 3600 * 1000,
+            hide_parts: false,
+        };
+        let key = GroupKey([8; 32]);
+        let g = key.group_id();
+        reserve(&store, &key, BlobId([1; 16]), 5).await.unwrap();
+        reserve(&store, &key, BlobId([2; 16]), 5).await.unwrap();
+        let local = crate::history::now_ms() as u64;
+        // Так считала чистка раньше — удалила бы обе папки.
+        assert_eq!(store.list(&group_dir(&g)).await.unwrap().len(), 2);
+        assert!(
+            store.list(&group_dir(&g)).await.unwrap()[0].modified_ms + 24 * 3600 * 1000 < local
+        );
+        assert_eq!(cleanup(&store, &g, 24).await.unwrap(), 0);
+        assert_eq!(store.list(&group_dir(&g)).await.unwrap().len(), 2);
+        // Отметка времени за собой не осталась.
+        assert!(
+            store
+                .list(&group_dir(&g))
+                .await
+                .unwrap()
+                .iter()
+                .all(|o| !o.name.contains("probe-clock"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn part_visible_to_head_but_not_get_gives_up() {
+        let dir = tmp("hidden");
+        let key = GroupKey([9; 32]);
+        let blob = BlobId([4; 16]);
+        let src = dir.join("src.bin");
+        std::fs::write(&src, vec![7u8; 100]).unwrap();
+        let inner = DirStore::new(dir.join("store"));
+        upload(&inner, &key, &job(&src, blob), |_| {}).await.unwrap();
+        let store = Quirky {
+            inner,
+            shift_ms: 0,
+            hide_parts: true,
+        };
+        let waits = Waits {
+            poll: Duration::from_millis(10),
+            stall: Duration::from_secs(600),
+            meta: Duration::from_secs(600),
+        };
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            download(&store, &key, blob, 100, &dir.join("o").join("f"), waits, |_| {}),
+        )
+        .await
+        .expect("скачивание должно сдаться, а не крутиться вечно");
+        match res {
+            Err(GetError::Failed(e)) => assert!(e.to_string().contains("не читается"), "{e}"),
+            other => panic!("ждали ошибку, а не {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn forged_meta_is_not_trusted() {
+        let dir = tmp("forged");
+        let store = DirStore::new(dir.join("store"));
+        let key = GroupKey([10; 32]);
+        let g = key.group_id();
+        let blob = BlobId([5; 16]);
+        let src = dir.join("src.bin");
+        let data = vec![3u8; clipwire_core::blob::CHUNK + 10];
+        std::fs::write(&src, &data).unwrap();
+        // Открытая meta с complete = true (так её подделал бы тот, у кого
+        // есть доступы к хранилищу, но нет ключа группы).
+        let open = postcard::to_stdvec(&BlobMeta {
+            size: data.len() as u64,
+            created_ms: 1,
+            complete: true,
+        })
+        .unwrap();
+        store.put(&meta_object(&g, blob), open).await.unwrap();
+        assert!(matches!(
+            get_meta(&store, &key, blob).await,
+            Err(StoreError::Corrupt(_))
+        ));
+        // Загрузка такой meta не верит: части грузятся, meta заводится своя.
+        upload(&store, &key, &job(&src, blob), |_| {}).await.unwrap();
+        for i in 0..2 {
+            assert!(store.head(&chunk_object(&g, blob, i)).await.unwrap().is_some());
+        }
+        assert!(get_meta(&store, &key, blob).await.unwrap().unwrap().complete);
+        // Своя meta с complete, но без последней части — тоже не «готово».
+        store.delete(&chunk_object(&g, blob, 1)).await.unwrap();
+        upload(&store, &key, &job(&src, blob), |_| {}).await.unwrap();
+        assert!(store.head(&chunk_object(&g, blob, 1)).await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn untagged_download_does_not_wait_for_dead_store() {
+        struct Down;
+        impl ObjectStore for Down {
+            fn put<'a>(&'a self, _: &'a str, _: Vec<u8>) -> StoreFuture<'a, ()> {
+                Box::pin(async { Err(StoreError::Network("нет".into())) })
+            }
+            fn get<'a>(
+                &'a self,
+                _: &'a str,
+                _: u64,
+            ) -> StoreFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async { Err(StoreError::Network("нет".into())) })
+            }
+            fn head<'a>(&'a self, _: &'a str) -> StoreFuture<'a, Option<ObjectInfo>> {
+                Box::pin(async { Err(StoreError::Network("нет".into())) })
+            }
+            fn delete<'a>(&'a self, _: &'a str) -> StoreFuture<'a, ()> {
+                Box::pin(async { Err(StoreError::Network("нет".into())) })
+            }
+            fn list<'a>(&'a self, _: &'a str) -> StoreFuture<'a, Vec<ObjectInfo>> {
+                Box::pin(async { Err(StoreError::Network("нет".into())) })
+            }
+        }
+        let dir = tmp("down");
+        let t = Instant::now();
+        let r = download(
+            &Down,
+            &GroupKey([1; 32]),
+            BlobId([1; 16]),
+            5,
+            &dir.join("f"),
+            Waits::untagged(),
+            |_| {},
+        )
+        .await;
+        assert!(matches!(r, Err(GetError::Unavailable(_))), "{r:?}");
+        assert!(t.elapsed() < Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn oversized_objects_are_refused() {
+        let dir = tmp("big");
+        let store = DirStore::new(dir.join("store"));
+        let key = GroupKey([11; 32]);
+        let blob = BlobId([6; 16]);
+        store
+            .put(&meta_object(&key.group_id(), blob), vec![0; 10_000])
+            .await
+            .unwrap();
+        assert!(matches!(
+            get_meta(&store, &key, blob).await,
+            Err(StoreError::Corrupt(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -39,6 +39,10 @@ pub enum StoreError {
     Network(String),
     /// Настройки не годятся (адрес, ключ не разобрался и т. п.).
     Config(String),
+    /// Хранилище отдало не то, что могло записать устройство группы: объект
+    /// больше предела, `meta` не открылась ключом группы, бесконечный список.
+    /// Не повторяется.
+    Corrupt(String),
     /// Всё остальное.
     Other(String),
 }
@@ -63,6 +67,7 @@ impl std::fmt::Display for StoreError {
             Self::Timeout => f.write_str("хранилище не ответило вовремя"),
             Self::Network(d) => write!(f, "нет связи с хранилищем ({d})"),
             Self::Config(d) => write!(f, "настройки хранилища не годятся: {d}"),
+            Self::Corrupt(d) => write!(f, "хранилище отдало испорченные данные: {d}"),
             Self::Other(d) => write!(f, "ошибка хранилища: {d}"),
         }
     }
@@ -80,6 +85,20 @@ pub struct ObjectInfo {
     pub modified_ms: u64,
 }
 
+/// Сколько объектов самое большее перечисляет [`ObjectStore::list`]: больше
+/// — ошибка [`StoreError::Corrupt`], а не память до отказа (хранилище
+/// недоверенное). Это 100 ГБ частей в одной группе.
+// shortcut: один предел на всё; переделать на постраничную чистку, если
+// группам понадобится хранить больше.
+pub const MAX_LIST: usize = 100_000;
+/// Глубина папок под той, что перечисляют: раскладка — группа/файл/часть.
+pub const MAX_DEPTH: usize = 2;
+
+/// Отказ, если объект больше предела.
+pub(crate) fn too_large(name: &str, max: u64) -> StoreError {
+    StoreError::Corrupt(format!("объект {name} больше {max} байт"))
+}
+
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StoreError>> + Send + 'a>>;
 
 /// Хранилище объектов. Все операции идемпотентны: удаление несуществующего —
@@ -87,11 +106,14 @@ pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StoreError>>
 /// читающего: он видит либо старый объект, либо новый целиком.
 pub trait ObjectStore: Send + Sync {
     fn put<'a>(&'a self, name: &'a str, data: Vec<u8>) -> StoreFuture<'a, ()>;
-    /// `None` — объекта нет.
-    fn get<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<Vec<u8>>>;
+    /// `None` — объекта нет. Объект больше `max` байт — [`StoreError::Corrupt`]:
+    /// размер известен заранее (часть, `meta`), больше хранилище подсунуть
+    /// не должно.
+    fn get<'a>(&'a self, name: &'a str, max: u64) -> StoreFuture<'a, Option<Vec<u8>>>;
     fn head<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<ObjectInfo>>;
     fn delete<'a>(&'a self, name: &'a str) -> StoreFuture<'a, ()>;
-    /// Все объекты внутри папки `dir` (рекурсивно).
+    /// Все объекты внутри папки `dir` (рекурсивно, не глубже [`MAX_DEPTH`]
+    /// папок и не больше [`MAX_LIST`] объектов).
     fn list<'a>(&'a self, dir: &'a str) -> StoreFuture<'a, Vec<ObjectInfo>>;
     /// Удалить папку целиком: объекты, затем (где есть папки) пустые папки.
     fn delete_dir<'a>(&'a self, dir: &'a str) -> StoreFuture<'a, ()> {
@@ -165,5 +187,6 @@ mod tests {
         assert!(StoreError::Network("x".into()).retryable());
         assert!(!StoreError::Auth("x".into()).retryable());
         assert!(!StoreError::Forbidden("x".into()).retryable());
+        assert!(!StoreError::Corrupt("x".into()).retryable());
     }
 }

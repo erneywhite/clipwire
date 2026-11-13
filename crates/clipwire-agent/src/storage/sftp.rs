@@ -20,7 +20,7 @@ use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::protocol::StatusCode;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{ObjectInfo, ObjectStore, StoreError, StoreFuture, check_name, join_prefix};
 
@@ -91,6 +91,16 @@ fn sftp_err(e: SftpError) -> StoreError {
 
 fn is_missing(e: &SftpError) -> bool {
     matches!(e, SftpError::Status(s) if s.status_code == StatusCode::NoSuchFile)
+}
+
+/// Ответил ли сервер отказом на операцию (а не пропала связь). Только после
+/// такого ответа `rename` поверх файла стоит повторять через удаление: при
+/// тайм-ауте первый `rename` мог пройти, и удаление снесло бы новый объект.
+fn is_refusal(e: &SftpError) -> bool {
+    matches!(e, SftpError::Status(s) if !matches!(
+        s.status_code,
+        StatusCode::NoConnection | StatusCode::ConnectionLost
+    ))
 }
 
 impl SftpStore {
@@ -298,6 +308,10 @@ async fn write_file(sftp: &SftpSession, path: &str, data: &[u8]) -> Result<(), S
     Ok(())
 }
 
+fn too_many(dir: &str) -> StoreError {
+    StoreError::Corrupt(format!("в {dir} больше {} объектов", super::MAX_LIST))
+}
+
 fn parent(path: &str) -> Option<&str> {
     path.rfind('/')
         .map(|i| &path[..i])
@@ -319,8 +333,13 @@ impl ObjectStore for SftpStore {
                     }
                     write_file(&s, &tmp, &data).await.map_err(sftp_err)?;
                 }
-                // SFTP v3 не переименовывает поверх существующего файла.
-                if s.rename(tmp.clone(), path.clone()).await.is_err() {
+                // SFTP v3 не переименовывает поверх существующего файла:
+                // сервер отвечает отказом, тогда удалить и повторить. Обрыв
+                // или тайм-аут — просто ошибка, загрузка повторится.
+                if let Err(e) = s.rename(tmp.clone(), path.clone()).await {
+                    if !is_refusal(&e) {
+                        return Err(sftp_err(e));
+                    }
                     let _ = s.remove_file(path.clone()).await;
                     if let Err(e) = s.rename(tmp.clone(), path.clone()).await {
                         let _ = s.remove_file(tmp).await;
@@ -333,15 +352,26 @@ impl ObjectStore for SftpStore {
         })
     }
 
-    fn get<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<Vec<u8>>> {
+    fn get<'a>(&'a self, name: &'a str, max: u64) -> StoreFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
             let path = self.path(name)?;
             self.run(|s| async move {
-                match s.read(path).await {
-                    Ok(d) => Ok(Some(d)),
-                    Err(e) if is_missing(&e) => Ok(None),
-                    Err(e) => Err(sftp_err(e)),
+                let f = match s.open(path).await {
+                    Ok(f) => f,
+                    Err(e) if is_missing(&e) => return Ok(None),
+                    Err(e) => return Err(sftp_err(e)),
+                };
+                // Не больше предела и ещё байта: сервер, отдающий бесконечный
+                // файл, не раздует память.
+                let mut out = Vec::new();
+                f.take(max + 1)
+                    .read_to_end(&mut out)
+                    .await
+                    .map_err(|e| StoreError::Network(e.to_string()))?;
+                if out.len() as u64 > max {
+                    return Err(super::too_large(name, max));
                 }
+                Ok(Some(out))
             })
             .await
         })
@@ -384,9 +414,10 @@ impl ObjectStore for SftpStore {
             let root = self.path(dir)?;
             self.run(|s| async move {
                 let mut out = Vec::new();
-                // Обход в ширину: (путь на сервере, имя без префикса).
-                let mut queue = vec![(root, dir.to_string())];
-                while let Some((path, rel)) = queue.pop() {
+                // Обход: (путь на сервере, имя без префикса, глубина).
+                let mut queue = vec![(root, dir.to_string(), 0)];
+                let mut seen = 0usize;
+                while let Some((path, rel, depth)) = queue.pop() {
                     let rd = match s.read_dir(path.clone()).await {
                         Ok(rd) => rd,
                         Err(e) if is_missing(&e) => continue,
@@ -397,10 +428,17 @@ impl ObjectStore for SftpStore {
                         if n == "." || n == ".." {
                             continue;
                         }
+                        seen += 1;
+                        if seen > super::MAX_LIST {
+                            return Err(too_many(dir));
+                        }
                         let m = e.metadata();
                         let (p, r) = (format!("{path}/{n}"), format!("{rel}/{n}"));
                         if m.is_dir() {
-                            queue.push((p, r));
+                            // Глубже раскладки Clipwire ничего не кладёт.
+                            if depth < super::MAX_DEPTH {
+                                queue.push((p, r, depth + 1));
+                            }
                         } else if !n.contains(".tmp-") {
                             out.push(ObjectInfo {
                                 name: r,
@@ -422,8 +460,9 @@ impl ObjectStore for SftpStore {
             self.run(|s| async move {
                 // Сначала файлы, потом папки от самых глубоких.
                 let mut dirs = vec![root.clone()];
-                let mut queue = vec![root];
-                while let Some(path) = queue.pop() {
+                let mut queue = vec![(root, 0)];
+                let mut seen = 0usize;
+                while let Some((path, depth)) = queue.pop() {
                     let rd = match s.read_dir(path.clone()).await {
                         Ok(rd) => rd,
                         Err(e) if is_missing(&e) => continue,
@@ -434,10 +473,18 @@ impl ObjectStore for SftpStore {
                         if n == "." || n == ".." {
                             continue;
                         }
+                        seen += 1;
+                        if seen > super::MAX_LIST {
+                            return Err(too_many(dir));
+                        }
                         let p = format!("{path}/{n}");
                         if e.metadata().is_dir() {
-                            dirs.push(p.clone());
-                            queue.push(p);
+                            // Папку глубже раскладки не обходим: удалить её
+                            // не выйдет, и это честная ошибка.
+                            if depth < super::MAX_DEPTH {
+                                dirs.push(p.clone());
+                                queue.push((p, depth + 1));
+                            }
                         } else if let Err(e) = s.remove_file(p).await
                             && !is_missing(&e)
                         {
@@ -493,6 +540,23 @@ mod tests {
         assert!(s.path("../etc").is_err());
         assert_eq!(parent("/a/b/c"), Some("/a/b"));
         assert_eq!(parent("c"), None);
+    }
+
+    #[test]
+    fn rename_retried_only_after_refusal() {
+        use russh_sftp::protocol::Status;
+        let st = |code| {
+            SftpError::Status(Status {
+                id: 0,
+                status_code: code,
+                error_message: String::new(),
+                language_tag: String::new(),
+            })
+        };
+        assert!(is_refusal(&st(StatusCode::Failure)));
+        assert!(!is_refusal(&st(StatusCode::ConnectionLost)));
+        assert!(!is_refusal(&SftpError::Timeout));
+        assert!(!is_refusal(&SftpError::IO("обрыв".into())));
     }
 
     #[test]

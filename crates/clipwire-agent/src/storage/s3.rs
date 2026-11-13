@@ -17,6 +17,13 @@ use super::{ObjectInfo, ObjectStore, StoreError, StoreFuture, check_name, join_p
 /// Предел одного запроса (часть файла — 1 МиБ).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Предел тела ответа без данных (ошибка, ответ на `PUT`/`DELETE`).
+const SMALL_BODY: u64 = 64 * 1024;
+/// Предел одной страницы `ListObjectsV2` (до 1000 ключей — сотни КБ).
+const LIST_PAGE_BODY: u64 = 8 * 1024 * 1024;
+/// Сколько страниц списка самое большее (по 1000 ключей, с запасом к
+/// [`super::MAX_LIST`]).
+const MAX_LIST_PAGES: usize = super::MAX_LIST / 1000 + 10;
 
 pub struct S3Store {
     cfg: S3Config,
@@ -190,6 +197,7 @@ impl S3Store {
         key: Option<&str>,
         query: &[(String, String)],
         body: Vec<u8>,
+        max_body: u64,
     ) -> Result<(StatusCode, reqwest::header::HeaderMap, Vec<u8>), StoreError> {
         let hash = if body.is_empty() {
             EMPTY_SHA256.to_string()
@@ -210,10 +218,22 @@ impl S3Store {
         if method == Method::PUT {
             req = req.body(body);
         }
-        let resp = req.send().await.map_err(net)?;
+        let mut resp = req.send().await.map_err(net)?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        let body = resp.bytes().await.map_err(net)?.to_vec();
+        let what = key.unwrap_or("список");
+        // Тело читается частями с подсчётом: хранилище недоверенное, и
+        // объект на гигабайты не должен оказаться в памяти целиком.
+        if resp.content_length().is_some_and(|n| n > max_body) {
+            return Err(super::too_large(what, max_body));
+        }
+        let mut body = Vec::new();
+        while let Some(c) = resp.chunk().await.map_err(net)? {
+            if (body.len() + c.len()) as u64 > max_body {
+                return Err(super::too_large(what, max_body));
+            }
+            body.extend_from_slice(&c);
+        }
         Ok((status, headers, body))
     }
 }
@@ -335,7 +355,7 @@ impl ObjectStore for S3Store {
         Box::pin(async move {
             check_name(name)?;
             let (status, _, body) = self
-                .send(Method::PUT, Some(&self.key(name)), &[], data)
+                .send(Method::PUT, Some(&self.key(name)), &[], data, SMALL_BODY)
                 .await?;
             if status.is_success() {
                 Ok(())
@@ -345,13 +365,20 @@ impl ObjectStore for S3Store {
         })
     }
 
-    fn get<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<Vec<u8>>> {
+    fn get<'a>(&'a self, name: &'a str, max: u64) -> StoreFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
             check_name(name)?;
             let (status, _, body) = self
-                .send(Method::GET, Some(&self.key(name)), &[], Vec::new())
+                .send(
+                    Method::GET,
+                    Some(&self.key(name)),
+                    &[],
+                    Vec::new(),
+                    max.max(SMALL_BODY),
+                )
                 .await?;
             match status {
+                s if s.is_success() && body.len() as u64 > max => Err(super::too_large(name, max)),
                 s if s.is_success() => Ok(Some(body)),
                 StatusCode::NOT_FOUND => match s3_error(status, &body) {
                     e @ StoreError::NoBucket(_) => Err(e),
@@ -366,7 +393,7 @@ impl ObjectStore for S3Store {
         Box::pin(async move {
             check_name(name)?;
             let (status, headers, body) = self
-                .send(Method::HEAD, Some(&self.key(name)), &[], Vec::new())
+                .send(Method::HEAD, Some(&self.key(name)), &[], Vec::new(), SMALL_BODY)
                 .await?;
             match status {
                 s if s.is_success() => Ok(Some(ObjectInfo {
@@ -390,7 +417,13 @@ impl ObjectStore for S3Store {
         Box::pin(async move {
             check_name(name)?;
             let (status, _, body) = self
-                .send(Method::DELETE, Some(&self.key(name)), &[], Vec::new())
+                .send(
+                    Method::DELETE,
+                    Some(&self.key(name)),
+                    &[],
+                    Vec::new(),
+                    SMALL_BODY,
+                )
                 .await?;
             match status {
                 s if s.is_success() => Ok(()),
@@ -411,7 +444,8 @@ impl ObjectStore for S3Store {
             let strip = join_prefix(&self.cfg.prefix, "");
             let mut out = Vec::new();
             let mut token: Option<String> = None;
-            loop {
+            let mut seen_tokens = std::collections::HashSet::new();
+            for _ in 0..MAX_LIST_PAGES {
                 let mut query = vec![
                     ("list-type".to_string(), "2".to_string()),
                     ("prefix".to_string(), prefix.clone()),
@@ -419,7 +453,9 @@ impl ObjectStore for S3Store {
                 if let Some(t) = &token {
                     query.push(("continuation-token".to_string(), t.clone()));
                 }
-                let (status, _, body) = self.send(Method::GET, None, &query, Vec::new()).await?;
+                let (status, _, body) = self
+                    .send(Method::GET, None, &query, Vec::new(), LIST_PAGE_BODY)
+                    .await?;
                 if !status.is_success() {
                     return Err(s3_error(status, &body));
                 }
@@ -433,11 +469,26 @@ impl ObjectStore for S3Store {
                         });
                     }
                 }
+                if out.len() > super::MAX_LIST {
+                    return Err(StoreError::Corrupt(format!(
+                        "в {dir} больше {} объектов",
+                        super::MAX_LIST
+                    )));
+                }
                 match next {
+                    // Повтор токена — список по кругу.
+                    Some(t) if !seen_tokens.insert(t.clone()) => {
+                        return Err(StoreError::Corrupt(
+                            "список объектов пошёл по кругу".into(),
+                        ));
+                    }
                     Some(t) => token = Some(t),
                     None => return Ok(out),
                 }
             }
+            Err(StoreError::Corrupt(format!(
+                "список {dir} длиннее {MAX_LIST_PAGES} страниц"
+            )))
         })
     }
 }

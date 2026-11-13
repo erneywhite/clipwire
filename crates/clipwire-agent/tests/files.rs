@@ -1397,3 +1397,34 @@ async fn queued_upload_keeps_its_reserve() -> Result<()> {
     dev.drop_link().await;
     server.shutdown().await
 }
+
+/// Задание во внешнее хранилище резерв на сервере не продлевает (и не
+/// заводит): квоту сервера оно не занимает. Группа вернулась на сервер —
+/// продлевает.
+#[tokio::test(flavor = "multi_thread")]
+async fn external_upload_does_not_reserve_on_server() -> Result<()> {
+    let (server, info) = start_server(1024 * 1024).await?;
+    let key = GroupKey::generate()?;
+    let dev = Device::join(&info, &key).await?;
+    let src = tmp("ext-refresh-src");
+    let (_, f) = make_file(&src, "во внешнее.bin", 100);
+    let (b, _events) = blobs(&key, &tmp("ext-refresh-state"));
+    b.storage().use_store(
+        5,
+        Arc::new(clipwire_agent::storage::dir::DirStore::new(tmp("bucket"))),
+    );
+    b.enqueue(vec![UploadJob {
+        external: Some(5),
+        ..job(&f)
+    }]);
+    assert_eq!(b.refresh_reserves(&dev.conn, &Default::default()).await, 0);
+    assert_eq!(server_have(&dev.conn, f.blob.unwrap(), f.size).await?, None);
+    // Без внешнего хранилища (новые настройки — сервер) резерв нужен.
+    assert!(b.storage().apply(clipwire_core::GroupConfig {
+        version: 6,
+        ..Default::default()
+    }));
+    assert_eq!(b.refresh_reserves(&dev.conn, &Default::default()).await, 1);
+    dev.drop_link().await;
+    server.shutdown().await
+}

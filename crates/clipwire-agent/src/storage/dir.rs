@@ -85,9 +85,10 @@ impl ObjectStore for DirStore {
         })
     }
 
-    fn get<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<Vec<u8>>> {
+    fn get<'a>(&'a self, name: &'a str, max: u64) -> StoreFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
             match tokio::fs::read(self.path(name)?).await {
+                Ok(d) if d.len() as u64 > max => Err(super::too_large(name, max)),
                 Ok(d) => Ok(Some(d)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(io(e)),

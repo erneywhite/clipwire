@@ -77,7 +77,7 @@ async fn s3_store_against_real_server() {
     for (i, n) in names.iter().enumerate() {
         store.put(n, vec![i as u8; 10 + i]).await.unwrap();
         assert_eq!(
-            store.get(n).await.unwrap(),
+            store.get(n, 1024).await.unwrap(),
             Some(vec![i as u8; 10 + i]),
             "{n}"
         );
@@ -87,7 +87,7 @@ async fn s3_store_against_real_server() {
     }
     assert_eq!(
         store
-            .get(&format!("{}/missing", group_dir(&g)))
+            .get(&format!("{}/missing", group_dir(&g)), 1024)
             .await
             .unwrap(),
         None
@@ -121,10 +121,10 @@ async fn s3_store_against_real_server() {
     // 3. Список с пагинацией: больше 1000 объектов не создаём, но проверяем
     // перезапись и удаление.
     store.put(&names[0], b"new".to_vec()).await.unwrap();
-    assert_eq!(store.get(&names[0]).await.unwrap(), Some(b"new".to_vec()));
+    assert_eq!(store.get(&names[0], 1024).await.unwrap(), Some(b"new".to_vec()));
     store.delete(&names[0]).await.unwrap();
     store.delete(&names[0]).await.unwrap(); // повтор — не ошибка
-    assert_eq!(store.get(&names[0]).await.unwrap(), None);
+    assert_eq!(store.get(&names[0], 1024).await.unwrap(), None);
 
     // 4. Файл через внешнее хранилище: загрузка и скачивание, 3 части.
     let dir = tmp("file");
@@ -167,8 +167,8 @@ async fn s3_store_against_real_server() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    assert_eq!(external::cleanup(&store, &g, 24, now).await.unwrap(), 0);
-    let removed = external::cleanup(&store, &g, 24, now + year).await.unwrap();
+    assert_eq!(external::cleanup(&store, &g, 24).await.unwrap(), 0);
+    let removed = external::cleanup_at(&store, &g, 24, now + year).await.unwrap();
     println!("cleanup removed {removed}");
     assert!(removed >= 1);
     store.delete_dir(&group_dir(&g)).await.unwrap();
