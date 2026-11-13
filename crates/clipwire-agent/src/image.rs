@@ -31,11 +31,59 @@ pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Пределы декодера: картинка не больше [`MAX_PIXELS`], память под неё — с
+/// запасом на 16 бит на канал. Без них PNG в пару килобайт с заголовком
+/// 20000×20000 заставил бы выделить гигабайты.
+fn limits() -> image::Limits {
+    let mut l = image::Limits::default();
+    l.max_image_width = Some(65_535);
+    l.max_image_height = Some(65_535);
+    l.max_alloc = Some(MAX_PIXELS * 8 * 2);
+    l
+}
+
+/// Открыть картинку с пределами: сначала размеры из заголовка и проверка
+/// [`MAX_PIXELS`], потом уже декодирование.
+fn decode_limited<R: std::io::BufRead + std::io::Seek>(
+    open: impl Fn() -> Result<image::ImageReader<R>>,
+) -> Result<image::DynamicImage> {
+    let mut r = open()?;
+    r.limits(limits());
+    let (w, h) = r
+        .into_dimensions()
+        .context("заголовок картинки не читается")?;
+    anyhow::ensure!(
+        (w as u64) * (h as u64) <= MAX_PIXELS,
+        "картинка {w}×{h} слишком большая"
+    );
+    let mut r = open()?;
+    r.limits(limits());
+    r.decode().context("картинка не читается")
+}
+
 /// PNG → RGBA для записи в буфер.
 pub fn decode_png(png: &[u8]) -> Result<RgbaImage> {
-    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
-        .context("PNG повреждён")?;
+    let img = decode_limited(|| {
+        Ok(image::ImageReader::with_format(
+            Cursor::new(png),
+            image::ImageFormat::Png,
+        ))
+    })
+    .context("PNG повреждён")?;
     Ok(img.to_rgba8())
+}
+
+/// PNG картинки из элемента: размеры, указанные в элементе, должны совпасть
+/// с настоящими.
+pub fn decode_png_sized(png: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
+    let img = decode_png(png)?;
+    anyhow::ensure!(
+        img.dimensions() == (width, height),
+        "размеры картинки {}×{} не совпадают с заявленными {width}×{height}",
+        img.width(),
+        img.height()
+    );
+    Ok(img)
 }
 
 /// Содержимое-картинка из пикселей буфера.
@@ -86,10 +134,7 @@ pub fn thumbnail_file(path: &std::path::Path) -> Result<Vec<u8>> {
         meta.len() <= MAX_IMAGE_FILE,
         "файл-картинка слишком большой"
     );
-    let img = image::ImageReader::open(path)?
-        .with_guessed_format()?
-        .decode()
-        .context("картинка не читается")?;
+    let img = decode_limited(|| Ok(image::ImageReader::open(path)?.with_guessed_format()?))?;
     thumb_of(img.to_rgba8())
 }
 
@@ -170,5 +215,53 @@ mod tests {
     #[test]
     fn rejects_absurd_size() {
         assert!(encode_png(20_000, 20_000, &[]).is_err());
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// PNG в сотню байт с заголовком 20000×20000: IHDR переписан, CRC
+    /// пересчитан, данные остались от картинки 8×8.
+    fn png_bomb() -> Vec<u8> {
+        let mut png = encode_png(8, 8, &checker(8, 8)).unwrap();
+        // Сигнатура 8 байт, длина и тип IHDR — ещё 8, дальше ширина и высота.
+        assert_eq!(&png[12..16], b"IHDR");
+        png[16..20].copy_from_slice(&20_000u32.to_be_bytes());
+        png[20..24].copy_from_slice(&20_000u32.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        png
+    }
+
+    #[test]
+    fn png_bomb_is_rejected_before_decoding() {
+        let bomb = png_bomb();
+        assert!(bomb.len() < 1024);
+        let err = decode_png(&bomb).unwrap_err();
+        assert!(format!("{err:#}").contains("слишком большая"), "{err:#}");
+        assert!(thumbnail(&bomb).is_err());
+        let path = std::env::temp_dir().join(format!("clipwire-bomb-{}.png", uuid::Uuid::now_v7()));
+        std::fs::write(&path, &bomb).unwrap();
+        assert!(thumbnail_file(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn declared_size_must_match_png() {
+        let png = encode_png(40, 24, &checker(40, 24)).unwrap();
+        assert!(decode_png_sized(&png, 40, 24).is_ok());
+        assert!(decode_png_sized(&png, 4000, 2400).is_err());
     }
 }

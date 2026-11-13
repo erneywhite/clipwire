@@ -164,6 +164,86 @@ async fn history_respects_cursor() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cursor_from_future_does_not_block_new_items() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key, None)?;
+    a.online().await?;
+    // Курсор 2099 года: его могла сохранить старая версия по элементу с
+    // часами вперёд. С ним новые элементы считались бы уже виденными.
+    let mut b = Agent::spawn(&info, &key, Some(ItemId::at_ms(4_070_908_800_000)))?;
+    b.online().await?;
+    a.local.send(Content::Text("после".into())).await?;
+    assert_eq!(b.incoming_text().await?, "после");
+    server.shutdown().await
+}
+
+/// Старый сервер не знает `JoinWithToken`: не разобрав кадр, он рвёт
+/// соединение. Агент должен войти повторно обычным `Join`.
+#[tokio::test(flavor = "multi_thread")]
+async fn old_server_without_join_with_token_still_works() -> Result<()> {
+    use clipwire_core::proto::io::{read_msg, write_msg};
+    use clipwire_core::proto::{ALPN, ClientMsg, ServerMsg};
+    use iroh::endpoint::presets;
+    use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey};
+
+    // Relay берём у настоящего сервера, а отвечает поддельный «старый».
+    let (server, info) = start_server().await?;
+    let url: RelayUrl = info.relay_url.parse()?;
+    let fake = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&random_key()?))
+        .relay_mode(RelayMode::Custom(
+            RelayMap::from_iter([url]).with_auth_token(info.relay_token.clone()),
+        ))
+        .alpns(vec![ALPN.to_vec()])
+        .bind()
+        .await?;
+    tokio::time::timeout(T, fake.online()).await?;
+    let (seen_tx, mut seen) = mpsc::unbounded_channel::<&'static str>();
+    let accept = {
+        let fake = fake.clone();
+        tokio::spawn(async move {
+            while let Some(inc) = fake.accept().await {
+                let Ok(conn) = inc.await else { continue };
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                        return;
+                    };
+                    match read_msg::<_, ClientMsg>(&mut recv).await {
+                        Ok(Some(ClientMsg::JoinWithToken { token, .. })) => {
+                            assert_eq!(token, "tok");
+                            let _ = seen_tx.send("с токеном");
+                            // Как старый сервер: кадр не понят, соединение закрыто.
+                            conn.close(0u32.into(), b"bad frame");
+                        }
+                        Ok(Some(ClientMsg::Join { .. })) => {
+                            let _ = seen_tx.send("обычный");
+                            let _ = write_msg(&mut send, &ServerMsg::Joined).await;
+                            let _ = write_msg(&mut send, &ServerMsg::HistoryEnd).await;
+                            // Держим соединение, пока агент на связи.
+                            let _ = conn.closed().await;
+                        }
+                        _ => {}
+                    }
+                });
+            }
+        })
+    };
+    let fake_info = ServerInfo {
+        server_id: *fake.id().as_bytes(),
+        ..info.clone()
+    };
+    let mut a = Agent::spawn(&fake_info, &GroupKey::generate()?, None)?;
+    a.online().await?;
+    assert_eq!(seen.recv().await, Some("с токеном"));
+    assert_eq!(seen.recv().await, Some("обычный"));
+    accept.abort();
+    fake.close().await;
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wrong_relay_token_is_reported_quickly() -> Result<()> {
     let (server, mut info) = start_server().await?;
     info.relay_token = "wrong".into();

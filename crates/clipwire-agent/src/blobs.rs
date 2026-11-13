@@ -45,9 +45,10 @@ pub fn files_dir(state_dir: &Path) -> PathBuf {
 }
 
 /// Где лежит (или будет лежать) скачанный файл: `<files>/<blob hex>/<имя>`.
-// shortcut: кэш скачанного не чистится. Чистить вместе с историей по сроку
-// хранения (удалять папки blob, на которые не ссылается ни одна запись), когда
-// дойдут руки до настроек места на диске.
+// shortcut: кэш скачанного чистится только при выходе из группы
+// (`Paths::reset`). Чистить вместе с историей по сроку хранения (удалять папки
+// blob, на которые не ссылается ни одна запись), когда дойдут руки до настроек
+// места на диске.
 pub fn cache_path(files_dir: &Path, blob: BlobId, name: &str) -> PathBuf {
     files_dir.join(blob.hex()).join(sanitize_name(name))
 }
@@ -113,14 +114,19 @@ fn part_path(dest: &Path) -> PathBuf {
 }
 
 /// Имя файла с другого устройства, безопасное для записи на диск: только
-/// последний компонент пути, без запрещённых в Windows и управляющих символов,
-/// без точек и пробелов в конце; зарезервированные имена (`CON`, `NUL`,
-/// `COM1`…) получают префикс `_`, пустое имя становится `file`.
+/// последний компонент пути, без запрещённых в Windows, управляющих и
+/// невидимых форматирующих символов, без точек и пробелов в конце;
+/// зарезервированные имена (`CON`, `NUL`, `COM1`…) получают префикс `_`,
+/// пустое имя становится `file`.
 pub fn sanitize_name(name: &str) -> String {
     let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
     let cleaned: String = last
         .chars()
-        .filter(|c| !c.is_control() && !matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .filter(|&c| {
+            !c.is_control()
+                && !is_format_char(c)
+                && !matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
         .collect();
     let shortened = if cleaned.chars().count() > MAX_NAME_CHARS {
         shorten(&cleaned)
@@ -135,6 +141,73 @@ pub fn sanitize_name(name: &str) -> String {
         s.insert(0, '_');
     }
     s
+}
+
+/// Невидимый форматирующий символ (категория Unicode Cf): метки направления
+/// текста, нулевой ширины и т. п. В имени файла они прячут настоящее
+/// расширение: «отчёт\u{202E}fdp.exe» выглядит как «отчётexe.pdf».
+/// Список — все символы Cf по Unicode 16.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Пометить скачанный с другого устройства файл как полученный из
+/// интернета (Mark-of-the-Web, поток `Zone.Identifier` с `ZoneId=3`):
+/// Windows и Office тогда предупреждают перед запуском и открывают документы
+/// в защищённом режиме. На дисках без NTFS потоков нет — молча пропускаем.
+#[cfg(windows)]
+pub fn mark_from_internet(path: &Path) {
+    let mut ads = path.as_os_str().to_owned();
+    ads.push(":Zone.Identifier");
+    if let Err(e) = std::fs::write(&ads, b"[ZoneTransfer]\r\nZoneId=3\r\n") {
+        tracing::debug!(
+            "метка «из интернета» не поставилась на {}: {e}",
+            path.display()
+        );
+    }
+}
+
+/// На других ОС такой метки нет.
+#[cfg(not(windows))]
+pub fn mark_from_internet(_path: &Path) {}
+
+/// [`mark_from_internet`] для файла или для всех файлов внутри папки.
+pub fn mark_tree_from_internet(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.is_file() {
+        mark_from_internet(path);
+    } else if meta.is_dir()
+        && let Ok(dir) = std::fs::read_dir(path)
+    {
+        for e in dir.flatten() {
+            mark_tree_from_internet(&e.path());
+        }
+    }
 }
 
 /// Обрезать длинное имя, по возможности сохранив расширение.
@@ -1529,13 +1602,17 @@ impl Blobs {
                 })
                 .await?
             };
+            // Файл с другого устройства — как скачанный из интернета: метка
+            // ставится до того, как путь уйдёт в буфер или в «Открыть».
             if !f.is_dir {
+                mark_from_internet(&got);
                 return Ok(got);
             }
             let (archive, out) = (got, dest.clone());
             tokio::task::spawn_blocking(move || {
                 crate::folder::unpack_archive(&archive, &out)?;
                 let _ = std::fs::remove_file(&archive);
+                mark_tree_from_internet(&out);
                 anyhow::Ok(out)
             })
             .await?
@@ -1804,11 +1881,49 @@ mod tests {
         assert_eq!(sanitize_name("a:b*c?d\"e<f>g|h"), "abcdefgh");
         assert_eq!(sanitize_name("tab\there\u{7}.txt"), "tabhere.txt");
         assert_eq!(sanitize_name("Отчёт 2026.pdf"), "Отчёт 2026.pdf");
+        // Невидимые метки направления и нулевой ширины прятали бы расширение.
+        assert_eq!(sanitize_name("отчёт\u{202E}fdp.exe"), "отчётfdp.exe");
+        assert_eq!(
+            sanitize_name("a\u{200E}\u{200F}\u{2066}\u{2069}\u{061C}\u{200B}\u{FEFF}b.txt"),
+            "ab.txt"
+        );
+        assert_eq!(sanitize_name("x\u{E0041}.txt"), "x.txt");
+        assert_eq!(sanitize_name("\u{202E}"), "file");
         assert_eq!(sanitize_name(".gitignore"), ".gitignore");
         let long = format!("{}.txt", "я".repeat(500));
         let s = sanitize_name(&long);
         assert_eq!(s.chars().count(), MAX_NAME_CHARS);
         assert!(s.ends_with(".txt"));
+    }
+
+    #[cfg(windows)]
+    fn zone_of(p: &Path) -> Option<String> {
+        let mut ads = p.as_os_str().to_owned();
+        ads.push(":Zone.Identifier");
+        std::fs::read_to_string(ads).ok()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn downloaded_files_get_mark_of_the_web() {
+        let dir = tmp("motw");
+        std::fs::create_dir_all(dir.join("папка").join("вложенная")).unwrap();
+        let one = dir.join("один.exe");
+        let inner = dir.join("папка").join("вложенная").join("два.docx");
+        std::fs::write(&one, b"1").unwrap();
+        std::fs::write(&inner, b"2").unwrap();
+        mark_from_internet(&one);
+        mark_tree_from_internet(&dir.join("папка"));
+        for p in [&one, &inner] {
+            let z = zone_of(p).expect("метка есть");
+            assert!(
+                z.contains("[ZoneTransfer]") && z.contains("ZoneId=3"),
+                "{z}"
+            );
+            // Содержимое самого файла не тронуто.
+            assert_eq!(std::fs::read(p).unwrap().len(), 1);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
