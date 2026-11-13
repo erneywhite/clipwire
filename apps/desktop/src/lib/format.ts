@@ -54,8 +54,33 @@ export function richDoc(html: string): string {
   const csp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:"
   const base =
     'html,body{margin:0;background:#fff;color:#1d1f23;font:14px/1.45 system-ui,sans-serif;overflow-wrap:anywhere}' +
-    'body{padding:10px 12px}img{max-width:100%;height:auto}table{border-collapse:collapse;max-width:100%}pre{white-space:pre-wrap}'
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><style>${base}</style></head><body>${html}</body></html>`
+    'body{padding:10px 12px}img{max-width:100%;height:auto}table{border-collapse:collapse;max-width:100%}pre{white-space:pre-wrap}' +
+    'button{all:unset}.cw-alt{color:#6b675f}'
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><style>${base}</style></head><body>${tameImages(html)}</body></html>`
+}
+
+/**
+ * Внешние картинки в предпросмотре всё равно не загрузятся, а значок битой
+ * картинки выглядит как поломка. Меняем их на подпись `alt` (у смайликов это
+ * их название) или убираем. DOMParser строит инертный документ: ничего не
+ * загружает и не исполняет. Во вставку уходит исходный HTML.
+ */
+export function tameImages(html: string): string {
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  for (const img of Array.from(doc.querySelectorAll('img'))) {
+    const src = img.getAttribute('src') ?? ''
+    if (src.startsWith('data:')) continue
+    const alt = (img.getAttribute('alt') ?? '').trim()
+    if (alt) {
+      const span = doc.createElement('span')
+      span.className = 'cw-alt'
+      span.textContent = alt
+      img.replaceWith(span)
+    } else {
+      img.remove()
+    }
+  }
+  return doc.body.innerHTML
 }
 
 /** Похоже на ссылку целиком. */
