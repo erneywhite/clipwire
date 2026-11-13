@@ -61,9 +61,11 @@ async fn main() -> Result<()> {
     println!("relay: {}", info.relay_url);
 
     let key = GroupKey::generate()?;
-    let join = ClientMsg::Join {
+    // Новую группу сервер создаёт только по коду сервера (токен relay).
+    let join = ClientMsg::JoinWithToken {
         group_id: key.group_id(),
         join_secret: key.join_secret(),
+        token: info.relay_token.clone(),
     };
 
     let t0 = Instant::now();

@@ -34,6 +34,8 @@ pub enum BlobBegin {
     QuotaExceeded,
     /// Новый файл не влезает в общее место сервера под файлы.
     ServerFull,
+    /// У группы уже слишком много файлов без единой части.
+    TooManyReserves,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,6 +46,32 @@ pub enum JoinOutcome {
     Joined,
     /// Группа есть, но секрет другой.
     Denied,
+    /// Группы нет, а создавать её этому входу нельзя (вход без токена сервера).
+    NoGroup,
+    /// Группы нет, и на сервере уже предельное число групп.
+    TooManyGroups,
+}
+
+/// У какой группы удалить самый старый элемент, когда история всех групп
+/// вместе не влезает в общий предел. `usage` — объём истории и число
+/// элементов по группам, уже вместе с только что добавленным элементом группы
+/// `group`.
+///
+/// Правило: платит группа с наибольшим объёмом. Если больше всех занимает та,
+/// что добавляет, она вытесняет свои старые элементы, а не чужие; маленькой
+/// группе место освобождает самая большая. При равенстве платит своя.
+/// Только что добавленный элемент не удаляется никогда.
+fn pick_victim<'a>(usage: &'a [(Vec<u8>, i64, i64)], group: &[u8]) -> Option<&'a [u8]> {
+    usage
+        .iter()
+        .filter_map(|(g, bytes, count)| {
+            let own = g.as_slice() == group;
+            // Свой новый элемент трогать нельзя: кандидатов на один меньше.
+            let deletable = if own { count - 1 } else { *count };
+            (deletable > 0).then_some((g.as_slice(), *bytes, own))
+        })
+        .max_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)))
+        .map(|(g, ..)| g)
 }
 
 impl Store {
@@ -111,12 +139,18 @@ impl Store {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Вход устройства в группу. Новая группа создаётся, только если
+    /// `may_create` (вход с токеном сервера) и групп меньше `max_groups`.
+    /// Проверка числа групп и вставка идут в одной транзакции, поэтому два
+    /// одновременных входа предел не проскочат.
     pub fn join(
         &self,
         group: &GroupId,
         secret: &JoinSecret,
         device: &DeviceId,
         now_ms: i64,
+        may_create: bool,
+        max_groups: usize,
     ) -> Result<JoinOutcome> {
         let digest = secret.digest();
         let mut conn = self.conn();
@@ -129,7 +163,12 @@ impl Store {
             )
             .optional()?;
         let outcome = match existing {
+            None if !may_create => return Ok(JoinOutcome::NoGroup),
             None => {
+                let groups: i64 = tx.query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0))?;
+                if groups as u64 >= max_groups as u64 {
+                    return Ok(JoinOutcome::TooManyGroups);
+                }
                 tx.execute(
                     "INSERT INTO groups (group_id, join_digest, created_ms) VALUES (?1, ?2, ?3)",
                     params![&group.0[..], &digest[..], now_ms],
@@ -151,6 +190,10 @@ impl Store {
     /// Сохраняет элемент и обрезает историю группы до `keep` последних.
     /// Повторная отправка того же `id` игнорируется. Возвращает `false`, если
     /// элемент уже был. `backfill` — элемент из локальной истории устройства.
+    ///
+    /// Если после этого история всех групп вместе больше `total_bytes` (по
+    /// длине шифротекста), лишнее вытесняется по правилу [`pick_victim`]:
+    /// самая большая группа теряет свой самый старый элемент, пока не влезет.
     pub fn push(
         &self,
         group: &GroupId,
@@ -158,6 +201,7 @@ impl Store {
         now_ms: i64,
         keep: usize,
         backfill: bool,
+        total_bytes: u64,
     ) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -182,39 +226,70 @@ impl Store {
                  ORDER BY item_id DESC LIMIT ?2)",
             params![&group.0[..], keep as i64],
         )?;
+        if inserted == 1 {
+            evict_over_total(&tx, group, item, total_bytes)?;
+        }
         tx.commit()?;
         Ok(inserted == 1)
     }
 
-    /// История группы от старых к новым, без просроченных элементов.
-    /// Второе в паре — элемент из локальной истории (`backfill`).
-    pub fn history(&self, group: &GroupId, not_before_ms: i64) -> Result<Vec<(SealedItem, bool)>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT item_id, origin, nonce, ciphertext, backfill FROM items
-             WHERE group_id = ?1 AND received_ms >= ?2 ORDER BY item_id ASC",
-        )?;
-        let rows = stmt.query_map(params![&group.0[..], not_before_ms], |r| {
-            Ok((
-                r.get::<_, Vec<u8>>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
-                r.get::<_, Vec<u8>>(3)?,
-                r.get::<_, bool>(4)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, origin, nonce, ciphertext, backfill) = row?;
-            out.push((
-                SealedItem {
-                    id: ItemId(Uuid::from_slice(&id).context("битый item_id в базе")?),
-                    origin: DeviceId(origin.try_into().ok().context("битый origin в базе")?),
-                    nonce: nonce.try_into().ok().context("битый nonce в базе")?,
-                    ciphertext,
+    /// Следующий элемент истории группы после `after` (или первый, если
+    /// `None`), от старых к новым, без просроченных. Второе в паре — элемент
+    /// из локальной истории (`backfill`).
+    ///
+    /// История отдаётся по одному элементу: при входе сервер не собирает её
+    /// целиком в памяти, и много одновременных входов не держат много копий.
+    /// Поиск идёт по первичному ключу `(group_id, item_id)`, так что каждый
+    /// шаг дешёвый.
+    pub fn history_after(
+        &self,
+        group: &GroupId,
+        not_before_ms: i64,
+        after: Option<&ItemId>,
+    ) -> Result<Option<(SealedItem, bool)>> {
+        // Пустой BLOB меньше любого id, так что `None` — с самого начала.
+        let after: &[u8] = after.map_or(&[], |a| &a.as_bytes()[..]);
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT item_id, origin, nonce, ciphertext, backfill FROM items
+                 WHERE group_id = ?1 AND item_id > ?2 AND received_ms >= ?3
+                 ORDER BY item_id ASC LIMIT 1",
+                params![&group.0[..], after, not_before_ms],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                        r.get::<_, Vec<u8>>(3)?,
+                        r.get::<_, bool>(4)?,
+                    ))
                 },
-                backfill,
-            ));
+            )
+            .optional()?;
+        let Some((id, origin, nonce, ciphertext, backfill)) = row else {
+            return Ok(None);
+        };
+        Ok(Some((
+            SealedItem {
+                id: ItemId(Uuid::from_slice(&id).context("битый item_id в базе")?),
+                origin: DeviceId(origin.try_into().ok().context("битый origin в базе")?),
+                nonce: nonce.try_into().ok().context("битый nonce в базе")?,
+                ciphertext,
+            },
+            backfill,
+        )))
+    }
+
+    /// Вся история группы разом. Только для тестов: сервер отдаёт её через
+    /// [`Store::history_after`].
+    #[cfg(test)]
+    pub fn history(&self, group: &GroupId, not_before_ms: i64) -> Result<Vec<(SealedItem, bool)>> {
+        let mut out: Vec<(SealedItem, bool)> = Vec::new();
+        while let Some(next) =
+            self.history_after(group, not_before_ms, out.last().map(|(i, _)| &i.id))?
+        {
+            out.push(next);
         }
         Ok(out)
     }
@@ -242,6 +317,7 @@ impl Store {
         not_before_ms: i64,
         quota: u64,
         total_quota: u64,
+        max_reserves: usize,
     ) -> Result<BlobBegin> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -278,6 +354,16 @@ impl Store {
         }
         if (total_used as u64).saturating_add(need) > total_quota {
             return Ok(BlobBegin::ServerFull);
+        }
+        // Файлы без единой части: резервы и только что начатые Put. Каждый
+        // держит квоту, поэтому их число на группу ограничено.
+        let empty: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM blobs WHERE group_id = ?1 AND have = 0 AND created_ms >= ?2",
+            params![&group.0[..], not_before_ms],
+            |r| r.get(0),
+        )?;
+        if empty as u64 >= max_reserves as u64 {
+            return Ok(BlobBegin::TooManyReserves);
         }
         tx.execute(
             "INSERT INTO blobs (group_id, blob_id, size, have, created_ms) VALUES (?1, ?2, ?3, 0, ?4)",
@@ -363,6 +449,41 @@ impl Store {
         Ok(out)
     }
 
+    /// Резервы, по которым не пришло ни одной части с момента `older_than_ms`
+    /// и раньше: кандидаты на удаление. Удаляет их [`Store::delete_stale_reserve`]
+    /// под замком записи файла.
+    pub fn stale_reserves(&self, older_than_ms: i64) -> Result<Vec<(GroupId, BlobId)>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT group_id, blob_id FROM blobs WHERE have = 0 AND created_ms < ?1")?;
+        let rows = stmt.query_map(params![older_than_ms], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (g, b) = row?;
+            out.push((
+                GroupId(g.try_into().ok().context("битый group_id в базе")?),
+                BlobId(b.try_into().ok().context("битый blob_id в базе")?),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Удалить резерв, если он всё ещё без частей и старше `older_than_ms`.
+    /// `true`, если удалён: пока ждали замок, загрузка могла начаться.
+    pub fn delete_stale_reserve(
+        &self,
+        group: &GroupId,
+        blob: &BlobId,
+        older_than_ms: i64,
+    ) -> Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2 AND have = 0 AND created_ms < ?3",
+            params![&group.0[..], &blob.0[..], older_than_ms],
+        )? > 0)
+    }
+
     /// Зарегистрировано ли устройство хоть в одной группе.
     #[allow(dead_code)] // понадобится для доступа к relay по endpoint ID (этап 6)
     pub fn is_known_device(&self, device: &DeviceId) -> Result<bool> {
@@ -378,7 +499,50 @@ impl Store {
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// Вытесняет старые элементы, пока история всех групп больше `total_bytes`.
+/// Кого вытеснять, решает [`pick_victim`]. Вызывается в транзакции `push`
+/// сразу после вставки `item`.
+fn evict_over_total(
+    conn: &Connection,
+    group: &GroupId,
+    item: &SealedItem,
+    total_bytes: u64,
+) -> Result<()> {
+    loop {
+        // length() у BLOB берётся из заголовка записи, сами данные не читаются.
+        let usage: Vec<(Vec<u8>, i64, i64)> = conn
+            .prepare_cached(
+                "SELECT group_id, SUM(length(ciphertext)), COUNT(*) FROM items GROUP BY group_id",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let total: i64 = usage.iter().map(|(_, b, _)| b).sum();
+        if total as u64 <= total_bytes {
+            return Ok(());
+        }
+        let Some(victim) = pick_victim(&usage, &group.0) else {
+            // Остался только новый элемент: он один больше предела. Такой
+            // предел меньше размера элемента, это ошибка настройки.
+            tracing::warn!("CLIPWIRE_HISTORY_TOTAL_BYTES меньше одного элемента");
+            return Ok(());
+        };
+        let deleted = conn.execute(
+            "DELETE FROM items WHERE rowid = (
+                 SELECT rowid FROM items
+                 WHERE group_id = ?1 AND NOT (group_id = ?3 AND item_id = ?2)
+                 ORDER BY item_id ASC LIMIT 1)",
+            params![victim, &item.id.as_bytes()[..], &group.0[..]],
+        )?;
+        if deleted == 0 {
+            // Не должно случаться: pick_victim выбирает группу, где есть что
+            // удалить. Но бесконечный цикл хуже переполнения.
+            return Ok(());
+        }
+        tracing::debug!("история сервера заполнена, вытеснен старый элемент");
+    }
+}
+
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
@@ -400,17 +564,26 @@ mod tests {
         let g = key.group_id();
         let dev = DeviceId([5; 32]);
         assert_eq!(
-            s.join(&g, &key.join_secret(), &dev, 0).unwrap(),
+            s.join(&g, &key.join_secret(), &dev, 0, true, usize::MAX)
+                .unwrap(),
             JoinOutcome::Created
         );
         assert_eq!(
-            s.join(&g, &key.join_secret(), &DeviceId([6; 32]), 1)
-                .unwrap(),
+            s.join(
+                &g,
+                &key.join_secret(),
+                &DeviceId([6; 32]),
+                1,
+                true,
+                usize::MAX
+            )
+            .unwrap(),
             JoinOutcome::Joined
         );
         let wrong = GroupKey([2; 32]).join_secret();
         assert_eq!(
-            s.join(&g, &wrong, &DeviceId([7; 32]), 2).unwrap(),
+            s.join(&g, &wrong, &DeviceId([7; 32]), 2, true, usize::MAX)
+                .unwrap(),
             JoinOutcome::Denied
         );
         assert!(s.is_known_device(&dev).unwrap());
@@ -422,13 +595,20 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let key = GroupKey([1; 32]);
         let g = key.group_id();
-        s.join(&g, &key.join_secret(), &DeviceId([5; 32]), 0)
-            .unwrap();
+        s.join(
+            &g,
+            &key.join_secret(),
+            &DeviceId([5; 32]),
+            0,
+            true,
+            usize::MAX,
+        )
+        .unwrap();
         let items: Vec<_> = (0..5).map(|i| sealed(&key, &format!("t{i}"))).collect();
         for it in &items {
-            assert!(s.push(&g, it, 10, 3, false).unwrap());
+            assert!(s.push(&g, it, 10, 3, false, u64::MAX).unwrap());
         }
-        assert!(!s.push(&g, &items[4], 10, 3, false).unwrap());
+        assert!(!s.push(&g, &items[4], 10, 3, false, u64::MAX).unwrap());
         let h: Vec<_> = s
             .history(&g, 0)
             .unwrap()
@@ -443,12 +623,19 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let key = GroupKey([1; 32]);
         let g = key.group_id();
-        s.join(&g, &key.join_secret(), &DeviceId([5; 32]), 0)
-            .unwrap();
+        s.join(
+            &g,
+            &key.join_secret(),
+            &DeviceId([5; 32]),
+            0,
+            true,
+            usize::MAX,
+        )
+        .unwrap();
         let old = sealed(&key, "old");
         let new = sealed(&key, "new");
-        s.push(&g, &old, 100, 50, false).unwrap();
-        s.push(&g, &new, 200, 50, true).unwrap();
+        s.push(&g, &old, 100, 50, false, u64::MAX).unwrap();
+        s.push(&g, &new, 200, 50, true, u64::MAX).unwrap();
         assert_eq!(s.history(&g, 150).unwrap(), vec![(new.clone(), true)]);
         assert_eq!(s.purge_expired(150).unwrap(), 1);
         assert_eq!(s.history(&g, 0).unwrap(), vec![(new, true)]);
@@ -456,8 +643,15 @@ mod tests {
 
     fn group(s: &Store, n: u8) -> GroupId {
         let key = GroupKey([n; 32]);
-        s.join(&key.group_id(), &key.join_secret(), &DeviceId([5; 32]), 0)
-            .unwrap();
+        s.join(
+            &key.group_id(),
+            &key.join_secret(),
+            &DeviceId([5; 32]),
+            0,
+            true,
+            usize::MAX,
+        )
+        .unwrap();
         key.group_id()
     }
 
@@ -467,20 +661,20 @@ mod tests {
         let g = group(&s, 1);
         let b = BlobId([3; 16]);
         assert_eq!(
-            s.blob_begin(&g, &b, 100, 10, 0, u64::MAX, u64::MAX)
+            s.blob_begin(&g, &b, 100, 10, 0, u64::MAX, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::Created
         );
         assert_eq!(s.blob_info(&g, &b, 0).unwrap(), Some((100, 0)));
         s.blob_set_have(&g, &b, 1).unwrap();
         assert_eq!(
-            s.blob_begin(&g, &b, 100, 20, 0, u64::MAX, u64::MAX)
+            s.blob_begin(&g, &b, 100, 20, 0, u64::MAX, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::Existing { have: 1 }
         );
         assert_eq!(s.blob_info(&g, &b, 0).unwrap(), Some((100, 1)));
         assert_eq!(
-            s.blob_begin(&g, &b, 101, 20, 0, u64::MAX, u64::MAX)
+            s.blob_begin(&g, &b, 101, 20, 0, u64::MAX, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::SizeMismatch
         );
@@ -496,8 +690,17 @@ mod tests {
         let g2 = group(&s, 2);
         let quota = sealed_size(1000) * 2;
         let begin = |g: &GroupId, n: u8, size: u64| {
-            s.blob_begin(g, &BlobId([n; 16]), size, 10, 0, quota, u64::MAX)
-                .unwrap()
+            s.blob_begin(
+                g,
+                &BlobId([n; 16]),
+                size,
+                10,
+                0,
+                quota,
+                u64::MAX,
+                usize::MAX,
+            )
+            .unwrap()
         };
         assert_eq!(begin(&g, 1, 1000), BlobBegin::Created);
         assert_eq!(begin(&g, 2, 1000), BlobBegin::Created);
@@ -517,8 +720,17 @@ mod tests {
         let big = CHUNK as u64 * 2 + 1;
         let total = sealed_size(big) + sealed_size(0) + sealed_size(1000);
         let begin = |g: &GroupId, n: u8, size: u64| {
-            s.blob_begin(g, &BlobId([n; 16]), size, 10, 0, u64::MAX, total)
-                .unwrap()
+            s.blob_begin(
+                g,
+                &BlobId([n; 16]),
+                size,
+                10,
+                0,
+                u64::MAX,
+                total,
+                usize::MAX,
+            )
+            .unwrap()
         };
         assert_eq!(begin(&g, 1, big), BlobBegin::Created);
         assert_eq!(begin(&g2, 2, 0), BlobBegin::Created);
@@ -540,13 +752,13 @@ mod tests {
         let (old, new) = (BlobId([1; 16]), BlobId([2; 16]));
         let quota = sealed_size(1000);
         assert_eq!(
-            s.blob_begin(&g, &old, 1000, 100, 0, quota, u64::MAX)
+            s.blob_begin(&g, &old, 1000, 100, 0, quota, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::Created
         );
         // Истёкший файл не занимает квоту и не виден.
         assert_eq!(
-            s.blob_begin(&g, &new, 1000, 200, 150, quota, u64::MAX)
+            s.blob_begin(&g, &new, 1000, 200, 150, quota, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::Created
         );
@@ -562,11 +774,11 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let g = group(&s, 1);
         let b = BlobId([1; 16]);
-        s.blob_begin(&g, &b, 1000, 100, 0, u64::MAX, u64::MAX)
+        s.blob_begin(&g, &b, 1000, 100, 0, u64::MAX, u64::MAX, usize::MAX)
             .unwrap();
         s.blob_set_have(&g, &b, 1).unwrap();
         assert_eq!(
-            s.blob_begin(&g, &b, 5, 200, 150, u64::MAX, u64::MAX)
+            s.blob_begin(&g, &b, 5, 200, 150, u64::MAX, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::Created
         );
@@ -577,12 +789,169 @@ mod tests {
     fn groups_are_isolated() {
         let s = Store::in_memory().unwrap();
         let (a, b) = (GroupKey([1; 32]), GroupKey([2; 32]));
-        s.join(&a.group_id(), &a.join_secret(), &DeviceId([5; 32]), 0)
-            .unwrap();
-        s.join(&b.group_id(), &b.join_secret(), &DeviceId([5; 32]), 0)
-            .unwrap();
-        s.push(&a.group_id(), &sealed(&a, "a"), 1, 50, false)
+        s.join(
+            &a.group_id(),
+            &a.join_secret(),
+            &DeviceId([5; 32]),
+            0,
+            true,
+            usize::MAX,
+        )
+        .unwrap();
+        s.join(
+            &b.group_id(),
+            &b.join_secret(),
+            &DeviceId([5; 32]),
+            0,
+            true,
+            usize::MAX,
+        )
+        .unwrap();
+        s.push(&a.group_id(), &sealed(&a, "a"), 1, 50, false, u64::MAX)
             .unwrap();
         assert!(s.history(&b.group_id(), 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_group_needs_token_and_free_slot() {
+        let s = Store::in_memory().unwrap();
+        let dev = DeviceId([5; 32]);
+        let (a, b, c) = (GroupKey([1; 32]), GroupKey([2; 32]), GroupKey([3; 32]));
+        // Без токена группа не создаётся и не появляется в базе.
+        assert_eq!(
+            s.join(&a.group_id(), &a.join_secret(), &dev, 0, false, 10)
+                .unwrap(),
+            JoinOutcome::NoGroup
+        );
+        assert_eq!(
+            s.join(&a.group_id(), &a.join_secret(), &dev, 0, true, 2)
+                .unwrap(),
+            JoinOutcome::Created
+        );
+        // В существующую группу пускает и без токена, по секрету.
+        assert_eq!(
+            s.join(&a.group_id(), &a.join_secret(), &dev, 1, false, 2)
+                .unwrap(),
+            JoinOutcome::Joined
+        );
+        assert_eq!(
+            s.join(&a.group_id(), &b.join_secret(), &dev, 1, true, 2)
+                .unwrap(),
+            JoinOutcome::Denied
+        );
+        assert_eq!(
+            s.join(&b.group_id(), &b.join_secret(), &dev, 2, true, 2)
+                .unwrap(),
+            JoinOutcome::Created
+        );
+        // Предел групп: третья не создаётся, а в имеющиеся входить можно.
+        assert_eq!(
+            s.join(&c.group_id(), &c.join_secret(), &dev, 3, true, 2)
+                .unwrap(),
+            JoinOutcome::TooManyGroups
+        );
+        assert_eq!(
+            s.join(&b.group_id(), &b.join_secret(), &dev, 3, true, 2)
+                .unwrap(),
+            JoinOutcome::Joined
+        );
+    }
+
+    #[test]
+    fn history_after_walks_one_by_one() {
+        let s = Store::in_memory().unwrap();
+        let g = group(&s, 1);
+        let key = GroupKey([1; 32]);
+        let items: Vec<_> = (0..3).map(|i| sealed(&key, &format!("t{i}"))).collect();
+        for it in &items {
+            s.push(&g, it, 10, 50, false, u64::MAX).unwrap();
+        }
+        let first = s.history_after(&g, 0, None).unwrap().unwrap().0;
+        assert_eq!(first, items[0]);
+        let second = s.history_after(&g, 0, Some(&first.id)).unwrap().unwrap().0;
+        assert_eq!(second, items[1]);
+        let third = s.history_after(&g, 0, Some(&second.id)).unwrap().unwrap().0;
+        assert_eq!(third, items[2]);
+        assert!(s.history_after(&g, 0, Some(&third.id)).unwrap().is_none());
+        // Просроченные пропускаются и при обходе.
+        assert!(s.history_after(&g, 11, None).unwrap().is_none());
+    }
+
+    fn sized(key: &GroupKey, len: usize) -> SealedItem {
+        let mut it = sealed(key, "x");
+        it.ciphertext = vec![0; len];
+        it
+    }
+
+    fn group_bytes(s: &Store, g: &GroupId) -> usize {
+        s.history(g, 0)
+            .unwrap()
+            .iter()
+            .map(|(i, _)| i.ciphertext.len())
+            .sum()
+    }
+
+    #[test]
+    fn total_history_limit_evicts_from_biggest_group() {
+        let s = Store::in_memory().unwrap();
+        let (big, small) = (group(&s, 1), group(&s, 2));
+        let (kb, ks) = (GroupKey([1; 32]), GroupKey([2; 32]));
+        let total = 1000;
+        // Большая группа заняла всё место.
+        for _ in 0..10 {
+            s.push(&big, &sized(&kb, 100), 1, 50, false, total).unwrap();
+        }
+        assert_eq!(group_bytes(&s, &big), 1000);
+        // Её новые элементы вытесняют её же старые.
+        let newest = sized(&kb, 100);
+        s.push(&big, &newest, 1, 50, false, total).unwrap();
+        let h = s.history(&big, 0).unwrap();
+        assert_eq!(h.len(), 10);
+        assert_eq!(h.last().unwrap().0, newest);
+        // Маленькой группе место освобождает большая.
+        let mine = sized(&ks, 150);
+        s.push(&small, &mine, 1, 50, false, total).unwrap();
+        assert_eq!(s.history(&small, 0).unwrap(), vec![(mine.clone(), false)]);
+        assert_eq!(group_bytes(&s, &big), 800);
+        // Большая группа снова пишет: платит она, маленькую не трогает.
+        for _ in 0..5 {
+            s.push(&big, &sized(&kb, 100), 1, 50, false, total).unwrap();
+        }
+        assert_eq!(s.history(&small, 0).unwrap(), vec![(mine, false)]);
+        assert!(group_bytes(&s, &big) + 150 <= total as usize);
+    }
+
+    #[test]
+    fn total_history_limit_keeps_new_item() {
+        let s = Store::in_memory().unwrap();
+        let g = group(&s, 1);
+        let k = GroupKey([1; 32]);
+        s.push(&g, &sized(&k, 100), 1, 50, false, 150).unwrap();
+        // Новый элемент один больше предела: старые уходят, он остаётся.
+        let huge = sized(&k, 200);
+        s.push(&g, &huge, 1, 50, false, 150).unwrap();
+        assert_eq!(s.history(&g, 0).unwrap(), vec![(huge, false)]);
+    }
+
+    #[test]
+    fn reserves_are_limited_and_stale_ones_found() {
+        let s = Store::in_memory().unwrap();
+        let g = group(&s, 1);
+        let begin = |n: u8, now: i64| {
+            s.blob_begin(&g, &BlobId([n; 16]), 10, now, 0, u64::MAX, u64::MAX, 2)
+                .unwrap()
+        };
+        assert_eq!(begin(1, 100), BlobBegin::Created);
+        assert_eq!(begin(2, 200), BlobBegin::Created);
+        assert_eq!(begin(3, 200), BlobBegin::TooManyReserves);
+        // Файл с частями в предел не считается.
+        s.blob_set_have(&g, &BlobId([2; 16]), 1).unwrap();
+        assert_eq!(begin(3, 300), BlobBegin::Created);
+        // Без частей старше 250 только первый.
+        assert_eq!(s.stale_reserves(250).unwrap(), vec![(g, BlobId([1; 16]))]);
+        assert!(!s.delete_stale_reserve(&g, &BlobId([3; 16]), 250).unwrap());
+        assert!(s.delete_stale_reserve(&g, &BlobId([1; 16]), 250).unwrap());
+        assert!(s.stale_reserves(250).unwrap().is_empty());
+        assert_eq!(begin(4, 400), BlobBegin::Created);
     }
 }

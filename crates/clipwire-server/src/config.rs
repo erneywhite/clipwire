@@ -93,3 +93,57 @@ impl Config {
         })
     }
 }
+
+/// Пределы против злоупотреблений: сколько групп, резервов, места под историю
+/// и соединений с одного устройства. Вынесены из [`Config`] отдельно, потому
+/// что у всех есть разумные значения по умолчанию ([`Guards::default`]) и
+/// встраивать сервер (в тестах) можно, не перечисляя их.
+#[derive(Debug, Clone)]
+pub struct Guards {
+    /// Сколько групп может быть на сервере. Сверх этого новые не создаются.
+    pub max_groups: usize,
+    /// Через сколько удаляется резерв файла (`Reserve`), по которому не
+    /// пришло ни одной части. Освобождает квоту.
+    pub reserve_ttl: Duration,
+    /// Сколько файлов без единой части (резервы и только начатые `Put`)
+    /// может держать одна группа.
+    pub max_reserves: usize,
+    /// Сколько места под историю элементов на весь сервер, по размеру
+    /// шифротекста. Правило вытеснения — в `Store::push`.
+    pub history_total_bytes: u64,
+    /// Сколько одновременных соединений можно держать с одного устройства.
+    pub max_device_conns: usize,
+}
+
+impl Default for Guards {
+    fn default() -> Self {
+        Self {
+            max_groups: 100,
+            reserve_ttl: Duration::from_secs(600),
+            max_reserves: 64,
+            history_total_bytes: 1024 * 1024 * 1024,
+            max_device_conns: 4,
+        }
+    }
+}
+
+impl Guards {
+    pub fn from_env() -> Result<Self> {
+        let d = Self::default();
+        let reserve_secs: u64 = parse("CLIPWIRE_RESERVE_TTL_SECS", d.reserve_ttl.as_secs())?;
+        if reserve_secs == 0 {
+            bail!("CLIPWIRE_RESERVE_TTL_SECS должен быть больше нуля");
+        }
+        let max_device_conns = parse("CLIPWIRE_MAX_DEVICE_CONNS", d.max_device_conns)?;
+        if max_device_conns == 0 {
+            bail!("CLIPWIRE_MAX_DEVICE_CONNS должен быть больше нуля");
+        }
+        Ok(Self {
+            max_groups: parse("CLIPWIRE_MAX_GROUPS", d.max_groups)?,
+            reserve_ttl: Duration::from_secs(reserve_secs),
+            max_reserves: parse("CLIPWIRE_MAX_RESERVES", d.max_reserves)?,
+            history_total_bytes: parse("CLIPWIRE_HISTORY_TOTAL_BYTES", d.history_total_bytes)?,
+            max_device_conns,
+        })
+    }
+}

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clipwire_server::{Config, Identity};
+use clipwire_server::{Config, Guards, Identity};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "\
@@ -42,7 +42,8 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let config = Config::from_env()?;
-    let running = clipwire_server::start(&config).await?;
+    let guards = Guards::from_env()?;
+    let running = clipwire_server::start_with(&config, &guards).await?;
     tracing::info!(
         relay = %config.relay_bind,
         quic = %config.quic_bind,
