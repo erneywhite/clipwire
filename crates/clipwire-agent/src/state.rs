@@ -111,6 +111,23 @@ impl Paths {
         Ok(())
     }
 
+    /// Ключ группы сменился: очередь загрузок и архивы папок в outbox
+    /// относились к старой группе, загружать их больше некуда.
+    pub fn forget_uploads(&self) -> Result<()> {
+        let uploads = self.dir.join(crate::blobs::UPLOADS_FILE);
+        match std::fs::remove_file(&uploads) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("не удалился {}", uploads.display())),
+        }
+        let outbox = crate::blobs::outbox_dir(&self.dir);
+        match std::fs::remove_dir_all(&outbox) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("не удалился {}", outbox.display())),
+        }
+    }
+
     /// Убрать кэш скачанных файлов, не падая на занятых файлах.
     fn trash_files(&self) {
         let files = crate::blobs::files_dir(&self.dir);

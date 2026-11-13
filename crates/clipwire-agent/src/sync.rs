@@ -2,19 +2,22 @@
 //! изменения буфера и отдаёт наружу чужие. С буфером ОС сам не работает —
 //! это делает платформенный слой, поэтому движок тестируется без GUI.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use clipwire_core::device::{open_rekey, rekey_public};
 use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
-use clipwire_core::proto::{ALPN, ClientMsg, ServerMsg};
-use clipwire_core::{Content, DeviceId, Item, ItemId};
+use clipwire_core::proto::{ALPN, ClientMsg, DeviceEntry, ServerMsg};
+use clipwire_core::{Content, DeviceId, GroupId, GroupKey, Item, ItemId};
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey, Watcher};
 use tokio::sync::mpsc;
 
 use crate::blobs::Blobs;
+use crate::devices::{Control, Rekeyed};
 use crate::state::AgentState;
 
 /// Больше этого не отправляем: сервер по умолчанию принимает до 8 МиБ
@@ -61,7 +64,27 @@ pub enum Event {
     /// Агент увидел элемент с этим id; сохранить, чтобы после перезапуска не
     /// применять старое повторно.
     Cursor(ItemId),
+    /// Ключ группы `old` сменили с другого устройства, новый ключ — `key`.
+    /// Движок дальше не подключается: сохранить новое состояние и запустить
+    /// новый движок (`devices::adopt_key`).
+    Rekeyed {
+        old: GroupId,
+        key: GroupKey,
+    },
+    /// Ключ группы `old` сменили без этого устройства: его исключили.
+    /// Движок дальше не подключается (`devices::leave_excluded`).
+    Excluded {
+        old: GroupId,
+    },
 }
+
+/// Кто ждёт ответа `Devices`, по порядку запросов: команда интерфейса или
+/// проверка, что сервер знает карточки (`None`).
+type DevicesWaiter = Option<tokio::sync::oneshot::Sender<Result<Vec<DeviceEntry>, String>>>;
+
+/// Если соединение оборвалось так скоро после `PublishCard`, сервер,
+/// скорее всего, старый и этого сообщения не знает.
+const CARD_CHECK: Duration = Duration::from_secs(10);
 
 /// Как сообщить UI, что в канале событий что-то появилось (на Windows —
 /// PostMessage в окно трея).
@@ -91,6 +114,16 @@ pub struct Engine {
     pending_reserved: bool,
     /// Сколько раз подряд резерв файлов `pending` не дошёл до сервера.
     reserve_failures: u32,
+    /// Команды интерфейса: список устройств и смена ключа.
+    control: Option<mpsc::Receiver<Control>>,
+    devices_waiters: VecDeque<DevicesWaiter>,
+    /// Ключ группы сменён (здесь или на другом устройстве) или устройство
+    /// исключено: больше не подключаться, ждать, пока движок снимут.
+    terminal: bool,
+    /// Когда отправлена карточка, если ответа на проверку ещё нет.
+    card_check: Option<Instant>,
+    /// Сервер не знает карточек (старая версия): не отправлять их.
+    cards_unsupported: bool,
 }
 
 impl Engine {
@@ -124,7 +157,18 @@ impl Engine {
             pending: None,
             pending_reserved: false,
             reserve_failures: 0,
+            control: None,
+            devices_waiters: VecDeque::new(),
+            terminal: false,
+            card_check: None,
+            cards_unsupported: false,
         }
+    }
+
+    /// Принимать команды интерфейса (`devices::Controller`).
+    pub fn with_control(mut self, control: mpsc::Receiver<Control>) -> Self {
+        self.control = Some(control);
+        self
     }
 
     /// Загружать файлы из очереди и давать соединение для скачивания.
@@ -210,16 +254,41 @@ impl Engine {
         let server = &self.state.invite.server;
         let addr = EndpointAddr::new(PublicKey::from_bytes(&server.server_id)?).with_relay_url(url);
 
+        let mut control = self.control.take();
         let mut backoff = Duration::from_secs(1);
         loop {
             self.emit(Event::Status(Status::Connecting));
-            match self.session(&ep, addr.clone(), &mut local).await {
+            let res = self
+                .session(&ep, addr.clone(), &mut local, &mut control)
+                .await;
+            // Ответов на запросы списка из оборвавшейся сессии уже не будет.
+            for w in self.devices_waiters.drain(..).flatten() {
+                let _ = w.send(Err("Связь с сервером оборвалась".into()));
+            }
+            match res {
                 // Сессия кончается без ошибки, только когда закрыт канал локальных изменений.
                 Ok(()) => {
                     ep.close().await;
                     return Ok(());
                 }
+                Err(_) if self.terminal => {
+                    self.idle(&mut local, &mut control).await;
+                    ep.close().await;
+                    return Ok(());
+                }
                 Err(e) => {
+                    // shortcut: старый сервер узнаётся по обрыву вскоре после
+                    // карточки; обрыв сети в эти секунды тоже выключит карточки
+                    // до перезапуска движка. Переделать, если в `Joined`
+                    // появится версия протокола.
+                    if self
+                        .card_check
+                        .take()
+                        .is_some_and(|t| t.elapsed() < CARD_CHECK)
+                    {
+                        tracing::info!("сервер, похоже, не знает карточек устройств");
+                        self.cards_unsupported = true;
+                    }
                     tracing::warn!("нет связи с сервером: {e:#}");
                     self.emit(Event::Status(Status::Offline(format!("{e:#}"))));
                 }
@@ -238,9 +307,58 @@ impl Engine {
                         Some(c) => self.replace_pending(c),
                         None => { ep.close().await; return Ok(()); }
                     },
+                    ctl = next_control(&mut control) => refuse_control(ctl, OFFLINE),
                 }
             }
             backoff = (backoff * 2).min(BACKOFF_MAX);
+        }
+    }
+
+    /// Ключ группы сменён: ждать, пока движок снимут (закроют `local`).
+    /// Копирования за это время в группу не уходят: старой группы больше нет.
+    async fn idle(
+        &mut self,
+        local: &mut mpsc::Receiver<Content>,
+        control: &mut Option<mpsc::Receiver<Control>>,
+    ) {
+        loop {
+            tokio::select! {
+                c = local.recv() => if c.is_none() { return },
+                ctl = next_control(control) => refuse_control(
+                    ctl,
+                    "Ключ группы сменён, устройство переподключается",
+                ),
+            }
+        }
+    }
+
+    /// Сервер сообщил, что ключ группы сменён (`Rekeyed` с пакетом или
+    /// `Excluded`). Возвращает ошибку, которой заканчивается сессия.
+    ///
+    /// Пакет, который не открылся, равен исключению: нового ключа у
+    /// устройства всё равно нет. Так сервер может выбросить устройство из
+    /// группы, но это не больше, чем отказ в обслуживании.
+    fn rotated(&mut self, envelope: Option<Vec<u8>>) -> anyhow::Error {
+        let old = self.state.invite.group_key.group_id();
+        self.terminal = true;
+        let key = envelope.and_then(|e| match open_rekey(&self.state.device_key, old, &e) {
+            Ok(k) => Some(k),
+            Err(err) => {
+                tracing::warn!("пакет нового ключа не открылся: {err}");
+                None
+            }
+        });
+        match key {
+            Some(key) => {
+                tracing::info!("ключ группы сменён, перехожу на новый");
+                self.emit(Event::Rekeyed { old, key });
+                anyhow!("ключ группы сменён")
+            }
+            None => {
+                tracing::info!("устройство исключили из группы");
+                self.emit(Event::Excluded { old });
+                anyhow!("устройство исключили из группы")
+            }
         }
     }
 
@@ -249,12 +367,15 @@ impl Engine {
         ep: &Endpoint,
         addr: EndpointAddr,
         local: &mut mpsc::Receiver<Content>,
+        control: &mut Option<mpsc::Receiver<Control>>,
     ) -> Result<()> {
+        let server_addr = addr.clone();
         let conn = connect(ep, addr.clone()).await?;
         let key = self.state.invite.group_key.clone();
         let (conn, mut send, mut recv) = match join(&conn, &key, Some(&self.token())).await {
             Ok((send, recv)) => (conn, send, recv),
             Err(JoinFail::Other(e)) => return Err(e),
+            Err(JoinFail::Rotated(env)) => return Err(self.rotated(env)),
             Err(first) => {
                 // Старый сервер не знает `JoinWithToken`: кадр не разбирается,
                 // и сервер просто рвёт соединение. Повторяем один раз обычным
@@ -263,6 +384,7 @@ impl Engine {
                 let conn = connect(ep, addr).await?;
                 match join(&conn, &key, None).await {
                     Ok((send, recv)) => (conn, send, recv),
+                    Err(JoinFail::Rotated(env)) => return Err(self.rotated(env)),
                     // Если на первый вход сервер отказал внятно, его причина
                     // понятнее второй.
                     Err(second) => match first {
@@ -288,6 +410,20 @@ impl Engine {
             }
         }
         self.apply_history(history);
+        // Карточка устройства для списка устройств и смены ключа. Следом
+        // запрос списка: ответ на него значит, что сервер карточки знает.
+        if !self.cards_unsupported {
+            let card = crate::devices::sealed_card(
+                &key,
+                &self.state.device_key,
+                &self.device_name,
+                now_ms(),
+            )?;
+            write_msg(&mut send, &ClientMsg::PublishCard(card)).await?;
+            write_msg(&mut send, &ClientMsg::ListDevices).await?;
+            self.devices_waiters.push_back(None);
+            self.card_check = Some(Instant::now());
+        }
         // Файлы ходят по своим потокам этого же соединения, пока сессия жива.
         let _files = self.blobs.as_ref().map(|b| b.attach(conn.clone()));
         self.went_online = true;
@@ -306,29 +442,201 @@ impl Engine {
                     None => {
                         // Закрываем поток и ждём, пока сервер его дочитает: при
                         // немедленном close QUIC выбросит ещё не доставленное.
+                        // Подтверждения QUIC мало: сервер мог получить данные, но
+                        // ещё не обработать (перед `Push` стоят карточка и запрос
+                        // списка), а закрытие соединения выбросит непрочитанное.
+                        // Сервер закрывает свой поток, только дочитав наш до конца.
                         let _ = send.finish();
-                        let _ = tokio::time::timeout(Duration::from_secs(3), send.stopped()).await;
+                        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                            while let Ok(Some(_)) = read_msg::<_, ServerMsg>(&mut recv).await {}
+                        })
+                        .await;
                         conn.close(0u32.into(), b"bye");
                         return Ok(());
                     }
                 },
                 msg = read_msg::<_, ServerMsg>(&mut recv) => match msg? {
-                    Some(ServerMsg::Deliver(sealed)) => self.deliver(&sealed),
-                    Some(ServerMsg::Backfill(sealed)) => {
-                        if sealed.origin == self.device {
-                            continue;
-                        }
-                        match key.open(&sealed) {
-                            Ok(item) => self.emit(Event::History(vec![item])),
-                            Err(e) => tracing::warn!("элемент не расшифровался, пропускаю: {e}"),
+                    Some(m) => self.handle_msg(&key, m)?,
+                    None => bail!("сервер закрыл соединение"),
+                },
+                ctl = next_control(control) => match ctl {
+                    Control::ListDevices(reply) => {
+                        write_msg(&mut send, &ClientMsg::ListDevices).await?;
+                        self.devices_waiters.push_back(Some(reply));
+                    }
+                    Control::Rekey { remove, reply } => {
+                        match self
+                            .rekey(ep, server_addr.clone(), &mut send, &mut recv, remove)
+                            .await
+                        {
+                            Ok(Ok(done)) => {
+                                let _ = reply.send(Ok(done));
+                                self.terminal = true;
+                                // Старая группа уже закрыла поток. Новый движок
+                                // запустит тот, кто сохранит новый ключ.
+                                conn.close(0u32.into(), b"rekeyed");
+                                bail!("ключ группы сменён на этом устройстве");
+                            }
+                            Ok(Err(refused)) => {
+                                let _ = reply.send(Err(refused));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(format!("Ключ не сменился: {e:#}")));
+                                return Err(e);
+                            }
                         }
                     }
-                    Some(ServerMsg::Error(e)) => bail!("сервер: {e}"),
-                    Some(other) => tracing::debug!("пропускаю {other:?}"),
-                    None => bail!("сервер закрыл соединение"),
                 },
             }
         }
+    }
+
+    /// Сообщение сервера посреди сессии. Ошибка заканчивает сессию.
+    fn handle_msg(&mut self, key: &GroupKey, msg: ServerMsg) -> Result<()> {
+        match msg {
+            ServerMsg::Deliver(sealed) => self.deliver(&sealed),
+            ServerMsg::Backfill(sealed) => {
+                if sealed.origin != self.device {
+                    match key.open(&sealed) {
+                        Ok(item) => self.emit(Event::History(vec![item])),
+                        Err(e) => tracing::warn!("элемент не расшифровался, пропускаю: {e}"),
+                    }
+                }
+            }
+            ServerMsg::Devices(list) => self.answer_devices(list),
+            ServerMsg::Rekeyed { envelope } => return Err(self.rotated(Some(envelope))),
+            ServerMsg::Excluded => return Err(self.rotated(None)),
+            ServerMsg::Error(e) => bail!("сервер: {e}"),
+            other => tracing::debug!("пропускаю {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Ответ `Devices` — первому, кто его ждёт.
+    fn answer_devices(&mut self, list: Vec<DeviceEntry>) {
+        match self.devices_waiters.pop_front() {
+            Some(Some(reply)) => {
+                let _ = reply.send(Ok(list));
+            }
+            Some(None) => self.card_check = None,
+            None => tracing::debug!("лишний ответ со списком устройств"),
+        }
+    }
+
+    /// Читать поток до своего ответа `Devices`, обрабатывая остальное как
+    /// обычно. Ответы на более ранние запросы уходят их владельцам.
+    async fn await_devices(
+        &mut self,
+        key: &GroupKey,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Result<Vec<DeviceEntry>> {
+        loop {
+            let msg = tokio::time::timeout(CONNECT_TIMEOUT, read_msg::<_, ServerMsg>(recv))
+                .await
+                .context("сервер не прислал список устройств")??;
+            match msg {
+                Some(ServerMsg::Devices(list)) if self.devices_waiters.is_empty() => {
+                    return Ok(list);
+                }
+                Some(m) => self.handle_msg(key, m)?,
+                None => bail!("сервер закрыл соединение"),
+            }
+        }
+    }
+
+    /// Сменить ключ группы по алгоритму `docs/devices.md`. Внешняя ошибка —
+    /// сессия сломана; внутренняя — отказ до того, как что-то изменилось
+    /// (текст для человека).
+    ///
+    /// Свой пакет тоже кладётся: если ответ сервера потеряется, при
+    /// следующем входе в старую группу устройство получит свой `Rekeyed`.
+    async fn rekey(
+        &mut self,
+        ep: &Endpoint,
+        addr: EndpointAddr,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+        remove: Option<DeviceId>,
+    ) -> Result<Result<Rekeyed, String>> {
+        let old_key = self.state.invite.group_key.clone();
+        let old = old_key.group_id();
+        write_msg(send, &ClientMsg::ListDevices).await?;
+        let entries = self.await_devices(&old_key, recv).await?;
+        let views = crate::devices::open_entries(&old_key, entries);
+        let plan = match crate::devices::plan_rekey(
+            &views,
+            self.device,
+            rekey_public(&self.state.device_key),
+            remove,
+        ) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(e.to_string())),
+        };
+        let new_key = GroupKey::generate()?;
+
+        // Новая группа: вход отдельным соединением и своя карточка в ней.
+        let conn2 = connect(ep, addr).await?;
+        let (mut send2, mut recv2) = join(&conn2, &new_key, Some(&self.token()))
+            .await
+            .map_err(|e| anyhow!("не удалось создать новую группу: {e}"))?;
+        let card = crate::devices::sealed_card(
+            &new_key,
+            &self.state.device_key,
+            &self.device_name,
+            now_ms(),
+        )?;
+        write_msg(&mut send2, &ClientMsg::PublishCard(card)).await?;
+        write_msg(&mut send2, &ClientMsg::ListDevices).await?;
+        // Ответ на список значит, что карточка уже записана.
+        loop {
+            match tokio::time::timeout(CONNECT_TIMEOUT, read_msg::<_, ServerMsg>(&mut recv2))
+                .await
+                .context("новая группа не ответила")??
+            {
+                Some(ServerMsg::Devices(_)) => break,
+                Some(ServerMsg::Error(e)) => bail!("новая группа: {e}"),
+                Some(_) => {}
+                None => bail!("сервер закрыл соединение с новой группой"),
+            }
+        }
+
+        let envelopes = crate::devices::seal_envelopes(&new_key, old, &plan)?;
+        write_msg(
+            send,
+            &ClientMsg::Rekey {
+                new_group: new_key.group_id(),
+                envelopes,
+            },
+        )
+        .await?;
+        // Успех — сервер закрывает поток без сообщений.
+        let res = loop {
+            let msg = tokio::time::timeout(CONNECT_TIMEOUT, read_msg::<_, ServerMsg>(recv))
+                .await
+                .context("сервер не ответил на смену ключа")??;
+            match msg {
+                None => break Ok(()),
+                Some(ServerMsg::Error(e)) => break Err(anyhow!("сервер отказал: {e}")),
+                Some(m) => {
+                    if let Err(e) = self.handle_msg(&old_key, m) {
+                        break Err(e);
+                    }
+                }
+            }
+        };
+        let _ = send2.finish();
+        conn2.close(0u32.into(), b"bye");
+        res?;
+        tracing::info!(
+            recipients = plan.recipients.len(),
+            skipped = plan.skipped.len(),
+            "ключ группы сменён"
+        );
+        Ok(Ok(Rekeyed {
+            old,
+            key: new_key,
+            skipped: plan.skipped,
+        }))
     }
 
     /// История группы при входе. В буфер идёт только самый свежий чужой
@@ -586,6 +894,9 @@ enum JoinFail {
     /// Всё остальное: таймаут, неожиданный ответ. Повторять другим входом
     /// смысла нет.
     Other(anyhow::Error),
+    /// Ключ группы сменён: пакет нового ключа для этого устройства
+    /// (`Rekeyed`) или `None` (`Excluded`).
+    Rotated(Option<Vec<u8>>),
 }
 
 impl std::fmt::Display for JoinFail {
@@ -594,6 +905,7 @@ impl std::fmt::Display for JoinFail {
             JoinFail::Refused(e) => write!(f, "сервер отказал: {e}"),
             JoinFail::Closed(e) => write!(f, "сервер закрыл соединение: {e}"),
             JoinFail::Other(e) => write!(f, "{e:#}"),
+            JoinFail::Rotated(_) => write!(f, "ключ группы сменён"),
         }
     }
 }
@@ -629,11 +941,39 @@ async fn join(
     match reply {
         Ok(Some(ServerMsg::Joined)) => Ok((send, recv)),
         Ok(Some(ServerMsg::Error(e))) => Err(JoinFail::Refused(e)),
+        Ok(Some(ServerMsg::Rekeyed { envelope })) => Err(JoinFail::Rotated(Some(envelope))),
+        Ok(Some(ServerMsg::Excluded)) => Err(JoinFail::Rotated(None)),
         Ok(Some(other)) => Err(JoinFail::Other(anyhow::anyhow!(
             "неожиданный ответ сервера: {other:?}"
         ))),
         Ok(None) => Err(JoinFail::Closed("без ответа".into())),
         Err(e) => Err(JoinFail::Closed(e.to_string())),
+    }
+}
+
+const OFFLINE: &str = "Нет связи с сервером. Попробуйте, когда устройство будет в сети";
+
+/// Следующая команда интерфейса. Без канала команд (или когда его закрыли)
+/// не заканчивается никогда.
+async fn next_control(c: &mut Option<mpsc::Receiver<Control>>) -> Control {
+    if let Some(rx) = c {
+        if let Some(ctl) = rx.recv().await {
+            return ctl;
+        }
+        *c = None;
+    }
+    std::future::pending().await
+}
+
+/// Ответить на команду отказом с этим текстом.
+fn refuse_control(ctl: Control, why: &str) {
+    match ctl {
+        Control::ListDevices(reply) => {
+            let _ = reply.send(Err(why.to_string()));
+        }
+        Control::Rekey { reply, .. } => {
+            let _ = reply.send(Err(why.to_string()));
+        }
     }
 }
 

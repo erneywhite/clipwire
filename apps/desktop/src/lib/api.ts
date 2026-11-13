@@ -29,6 +29,31 @@ export interface DeviceInfo {
   device_id: string | null
 }
 
+/** Устройство группы (`devices_list`). */
+export interface GroupDevice {
+  /** Полный id, 64 hex. */
+  id: string
+  /** Короткий отпечаток. */
+  fingerprint: string
+  /** Имя и ОС из карточки; null — неизвестное устройство. */
+  name: string | null
+  os: string | null
+  /** Карточка открылась: при смене ключа устройство получит новый. */
+  known: boolean
+  me: boolean
+  online: boolean
+  /** Последний вход в группу, мс; 0 — неизвестно. */
+  last_seen_ms: number
+}
+
+/** Итог смены ключа группы. */
+export interface RekeyResult {
+  /** Новый код приглашения. */
+  invite: string
+  /** Отпечатки устройств, которым новый ключ не достался. */
+  skipped: string[]
+}
+
 export interface Entry {
   id: string
   kind: 'text' | 'image' | 'files' | 'other'
@@ -137,6 +162,9 @@ export const api = {
   sizePreviewHide: () => invoke<void>('size_preview_hide'),
   leaveGroup: () => invoke<void>('leave_group'),
   deviceInfo: () => invoke<DeviceInfo>('device_info'),
+  devicesList: () => invoke<GroupDevice[]>('devices_list'),
+  deviceRemove: (deviceId: string) => invoke<RekeyResult>('device_remove', { deviceId }),
+  groupRekey: () => invoke<RekeyResult>('group_rekey'),
   copyQuietly: (text: string) => invoke<void>('copy_quietly', { text }),
   editImage: (id: string) => invoke<void>('editor_open', { id }),
   linkPreview: (url: string) => invoke<LinkCard>('link_preview', { url }),
