@@ -234,7 +234,15 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         may_create,
         shared.limits.max_groups,
     )?;
-    let reason = match outcome {
+    let reason = match &outcome {
+        JoinOutcome::Rotated(r) => {
+            // Ключ сменён: ни истории, ни входа, только пакет этого устройства.
+            let msg = crate::devices::rotation_msg(r.clone());
+            let rekeyed = matches!(msg, ServerMsg::Rekeyed { .. });
+            crate::devices::close_with(&mut send, Some(&msg)).await;
+            tracing::info!(group = %short(&group), rekeyed, "вход в группу со сменённым ключом");
+            return Ok(());
+        }
         JoinOutcome::Created | JoinOutcome::Joined => None,
         JoinOutcome::Denied => Some("неверный секрет группы"),
         JoinOutcome::NoGroup => Some("группы нет; создать группу можно только с кодом сервера"),
@@ -262,7 +270,12 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
     write_msg(&mut send, &ServerMsg::HistoryEnd).await?;
 
     let (tx, mut rx) = mpsc::channel(QUEUE);
-    let reg = shared.hub.register(group, tx);
+    let reg = shared.hub.register(group, device, tx);
+    // Ключ могли сменить между входом и регистрацией: тогда `Rekey` нас не
+    // разбудил, будим себя сами.
+    if shared.store.rotation(&group, &device)?.is_some() {
+        reg.kick.notify_one();
+    }
 
     // Файлы идут отдельными потоками того же соединения. Задача живёт, пока
     // жив основной поток: JoinSet снимает её при выходе из функции.
@@ -284,11 +297,36 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     Some(ClientMsg::Join { .. } | ClientMsg::JoinWithToken { .. }) => {
                         bail!("повторный Join")
                     }
-                    // shortcut: устройства и смена ключа — вторая волна (docs/devices.md).
-                    Some(ClientMsg::PublishCard(_) | ClientMsg::ListDevices | ClientMsg::Rekey { .. }) => {
-                        tracing::debug!("устройства и смена ключа ещё не поддерживаются");
+                    Some(ClientMsg::PublishCard(card)) => {
+                        if let Some(reply) = crate::devices::publish_card(shared, &group, &device, &card)? {
+                            write_msg(&mut send, &reply).await?;
+                        }
+                    }
+                    Some(ClientMsg::ListDevices) => {
+                        write_msg(&mut send, &crate::devices::list_devices(shared, &group)?).await?;
+                    }
+                    Some(ClientMsg::Rekey { new_group, envelopes }) => {
+                        match crate::devices::rekey(shared, &group, &device, reg.id, &new_group, &envelopes)? {
+                            // Успех: поток закрывается без Error (см. docs/devices.md).
+                            Ok(()) => {
+                                streams.shutdown().await;
+                                crate::devices::close_with(&mut send, None).await;
+                                return Ok(());
+                            }
+                            Err(reason) => {
+                                refuse(&mut send, reason).await;
+                                bail!("смена ключа отклонена: {reason}");
+                            }
+                        }
                     }
                 }
+            }
+            () = reg.kick.notified() => {
+                // Ключ группы сменили с другого устройства.
+                streams.shutdown().await;
+                let msg = shared.store.rotation(&group, &device)?.map(crate::devices::rotation_msg);
+                crate::devices::close_with(&mut send, msg.as_ref()).await;
+                return Ok(());
             }
             out = rx.recv() => {
                 // Отправитель живёт в hub, пока жива регистрация, поэтому None не придёт.

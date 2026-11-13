@@ -4,6 +4,7 @@
 
 mod blobs;
 pub mod config;
+mod devices;
 mod hub;
 mod relay;
 mod session;
@@ -205,6 +206,11 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("удалено брошенных резервов: {n}"),
                     Err(e) => tracing::warn!("очистка резервов не удалась: {e:#}"),
+                }
+                match devices::purge_rotated(&shared) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("удалено групп со сменённым ключом: {n}"),
+                    Err(e) => tracing::warn!("очистка групп со сменённым ключом не удалась: {e:#}"),
                 }
                 // После чистки истории и файлов: у заброшенной группы их уже нет.
                 match transfer::purge_idle_groups(&shared) {

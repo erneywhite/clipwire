@@ -278,6 +278,10 @@ async fn begin(
         // Временная ошибка: резервы освобождаются, как только по ним приходят
         // части, и агент повторяет запрос, а не снимает файл с элемента.
         BlobBegin::TooManyReserves => return Err(BlobFail::Stalled.into()),
+        // Соединение со старой группой вот-вот закроется (`docs/devices.md`).
+        BlobBegin::Rotated => {
+            return Err(BlobFail::Protocol("ключ группы сменён".into()).into());
+        }
     };
     let now = Progress {
         have,

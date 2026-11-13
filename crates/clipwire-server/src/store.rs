@@ -14,6 +14,9 @@ use clipwire_core::{BlobId, DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+mod devices;
+pub use devices::{RekeyLimits, RekeyOutcome, Rotation};
+
 // shortcut: синхронный rusqlite под std::Mutex прямо из async-кода. Запросы
 // короткие, а нагрузка — единицы устройств. Переделать на пул и spawn_blocking,
 // если сервером начнут пользоваться десятки групп.
@@ -36,6 +39,8 @@ pub enum BlobBegin {
     ServerFull,
     /// У устройства-источника уже слишком много файлов без единой части.
     TooManyReserves,
+    /// Ключ группы сменён: файлы в неё больше не принимаются.
+    Rotated,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -50,6 +55,9 @@ pub enum JoinOutcome {
     NoGroup,
     /// Группы нет, и на сервере уже предельное число групп.
     TooManyGroups,
+    /// Секрет совпал, но ключ группы сменён: устройству отдаётся только
+    /// его пакет нового ключа или «исключено» (`docs/devices.md`).
+    Rotated(Rotation),
 }
 
 /// Условие «группа `g` заброшена» для [`Store::idle_groups`] и
@@ -57,7 +65,8 @@ pub enum JoinOutcome {
 const IDLE_GROUP: &str = "NOT EXISTS (SELECT 1 FROM devices AS d
                              WHERE d.group_id = g.group_id AND d.last_seen_ms >= ?1)
      AND NOT EXISTS (SELECT 1 FROM items AS i WHERE i.group_id = g.group_id)
-     AND NOT EXISTS (SELECT 1 FROM blobs AS b WHERE b.group_id = g.group_id)";
+     AND NOT EXISTS (SELECT 1 FROM blobs AS b WHERE b.group_id = g.group_id)
+     AND g.rotated_ms IS NULL";
 
 /// У какой группы удалить самый старый элемент, когда история всех групп
 /// вместе не влезает в общий предел. `usage` — объём истории и число
@@ -157,6 +166,7 @@ impl Store {
         if !has_origin {
             conn.execute_batch("ALTER TABLE blobs ADD COLUMN origin BLOB;")?;
         }
+        devices::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -204,7 +214,13 @@ impl Store {
                 )?;
                 JoinOutcome::Created
             }
-            Some(d) if constant_time_eq(&d, &digest) => JoinOutcome::Joined,
+            Some(d) if constant_time_eq(&d, &digest) => {
+                // Секрет проверен — теперь можно сказать, что ключ сменён.
+                if let Some(r) = devices::rotation_in(&tx, group, device)? {
+                    return Ok(JoinOutcome::Rotated(r));
+                }
+                JoinOutcome::Joined
+            }
             Some(_) => return Ok(JoinOutcome::Denied),
         };
         tx.execute(
@@ -234,6 +250,10 @@ impl Store {
     ) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if is_rotated(&tx, group)? {
+            // Ключ сменён, пока соединение ещё живо: элемент не нужен никому.
+            return Ok(false);
+        }
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO items (group_id, item_id, origin, nonce, ciphertext, received_ms, backfill)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -354,6 +374,9 @@ impl Store {
     ) -> Result<BlobBegin> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if is_rotated(&tx, group)? {
+            return Ok(BlobBegin::Rotated);
+        }
         let existing: Option<(i64, i64, i64)> = tx
             .query_row(
                 "SELECT size, have, created_ms FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
@@ -620,6 +643,18 @@ fn evict_over_total(
         }
         tracing::debug!("история сервера заполнена, вытеснен старый элемент");
     }
+}
+
+/// Сменён ли ключ группы.
+fn is_rotated(conn: &Connection, group: &GroupId) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM groups WHERE group_id = ?1 AND rotated_ms IS NOT NULL",
+            params![&group.0[..]],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
