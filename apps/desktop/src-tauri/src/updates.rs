@@ -348,7 +348,7 @@ fn announce(app: &AppHandle, dir: &Path) -> Startup {
     }
 }
 
-pub(crate) fn notify(app: &AppHandle, text: &str) {
+fn notify(app: &AppHandle, text: &str) {
     use tauri_plugin_notification::NotificationExt;
     if let Err(e) = app.notification().builder().title(text).show() {
         tracing::warn!("уведомление не показалось: {e}");

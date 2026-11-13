@@ -247,7 +247,7 @@ pub struct WatchOptions {
 /// Описание локального файла или папки для элемента буфера: имя, размер,
 /// время изменения, у картинок — размеры в пикселях.
 #[cfg(windows)]
-pub fn local_file_ref(p: &std::path::Path) -> clipwire_core::FileRef {
+pub(crate) fn local_file_ref(p: &std::path::Path) -> clipwire_core::FileRef {
     let meta = std::fs::metadata(p).ok();
     let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
     let (width, height) = if is_dir {

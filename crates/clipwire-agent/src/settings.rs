@@ -80,10 +80,6 @@ pub struct Settings {
     /// Скачивать обновления в фоне и ставить, когда программа не нужна.
     /// Выключено — обновление ставится только по кнопке.
     pub auto_update: bool,
-    /// Win+V открывает окно Clipwire вместо системного журнала (только Windows).
-    pub win_v: bool,
-    /// Пункт «Отправить в Clipwire» в контекстном меню Проводника.
-    pub explorer_menu: bool,
 }
 
 impl Default for Settings {
@@ -109,8 +105,6 @@ impl Default for Settings {
             ],
             file_upload_limit_mb: 100,
             auto_update: true,
-            win_v: false,
-            explorer_menu: true,
         }
     }
 }

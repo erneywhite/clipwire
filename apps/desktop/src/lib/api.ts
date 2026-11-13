@@ -23,10 +23,6 @@ export interface Settings {
   file_upload_limit_mb: number
   /** Скачивать обновления в фоне и ставить, когда программа не нужна. */
   auto_update: boolean
-  /** Win+V открывает окно Clipwire вместо системного журнала буфера. */
-  win_v: boolean
-  /** Пункт «Отправить в Clipwire» в меню Проводника. */
-  explorer_menu: boolean
 }
 
 export interface DeviceInfo {

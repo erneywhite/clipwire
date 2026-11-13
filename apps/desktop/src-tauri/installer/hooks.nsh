@@ -27,9 +27,9 @@ Function un.ClipwireClearBranding
   !insertmacro CLIPWIRE_CLEAR_BRANDING
 FunctionEnd
 
-; Пункт «Отправить в Clipwire» программа пишет в реестр пользователя сама
-; (send_to.rs), при удалении его надо убрать, иначе он останется в меню
-; Проводника без программы.
+; Пункт «Отправить в Clipwire» писала в реестр пользователя версия 0.1.2.
+; Новые версии убирают его при запуске (send_to.rs), а при удалении программы
+; его убирает установщик, чтобы в меню Проводника не осталось ссылки в никуда.
 !macro NSIS_HOOK_POSTUNINSTALL
   DeleteRegKey HKCU "Software\Classes\*\shell\Clipwire.Send"
   DeleteRegKey HKCU "Software\Classes\Directory\shell\Clipwire.Send"

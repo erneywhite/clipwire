@@ -421,12 +421,6 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
         let _ = crate::popup::register_hotkey(&app);
         return Err(e);
     }
-    if old.explorer_menu != settings.explorer_menu {
-        crate::send_to::set_menu(settings.explorer_menu);
-    }
-    if old.win_v != settings.win_v {
-        crate::winv::set(&app, settings.win_v);
-    }
     if old.hide_from_capture != settings.hide_from_capture {
         crate::apply_capture_protection(&app, settings.hide_from_capture);
     }
