@@ -5,7 +5,9 @@
 //! - `cursor` — id последнего элемента, который агент уже видел. Секретом не
 //!   является, меняется часто, поэтому лежит отдельно открытым текстом;
 //! - `devices.bin` — проверенные карточки устройств группы, `excluded` —
-//!   отметка «устройство исключено» (`crate::devices`).
+//!   отметка «устройство исключено» (`crate::devices`);
+//! - `group_config.bin` — настройки группы (хранилище файлов и доступы к
+//!   нему), защищены как `state.bin` (`crate::group_config`).
 
 use std::path::{Path, PathBuf};
 
@@ -96,7 +98,17 @@ impl Paths {
         let uploads = self.dir.join(crate::blobs::UPLOADS_FILE);
         let known = self.dir.join(crate::devices::KNOWN_FILE);
         let excluded = self.dir.join(crate::devices::EXCLUDED_FILE);
-        for p in [self.state(), self.cursor(), uploads, known, excluded] {
+        let config = self.dir.join(crate::group_config::CONFIG_FILE);
+        let cleaned = self.dir.join(crate::group_config::CLEANED_FILE);
+        for p in [
+            self.state(),
+            self.cursor(),
+            uploads,
+            known,
+            excluded,
+            config,
+            cleaned,
+        ] {
             match std::fs::remove_file(&p) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

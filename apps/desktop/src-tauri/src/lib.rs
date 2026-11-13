@@ -147,6 +147,14 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
             UiEvent::RekeyLost(why) => {
                 let _ = handle.emit("clipwire://group-rekey-failed", why);
             }
+            // Настройки хранилища группы (без секретов) и предупреждение,
+            // что файл ушёл через сервер: для будущего раздела настроек.
+            UiEvent::GroupConfig(view) => {
+                let _ = handle.emit("clipwire://group-config", &view);
+            }
+            UiEvent::StorageWarning(w) => {
+                let _ = handle.emit("clipwire://storage-warning", w);
+            }
             UiEvent::NewEntry => {
                 let on = handle
                     .state::<AppState>()

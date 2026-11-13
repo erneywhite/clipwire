@@ -240,6 +240,8 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
                 }
             }
             UiEvent::RekeyLost(why) => eprintln!("{why}"),
+            UiEvent::GroupConfig(v) => eprintln!("настройки группы: хранилище {}", v.kind),
+            UiEvent::StorageWarning(w) => eprintln!("{w}"),
         }),
     )?;
     eprintln!("синхронизация буфера запущена, Ctrl+C — выход");

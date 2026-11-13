@@ -191,7 +191,9 @@ async fn download(app: &AppHandle, e: &Entry, files: &[FileRef]) -> Result<Vec<P
         svc.as_ref().and_then(|s| s.blobs())
     }
     .ok_or("Устройство не в группе: файлы с других устройств не скачать")?;
-    let res = blobs.download_all(files, e.origin).await;
+    // Где лежат файлы (сервер или внешнее хранилище группы) — метка записи.
+    let places = clipwire_agent::storage::external::places(&e.ext);
+    let res = blobs.download_all_at(files, e.origin, &places).await;
     // Даже при ошибке часть файлов могла скачаться — окну стоит перечитать.
     let _ = app.emit("clipwire://history-changed", ());
     let paths = res.map_err(|err| download_error(&err, &e.device_name))?;

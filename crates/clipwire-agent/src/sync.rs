@@ -192,6 +192,18 @@ pub struct Engine {
     want_list: bool,
     /// `Rekey` отправлен, ответа ещё нет (или он потерялся).
     pending_rekey: Option<PendingRekey>,
+    /// Когда спрошены настройки группы, если ответа ещё нет: обрыв вскоре
+    /// после `GetGroupConfig` значит, что сервер его не знает.
+    config_check: Option<Instant>,
+    /// Сервер, похоже, не знает настроек группы: до этого момента не спрашивать.
+    config_off_until: Option<Instant>,
+    /// Пора спросить настройки (сервер ответил на проверку карточек).
+    want_config: bool,
+    /// В этой сессии сервер ответил на `GetGroupConfig`: настройки он знает.
+    config_supported: bool,
+    /// Свои настройки новее серверных (сервер их потерял или ключ сменили):
+    /// отправить серверу.
+    config_push: Option<Vec<u8>>,
 }
 
 impl Engine {
@@ -234,6 +246,11 @@ impl Engine {
             listed_at: None,
             want_list: false,
             pending_rekey: None,
+            config_check: None,
+            config_off_until: None,
+            want_config: false,
+            config_supported: false,
+            config_push: None,
         }
     }
 
@@ -268,6 +285,11 @@ impl Engine {
     /// Отправлять ли карточки сейчас.
     fn cards_on(&self) -> bool {
         self.cards_off_until.is_none_or(|t| Instant::now() >= t)
+    }
+
+    /// Спрашивать ли настройки группы сейчас.
+    fn config_on(&self) -> bool {
+        self.blobs.is_some() && self.config_off_until.is_none_or(|t| Instant::now() >= t)
     }
 
     fn emit(&self, e: Event) {
@@ -371,6 +393,16 @@ impl Engine {
                     {
                         tracing::info!("сервер, похоже, не знает карточек устройств");
                         self.cards_off_until = Some(Instant::now() + CARD_RETRY);
+                    }
+                    // shortcut: то же для настроек группы — старый сервер
+                    // узнаётся по обрыву вскоре после `GetGroupConfig`.
+                    if self
+                        .config_check
+                        .take()
+                        .is_some_and(|t| t.elapsed() < CARD_CHECK)
+                    {
+                        tracing::info!("сервер, похоже, не знает настроек группы");
+                        self.config_off_until = Some(Instant::now() + CARD_RETRY);
                     }
                     tracing::warn!("нет связи с сервером: {e:#}");
                     self.emit(Event::Status(Status::Offline(format!("{e:#}"))));
@@ -577,6 +609,9 @@ impl Engine {
             }
         }
         self.apply_history(history);
+        self.config_supported = false;
+        self.want_config = false;
+        self.config_push = None;
         // Карточка устройства для списка устройств и смены ключа. Следом
         // запрос списка: ответ на него значит, что сервер карточки знает.
         if self.cards_on() {
@@ -629,6 +664,18 @@ impl Engine {
                 msg = read_msg::<_, ServerMsg>(&mut recv) => match msg? {
                     Some(m) => {
                         self.handle_msg(&key, m)?;
+                        // Настройки группы спрашиваем, когда сервер ответил
+                        // на проверку карточек: сервер без карточек их тем
+                        // более не знает, а обрыв от незнакомого сообщения
+                        // не спутается с проверкой карточек.
+                        if std::mem::take(&mut self.want_config) && self.config_on() {
+                            write_msg(&mut send, &ClientMsg::GetGroupConfig).await?;
+                            self.config_check = Some(Instant::now());
+                        }
+                        if let Some(sealed) = self.config_push.take() {
+                            tracing::info!("свои настройки группы новее серверных, отправляю");
+                            write_msg(&mut send, &ClientMsg::SetGroupConfig(sealed)).await?;
+                        }
                         let due = self
                             .listed_at
                             .is_none_or(|t| t.elapsed() >= DEVICES_REFRESH_MIN);
@@ -645,6 +692,23 @@ impl Engine {
                     Control::ListDevices(reply) => {
                         write_msg(&mut send, &ClientMsg::ListDevices).await?;
                         self.devices_waiters.push_back(Some(reply));
+                    }
+                    Control::SetGroupConfig { sealed, config, reply } => {
+                        if !self.config_supported {
+                            let _ = reply.send(Err(
+                                "Сервер не поддерживает настройки группы: обновите сервер Clipwire".into(),
+                            ));
+                        } else if let Err(e) =
+                            write_msg(&mut send, &ClientMsg::SetGroupConfig(sealed)).await
+                        {
+                            let _ = reply.send(Err(format!("Настройки не сохранились: {e}")));
+                            return Err(e.into());
+                        } else {
+                            if let Some(b) = &self.blobs {
+                                b.storage().apply(config);
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
                     }
                     Control::Rekey { remove, reply } => {
                         match self
@@ -702,9 +766,31 @@ impl Engine {
             ServerMsg::Rekeyed { envelope } => return Err(self.rotated(Some(envelope))),
             ServerMsg::Excluded => return Err(self.rotated(None)),
             ServerMsg::Error(e) => bail!("сервер: {e}"),
+            ServerMsg::GroupConfig(sealed) => self.group_config(key, sealed),
             other => tracing::debug!("пропускаю {other:?}"),
         }
         Ok(())
+    }
+
+    /// Настройки группы с сервера: ответ на `GetGroupConfig` или изменение с
+    /// другого устройства. Применяются, если новее своих.
+    fn group_config(&mut self, key: &GroupKey, sealed: Option<Vec<u8>>) {
+        let Some(b) = &self.blobs else { return };
+        let storage = b.storage().clone();
+        let first = !std::mem::replace(&mut self.config_supported, true);
+        self.config_check = None;
+        let server_version = sealed
+            .as_ref()
+            .and_then(|s| key.open_config(s).ok())
+            .map_or(0, |c| c.version);
+        if let Some(s) = &sealed {
+            storage.apply_sealed(s);
+        }
+        // Первый ответ сессии: если у сервера настройки старее своих, вернуть
+        // ему свои (например, база сервера пропала).
+        if first && storage.version() > server_version {
+            self.config_push = storage.seal_current(key);
+        }
     }
 
     /// Ответ `Devices` — первому, кто его ждёт.
@@ -714,7 +800,10 @@ impl Engine {
             Some(Some(reply)) => {
                 let _ = reply.send(Ok(list));
             }
-            Some(None) => self.card_check = None,
+            Some(None) => {
+                self.card_check = None;
+                self.want_config = true;
+            }
             None => tracing::debug!("лишний ответ со списком устройств"),
         }
     }
@@ -783,6 +872,15 @@ impl Engine {
             now_ms(),
         )?;
         write_msg(&mut send2, &ClientMsg::PublishCard(card)).await?;
+        // Настройки группы — в новую группу заново зашифрованными, до рассылки
+        // пакетов. Только если сервер их знает (иначе он оборвёт соединение).
+        let storage = self.blobs.as_ref().map(|b| b.storage().clone());
+        if self.config_supported
+            && let Some(sealed) = storage.as_ref().and_then(|s| s.seal_current(&new_key))
+        {
+            write_msg(&mut send2, &ClientMsg::SetGroupConfig(sealed)).await?;
+        }
+        // Ответ на список значит, что карточка (и настройки) уже записаны.
         write_msg(&mut send2, &ClientMsg::ListDevices).await?;
         // Ответ на список значит, что карточка уже записана.
         loop {
@@ -835,6 +933,17 @@ impl Engine {
         conn2.close(0u32.into(), b"bye");
         res?;
         self.pending_rekey = None;
+        // Объекты старой группы во внешнем хранилище — в фоне и без гарантии:
+        // что останется, дочистит срок хранения.
+        if let Some((_, store)) = storage.as_ref().and_then(|s| s.external()) {
+            tokio::spawn(async move {
+                let dir = clipwire_core::storage::group_dir(&old);
+                match store.delete_dir(&dir).await {
+                    Ok(()) => tracing::info!("файлы старой группы удалены из внешнего хранилища"),
+                    Err(e) => tracing::info!("файлы старой группы не удалились: {e}"),
+                }
+            });
+        }
         tracing::info!(
             recipients = plan.recipients.len(),
             skipped = plan.skipped.len(),
@@ -1011,7 +1120,7 @@ impl Engine {
         // Файлы сначала резервируются на сервере: получатель, вставивший
         // элемент сразу, будет ждать частей, а не получит «файла нет».
         // Отказанным файлам blob снимается, загрузок по ним не будет.
-        let (c, jobs) = match (&self.blobs, c) {
+        let (c, jobs, places) = match (&self.blobs, c) {
             (Some(b), c @ Content::Files(_)) => {
                 let give_up = self.reserve_failures + 1 >= MAX_RESERVE_ATTEMPTS;
                 match b.reserve_files(conn, c, give_up).await {
@@ -1027,10 +1136,16 @@ impl Engine {
                     }
                 }
             }
-            (_, c) => (c, Vec::new()),
+            (_, c) => (c, Vec::new(), Vec::new()),
         };
         let mut item = Item::new(self.device, c).with_device_name(self.device_name.clone());
         item.ext = ext;
+        // Где лежат файлы: метка только если хоть один во внешнем хранилище.
+        item.ext
+            .retain(|e| e.tag != clipwire_core::item::ext::BLOB_PLACES);
+        if !places.is_empty() {
+            item.ext_set(clipwire_core::item::ext::BLOB_PLACES, &places);
+        }
         let sealed = self.state.invite.group_key.seal(&item)?;
         if let Err(e) = write_msg(send, &ClientMsg::Push(sealed)).await {
             self.restore_pending(Outgoing {
@@ -1189,6 +1304,9 @@ fn refuse_control(ctl: Control, why: &str) {
             let _ = reply.send(Err(why.to_string()));
         }
         Control::Rekey { reply, .. } => {
+            let _ = reply.send(Err(why.to_string()));
+        }
+        Control::SetGroupConfig { reply, .. } => {
             let _ = reply.send(Err(why.to_string()));
         }
     }

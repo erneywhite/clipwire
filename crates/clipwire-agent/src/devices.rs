@@ -167,8 +167,13 @@ pub fn adopt_key(paths: &Paths, old: GroupId, new_key: GroupKey) -> Result<bool>
         return Ok(false);
     }
     let new = new_key.group_id();
-    state.invite.group_key = new_key;
+    let old_key = std::mem::replace(&mut state.invite.group_key, new_key.clone());
     paths.save(&state)?;
+    // Настройки группы (хранилище файлов) переходят под новый ключ: новый
+    // сервис сразу ходит в то же хранилище, не дожидаясь сервера.
+    if let Err(e) = crate::group_config::reseal_local(&paths.dir, &old_key, &new_key) {
+        tracing::warn!("настройки группы не перенеслись под новый ключ: {e:#}");
+    }
     if let Err(e) = paths.forget_uploads() {
         tracing::warn!("очередь загрузок старой группы не удалилась: {e:#}");
     }
@@ -298,6 +303,13 @@ pub enum Control {
     Rekey {
         remove: Option<DeviceId>,
         reply: oneshot::Sender<Result<Rekeyed, String>>,
+    },
+    /// Сохранить настройки группы (`SetGroupConfig`): `sealed` — они же,
+    /// зашифрованные ключом группы. После отправки движок применяет их у себя.
+    SetGroupConfig {
+        sealed: Vec<u8>,
+        config: clipwire_core::GroupConfig,
+        reply: oneshot::Sender<Result<(), String>>,
     },
 }
 

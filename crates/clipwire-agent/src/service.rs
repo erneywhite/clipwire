@@ -47,6 +47,12 @@ pub enum UiEvent {
     /// другого устройства. Повтор того, что уже есть в истории (вставка из
     /// истории, то же содержимое ещё раз), новой записью не считается.
     NewEntry,
+    /// Настройки группы изменились (здесь или на другом устройстве). Без
+    /// секретов: полные настройки — `StorageController::config_for_form`.
+    GroupConfig(crate::group_config::StorageView),
+    /// Внешнее хранилище группы недоступно, файл ушёл через сервер Clipwire
+    /// (текст для человека).
+    StorageWarning(String),
 }
 
 pub type UiCallback = Arc<dyn Fn(UiEvent) + Send + Sync>;
@@ -73,6 +79,8 @@ pub struct Service {
     watcher: Option<Watcher>,
     /// Команды движку: устройства группы и смена ключа. Только в группе.
     controller: Option<crate::devices::Controller>,
+    /// Настройки хранилища файлов группы. Только в группе.
+    storage: Option<crate::group_config::StorageController>,
 }
 
 /// Копирование на этом устройстве: решить, как передаются файлы, отправить
@@ -229,6 +237,16 @@ impl Service {
             )
         });
         let mut controller = None;
+        let mut storage = None;
+        if let Some(b) = &blobs {
+            let on_event = on_event.clone();
+            b.storage().set_sink(Arc::new(move |e| {
+                on_event(match e {
+                    crate::group_config::StorageEvent::Changed(v) => UiEvent::GroupConfig(*v),
+                    crate::group_config::StorageEvent::Warning(w) => UiEvent::StorageWarning(w),
+                })
+            }));
+        }
         let (device, engine) = match state {
             Some(state) => {
                 let (ctl_tx, ctl_rx) = mpsc::channel(8);
@@ -250,6 +268,12 @@ impl Service {
                 .with_blobs(blobs.clone().expect("в группе передача файлов есть"))
                 .with_control(ctl_rx);
                 let device = engine.device();
+                if let Some(b) = &blobs {
+                    storage = Some(crate::group_config::StorageController::new(
+                        ctl_tx.clone(),
+                        b.storage().clone(),
+                    ));
+                }
                 controller = Some(crate::devices::Controller::new(ctl_tx, group_key, device));
                 (device, Some(rt.spawn(engine.run(local_rx))))
             }
@@ -413,6 +437,7 @@ impl Service {
             blobs,
             watcher: Some(watcher),
             controller,
+            storage,
         })
     }
 
@@ -423,6 +448,13 @@ impl Service {
     /// Устройства группы и смена ключа. `None` в локальном режиме.
     pub fn controller(&self) -> Option<crate::devices::Controller> {
         self.controller.clone()
+    }
+
+    /// Хранилище файлов группы: настройки, сохранение, проверка
+    /// подключения. `None` в локальном режиме (внешнее хранилище там не
+    /// используется).
+    pub fn storage(&self) -> Option<crate::group_config::StorageController> {
+        self.storage.clone()
     }
 
     pub fn status(&self) -> Status {
