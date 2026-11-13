@@ -26,7 +26,7 @@ use clipwire_core::proto::{
     ALPN, BlobChunk, BlobFail, BlobReply, BlobRequest, ClientMsg, ServerMsg, encode_frame,
 };
 use clipwire_core::{BlobId, Content, DeviceId, FileRef, GroupKey, Invite, ServerInfo};
-use clipwire_server::Config;
+use clipwire_server::{Config, Guards};
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
 use tokio::io::AsyncWrite;
@@ -50,6 +50,14 @@ async fn start_server_stall(
     max_file_bytes: u64,
     blob_stall: Duration,
 ) -> Result<(clipwire_server::Running, ServerInfo)> {
+    start_server_guarded(max_file_bytes, blob_stall, Guards::default()).await
+}
+
+async fn start_server_guarded(
+    max_file_bytes: u64,
+    blob_stall: Duration,
+    guards: Guards,
+) -> Result<(clipwire_server::Running, ServerInfo)> {
     let config = Config {
         data_dir: tmp("server"),
         public_url: "http://unused".into(),
@@ -65,7 +73,7 @@ async fn start_server_stall(
         blob_total_quota: u64::MAX,
         blob_stall,
     };
-    let server = clipwire_server::start(&config).await?;
+    let server = clipwire_server::start_with(&config, &guards).await?;
     tokio::time::timeout(T, server.endpoint().online()).await?;
     let port = server.relay_addr().context("нет relay")?.port();
     let mut info = server.info.clone();
@@ -1331,5 +1339,47 @@ async fn refused_folder_archive_leaves_outbox() -> Result<()> {
         drop(x.local);
         x.task.await??;
     }
+    server.shutdown().await
+}
+
+/// Файл ждёт загрузки в очереди дольше срока резерва: агент повторяет
+/// `Reserve`, и сервер резерв не удаляет. Брошенный резерв удаляется.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_upload_keeps_its_reserve() -> Result<()> {
+    let guards = Guards {
+        reserve_ttl: Duration::from_secs(2),
+        ..Guards::default()
+    };
+    let (server, info) = start_server_guarded(1024 * 1024, Duration::from_secs(10), guards).await?;
+    let key = GroupKey::generate()?;
+    let dev = Device::join(&info, &key).await?;
+    let src = tmp("refresh-src");
+    let (_, queued) = make_file(&src, "в очереди.bin", 100);
+    let (_, left) = make_file(&src, "брошен.bin", 100);
+    for f in [&queued, &left] {
+        reserve_blob(&dev.conn, f.blob.unwrap(), f.size)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    // Загрузчик не запущен: задание просто стоит в очереди.
+    let (b, _events) = blobs(&key, &tmp("refresh-state"));
+    b.enqueue(vec![job(&queued)]);
+    // Уже грузящиеся задания не продлеваются: их Put держит замок файла.
+    let running = std::collections::HashSet::from([queued.blob.unwrap()]);
+    assert_eq!(b.refresh_reserves(&dev.conn, &running).await, 0);
+    let until = std::time::Instant::now() + Duration::from_secs(7);
+    while std::time::Instant::now() < until {
+        assert_eq!(b.refresh_reserves(&dev.conn, &Default::default()).await, 1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        server_have(&dev.conn, queued.blob.unwrap(), queued.size).await?,
+        Some(0)
+    );
+    assert_eq!(
+        server_have(&dev.conn, left.blob.unwrap(), left.size).await?,
+        None
+    );
+    dev.drop_link().await;
     server.shutdown().await
 }

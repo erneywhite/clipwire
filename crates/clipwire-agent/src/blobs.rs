@@ -33,6 +33,11 @@ pub const EMIT_EVERY: Duration = Duration::from_millis(200);
 const WAIT_CONN: Duration = Duration::from_secs(10);
 /// Через сколько повторить загрузку после временной ошибки на том же соединении.
 pub const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Как часто продлевать на сервере резервы файлов, которые ждут загрузки в
+/// очереди. Сервер удаляет резерв, который не трогали
+/// `CLIPWIRE_RESERVE_TTL_SECS` (по умолчанию 10 минут), а в очереди файл
+/// может стоять дольше: впереди большие файлы, а грузится их по [`MAX_UPLOADS`].
+pub const RESERVE_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// Предел длины имени в кэше (в символах): с запасом под `.part` и под
 /// 255 UTF-16-единиц на компонент пути в Windows.
 const MAX_NAME_CHARS: usize = 120;
@@ -1702,6 +1707,43 @@ impl Blobs {
         ))
     }
 
+    /// Продлить на сервере резервы заданий, которые ждут в очереди: повторный
+    /// `Reserve` того же файла обновляет время, от которого сервер считает
+    /// срок резерва. `skip` — задания, которые уже грузятся: их `Put` держит
+    /// замок файла, и `Reserve` ждал бы конца загрузки. Запросы идут по
+    /// одному; задание, ушедшее из очереди за это время, пропускается.
+    /// Закрытое соединение прерывает обход (остальные продлятся на следующем).
+    /// Возвращает, сколько резервов продлено.
+    pub async fn refresh_reserves(&self, conn: &Connection, skip: &HashSet<BlobId>) -> usize {
+        let mut done = 0;
+        for job in self.queued() {
+            if skip.contains(&job.blob) {
+                continue;
+            }
+            let queued = self
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .jobs()
+                .iter()
+                .any(|j| j.blob == job.blob);
+            if !queued {
+                continue;
+            }
+            match reserve_blob(conn, job.blob, job.size).await {
+                Ok(()) => done += 1,
+                Err(e) if conn.close_reason().is_some() => {
+                    tracing::info!("резервы не продлились, связь оборвалась: {e}");
+                    break;
+                }
+                // Окончательный отказ разберёт сама загрузка, временный
+                // повторится на следующем тике.
+                Err(e) => tracing::info!(path = %job.path, "резерв не продлился: {e}"),
+            }
+        }
+        done
+    }
+
     /// Скачать все файлы записи с устройства `origin` по порядку. Первая
     /// ошибка прерывает.
     // shortcut: файлы качаются по одному; параллельно — если окажется, что
@@ -1718,6 +1760,8 @@ impl Blobs {
     /// файлов одновременно. Файл, оборвавшийся из-за связи, остаётся в очереди
     /// и повторяется на следующем соединении (или на этом же через
     /// [`RETRY_AFTER`], если связь не рвалась, а сервер ответил временной ошибкой).
+    /// Резервы заданий очереди продлеваются сразу после каждого подключения и
+    /// дальше раз в [`RESERVE_REFRESH`] ([`Blobs::refresh_reserves`]).
     // shortcut: загрузки отдельных файлов идут задачами JoinSet; когда движок
     // снимают, они получают abort и останавливаются на ближайшем await, а не
     // вместе с ним. Окно — доли миллисекунды (запись uploads.json после
@@ -1738,6 +1782,15 @@ impl Blobs {
             OUTBOX_CLEAN_EVERY,
         );
         cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Продление резервов: на каком соединении оно последний раз шло (0 —
+        // пора продлить на текущем) и сама задача, одна на всех.
+        let mut refresh = tokio::time::interval_at(
+            tokio::time::Instant::now() + RESERVE_REFRESH,
+            RESERVE_REFRESH,
+        );
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut refreshed_on = 0;
+        let mut refreshing = tokio::task::JoinSet::new();
         loop {
             let (n, conn) = rx.borrow_and_update().clone();
             if let Some(conn) = conn {
@@ -1767,11 +1820,26 @@ impl Blobs {
                         (job.blob, n, retry)
                     });
                 }
+                // После запуска загрузок: те, что уже грузятся, не трогаем.
+                // Задания, поставленные позже, только что зарезервированы
+                // движком, их продлит следующий тик.
+                if std::mem::replace(&mut refreshed_on, n) != n
+                    && self.queued().len() > running.len()
+                {
+                    refreshing.abort_all();
+                    let (me, conn, skip) = (self.clone(), conn.clone(), running.clone());
+                    refreshing.spawn(async move {
+                        let n = me.refresh_reserves(&conn, &skip).await;
+                        tracing::debug!(n, "резервы очереди продлены");
+                    });
+                }
             }
             tokio::select! {
                 r = rx.changed() => if r.is_err() { return },
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(RETRY_AFTER), if !failed_on.is_empty() => {}
+                _ = refresh.tick() => refreshed_on = 0,
+                Some(_) = refreshing.join_next(), if !refreshing.is_empty() => {}
                 _ = cleanup.tick() => {
                     let cleaned = self.clean_outbox();
                     if cleaned > 0 {
@@ -2534,9 +2602,14 @@ mod tests {
         // Обрыв и тайм-аут — повторить с тем же blob, пока не сдались.
         assert_eq!(reserve_verdict(&net(), false), Verdict::Retry);
         assert_eq!(reserve_verdict(&net(), true), Verdict::Strip);
-        // Временная ошибка сервера — тоже повтор.
+        // Временная ошибка сервера — тоже повтор. Stalled на Reserve сервер
+        // отвечает и тогда, когда у устройства слишком много резервов.
         assert_eq!(
             reserve_verdict(&Err(server_fail(BlobFail::Internal("x".into()))), false),
+            Verdict::Retry
+        );
+        assert_eq!(
+            reserve_verdict(&Err(server_fail(BlobFail::Stalled)), false),
             Verdict::Retry
         );
         for f in [

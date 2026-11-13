@@ -9,7 +9,7 @@ use std::time::Duration;
 use clipwire_core::blob::{CHUNK, OVERHEAD, chunk_count};
 use clipwire_core::proto::io::{IoError, read_msg_limited, write_msg};
 use clipwire_core::proto::{BlobChunk, BlobFail, BlobReply, BlobRequest};
-use clipwire_core::{BlobId, GroupId};
+use clipwire_core::{BlobId, DeviceId, GroupId};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -137,7 +137,13 @@ impl From<IoError> for Fail {
 /// плодить потоки без запроса. `Put` и `Get` отдают его после первого кадра и
 /// ждут своих пропусков; сколько их может ждать, ограничивает сам QUIC
 /// (предел одновременных потоков соединения).
-pub async fn serve_streams(shared: Arc<Shared>, conn: Connection, group: GroupId) {
+/// `origin` — устройство соединения: на него считается предел резервов.
+pub async fn serve_streams(
+    shared: Arc<Shared>,
+    conn: Connection,
+    group: GroupId,
+    origin: DeviceId,
+) {
     let opening = Arc::new(Semaphore::new(MAX_OPENING));
     let streams = Arc::new(Semaphore::new(MAX_STREAMS));
     let mut tasks = JoinSet::new();
@@ -149,19 +155,31 @@ pub async fn serve_streams(shared: Arc<Shared>, conn: Connection, group: GroupId
         };
         let (shared, streams) = (shared.clone(), streams.clone());
         tasks.spawn(async move {
-            serve_stream(&shared, &group, &streams, permit, send, recv).await;
+            let at = At {
+                group: &group,
+                origin: &origin,
+            };
+            serve_stream(&shared, at, &streams, permit, send, recv).await;
         });
     }
 }
 
+/// Чей поток: группа и устройство соединения.
+#[derive(Clone, Copy)]
+struct At<'a> {
+    group: &'a GroupId,
+    origin: &'a DeviceId,
+}
+
 async fn serve_stream(
     shared: &Shared,
-    group: &GroupId,
+    at: At<'_>,
     conn_streams: &Arc<Semaphore>,
     opening: OwnedSemaphorePermit,
     mut send: SendStream,
     mut recv: RecvStream,
 ) {
+    let group = at.group;
     let first = read_msg_limited(&mut recv, MAX_REQUEST_FRAME);
     let res = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, first).await {
         Err(_) => Err(Fail::Reply(BlobFail::Stalled)),
@@ -173,7 +191,7 @@ async fn serve_stream(
                 .streams
                 .acquire(conn_streams, *group, Kind::Put)
                 .await;
-            put(shared, group, &mut send, &mut recv, blob, size).await
+            put(shared, at, &mut send, &mut recv, blob, size).await
         }
         Ok(Ok(Some(BlobRequest::Get { blob, from }))) => {
             drop(opening);
@@ -184,7 +202,7 @@ async fn serve_stream(
             get(shared, group, &mut send, blob, from).await
         }
         Ok(Ok(Some(BlobRequest::Reserve { blob, size }))) => {
-            reserve(shared, group, &mut send, blob, size).await
+            reserve(shared, at, &mut send, blob, size).await
         }
         Ok(Ok(Some(BlobRequest::Abort { blob }))) => abort(shared, group, &mut send, blob).await,
     };
@@ -233,15 +251,16 @@ fn precheck(shared: &Shared, group: &GroupId, blob: &BlobId, size: u64) -> Resul
 /// файла на диске обнуляется старое содержимое с тем же именем (истёкший файл).
 async fn begin(
     shared: &Shared,
-    group: &GroupId,
+    at: At<'_>,
     blob: &BlobId,
     size: u64,
     live: &Live,
 ) -> Result<(u64, bool), Fail> {
-    let limits = &shared.limits;
+    let (limits, group) = (&shared.limits, at.group);
     let begin = shared.store.blob_begin(
         group,
         blob,
+        at.origin,
         size,
         now_ms(),
         shared.not_before_ms(),
@@ -253,9 +272,12 @@ async fn begin(
         BlobBegin::Created => (0, true),
         BlobBegin::Existing { have } => (have, false),
         BlobBegin::SizeMismatch => return Err(BlobFail::SizeMismatch.into()),
-        BlobBegin::QuotaExceeded | BlobBegin::ServerFull | BlobBegin::TooManyReserves => {
+        BlobBegin::QuotaExceeded | BlobBegin::ServerFull => {
             return Err(BlobFail::QuotaExceeded.into());
         }
+        // Временная ошибка: резервы освобождаются, как только по ним приходят
+        // части, и агент повторяет запрос, а не снимает файл с элемента.
+        BlobBegin::TooManyReserves => return Err(BlobFail::Stalled.into()),
     };
     let now = Progress {
         have,
@@ -269,17 +291,20 @@ async fn begin(
     Ok((have, fresh))
 }
 
+/// `Reserve`: завести файл или продлить резерв уже заведённого. Повторный
+/// `Reserve` агент шлёт, пока файл ждёт загрузки в его очереди.
 async fn reserve(
     shared: &Shared,
-    group: &GroupId,
+    at: At<'_>,
     send: &mut SendStream,
     blob: BlobId,
     size: u64,
 ) -> Result<(), Fail> {
-    let live = precheck(shared, group, &blob, size)?;
+    let live = precheck(shared, at.group, &blob, size)?;
     {
+        // У заведённого файла begin только обновляет last_touch_ms.
         let _writer = live.writer.lock().await;
-        begin(shared, group, &blob, size, &live).await?;
+        begin(shared, at, &blob, size, &live).await?;
     }
     write_msg(send, &BlobReply::Reserved).await?;
     Ok(())
@@ -306,11 +331,13 @@ async fn abort(
     Ok(())
 }
 
-/// Чистка брошенных резервов: файлы, по которым за `reserve_ttl` не пришло ни
-/// одной части. Иначе `Reserve` без загрузки держал бы квоту группы до общего
-/// срока (сутки). Удаление — как у `Abort`, под замком записи: если за это
-/// время началась загрузка, у неё замок, и после него у файла уже есть части,
-/// тогда его не трогаем. Ждущие `Get` получают `Cancelled`.
+/// Чистка брошенных резервов: файлы без единой части, которые за `reserve_ttl`
+/// никто не трогал (ни `Reserve`, ни `Put`). Иначе `Reserve` без загрузки
+/// держал бы квоту группы до общего срока (сутки). Агент, у которого файл
+/// ждёт в очереди, повторяет `Reserve` и так продлевает резерв. Удаление — как
+/// у `Abort`, под замком записи: если за это время началась загрузка, у неё
+/// замок, и после него у файла уже есть части, а если резерв продлили, он уже
+/// не старый; тогда его не трогаем. Ждущие `Get` получают `Cancelled`.
 /// Возвращает, сколько резервов удалено.
 pub async fn purge_stale_reserves(shared: &Shared) -> anyhow::Result<usize> {
     let older_than = now_ms() - shared.limits.reserve_ttl.as_millis() as i64;
@@ -325,6 +352,24 @@ pub async fn purge_stale_reserves(shared: &Shared) -> anyhow::Result<usize> {
         shared.blobs.remove(group, blob);
         live.state.send_modify(|p| p.cancelled = true);
         removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Чистка заброшенных групп: ни одно устройство не входило за `group_idle`,
+/// нет ни элементов, ни файлов, и сейчас никто не подключён. Устройства
+/// группы удаляются вместе с ней. Так освобождаются места под
+/// `CLIPWIRE_MAX_GROUPS`. Возвращает, сколько групп удалено.
+pub fn purge_idle_groups(shared: &Shared) -> anyhow::Result<usize> {
+    let seen_before = now_ms() - shared.limits.group_idle.as_millis() as i64;
+    let mut removed = 0;
+    for group in shared.store.idle_groups(seen_before)? {
+        if shared.hub.is_online(&group) {
+            continue;
+        }
+        if shared.store.delete_idle_group(&group, seen_before)? {
+            removed += 1;
+        }
     }
     Ok(removed)
 }
@@ -350,15 +395,16 @@ pub async fn purge_expired(shared: &Shared) -> anyhow::Result<usize> {
 
 async fn put(
     shared: &Shared,
-    group: &GroupId,
+    at: At<'_>,
     send: &mut SendStream,
     recv: &mut RecvStream,
     blob: BlobId,
     size: u64,
 ) -> Result<(), Fail> {
+    let group = at.group;
     let live = precheck(shared, group, &blob, size)?;
     let _writer = live.writer.lock().await;
-    let (mut have, fresh) = begin(shared, group, &blob, size, &live).await?;
+    let (mut have, fresh) = begin(shared, at, &blob, size, &live).await?;
     let mut file = shared.blobs.open_write(group, &blob, fresh).await?;
     write_msg(send, &BlobReply::PutReady { have }).await?;
 

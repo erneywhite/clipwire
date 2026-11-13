@@ -131,6 +131,17 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
 
 fn load_state() -> anyhow::Result<AppState> {
     let paths = Paths::resolve()?;
+    // Остатки кэша прошлой группы, которые не удалились при выходе (файл был
+    // открыт). Отдельным потоком: кэш бывает большим, запуск ждать не должен.
+    let trash = Paths {
+        dir: paths.dir.clone(),
+    };
+    std::thread::spawn(move || {
+        let n = trash.clean_trash();
+        if n > 0 {
+            tracing::info!("удалены остатки кэша прошлой группы: {n}");
+        }
+    });
     let settings = Settings::load(&paths.dir);
     let history = History::open(&paths.dir)?;
     Ok(AppState {

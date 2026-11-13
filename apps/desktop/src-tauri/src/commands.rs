@@ -385,10 +385,14 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
 #[tauri::command]
 pub async fn leave_group(app: AppHandle) -> CmdResult<()> {
     crate::stop_service(&app).await;
-    app.state::<AppState>().paths.reset().map_err(err)?;
-    // Дальше работаем локально: история и окно вставки остаются.
-    start_service(&app).map_err(err)?;
+    let reset = app.state::<AppState>().paths.reset();
+    // Сервис запускаем в любом случае: даже если выход не удался, приложение
+    // не должно остаться без синхронизации и окна вставки. Если ключ
+    // удалился, дальше работаем локально, история остаётся.
+    let started = start_service(&app);
     publish_status(&app);
+    reset.map_err(err)?;
+    started.map_err(err)?;
     Ok(())
 }
 

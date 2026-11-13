@@ -33,10 +33,15 @@ pub const MAX_RESERVE_ATTEMPTS: u32 = 3;
 /// двигался курсор. Курсор «из будущего» заставил бы пропускать все новые
 /// элементы до той даты: их id меньше курсора.
 pub const MAX_CURSOR_AHEAD: Duration = Duration::from_secs(5 * 60);
-/// В буфер ОС идут только элементы, скопированные не раньше этого. Старше —
-/// только в историю: запоздалая доставка не должна внезапно подменить то,
-/// что человек скопировал у себя.
-pub const FRESH_FOR_CLIPBOARD: Duration = Duration::from_secs(10 * 60);
+/// Элемент, который сервер разослал сейчас (`Deliver`), идёт в буфер ОС, если
+/// скопирован не раньше этого. Окно широкое: время копирования берётся с
+/// часов источника, и у источника с отстающими часами узкое окно не
+/// пропускало бы в буфер ничего. Старше — только в историю.
+pub const FRESH_LIVE: Duration = Duration::from_secs(6 * 3600);
+/// Самый свежий элемент истории группы при входе идёт в буфер, только если
+/// скопирован не раньше этого: копирование, пропущенное, пока устройство было
+/// не на связи, не должно внезапно подменить то, что человек скопировал у себя.
+pub const FRESH_FROM_HISTORY: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -366,7 +371,7 @@ impl Engine {
             self.emit(Event::History(items));
         }
         if let Some(item) = current {
-            self.accept(item);
+            self.accept(item, FRESH_FROM_HISTORY);
         }
         if let Some(max) = newest {
             self.set_cursor(max);
@@ -379,7 +384,7 @@ impl Engine {
             return;
         }
         match self.state.invite.group_key.open(sealed) {
-            Ok(item) => self.accept(item),
+            Ok(item) => self.accept(item, FRESH_LIVE),
             Err(e) => tracing::warn!("элемент не расшифровался, пропускаю: {e}"),
         }
     }
@@ -412,12 +417,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Чужой элемент для буфера. Скопированный давно (запоздалая доставка
-    /// или старый элемент, выданный за новый) идёт только в историю: время
-    /// копирования лежит под шифрованием, сервер его не подделает.
-    fn accept(&mut self, item: Item) {
+    /// Чужой элемент для буфера. Скопированный раньше, чем `window` назад
+    /// (запоздалая доставка или старый элемент, выданный за новый), идёт
+    /// только в историю: время копирования лежит под шифрованием, сервер его
+    /// не подделает.
+    fn accept(&mut self, item: Item, window: Duration) {
         let id = item.id;
-        if is_fresh(&item, now_ms()) {
+        if is_fresh(&item, now_ms(), window) {
             self.emit(Event::Incoming(item));
         } else {
             tracing::info!("элемент скопирован давно, кладу только в историю");
@@ -547,12 +553,11 @@ fn ahead_of_clock(id: ItemId, now_ms: u64) -> bool {
         .is_none_or(|ms| ms > now_ms.saturating_add(MAX_CURSOR_AHEAD.as_millis() as u64))
 }
 
-/// Скопирован не раньше [`FRESH_FOR_CLIPBOARD`] назад. Время из будущего
-/// (часы источника спешат) считается свежим.
-fn is_fresh(item: &Item, now_ms: u64) -> bool {
-    item.created_at_ms
-        .saturating_add(FRESH_FOR_CLIPBOARD.as_millis() as u64)
-        >= now_ms
+/// Скопирован не раньше `window` назад ([`FRESH_LIVE`] или
+/// [`FRESH_FROM_HISTORY`]). Время из будущего (часы источника спешат)
+/// считается свежим.
+fn is_fresh(item: &Item, now_ms: u64, window: Duration) -> bool {
+    item.created_at_ms.saturating_add(window.as_millis() as u64) >= now_ms
 }
 
 /// Подключиться к серверу. Пока идёт подключение, следим за relay: если он
@@ -808,23 +813,48 @@ mod tests {
     fn stale_item_goes_only_to_history() {
         let now = now_ms();
         let (mut e, mut rx) = engine(None);
-        let old = now - FRESH_FOR_CLIPBOARD.as_millis() as u64 - 60_000;
+        let old = now - FRESH_LIVE.as_millis() as u64 - 60_000;
         e.deliver(&sealed(2, old));
+        // У источника отстают часы на час: живая доставка всё равно в буфер.
+        let lagging = now - 3_600_000;
+        e.deliver(&sealed(2, lagging));
         let fresh = now - 60_000;
         e.deliver(&sealed(2, fresh));
         let (clip, hist) = drain(&mut rx);
-        assert_eq!(clip, texts(&[fresh]));
+        assert_eq!(clip, texts(&[lagging, fresh]));
         assert_eq!(hist, texts(&[old]));
+    }
+
+    #[test]
+    fn history_on_join_uses_short_window() {
+        let now = now_ms();
+        let seen = sealed(2, now - 7_200_000);
+        // Пропущенное час назад — только в историю, хотя для живой
+        // доставки это окно ещё открыто.
+        let (mut e, mut rx) = engine(Some(seen.id));
+        e.apply_history(vec![(sealed(2, now - 3_600_000), false)]);
+        let (clip, hist) = drain(&mut rx);
+        assert!(clip.is_empty());
+        assert_eq!(hist, texts(&[now - 3_600_000]));
+        // Свежее пяти минут — в буфер.
+        let (mut e, mut rx) = engine(Some(seen.id));
+        e.apply_history(vec![(sealed(2, now - 300_000), false)]);
+        let (clip, _) = drain(&mut rx);
+        assert_eq!(clip, texts(&[now - 300_000]));
     }
 
     #[test]
     fn freshness_and_clock_checks() {
         let now = 1_000_000_000_000;
         let i = |ms| Item::backdated(DeviceId([2; 32]), Content::Text(String::new()), ms);
-        assert!(is_fresh(&i(now), now));
-        assert!(is_fresh(&i(now + 3_600_000), now));
-        assert!(is_fresh(&i(now - 9 * 60_000), now));
-        assert!(!is_fresh(&i(now - 11 * 60_000), now));
+        let (live, hist) = (FRESH_LIVE, FRESH_FROM_HISTORY);
+        assert!(is_fresh(&i(now), now, hist));
+        assert!(is_fresh(&i(now + 3_600_000), now, hist));
+        assert!(is_fresh(&i(now - 9 * 60_000), now, hist));
+        assert!(!is_fresh(&i(now - 11 * 60_000), now, hist));
+        assert!(is_fresh(&i(now - 11 * 60_000), now, live));
+        assert!(is_fresh(&i(now - 5 * 3_600_000), now, live));
+        assert!(!is_fresh(&i(now - 7 * 3_600_000), now, live));
         assert!(!ahead_of_clock(ItemId::at_ms(now + 4 * 60_000), now));
         assert!(ahead_of_clock(ItemId::at_ms(now + 6 * 60_000), now));
         // UUID без времени — не v7, курсор по нему не двигаем.

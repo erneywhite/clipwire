@@ -56,6 +56,12 @@ impl Hub {
         }
     }
 
+    /// Есть ли у группы хоть одно соединение. Чистка заброшенных групп
+    /// такие не трогает.
+    pub fn is_online(&self, group: &GroupId) -> bool {
+        self.lock().contains_key(group)
+    }
+
     /// Рассылает сообщение всем соединениям группы, кроме `except`.
     /// Возвращает число получателей.
     pub fn broadcast(&self, group: &GroupId, except: u64, msg: &ServerMsg) -> usize {
@@ -105,6 +111,7 @@ mod tests {
         let (t, _r) = mpsc::channel(4);
         {
             let _reg = hub.register(g, t);
+            assert!(hub.is_online(&g));
             assert_eq!(
                 hub.broadcast(&g, u64::MAX, &ServerMsg::Error("x".into())),
                 1
@@ -115,5 +122,6 @@ mod tests {
             0
         );
         assert!(hub.lock().is_empty());
+        assert!(!hub.is_online(&g));
     }
 }
