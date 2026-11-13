@@ -3,6 +3,7 @@
   // в отдельном окне рядом с настройками, которое не забирает фокус.
   import EntryRow from '../lib/EntryRow.svelte'
   import type { Entry } from '../lib/api'
+  import type { TransferMap } from '../lib/transfer'
 
   // fill — занять всё окно (отдельное окно-превью); иначе заданный размер.
   let { width = 0, height = 0, fill = false }: { width?: number; height?: number; fill?: boolean } = $props()
@@ -27,9 +28,15 @@
         <rect x="118" y="114" width="188" height="52" rx="4" fill="#3d4450"/>
       </svg>`,
     )
+  // Образец файла с другого устройства: идёт скачивание, видна полоса прогресса.
+  const sampleFile = { name: 'Отчёт за ноябрь.pdf', path: '/Users/me/Отчёт за ноябрь.pdf', size: 2_400_000, is_dir: false, exists: false, blob: '0'.repeat(32), local_path: null, remote: true }
+  const sampleTransfers: TransferMap = {
+    [sampleFile.blob]: { blob: sampleFile.blob, direction: 'down', done: 1_100_000, total: 2_400_000, state: 'active', error: null },
+  }
   const samples: Entry[] = [
     { ...base, id: '1', kind: 'image', text: '', chars: 0, seen_ms: now - 1 * min, local: false, device_name: 'MacBook', width: 1920, height: 1080, bytes: 348_000, thumb: sampleShot },
     { ...base, id: '2', kind: 'text', text: 'https://github.com/erneywhite/clipwire', chars: 38, seen_ms: now - 4 * min },
+    { ...base, id: 'f', kind: 'files', text: '', chars: 0, seen_ms: now - 6 * min, local: false, device_name: 'MacBook', bytes: sampleFile.size, files: [sampleFile] },
     { ...base, id: '3', kind: 'text', text: 'docker compose pull && docker compose up -d', chars: 43, seen_ms: now - 9 * min },
     { ...base, id: '4', kind: 'text', text: 'Созвон завтра в 10:00, ссылку пришлю утром', chars: 42, seen_ms: now - 25 * min, local: false, device_name: 'MacBook', pinned: true },
     { ...base, id: '5', kind: 'text', text: 'Ответ клиенту: заказ отправлен, номер для отслеживания пришлю отдельным письмом сегодня вечером', chars: 96, lines: 1, seen_ms: now - 50 * min },
@@ -46,7 +53,7 @@
   <div class="tabs"><span class="on">История</span><span>Закреплённое</span></div>
   <ul class="list">
     {#each samples as item, i (item.id)}
-      <EntryRow {item} index={i} selected={i === 0} />
+      <EntryRow {item} transfers={sampleTransfers} index={i} selected={i === 0} />
     {/each}
   </ul>
   <div class="hints"><span>↵ вставить</span><span>␣ просмотр</span><span>Ctrl P закрепить</span><span>Esc</span></div>

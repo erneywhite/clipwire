@@ -19,6 +19,8 @@ export interface Settings {
   link_previews: boolean
   hide_from_capture: boolean
   ignored_apps: string[]
+  /** Файлы до этого размера уходят на сервер; 0 — не загружать. */
+  file_upload_limit_mb: number
 }
 
 export interface DeviceInfo {
@@ -58,8 +60,24 @@ export interface FileInfo {
   path: string
   size: number
   is_dir: boolean
-  /** Файл ещё на месте. */
+  /** Файл по local_path есть на диске. */
   exists: boolean
+  /** Id файла на сервере (32 hex); null — папка или файл крупнее порога. */
+  blob: string | null
+  /** Путь на этом компьютере: исходный у локальной записи, путь в кэше у скачанной. */
+  local_path: string | null
+  /** Запись пришла с другого устройства. */
+  remote: boolean
+}
+
+/** Передача одного файла: событие clipwire://transfer и ответ transfers(). */
+export interface Transfer {
+  blob: string
+  direction: 'up' | 'down'
+  done: number
+  total: number
+  state: 'active' | 'done' | 'failed'
+  error: string | null
 }
 
 export interface FilePreview {
@@ -115,4 +133,7 @@ export const api = {
   editImage: (id: string) => invoke<void>('editor_open', { id }),
   linkPreview: (url: string) => invoke<LinkCard>('link_preview', { url }),
   filePreview: (path: string) => invoke<FilePreview>('file_preview', { path }),
+  /** Скачать файлы записи с другого устройства без вставки. Прогресс идёт событиями. */
+  filesDownload: (id: string) => invoke<void>('files_download', { id }),
+  transfers: () => invoke<Transfer[]>('transfers'),
 }

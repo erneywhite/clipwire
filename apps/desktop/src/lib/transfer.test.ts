@@ -1,0 +1,69 @@
+// Проверка сводки передач. Запуск: node src/lib/transfer.test.ts
+// (Node 23.6+ сам убирает типы). Тестового фреймворка у фронтенда нет,
+// поэтому простые проверки с исключением.
+// shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
+import type { Transfer } from './api'
+
+// Node требует расширение в пути, а TypeScript без allowImportingTsExtensions его
+// не пропускает: путь собирается строкой, тип берётся отдельно.
+const { entryProgress, percentOf, progressLabel } = (await import('./transfer' + '.ts')) as typeof import('./transfer')
+
+function check(cond: boolean, msg: string) {
+  if (!cond) throw new Error(`не прошло: ${msg}`)
+}
+
+function t(blob: string, over: Partial<Transfer>): Transfer {
+  return { blob, direction: 'up', done: 0, total: 100, state: 'active', error: null, ...over }
+}
+
+check(percentOf(0, 0) === 0, 'пустой файл — 0%')
+check(percentOf(999, 1000) === 99, '99,9% показывается как 99%')
+check(percentOf(1000, 1000) === 100, 'всё передано — 100%')
+check(percentOf(2000, 1000) === 100, 'больше 100% не бывает')
+
+check(entryProgress([{ blob: null }], {}) === null, 'папка без передач — ничего')
+check(entryProgress([{ blob: 'a' }], {}) === null, 'передачи ещё нет — ничего')
+check(entryProgress([{ blob: 'a' }], { a: t('a', { state: 'done', done: 100 }) }) === null, 'всё готово — полосы нет')
+
+{
+  const p = entryProgress([{ blob: 'a' }, { blob: 'b' }, { blob: null }], {
+    a: t('a', { done: 50, total: 100 }),
+    b: t('b', { done: 0, total: 300 }),
+  })
+  check(p !== null && p.done === 50 && p.total === 400 && p.percent === 12, 'прогресс суммарный по файлам')
+  check(p !== null && progressLabel(p) === '↑ 12%', 'подпись загрузки')
+}
+
+{
+  // Первый файл уже готов, последнее событие о нём пришло чуть раньше конца.
+  const p = entryProgress([{ blob: 'a' }, { blob: 'b' }], {
+    a: t('a', { direction: 'down', state: 'done', done: 90, total: 100 }),
+    b: t('b', { direction: 'down', done: 50, total: 100 }),
+  })
+  check(p !== null && p.direction === 'down' && p.done === 150 && p.active, 'готовый файл засчитан целиком')
+  check(p !== null && progressLabel(p) === '↓ 75%', 'подпись скачивания')
+}
+
+{
+  const p = entryProgress([{ blob: 'a' }, { blob: 'b' }], {
+    a: t('a', { done: 10 }),
+    b: t('b', { direction: 'down', done: 20 }),
+  })
+  check(p !== null && p.direction === 'down', 'скачивание важнее загрузки')
+}
+
+{
+  const p = entryProgress([{ blob: 'a' }, { blob: 'b' }], {
+    a: t('a', { state: 'failed', error: 'файл изменился после копирования' }),
+    b: t('b', { state: 'done', done: 100 }),
+  })
+  check(p !== null && !p.active, 'после ошибки ничего не идёт')
+  check(p !== null && progressLabel(p) === 'не отправлено: файл изменился после копирования', 'подпись ошибки')
+}
+
+{
+  const p = entryProgress([{ blob: 'a' }], { a: t('a', { direction: 'down', state: 'failed', error: null }) })
+  check(p !== null && progressLabel(p) === 'не скачано: неизвестная ошибка', 'ошибка без текста')
+}
+
+console.log('transfer: все проверки прошли')
