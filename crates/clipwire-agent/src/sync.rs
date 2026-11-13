@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{ALPN, ClientMsg, ServerMsg};
 use clipwire_core::{Content, DeviceId, Item, ItemId};
-use iroh::endpoint::presets;
+use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey, Watcher};
 use tokio::sync::mpsc;
 
@@ -66,15 +66,6 @@ pub struct Engine {
     blobs: Option<Arc<Blobs>>,
 }
 
-/// Останавливает задачу, когда выходит из области видимости.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 impl Engine {
     pub fn new(
         state: AgentState,
@@ -119,7 +110,27 @@ impl Engine {
     }
 
     /// Работает, пока не закроется `local`. Переподключается сама.
-    pub async fn run(mut self, mut local: mpsc::Receiver<Content>) -> Result<()> {
+    ///
+    /// Загрузчик файлов работает внутри этой же задачи: если задачу движка
+    /// снять (`abort`), загрузчик снимается вместе с ней, и следующий движок
+    /// не столкнётся со старым на одной очереди загрузок.
+    pub async fn run(self, local: mpsc::Receiver<Content>) -> Result<()> {
+        let uploads = self.blobs.clone();
+        let uploader = async move {
+            if let Some(b) = uploads {
+                b.run_uploads().await;
+            }
+            // Загрузчик сам не заканчивается; если всё же закончился, движок
+            // продолжает работать без него.
+            std::future::pending::<()>().await
+        };
+        tokio::select! {
+            r = self.run_sessions(local) => r,
+            () = uploader => Ok(()),
+        }
+    }
+
+    async fn run_sessions(mut self, mut local: mpsc::Receiver<Content>) -> Result<()> {
         let server = &self.state.invite.server;
         let url: RelayUrl = server
             .relay_url
@@ -134,11 +145,6 @@ impl Engine {
             .await
             .context("не поднялся iroh-эндпоинт")?;
         let addr = EndpointAddr::new(PublicKey::from_bytes(&server.server_id)?).with_relay_url(url);
-        // Загрузчик ждёт соединения сам и останавливается вместе с движком.
-        let _uploader = self
-            .blobs
-            .clone()
-            .map(|b| AbortOnDrop(tokio::spawn(b.run_uploads())));
 
         let mut pending: Option<Content> = None;
         let mut backoff = Duration::from_secs(1);
@@ -239,14 +245,14 @@ impl Engine {
         tracing::info!("на связи с сервером");
 
         if let Some(c) = pending.take() {
-            self.push(&mut send, c).await?;
+            self.push(&conn, &mut send, c).await?;
         }
         self.send_backfill(&mut send).await?;
 
         loop {
             tokio::select! {
                 c = local.recv() => match c {
-                    Some(c) => self.push(&mut send, c).await?,
+                    Some(c) => self.push(&conn, &mut send, c).await?,
                     None => {
                         // Закрываем поток и ждём, пока сервер его дочитает: при
                         // немедленном close QUIC выбросит ещё не доставленное.
@@ -348,16 +354,32 @@ impl Engine {
         }
     }
 
-    async fn push(&mut self, send: &mut iroh::endpoint::SendStream, c: Content) -> Result<()> {
+    async fn push(
+        &mut self,
+        conn: &Connection,
+        send: &mut iroh::endpoint::SendStream,
+        c: Content,
+    ) -> Result<()> {
         // Огромный HTML из Word не повод не отправить сам текст.
         let c = c.fit(MAX_ITEM_BYTES);
         if c.len() > MAX_ITEM_BYTES {
             tracing::info!(len = c.len(), "слишком большой элемент, не отправляю");
             return Ok(());
         }
+        // Файлы сначала резервируются на сервере: получатель, вставивший
+        // элемент сразу, будет ждать частей, а не получит «файла нет».
+        // Отказанным файлам blob снимается, загрузок по ним не будет.
+        let (c, jobs) = match (&self.blobs, c) {
+            (Some(b), c @ Content::Files(_)) => b.reserve_files(conn, c).await,
+            (_, c) => (c, Vec::new()),
+        };
         let item = Item::new(self.device, c).with_device_name(self.device_name.clone());
         let sealed = self.state.invite.group_key.seal(&item)?;
         write_msg(send, &ClientMsg::Push(sealed)).await?;
+        // Загрузки — только для элемента, который действительно ушёл.
+        if let Some(b) = &self.blobs {
+            b.enqueue(jobs);
+        }
         // Свой элемент тоже двигает курсор: он новее всего, что было в истории.
         self.set_cursor(item.id);
         Ok(())

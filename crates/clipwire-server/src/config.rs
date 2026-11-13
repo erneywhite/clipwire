@@ -35,6 +35,9 @@ pub struct Config {
     pub max_file_bytes: u64,
     /// Сколько места под файлы на группу, считается по зашифрованному размеру.
     pub blob_quota: u64,
+    /// Сколько места под файлы на весь сервер (все группы вместе), тоже по
+    /// зашифрованному размеру. Защищает диск, если групп много.
+    pub blob_total_quota: u64,
     /// Сколько ждать следующей части файла, прежде чем сдаться.
     pub blob_stall: Duration,
 }
@@ -85,6 +88,7 @@ impl Config {
             ttl: Duration::from_secs(ttl_hours * 3600),
             max_file_bytes: parse("CLIPWIRE_MAX_FILE_BYTES", 100 * 1024 * 1024)?,
             blob_quota: parse("CLIPWIRE_BLOB_QUOTA", 2 * 1024 * 1024 * 1024)?,
+            blob_total_quota: parse("CLIPWIRE_BLOB_TOTAL_QUOTA", 20 * 1024 * 1024 * 1024)?,
             blob_stall: Duration::from_secs(stall_secs),
         })
     }

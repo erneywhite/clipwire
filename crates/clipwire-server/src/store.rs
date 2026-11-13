@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use clipwire_core::blob::sealed_size;
+use clipwire_core::blob::{CHUNK, OVERHEAD};
 use clipwire_core::{BlobId, DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
@@ -32,6 +32,8 @@ pub enum BlobBegin {
     SizeMismatch,
     /// Новый файл не влезает в место, выделенное группе.
     QuotaExceeded,
+    /// Новый файл не влезает в общее место сервера под файлы.
+    ServerFull,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -225,9 +227,12 @@ impl Store {
         )?)
     }
 
-    /// Начать загрузку файла или продолжить начатую. Квота считается по
-    /// `sealed_size` всех живых файлов группы. Истёкший файл с тем же id
-    /// удаляется и создаётся заново: его части уже не нужны.
+    /// Начать загрузку файла или продолжить начатую (то же для `Reserve`).
+    /// Квоты считаются по `sealed_size` живых файлов: `quota` — на группу,
+    /// `total_quota` — на весь сервер; обе проверяются в одной транзакции,
+    /// так что два одновременных новых файла не проскочат вместе. Истёкший
+    /// файл с тем же id удаляется и создаётся заново: его части уже не нужны.
+    #[allow(clippy::too_many_arguments)]
     pub fn blob_begin(
         &self,
         group: &GroupId,
@@ -236,6 +241,7 @@ impl Store {
         now_ms: i64,
         not_before_ms: i64,
         quota: u64,
+        total_quota: u64,
     ) -> Result<BlobBegin> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -257,19 +263,21 @@ impl Store {
             Some((_, have, _)) => return Ok(BlobBegin::Existing { have: have as u64 }),
             None => {}
         }
-        let used = {
-            let mut stmt =
-                tx.prepare("SELECT size FROM blobs WHERE group_id = ?1 AND created_ms >= ?2")?;
-            let sizes =
-                stmt.query_map(params![&group.0[..], not_before_ms], |r| r.get::<_, i64>(0))?;
-            let mut used = 0u64;
-            for s in sizes {
-                used = used.saturating_add(sealed_size(s? as u64));
-            }
-            used
-        };
-        if used.saturating_add(sealed_size(size)) > quota {
+        // sealed_size(size) = size + max(1, ceil(size / CHUNK)) * OVERHEAD,
+        // посчитано прямо в SQLite: так не надо тянуть все строки в память.
+        let (group_used, total_used): (i64, i64) = tx.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN group_id = ?1 THEN s END), 0), COALESCE(SUM(s), 0)
+             FROM (SELECT group_id, size + MAX(1, (size + ?3 - 1) / ?3) * ?4 AS s
+                   FROM blobs WHERE created_ms >= ?2)",
+            params![&group.0[..], not_before_ms, CHUNK as i64, OVERHEAD as i64],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let need = clipwire_core::blob::sealed_size(size);
+        if (group_used as u64).saturating_add(need) > quota {
             return Ok(BlobBegin::QuotaExceeded);
+        }
+        if (total_used as u64).saturating_add(need) > total_quota {
+            return Ok(BlobBegin::ServerFull);
         }
         tx.execute(
             "INSERT INTO blobs (group_id, blob_id, size, have, created_ms) VALUES (?1, ?2, ?3, 0, ?4)",
@@ -277,6 +285,28 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(BlobBegin::Created)
+    }
+
+    /// Удалить строку файла (отмена отправки). `true`, если она была.
+    pub fn blob_delete(&self, group: &GroupId, blob: &BlobId) -> Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
+            params![&group.0[..], &blob.0[..]],
+        )? > 0)
+    }
+
+    /// Есть ли строка файла, даже истёкшая: чистка по сроку проверяет, не
+    /// завёл ли кто-то файл с тем же id заново, прежде чем удалять его с диска.
+    pub fn blob_exists(&self, group: &GroupId, blob: &BlobId) -> Result<bool> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
+                params![&group.0[..], &blob.0[..]],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Размер файла и сколько частей принято. `None`, если файла нет или он истёк.
@@ -355,6 +385,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clipwire_core::blob::sealed_size;
     use clipwire_core::{Content, GroupKey, Item};
 
     fn sealed(key: &GroupKey, text: &str) -> SealedItem {
@@ -436,18 +467,21 @@ mod tests {
         let g = group(&s, 1);
         let b = BlobId([3; 16]);
         assert_eq!(
-            s.blob_begin(&g, &b, 100, 10, 0, u64::MAX).unwrap(),
+            s.blob_begin(&g, &b, 100, 10, 0, u64::MAX, u64::MAX)
+                .unwrap(),
             BlobBegin::Created
         );
         assert_eq!(s.blob_info(&g, &b, 0).unwrap(), Some((100, 0)));
         s.blob_set_have(&g, &b, 1).unwrap();
         assert_eq!(
-            s.blob_begin(&g, &b, 100, 20, 0, u64::MAX).unwrap(),
+            s.blob_begin(&g, &b, 100, 20, 0, u64::MAX, u64::MAX)
+                .unwrap(),
             BlobBegin::Existing { have: 1 }
         );
         assert_eq!(s.blob_info(&g, &b, 0).unwrap(), Some((100, 1)));
         assert_eq!(
-            s.blob_begin(&g, &b, 101, 20, 0, u64::MAX).unwrap(),
+            s.blob_begin(&g, &b, 101, 20, 0, u64::MAX, u64::MAX)
+                .unwrap(),
             BlobBegin::SizeMismatch
         );
         // Другая группа этого файла не видит.
@@ -462,7 +496,7 @@ mod tests {
         let g2 = group(&s, 2);
         let quota = sealed_size(1000) * 2;
         let begin = |g: &GroupId, n: u8, size: u64| {
-            s.blob_begin(g, &BlobId([n; 16]), size, 10, 0, quota)
+            s.blob_begin(g, &BlobId([n; 16]), size, 10, 0, quota, u64::MAX)
                 .unwrap()
         };
         assert_eq!(begin(&g, 1, 1000), BlobBegin::Created);
@@ -476,18 +510,44 @@ mod tests {
     }
 
     #[test]
+    fn total_quota_counts_all_groups() {
+        let s = Store::in_memory().unwrap();
+        let (g, g2) = (group(&s, 1), group(&s, 2));
+        // Части по CHUNK: проверяем, что SQL считает sealed_size так же, как Rust.
+        let big = CHUNK as u64 * 2 + 1;
+        let total = sealed_size(big) + sealed_size(0) + sealed_size(1000);
+        let begin = |g: &GroupId, n: u8, size: u64| {
+            s.blob_begin(g, &BlobId([n; 16]), size, 10, 0, u64::MAX, total)
+                .unwrap()
+        };
+        assert_eq!(begin(&g, 1, big), BlobBegin::Created);
+        assert_eq!(begin(&g2, 2, 0), BlobBegin::Created);
+        assert_eq!(begin(&g2, 3, 1001), BlobBegin::ServerFull);
+        assert_eq!(begin(&g2, 3, 1000), BlobBegin::Created);
+        assert_eq!(begin(&g, 4, 0), BlobBegin::ServerFull);
+        // Удалённый файл место освобождает.
+        assert!(s.blob_delete(&g, &BlobId([1; 16])).unwrap());
+        assert!(!s.blob_delete(&g, &BlobId([1; 16])).unwrap());
+        assert!(!s.blob_exists(&g, &BlobId([1; 16])).unwrap());
+        assert!(s.blob_exists(&g2, &BlobId([2; 16])).unwrap());
+        assert_eq!(begin(&g, 4, 0), BlobBegin::Created);
+    }
+
+    #[test]
     fn expired_blobs_are_hidden_and_purged() {
         let s = Store::in_memory().unwrap();
         let g = group(&s, 1);
         let (old, new) = (BlobId([1; 16]), BlobId([2; 16]));
         let quota = sealed_size(1000);
         assert_eq!(
-            s.blob_begin(&g, &old, 1000, 100, 0, quota).unwrap(),
+            s.blob_begin(&g, &old, 1000, 100, 0, quota, u64::MAX)
+                .unwrap(),
             BlobBegin::Created
         );
         // Истёкший файл не занимает квоту и не виден.
         assert_eq!(
-            s.blob_begin(&g, &new, 1000, 200, 150, quota).unwrap(),
+            s.blob_begin(&g, &new, 1000, 200, 150, quota, u64::MAX)
+                .unwrap(),
             BlobBegin::Created
         );
         assert_eq!(s.blob_info(&g, &old, 150).unwrap(), None);
@@ -502,10 +562,12 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let g = group(&s, 1);
         let b = BlobId([1; 16]);
-        s.blob_begin(&g, &b, 1000, 100, 0, u64::MAX).unwrap();
+        s.blob_begin(&g, &b, 1000, 100, 0, u64::MAX, u64::MAX)
+            .unwrap();
         s.blob_set_have(&g, &b, 1).unwrap();
         assert_eq!(
-            s.blob_begin(&g, &b, 5, 200, 150, u64::MAX).unwrap(),
+            s.blob_begin(&g, &b, 5, 200, 150, u64::MAX, u64::MAX)
+                .unwrap(),
             BlobBegin::Created
         );
         assert_eq!(s.blob_info(&g, &b, 150).unwrap(), Some((5, 0)));

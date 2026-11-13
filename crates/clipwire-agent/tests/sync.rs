@@ -26,6 +26,7 @@ async fn start_server() -> Result<(clipwire_server::Running, ServerInfo)> {
         ttl: Duration::from_secs(3600),
         max_file_bytes: 8 * 1024 * 1024,
         blob_quota: 64 * 1024 * 1024,
+        blob_total_quota: u64::MAX,
         blob_stall: Duration::from_secs(10),
     };
     let server = clipwire_server::start(&config).await?;

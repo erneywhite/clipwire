@@ -173,8 +173,10 @@ pub async fn start(config: &Config) -> Result<Running> {
             ttl: config.ttl,
             max_file_bytes: config.max_file_bytes,
             blob_quota: config.blob_quota,
+            blob_total_quota: config.blob_total_quota,
             blob_stall: config.blob_stall,
         },
+        streams: Arc::new(tokio::sync::Semaphore::new(transfer::MAX_SERVER_STREAMS)),
     });
 
     let purge = {
@@ -188,15 +190,9 @@ pub async fn start(config: &Config) -> Result<Running> {
                     Ok(n) => tracing::info!("удалено просроченных элементов: {n}"),
                     Err(e) => tracing::warn!("очистка истории не удалась: {e:#}"),
                 }
-                match shared.store.purge_expired_blobs(shared.not_before_ms()) {
-                    Ok(gone) => {
-                        for (group, blob) in &gone {
-                            shared.blobs.remove(group, blob);
-                        }
-                        if !gone.is_empty() {
-                            tracing::info!("удалено просроченных файлов: {}", gone.len());
-                        }
-                    }
+                match transfer::purge_expired(&shared).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("удалено просроченных файлов: {n}"),
                     Err(e) => tracing::warn!("очистка файлов не удалась: {e:#}"),
                 }
             }

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clipwire_agent::blobs::{
-    Blobs, Direction, Transfer, TransferState, UploadJob, cache_path, download_blob, file_stamp,
-    upload_blob, upload_stream,
+    Blobs, Direction, Transfer, TransferState, UploadError, UploadJob, abort_blob, cache_path,
+    download_blob, file_stamp, reserve_blob, upload_blob, upload_stream,
 };
 use clipwire_agent::state::{AgentState, random_key};
 use clipwire_agent::sync::{Engine, Event, Status};
@@ -50,6 +50,7 @@ async fn start_server(max_file_bytes: u64) -> Result<(clipwire_server::Running, 
         ttl: Duration::from_secs(3600),
         max_file_bytes,
         blob_quota: 64 * 1024 * 1024,
+        blob_total_quota: u64::MAX,
         blob_stall: Duration::from_secs(10),
     };
     let server = clipwire_server::start(&config).await?;
@@ -494,12 +495,23 @@ impl Agent {
             .await
     }
 
-    /// Скопировать файлы так же, как сервис: элемент в группу, загрузки в очередь.
+    /// Скопировать файлы так же, как сервис: элемент уходит в движок, а тот
+    /// резервирует файлы на сервере, отправляет элемент и ставит загрузки.
     async fn copy_files(&self, files: Vec<FileRef>) -> Result<()> {
-        let jobs = files.iter().filter_map(UploadJob::from_file).collect();
         self.local.send(Content::Files(files)).await?;
-        self.blobs.enqueue(jobs);
         Ok(())
+    }
+
+    /// Ждать элемент с файлами с другого устройства.
+    async fn incoming_files(&mut self) -> Result<Vec<FileRef>> {
+        self.wait(|e| match e {
+            Event::Incoming(item) => match &item.content {
+                Content::Files(fs) => Some(fs.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .await
     }
 
     /// Ждать финальных событий загрузки этих файлов (в любом порядке).
@@ -537,19 +549,21 @@ async fn engine_uploads_and_other_device_downloads() -> Result<()> {
     let src = tmp("src");
     let (data, f) = make_file(&src, "из движка.bin", CHUNK as u64 * 5 / 2);
     let (_, small) = make_file(&src, "маленький.txt", 17);
+    let probe = Device::join(&info, &key).await?;
     a.copy_files(vec![f.clone(), small.clone()]).await?;
 
     // B получает элемент и сразу качает — как вставка в окне.
-    let files = b
-        .wait(|e| match e {
-            Event::Incoming(item) => match &item.content {
-                Content::Files(fs) => Some(fs.clone()),
-                _ => None,
-            },
-            _ => None,
-        })
-        .await?;
+    let files = b.incoming_files().await?;
     assert_eq!(files, vec![f.clone(), small.clone()]);
+    // Элемент ушёл в группу только после резервирования: сервер уже знает
+    // оба файла, даже если загрузка ещё не началась.
+    for x in &files {
+        assert!(
+            server_have(&probe.conn, x.blob.unwrap(), x.size)
+                .await?
+                .is_some()
+        );
+    }
     let got = tokio::time::timeout(T, b.blobs.download_all(&files)).await??;
     assert_eq!(std::fs::read(&got[0])?, data);
     assert_eq!(std::fs::read(&got[1])?, std::fs::read(&small.path)?);
@@ -563,6 +577,7 @@ async fn engine_uploads_and_other_device_downloads() -> Result<()> {
     assert!(a.blobs.queued().is_empty());
     assert!(a.blobs.transfers().is_empty());
 
+    probe.drop_link().await;
     drop(a.local);
     a.task.await??;
     drop(b.local);
@@ -571,27 +586,42 @@ async fn engine_uploads_and_other_device_downloads() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn server_refusal_ends_upload_without_retries() -> Result<()> {
+async fn reserve_refusal_strips_blob_and_skips_upload() -> Result<()> {
     let (server, info) = start_server(1024 * 1024).await?;
     let key = GroupKey::generate()?;
     let mut a = Agent::spawn(&info, &key)?;
+    let mut b = Agent::spawn(&info, &key)?;
     a.online().await?;
+    b.online().await?;
 
     let src = tmp("src");
     let (_, f) = make_file(&src, "великоват.bin", CHUNK as u64 * 3 / 2);
+    let (small_data, small) = make_file(&src, "влезает.txt", 100);
     let blob = f.blob.unwrap();
-    a.copy_files(vec![f.clone()]).await?;
+    a.copy_files(vec![f.clone(), small.clone()]).await?;
+
+    // Сервер отказал в резервировании: в элементе у большого файла blob
+    // снят (получатель увидит «есть только на устройстве»), у маленького — нет.
+    let got = b.incoming_files().await?;
+    assert_eq!(got[0].blob, None);
+    assert_eq!(got[0].name, f.name);
+    assert_eq!(got[1].blob, small.blob);
+    let paths = b.blobs.download_all(&got[1..]).await?;
+    assert_eq!(std::fs::read(&paths[0])?, small_data);
 
     let t = a.upload_ends(&[blob]).await?.remove(0);
     assert_eq!(t.state, TransferState::Failed);
     let err = t.error.unwrap_or_default();
     assert!(err.contains("больше 1048576 байт"), "{err}");
     assert!(!err.contains("переподключения"), "{err}");
-    // Из очереди убран, в списке передач — с причиной.
+    let ok = a.upload_ends(&[small.blob.unwrap()]).await?.remove(0);
+    assert_eq!(ok.state, TransferState::Done);
+    // В очередь не попадал, в списке передач — с причиной.
     assert!(a.blobs.queued().is_empty());
     let listed = a.blobs.transfers();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].state, TransferState::Failed);
+    assert_eq!(listed[0].blob, blob.hex());
 
     // Новых попыток нет.
     let more = Arc::new(Mutex::new(Vec::new()));
@@ -609,5 +639,143 @@ async fn server_refusal_ends_upload_without_retries() -> Result<()> {
 
     drop(a.local);
     a.task.await??;
+    drop(b.local);
+    b.task.await??;
+    server.shutdown().await
+}
+
+fn is_cancelled(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<BlobFail>() == Some(&BlobFail::Cancelled))
+}
+
+/// Файл изменился посреди загрузки: источник шлёт Abort, сервер удаляет
+/// части, а получатель, который уже ждёт файл, сразу видит «отменил».
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_file_aborts_and_receiver_sees_cancelled() -> Result<()> {
+    let (server, info) = start_server(8 * 1024 * 1024).await?;
+    let key = GroupKey::generate()?;
+    let a = Device::join(&info, &key).await?;
+    let b = Device::join(&info, &key).await?;
+    let src = tmp("src");
+    let (_, f) = make_file(&src, "меняется.bin", CHUNK as u64 * 5 / 2);
+    let blob = f.blob.unwrap();
+    reserve_blob(&a.conn, blob, f.size)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Загрузка встаёт на паузу после первой части.
+    let (go, wait) = oneshot::channel();
+    let upload = {
+        let (conn, key, job) = (a.conn.clone(), key.clone(), job(&f));
+        let limit = put_frame(&f) + chunk_frame(f.size, 0);
+        tokio::spawn(async move {
+            let (send, mut recv) = conn.open_bi().await?;
+            let mut send = CutWriter {
+                inner: send,
+                left: limit,
+                cut: Some(Cut::Pause(wait)),
+            };
+            anyhow::Ok(upload_stream(&mut send, &mut recv, &key, &job, |_| {}).await)
+        })
+    };
+    wait_server_have(&b.conn, blob, f.size, 1).await?;
+
+    // Получатель качает и ждёт второй части.
+    let dest = cache_path(&tmp("b").join("files"), blob, &f.name);
+    let download = {
+        let (conn, key, dest, size) = (b.conn.clone(), key.clone(), dest.clone(), f.size);
+        tokio::spawn(async move { download_blob(&conn, &key, blob, size, &dest, |_| {}).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!download.is_finished());
+
+    // Файл дописали — следующая прочитанная часть уже не та.
+    {
+        use std::io::Write;
+        let mut w = std::fs::OpenOptions::new().append(true).open(&f.path)?;
+        w.write_all("ещё".as_bytes())?;
+    }
+    go.send(()).unwrap();
+    let err = upload.await??.unwrap_err();
+    assert!(matches!(err, UploadError::Changed), "{err}");
+    abort_blob(&a.conn, blob)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let err = tokio::time::timeout(Duration::from_secs(5), download)
+        .await
+        .context("получатель не узнал об отмене")??
+        .unwrap_err();
+    assert!(is_cancelled(&err), "{err:#}");
+    assert!(format!("{err:#}").contains("отменил"), "{err:#}");
+    assert!(!dest.exists());
+    assert_eq!(server_have(&b.conn, blob, f.size).await?, None);
+
+    // То же через upload_blob: изменённый файл он отменяет на сервере сам.
+    let (_, g) = make_file(&src, "второй.bin", 1000);
+    let gblob = g.blob.unwrap();
+    reserve_blob(&a.conn, gblob, g.size)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    assert_eq!(server_have(&b.conn, gblob, g.size).await?, Some(0));
+    std::fs::write(&g.path, "другое")?;
+    let err = upload_blob(&a.conn, &key, &job(&g), |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(err, UploadError::Changed), "{err}");
+    assert_eq!(server_have(&b.conn, gblob, g.size).await?, None);
+
+    a.drop_link().await;
+    b.drop_link().await;
+    server.shutdown().await
+}
+
+/// То же через движок: файл изменился до загрузки. Источник показывает
+/// «файл изменился», файл на сервере отменён, получатель не ждёт впустую.
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_aborts_changed_file() -> Result<()> {
+    let (server, info) = start_server(8 * 1024 * 1024).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key)?;
+    let mut b = Agent::spawn(&info, &key)?;
+    a.online().await?;
+    b.online().await?;
+    let probe = Device::join(&info, &key).await?;
+
+    let src = tmp("src");
+    let (_, f) = make_file(&src, "правится.txt", 100);
+    // Метка снята при копировании, а файл уже другой.
+    std::fs::write(&f.path, "совсем другое содержимое")?;
+    a.copy_files(vec![f.clone()]).await?;
+
+    let got = b.incoming_files().await?;
+    assert_eq!(got[0].blob, f.blob);
+    let t = a.upload_ends(&[f.blob.unwrap()]).await?.remove(0);
+    assert_eq!(t.state, TransferState::Failed);
+    assert_eq!(t.error.as_deref(), Some("файл изменился после копирования"));
+    assert!(a.blobs.queued().is_empty());
+    // Abort дошёл: файла на сервере нет, скачивание сразу говорит об этом.
+    tokio::time::timeout(T, async {
+        while server_have(&probe.conn, f.blob.unwrap(), f.size)
+            .await?
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+    let err = tokio::time::timeout(Duration::from_secs(5), b.blobs.download(&got[0]))
+        .await
+        .context("скачивание отменённого файла зависло")?
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("нет на сервере"), "{err:#}");
+
+    probe.drop_link().await;
+    drop(a.local);
+    a.task.await??;
+    drop(b.local);
+    b.task.await??;
     server.shutdown().await
 }

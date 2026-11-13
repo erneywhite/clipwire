@@ -10,7 +10,7 @@ use anyhow::Result;
 use clipwire_core::{BlobId, Content, DeviceId, Item};
 use tokio::sync::mpsc;
 
-use crate::blobs::{Blobs, Transfer, UploadJob};
+use crate::blobs::{Blobs, Transfer};
 use crate::clipboard::{self, Watcher};
 use crate::history::{Entry, History, local_entry, now_ms};
 use crate::loopguard::LoopGuard;
@@ -225,9 +225,11 @@ impl Service {
                 if !guard.should_send(&content) {
                     return;
                 }
-                let (content, jobs) = match &blobs {
-                    Some(_) => prepare_files(content, &history, &upload_limit_mb),
-                    None => (content, Vec::new()),
+                // Загрузки в очередь ставит движок, когда элемент на самом деле
+                // уходит в группу (см. `Engine::push`).
+                let content = match &blobs {
+                    Some(_) => prepare_files(content, &upload_limit_mb),
+                    None => content,
                 };
                 if let Some(tx) = &tx
                     && tx.try_send(content.clone()).is_err()
@@ -235,9 +237,6 @@ impl Service {
                     tracing::warn!("очередь отправки переполнена, копирование пропущено");
                 }
                 record(&history, local_entry(device, &device_name, content.clone()));
-                if let Some(b) = &blobs {
-                    b.enqueue(jobs);
-                }
                 on_event(UiEvent::Copied(content));
             })?
         };
@@ -311,10 +310,10 @@ impl Service {
         self.guard.wrote(&content);
         clipboard::write(&content)?;
         let send = !self.paused() && self.local_tx.is_some();
-        let (content, jobs) = if send {
-            prepare_files(content, &self.history, &self.upload_limit_mb)
+        let content = if send {
+            prepare_files(content, &self.upload_limit_mb)
         } else {
-            (content, Vec::new())
+            content
         };
         if send
             && let Some(tx) = &self.local_tx
@@ -326,18 +325,25 @@ impl Service {
             &self.history,
             local_entry(self.device, &self.device_name, content.clone()),
         );
-        if let Some(b) = &self.blobs {
-            b.enqueue(jobs);
-        }
         (self.on_event)(UiEvent::Copied(content));
         Ok(())
     }
 
     /// Остановить: слежение снимается, движок дошлёт очередь и закроется.
+    /// Не успел за 3 секунды — задача движка снимается вместе с загрузчиком,
+    /// чтобы следующий сервис (например, после входа в другую группу) не
+    /// работал с той же очередью загрузок параллельно со старым.
     pub async fn shutdown(mut self) {
         drop(self.local_tx.take());
-        if let Some(e) = self.engine.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), e).await;
+        if let Some(mut e) = self.engine.take() {
+            let wait = std::time::Duration::from_secs(3);
+            if tokio::time::timeout(wait, &mut e).await.is_err() {
+                tracing::info!("движок не закрылся вовремя, останавливаю");
+                e.abort();
+                // После abort задача завершается на ближайшей точке ожидания;
+                // дожидаемся, пока её future будет снят целиком.
+                let _ = tokio::time::timeout(wait, e).await;
+            }
         }
     }
 }
@@ -363,57 +369,29 @@ fn sendable_backfill(c: &Content) -> bool {
     !matches!(c, Content::Files(_))
 }
 
-/// Назначить скопированным файлам `blob` и собрать задания загрузки (см.
-/// [`assign_blobs`]). Прошлое копирование тех же файлов берётся из истории.
-fn prepare_files(
-    content: Content,
-    history: &Mutex<History>,
-    limit_mb: &AtomicU64,
-) -> (Content, Vec<UploadJob>) {
-    if !matches!(content, Content::Files(_)) {
-        return (content, Vec::new());
-    }
-    let prev = history
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .find(&content)
-        .filter(|e| e.local)
-        .map(|e| e.content.clone());
-    assign_blobs(content, limit_mb.load(Ordering::Relaxed), prev.as_ref())
+/// Назначить скопированным файлам `blob` (см. [`assign_blobs`]).
+fn prepare_files(content: Content, limit_mb: &AtomicU64) -> Content {
+    assign_blobs(content, limit_mb.load(Ordering::Relaxed))
 }
 
-/// Файлам (не папкам) не больше `limit_mb` МБ назначается `blob`, остальным он
-/// снимается. Если тот же файл (путь, размер, время изменения) уже копировали и
-/// у него был `blob`, берётся прежний: сервер ответит, что файл уже есть, и
-/// повторной загрузки не будет. Возвращает содержимое и задания загрузки.
-pub fn assign_blobs(
-    content: Content,
-    limit_mb: u64,
-    prev: Option<&Content>,
-) -> (Content, Vec<UploadJob>) {
+/// Файлам (не папкам) не больше `limit_mb` МБ назначается новый случайный
+/// `blob`, остальным он снимается. Прежний `blob` (из истории или прошлого
+/// копирования тех же файлов) никогда не переиспользуется: файл мог
+/// измениться так, что размер и время изменения остались прежними, и тогда
+/// докачка склеила бы старые части на сервере с новыми.
+pub fn assign_blobs(content: Content, limit_mb: u64) -> Content {
     let Content::Files(mut files) = content else {
-        return (content, Vec::new());
-    };
-    let prev: &[clipwire_core::FileRef] = match prev {
-        Some(Content::Files(p)) => p,
-        _ => &[],
+        return content;
     };
     let limit = limit_mb.saturating_mul(1024 * 1024);
-    let mut jobs = Vec::new();
     for f in &mut files {
-        if f.is_dir || limit_mb == 0 || f.size > limit {
-            f.blob = None;
-            continue;
-        }
-        if f.blob.is_none() {
-            let same = prev
-                .iter()
-                .find(|p| p.path == f.path && p.size == f.size && p.modified_ms == f.modified_ms);
-            f.blob = same.and_then(|p| p.blob).or_else(|| BlobId::random().ok());
-        }
-        jobs.extend(UploadJob::from_file(f));
+        f.blob = if f.is_dir || limit_mb == 0 || f.size > limit {
+            None
+        } else {
+            BlobId::random().ok()
+        };
     }
-    (Content::Files(files), jobs)
+    Content::Files(files)
 }
 
 fn record(history: &Mutex<History>, entry: Entry) {
@@ -438,6 +416,7 @@ pub fn is_ignored(list: &[String], exe: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blobs::UploadJob;
     use clipwire_core::FileRef;
 
     fn file(path: &str, size: u64, is_dir: bool) -> FileRef {
@@ -462,12 +441,13 @@ mod tests {
             file("C:\\big.iso", 5 * mb + 1, false),
             file("C:\\edge.bin", 5 * mb, false),
         ]);
-        let (out, jobs) = assign_blobs(c.clone(), 5, None);
+        let out = assign_blobs(c.clone(), 5);
         let Content::Files(f) = &out else { panic!() };
         assert!(f[0].blob.is_some());
         assert!(f[1].blob.is_none());
         assert!(f[2].blob.is_none());
         assert!(f[3].blob.is_some());
+        let jobs: Vec<_> = f.iter().filter_map(UploadJob::from_file).collect();
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0].blob, f[0].blob.unwrap());
         assert_eq!(jobs[0].path, "C:\\a.txt");
@@ -475,26 +455,25 @@ mod tests {
         // Хэш (защита от петель, поиск в истории) от blob не зависит.
         assert_eq!(out.hash(), c.hash());
 
-        // 0 — ничего не загружать.
-        let (out0, jobs0) = assign_blobs(c.clone(), 0, None);
-        assert!(jobs0.is_empty());
-        let Content::Files(f0) = out0 else { panic!() };
+        // 0 — ничего не загружать, даже если blob уже был.
+        let Content::Files(f0) = assign_blobs(out.clone(), 0) else {
+            panic!()
+        };
         assert!(f0.iter().all(|f| f.blob.is_none()));
 
-        // Повтор того же файла берёт прежний blob; изменённый получает новый.
-        let (again, _) = assign_blobs(c.clone(), 5, Some(&out));
-        let Content::Files(g) = &again else { panic!() };
-        assert_eq!(g[0].blob, f[0].blob);
-        let mut changed = file("C:\\a.txt", 10, false);
-        changed.modified_ms = 43;
-        let (new, _) = assign_blobs(Content::Files(vec![changed]), 5, Some(&out));
-        let Content::Files(n) = new else { panic!() };
-        assert!(n[0].blob.is_some() && n[0].blob != f[0].blob);
+        // Повтор того же содержимого (в том числе с уже назначенным blob)
+        // всегда получает новые blob.
+        let Content::Files(g) = assign_blobs(out.clone(), 5) else {
+            panic!()
+        };
+        assert!(g[0].blob.is_some() && g[0].blob != f[0].blob);
+        assert!(g[3].blob.is_some() && g[3].blob != f[3].blob);
 
         // Не файлы не трогаем.
-        let (t, j) = assign_blobs(Content::Text("x".into()), 5, None);
-        assert_eq!(t, Content::Text("x".into()));
-        assert!(j.is_empty());
+        assert_eq!(
+            assign_blobs(Content::Text("x".into()), 5),
+            Content::Text("x".into())
+        );
     }
 
     #[test]

@@ -110,6 +110,7 @@ async fn start_server_with(
         ttl: Duration::from_secs(3600),
         max_file_bytes: 8 * 1024 * 1024,
         blob_quota: 64 * 1024 * 1024,
+        blob_total_quota: u64::MAX,
         blob_stall: Duration::from_secs(10),
     };
     tune(&mut config);
@@ -580,5 +581,189 @@ async fn file_download_stalls_when_upload_stops() -> Result<()> {
     assert!(started.elapsed() >= Duration::from_millis(900));
     // Загрузчик тоже молчал дольше blob_stall — его поток сервер закрывает.
     assert_eq!(expect_fail(&mut put).await?, BlobFail::Stalled);
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_reserve_then_get_waits_for_parts() -> Result<()> {
+    let (server, relay) = start_server_with(|c| {
+        c.max_file_bytes = 4 * 1024 * 1024;
+        c.blob_quota = sealed_size(CHUNK as u64 * 2) + sealed_size(10);
+    })
+    .await?;
+    let key = GroupKey::generate()?;
+    let a = joined(&server.info, &relay, &key).await?;
+    let b = joined(&server.info, &relay, &key).await?;
+    let data = sample(CHUNK * 3 / 2);
+    let size = data.len() as u64;
+    let blob = BlobId::random()?;
+
+    let mut r = BlobStream::open(&a.conn, BlobRequest::Reserve { blob, size }).await?;
+    assert_eq!(r.reply().await?, BlobReply::Reserved);
+    assert!(
+        r.next().await?.is_none(),
+        "после Reserved поток закрывается"
+    );
+    // Повторный Reserve того же файла — как докачка: всё в порядке.
+    let mut r = BlobStream::open(&a.conn, BlobRequest::Reserve { blob, size }).await?;
+    assert_eq!(r.reply().await?, BlobReply::Reserved);
+    // Другой размер того же id и превышение предела — те же отказы, что у Put.
+    let mut r = BlobStream::open(&a.conn, BlobRequest::Reserve { blob, size: 5 }).await?;
+    assert_eq!(expect_fail(&mut r).await?, BlobFail::SizeMismatch);
+    let mut r = BlobStream::open(
+        &a.conn,
+        BlobRequest::Reserve {
+            blob: BlobId::random()?,
+            size: 4 * 1024 * 1024 + 1,
+        },
+    )
+    .await?;
+    assert!(matches!(
+        expect_fail(&mut r).await?,
+        BlobFail::TooLarge { .. }
+    ));
+    // Зарезервированный файл уже занимает квоту группы.
+    let mut r = BlobStream::open(
+        &a.conn,
+        BlobRequest::Reserve {
+            blob: BlobId::random()?,
+            size: CHUNK as u64,
+        },
+    )
+    .await?;
+    assert_eq!(expect_fail(&mut r).await?, BlobFail::QuotaExceeded);
+
+    // Get до первой части: сервер не говорит NotFound, а ждёт.
+    let mut get = BlobStream::open(&b.conn, BlobRequest::Get { blob, from: 0 }).await?;
+    assert_eq!(
+        get.reply().await?,
+        BlobReply::GetReady {
+            size,
+            have: 0,
+            complete: false
+        }
+    );
+    let reader = {
+        let key = key.clone();
+        tokio::spawn(async move { read_chunks(&mut get, &key, blob, size, 0).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!reader.is_finished());
+    // Загрузка зарезервированного начинается с нуля.
+    assert_eq!(upload(&a.conn, &key, blob, &data).await?, 0);
+    assert_eq!(tokio::time::timeout(T, reader).await???, data);
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_abort_wakes_waiting_get_and_frees_quota() -> Result<()> {
+    let (server, relay) =
+        start_server_with(|c| c.blob_quota = sealed_size(CHUNK as u64 * 2)).await?;
+    let key = GroupKey::generate()?;
+    let a = joined(&server.info, &relay, &key).await?;
+    let b = joined(&server.info, &relay, &key).await?;
+    let data = sample(CHUNK * 2);
+    let size = data.len() as u64;
+    let blob = BlobId::random()?;
+
+    let mut r = BlobStream::open(&a.conn, BlobRequest::Reserve { blob, size }).await?;
+    assert_eq!(r.reply().await?, BlobReply::Reserved);
+    // Первая часть ушла, потом загрузчик бросил поток (файл изменился).
+    let mut put = BlobStream::open(&a.conn, BlobRequest::Put { blob, size }).await?;
+    assert_eq!(put.reply().await?, BlobReply::PutReady { have: 0 });
+    put.chunk(&key, blob, size, 0, &data).await?;
+
+    let mut get = BlobStream::open(&b.conn, BlobRequest::Get { blob, from: 0 }).await?;
+    assert!(matches!(get.reply().await?, BlobReply::GetReady { .. }));
+    assert!(matches!(
+        get.reply().await?,
+        BlobReply::Chunk(BlobChunk { index: 0, .. })
+    ));
+    put.send.finish()?;
+    drop(put);
+
+    let started = std::time::Instant::now();
+    let mut ab = BlobStream::open(&a.conn, BlobRequest::Abort { blob }).await?;
+    assert_eq!(ab.reply().await?, BlobReply::Aborted);
+    // Ждущий получает Cancelled сразу, а не через blob_stall (10 с в тесте).
+    assert_eq!(expect_fail(&mut get).await?, BlobFail::Cancelled);
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // Файла больше нет, место свободно для нового такого же.
+    let mut g = BlobStream::open(&b.conn, BlobRequest::Get { blob, from: 0 }).await?;
+    assert_eq!(expect_fail(&mut g).await?, BlobFail::NotFound);
+    let other = BlobId::random()?;
+    let mut r = BlobStream::open(&a.conn, BlobRequest::Reserve { blob: other, size }).await?;
+    assert_eq!(r.reply().await?, BlobReply::Reserved);
+    // Отмена неизвестного файла — тоже Aborted.
+    let mut ab = BlobStream::open(
+        &a.conn,
+        BlobRequest::Abort {
+            blob: BlobId::random()?,
+        },
+    )
+    .await?;
+    assert_eq!(ab.reply().await?, BlobReply::Aborted);
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_total_quota_covers_all_groups() -> Result<()> {
+    let (server, relay) = start_server_with(|c| {
+        c.blob_quota = 64 * 1024 * 1024;
+        c.blob_total_quota = sealed_size(3000) + sealed_size(500);
+    })
+    .await?;
+    let (k1, k2) = (GroupKey::generate()?, GroupKey::generate()?);
+    let a = joined(&server.info, &relay, &k1).await?;
+    let b = joined(&server.info, &relay, &k2).await?;
+    upload(&a.conn, &k1, BlobId::random()?, &sample(3000)).await?;
+    // У второй группы своя квота свободна, но общее место сервера кончилось.
+    let mut s = BlobStream::open(
+        &b.conn,
+        BlobRequest::Put {
+            blob: BlobId::random()?,
+            size: 3000,
+        },
+    )
+    .await?;
+    assert_eq!(expect_fail(&mut s).await?, BlobFail::QuotaExceeded);
+    upload(&b.conn, &k2, BlobId::random()?, &sample(500)).await?;
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_stream_rejects_oversized_frames() -> Result<()> {
+    let (server, relay) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let a = joined(&server.info, &relay, &key).await?;
+
+    // Запрос с префиксом длины 16 МиБ: сервер отвечает сразу, тела не ждёт
+    // (и буфер под него не выделяет).
+    let (mut send, recv) = a.conn.open_bi().await?;
+    send.write_all(&(16u32 * 1024 * 1024).to_be_bytes()).await?;
+    let mut s = BlobStream { send, recv };
+    match expect_fail(&mut s).await? {
+        BlobFail::Protocol(m) => assert!(m.contains("допустимого 256"), "{m}"),
+        other => panic!("ждали Protocol, пришло {other:?}"),
+    }
+
+    // Часть файла длиннее предела кадра части.
+    let size = 100u64;
+    let mut s = BlobStream::open(
+        &a.conn,
+        BlobRequest::Put {
+            blob: BlobId::random()?,
+            size,
+        },
+    )
+    .await?;
+    assert_eq!(s.reply().await?, BlobReply::PutReady { have: 0 });
+    let too_long = (CHUNK + OVERHEAD + 65) as u32;
+    s.send.write_all(&too_long.to_be_bytes()).await?;
+    match expect_fail(&mut s).await? {
+        BlobFail::Protocol(m) => assert!(m.contains("больше допустимого"), "{m}"),
+        other => panic!("ждали Protocol, пришло {other:?}"),
+    }
     server.shutdown().await
 }
