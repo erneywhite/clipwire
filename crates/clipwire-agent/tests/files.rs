@@ -941,6 +941,15 @@ async fn expired_upload_job_is_aborted_on_first_connection() -> Result<()> {
 
 // ------------------------------------------------- часть 4: напрямую и папки
 
+/// Тесты с прямой отдачей идут по одному: счётчик отдач
+/// (`activity::SERVING`) общий на процесс, и `direct_serving_marks_source_busy`
+/// должен видеть только свою.
+static P2P_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn p2p_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    P2P_SERIAL.lock().await
+}
+
 /// «История» источника для прямой отдачи: какие файлы он отдаёт.
 fn serve_files(a: &Agent, files: &[FileRef]) {
     let list = files.to_vec();
@@ -1014,6 +1023,7 @@ fn prepared_folder(a: &Agent, path: &Path, limit_mb: u64) -> FileRef {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn big_file_goes_directly_and_strangers_are_denied() -> Result<()> {
+    let _serial = p2p_serial().await;
     let (server, info) = start_server(1024 * 1024).await?;
     let key = GroupKey::generate()?;
     let mut a = Agent::spawn(&info, &key)?;
@@ -1099,6 +1109,7 @@ async fn big_file_goes_directly_and_strangers_are_denied() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn offline_source_gives_clear_error() -> Result<()> {
+    let _serial = p2p_serial().await;
     let (server, info) = start_server(1024 * 1024).await?;
     let key = GroupKey::generate()?;
     let mut a = Agent::spawn(&info, &key)?;
@@ -1138,6 +1149,7 @@ async fn offline_source_gives_clear_error() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn folders_go_through_server_and_directly() -> Result<()> {
+    let _serial = p2p_serial().await;
     let (server, info) = start_server(8 * 1024 * 1024).await?;
     let key = GroupKey::generate()?;
     let mut a = Agent::spawn(&info, &key)?;
@@ -1226,6 +1238,7 @@ async fn folders_go_through_server_and_directly() -> Result<()> {
 /// нет: получатель переподключается и скачивает, а не падает.
 #[tokio::test(flavor = "multi_thread")]
 async fn restarted_source_is_reconnected() -> Result<()> {
+    let _serial = p2p_serial().await;
     let (server, info) = start_server(1024 * 1024).await?;
     let key = GroupKey::generate()?;
     let device_key = random_key()?;
@@ -1274,6 +1287,7 @@ async fn restarted_source_is_reconnected() -> Result<()> {
 /// соединения закрываются через `HELLO_TIMEOUT`, а участник группы качает.
 #[tokio::test(flavor = "multi_thread")]
 async fn strangers_without_hello_do_not_block_members() -> Result<()> {
+    let _serial = p2p_serial().await;
     let (server, info) = start_server(1024 * 1024).await?;
     let key = GroupKey::generate()?;
     let mut a = Agent::spawn(&info, &key)?;
@@ -1434,12 +1448,14 @@ async fn external_upload_does_not_reserve_on_server() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_serving_marks_source_busy() -> Result<()> {
     use clipwire_agent::activity;
+    let _serial = p2p_serial().await;
     let (server, info) = start_server(1024 * 1024).await?;
     let key = GroupKey::generate()?;
     let mut a = Agent::spawn(&info, &key)?;
     let mut b = Agent::spawn(&info, &key)?;
     a.online().await?;
     b.online().await?;
+    let probe = Device::join(&info, &key).await?;
 
     let src = tmp("busy-src");
     let (data, mut f) = make_file(&src, "отдаётся.bin", CHUNK as u64 * 24);
@@ -1447,18 +1463,26 @@ async fn direct_serving_marks_source_busy() -> Result<()> {
     serve_files(&a, std::slice::from_ref(&f));
     a.copy_files(vec![f.clone()]).await?;
     let got = b.incoming_files().await?;
+    // Файл может прийти только напрямую: он больше предела сервера, на
+    // сервере не резервировался, и загрузки в очереди нет.
+    assert!(f.size > 1024 * 1024);
+    assert_eq!(
+        got,
+        vec![f.clone()],
+        "blob не снят: резерва на сервере не было"
+    );
+    assert!(a.blobs.queued().is_empty());
 
-    // Счётчик общий на процесс, поэтому смотрим, что во время скачивания он
-    // хоть раз был больше нуля.
-    let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Прямые отдачи других тестов ждут `p2p_serial`, но хвосты прошлых могут
+    // ещё доживать: считаем от уровня до скачивания.
+    let base = activity::SERVING.get();
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(base));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watch = {
-        let (seen, stop) = (seen.clone(), stop.clone());
+        let (peak, stop) = (peak.clone(), stop.clone());
         std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                if activity::SERVING.get() > 0 {
-                    seen.store(true, Ordering::SeqCst);
-                }
+                peak.fetch_max(activity::SERVING.get(), Ordering::SeqCst);
                 std::thread::yield_now();
             }
         })
@@ -1467,6 +1491,22 @@ async fn direct_serving_marks_source_busy() -> Result<()> {
     stop.store(true, Ordering::SeqCst);
     watch.join().unwrap();
     assert_eq!(std::fs::read(&paths[0])?, data);
-    assert!(seen.load(Ordering::SeqCst), "прямая отдача не отмечена");
+    assert!(
+        peak.load(Ordering::SeqCst) > base,
+        "прямая отдача не отмечена"
+    );
+    assert_eq!(
+        server_have(&probe.conn, f.blob.unwrap(), f.size).await?,
+        None,
+        "файл шёл через сервер"
+    );
+    // Отдача закончилась — источник снова свободен.
+    tokio::time::timeout(T, async {
+        while activity::SERVING.get() > base {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("счётчик отдачи не вернулся")?;
     server.shutdown().await
 }

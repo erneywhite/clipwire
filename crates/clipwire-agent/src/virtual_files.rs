@@ -462,7 +462,8 @@ impl Captured {
 // shortcut: если источник завис так, что даже CoCancelCall не помог (вызов
 // внутри своего процесса), поток остаётся висеть, и следующие виртуальные
 // копирования пропускаются до перезапуска. Если станет встречаться — пускать
-// новое чтение рядом с зависшим, ограничив их число.
+// новое чтение рядом с зависшим, ограничив их число. Автообновление такой
+// поток держит не дольше `activity::VIRTUAL_READ_LIMIT`.
 pub fn spawn_read(
     busy: &Arc<AtomicBool>,
     root: PathBuf,
@@ -1027,6 +1028,7 @@ mod tests {
                 virtual_dir: crate::clipboard::virtual_dir(&state),
                 limit_mb: Arc::new(AtomicU64::new(10)),
                 accept_virtual: Box::new(|_| true),
+                on_late_virtual: Box::new(|_, _, _| false),
             },
             move |content, _owner| {
                 let _ = tx.send(content);

@@ -887,13 +887,14 @@ impl Engine {
         write_msg(&mut send2, &ClientMsg::PublishCard(card)).await?;
         // Настройки группы — в новую группу заново зашифрованными, до рассылки
         // пакетов. Только если сервер их знает (иначе он оборвёт соединение).
-        // При исключении устройства доступы к внешнему хранилищу остаются у
-        // него: настройки уходят с пометкой, интерфейс попросит их сменить.
+        // Доступы к внешнему хранилищу остаются у всех, кто окажется вне
+        // группы (исключаемое и устройства без карточки): настройки уходят с
+        // пометкой, интерфейс попросит их сменить.
         let storage = self.blobs.as_ref().map(|b| b.storage().clone());
         if self.config_supported
             && let Some(sealed) = storage
                 .as_ref()
-                .and_then(|s| s.seal_for_rekey(&new_key, remove.is_some()))
+                .and_then(|s| s.seal_for_rekey(&new_key, plan.leaves_out_any(remove)))
         {
             write_msg(&mut send2, &ClientMsg::SetGroupConfig(sealed)).await?;
         }

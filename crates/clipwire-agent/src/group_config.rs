@@ -277,6 +277,20 @@ impl GroupStorage {
         c.store.clone().map(|s| (c.cfg.version, s))
     }
 
+    /// Хранилище для задания, заведённого по настройкам версии `v`: текущее,
+    /// если версия та же, даже когда настройки уже устарели
+    /// ([`Self::note_version`]). Начатую загрузку доводим туда, где лежит её
+    /// `meta` с `complete = false`, иначе получатели с теми же настройками
+    /// ждали бы её до [`crate::storage::external::STALL`]. Новые резервы по
+    /// устаревшим настройкам не заводятся: их выдаёт только [`Self::external`].
+    pub fn external_for(&self, v: u64) -> Option<Arc<dyn ObjectStore>> {
+        let c = self.lock();
+        if c.cfg.version != v {
+            return None;
+        }
+        c.store.clone()
+    }
+
     /// В элементе соседа файл лежит по настройкам версии `v`. Если она
     /// больше своей, свои настройки устарели: попросить их у сервера заново.
     /// `true`, если устарели.
@@ -375,18 +389,19 @@ impl GroupStorage {
         key.seal_config(&cfg).ok()
     }
 
-    /// Настройки для новой группы при смене ключа. Если исключают
-    /// устройство, а у группы внешнее хранилище, доступы к нему остаются у
-    /// исключённого: настройки уходят с пометкой [`GroupConfig::access_exposed`]
+    /// Настройки для новой группы при смене ключа. Если вне новой группы
+    /// останется устройство (`leaves_out`: исключаемое или без карточки,
+    /// [`crate::devices::RekeyPlan::leaves_out_any`]), а у группы внешнее
+    /// хранилище, доступы к нему остаются у этого устройства: настройки уходят с пометкой [`GroupConfig::access_exposed`]
     /// и новой версией, интерфейс всех устройств попросит их сменить.
     /// Доступы сами по себе не сбрасываются: молча вернуть файлы на сервер
     /// Clipwire было бы хуже. `None` — настроек нет.
-    pub fn seal_for_rekey(&self, key: &GroupKey, removing: bool) -> Option<Vec<u8>> {
+    pub fn seal_for_rekey(&self, key: &GroupKey, leaves_out: bool) -> Option<Vec<u8>> {
         let mut cfg = self.config();
         if cfg.version == 0 {
             return None;
         }
-        if removing && !matches!(cfg.storage, StorageConfig::Server) {
+        if leaves_out && !matches!(cfg.storage, StorageConfig::Server) {
             cfg.access_exposed = true;
             let now = crate::history::now_ms().max(0) as u64;
             cfg.version = now.max(cfg.version + 1);
@@ -428,6 +443,52 @@ impl GroupStorage {
             Ok(Err(e)) => tracing::info!("чистка внешнего хранилища не прошла: {e}"),
             Err(_) => tracing::info!("чистка внешнего хранилища не уложилась в срок, прервана"),
         }
+    }
+}
+
+/// Сменились ли доступы, которые могли остаться у устройства вне группы:
+/// секрет (ключ S3, пароль, закрытый ключ SSH) или само хранилище (адрес
+/// S3, сервер и пользователь SFTP, вид хранилища). Папка, бакет, срок и
+/// отпечаток хоста доступы не меняют: со старым ключом S3 новый бакет того
+/// же поставщика обычно тоже открывается. Пароль к закрытому ключу SSH тоже
+/// не в счёт: сам ключ на сервере остаётся рабочим.
+fn access_rotated(old: &StorageConfig, new: &StorageConfig) -> bool {
+    match (old, new) {
+        (StorageConfig::S3(a), StorageConfig::S3(b)) => {
+            a.endpoint != b.endpoint || a.access_key != b.access_key || a.secret_key != b.secret_key
+        }
+        (StorageConfig::Sftp(a), StorageConfig::Sftp(b)) => {
+            let secret_changed = match (&a.auth, &b.auth) {
+                (SftpAuth::Password(x), SftpAuth::Password(y)) => x != y,
+                (SftpAuth::Key { private_key: x, .. }, SftpAuth::Key { private_key: y, .. }) => {
+                    x != y
+                }
+                _ => true,
+            };
+            secret_changed || a.host != b.host || a.port != b.port || a.user != b.user
+        }
+        (StorageConfig::Server, StorageConfig::Server) => false,
+        _ => true,
+    }
+}
+
+/// Настройки, которые уйдут при сохранении из формы: версия больше текущей,
+/// пометка [`GroupConfig::access_exposed`] снимается, только если доступы
+/// правда сменили ([`access_rotated`]); сохранение с прежним секретом
+/// (поменяли срок, нажали «Сохранить» с пустыми полями секрета) её
+/// оставляет.
+fn next_config(
+    cur: &GroupConfig,
+    storage: StorageConfig,
+    file_ttl_hours: u32,
+    now: u64,
+) -> GroupConfig {
+    let access_exposed = cur.access_exposed && !access_rotated(&cur.storage, &storage);
+    GroupConfig {
+        version: now.max(cur.version + 1),
+        storage,
+        file_ttl_hours,
+        access_exposed,
     }
 }
 
@@ -474,14 +535,7 @@ impl StorageController {
             );
         }
         let now = crate::history::now_ms().max(0) as u64;
-        // Сохранение снимает пометку «доступы у исключённого устройства»:
-        // человек ввёл их заново.
-        let cfg = GroupConfig {
-            version: now.max(self.storage.version() + 1),
-            storage,
-            file_ttl_hours,
-            access_exposed: false,
-        };
+        let cfg = next_config(&self.storage.config(), storage, file_ttl_hours, now);
         let sealed = self
             .storage
             .key
@@ -587,6 +641,9 @@ mod tests {
         assert!(st.external().is_some());
         assert!(st.note_version(12));
         assert!(st.external().is_none());
+        // Уже заведённое по версии 10 догружается туда же, чужая версия — нет.
+        assert!(st.external_for(10).is_some());
+        assert!(st.external_for(9).is_none());
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -643,6 +700,67 @@ mod tests {
             .unwrap();
         assert!(!c.access_exposed && c.version == 3);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn save_clears_exposed_mark_only_when_access_changes() {
+        let mut cur = s3(10);
+        cur.access_exposed = true;
+        let StorageConfig::S3(base) = cur.storage.clone() else {
+            unreachable!()
+        };
+        let with = |f: &dyn Fn(&mut S3Config)| {
+            let mut c = base.clone();
+            f(&mut c);
+            StorageConfig::S3(c)
+        };
+        // Тот же секрет: поменяли срок или папку — пометка остаётся.
+        let same = next_config(&cur, cur.storage.clone(), 48, 5);
+        assert!(same.access_exposed && same.version == 11 && same.file_ttl_hours == 48);
+        assert!(next_config(&cur, with(&|c| c.prefix = "x".into()), 24, 0).access_exposed);
+        assert!(next_config(&cur, with(&|c| c.bucket = "b2".into()), 24, 0).access_exposed);
+        // Новый ключ или другое хранилище — снимается.
+        assert!(!next_config(&cur, with(&|c| c.secret_key = "новый".into()), 24, 0).access_exposed);
+        assert!(
+            !next_config(&cur, with(&|c| c.endpoint = "https://other".into()), 24, 0)
+                .access_exposed
+        );
+        assert!(!next_config(&cur, StorageConfig::Server, 24, 0).access_exposed);
+        // Без пометки она и не появляется.
+        cur.access_exposed = false;
+        assert!(!next_config(&cur, cur.storage.clone(), 24, 0).access_exposed);
+
+        let sftp = |auth: SftpAuth, host: &str| {
+            StorageConfig::Sftp(clipwire_core::storage::SftpConfig {
+                host: host.into(),
+                port: 22,
+                user: "u".into(),
+                auth,
+                path: "/clip".into(),
+                host_key_sha256: "SHA256:x".into(),
+            })
+        };
+        let key = |k: &str, p: Option<&str>| SftpAuth::Key {
+            private_key: k.into(),
+            passphrase: p.map(Into::into),
+        };
+        let a = sftp(key("K", Some("p1")), "h");
+        assert!(
+            !access_rotated(&a, &sftp(key("K", Some("p2")), "h")),
+            "пароль к ключу не в счёт"
+        );
+        assert!(access_rotated(&a, &sftp(key("K2", None), "h")));
+        assert!(access_rotated(
+            &a,
+            &sftp(SftpAuth::Password("K".into()), "h")
+        ));
+        assert!(access_rotated(&a, &sftp(key("K", Some("p1")), "h2")));
+        let pw = sftp(SftpAuth::Password("old".into()), "h");
+        assert!(!access_rotated(&pw, &pw.clone()));
+        assert!(access_rotated(
+            &pw,
+            &sftp(SftpAuth::Password("new".into()), "h")
+        ));
     }
 
     #[test]

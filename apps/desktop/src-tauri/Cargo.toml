@@ -23,6 +23,8 @@ data-encoding = "2.11.1"
 # криптопровайдер ring ставится на старте (aws-lc не нужен).
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+# Сравнение версий после установки обновления (та же версия, что у Tauri).
+semver = "1.0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2.12.5", features = ["tray-icon", "image-png", "protocol-asset"] }

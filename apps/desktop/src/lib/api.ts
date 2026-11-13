@@ -229,7 +229,7 @@ export interface StorageState {
   error: string | null
   insecure_http: boolean
   warning: StorageWarning | null
-  /** Доступы к хранилищу были у исключённого устройства: их надо сменить и сохранить заново. */
+  /** Доступы к хранилищу остались у устройства вне группы (исключённого или без карточки): их надо сменить и сохранить заново. */
   access_exposed: boolean
 }
 

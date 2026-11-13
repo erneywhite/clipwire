@@ -97,6 +97,15 @@ pub struct RekeyPlan {
     pub skipped: Vec<DeviceId>,
 }
 
+impl RekeyPlan {
+    /// Окажется ли после смены ключа вне группы хоть одно устройство,
+    /// кроме этого: исключаемое (`remove`) или без карточки (`skipped`).
+    /// У таких остаются доступы к внешнему хранилищу группы.
+    pub fn leaves_out_any(&self, remove: Option<DeviceId>) -> bool {
+        remove.is_some() || !self.skipped.is_empty()
+    }
+}
+
 /// Решить, кто получает новый ключ: все устройства с карточкой, кроме
 /// `remove`, и это устройство (`me`, `my_rekey_pub`).
 pub fn plan_rekey(
@@ -439,6 +448,14 @@ mod tests {
         let to: Vec<_> = plan.recipients.iter().map(|r| r.0).collect();
         assert_eq!(to, vec![me, device_id(&dev(2))]);
         assert_eq!(plan.skipped, vec![device_id(&dev(4))]);
+        // Устройство без карточки окажется вне группы и без исключения.
+        assert!(plan.leaves_out_any(None));
+        let all_known = RekeyPlan {
+            recipients: plan.recipients.clone(),
+            skipped: Vec::new(),
+        };
+        assert!(!all_known.leaves_out_any(None));
+        assert!(all_known.leaves_out_any(Some(device_id(&dev(3)))));
 
         // Своя карточка в списке не даёт второй пакет себе.
         list.push(entry(&key, dev(1), "A"));

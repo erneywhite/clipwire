@@ -221,6 +221,12 @@ pub fn virtual_dir(state_dir: &std::path::Path) -> std::path::PathBuf {
 /// Проверка владельца буфера перед чтением виртуальных файлов.
 pub type AcceptVirtual = Box<dyn Fn(Option<&str>) -> bool + Send>;
 
+/// Виртуальные файлы, дочитанные уже после того, как буфер сменился:
+/// содержимое, путь exe владельца и время начала чтения (мс Unix). Их место
+/// в истории, но не наверху и не в буфере: текущее содержимое уже другое.
+/// `false` — не взяли (пауза, сервис снят): папку с файлами удалить.
+pub type OnLateVirtual = Box<dyn FnMut(clipwire_core::Content, Option<String>, i64) -> bool + Send>;
+
 /// Настройки слежения за буфером, кроме колбэка.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub struct WatchOptions {
@@ -234,6 +240,8 @@ pub struct WatchOptions {
     /// буфера): проверяется до чтения, чтобы не писать на диск то, что всё
     /// равно не уйдёт (пауза, игнорируемая программа).
     pub accept_virtual: AcceptVirtual,
+    /// Куда деть виртуальные файлы, дочитанные после смены буфера.
+    pub on_late_virtual: OnLateVirtual,
 }
 
 /// Описание локального файла или папки для элемента буфера: имя, размер,
@@ -307,9 +315,14 @@ mod win {
     /// буфера, если удалось узнать.
     type Callback = Box<dyn FnMut(Content, Option<String>)>;
 
-    /// Результат чтения виртуальных файлов: забранное, владелец и номер
-    /// версии буфера, который читался.
-    type VirtualResult = (Result<crate::virtual_files::Captured>, Option<String>, u32);
+    /// Результат чтения виртуальных файлов: забранное, владелец, номер
+    /// версии буфера, который читался, и время начала чтения (мс Unix).
+    type VirtualResult = (
+        Result<crate::virtual_files::Captured>,
+        Option<String>,
+        u32,
+        i64,
+    );
 
     struct Ctx {
         formats: ExclusionFormats,
@@ -432,7 +445,7 @@ mod win {
                 let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Ctx;
                 // SAFETY: как в WM_TIMER.
                 if let Some(ctx) = unsafe { ptr.as_mut() } {
-                    while let Ok((res, owner, seq)) = ctx.virt_rx.try_recv() {
+                    while let Ok((res, owner, seq, started_ms)) = ctx.virt_rx.try_recv() {
                         let now = unsafe { GetClipboardSequenceNumber() };
                         let done = ctx.virt.finished(seq, now);
                         match res {
@@ -444,10 +457,20 @@ mod win {
                             Ok(got) => {
                                 // Пока файлы читались, скопировали другое: оно
                                 // уже ушло, и старые файлы его бы перекрыли.
+                                // Прочитанное не выбрасываем: в историю на
+                                // время начала чтения, без отправки в группу.
                                 tracing::info!(
-                                    "виртуальные файлы пропущены: буфер сменился, пока они читались"
+                                    "виртуальные файлы дочитаны после смены буфера: только в историю"
                                 );
-                                got.discard();
+                                let files: Vec<_> =
+                                    got.tops.iter().map(|p| super::local_file_ref(p)).collect();
+                                if !(ctx.opts.on_late_virtual)(
+                                    Content::Files(files),
+                                    owner,
+                                    started_ms,
+                                ) {
+                                    got.discard();
+                                }
                             }
                             Err(e) => {
                                 tracing::info!("виртуальные файлы из буфера пропущены: {e:#}")
@@ -550,13 +573,14 @@ mod win {
         let limit = ctx.opts.limit_mb.load(std::sync::atomic::Ordering::Relaxed);
         let max_bytes = crate::virtual_files::limit_bytes(limit);
         let (tx, hwnd_raw) = (ctx.virt_tx.clone(), hwnd.0 as isize);
+        let started_ms = crate::history::now_ms();
         let started = crate::virtual_files::spawn_read(
             &ctx.virt_busy,
             ctx.opts.virtual_dir.clone(),
             max_bytes,
             seq,
             move |res| {
-                if tx.send((res, owner, seq)).is_ok() {
+                if tx.send((res, owner, seq, started_ms)).is_ok() {
                     let hwnd = HWND(hwnd_raw as *mut _);
                     let _ =
                         unsafe { PostMessageW(Some(hwnd), WM_VIRTUAL_DONE, WPARAM(0), LPARAM(0)) };
