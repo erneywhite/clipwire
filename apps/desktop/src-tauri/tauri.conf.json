@@ -119,7 +119,7 @@
         "https://github.com/erneywhite/clipwire/releases/latest/download/latest.json"
       ],
       "windows": {
-        "installMode": "passive"
+        "installMode": "quiet"
       }
     }
   }

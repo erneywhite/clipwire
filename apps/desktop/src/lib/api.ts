@@ -21,6 +21,8 @@ export interface Settings {
   ignored_apps: string[]
   /** Файлы до этого размера уходят на сервер; 0 — не загружать. */
   file_upload_limit_mb: number
+  /** Скачивать обновления в фоне и ставить, когда программа не нужна. */
+  auto_update: boolean
 }
 
 export interface DeviceInfo {
@@ -192,6 +194,10 @@ export const api = {
   sizePreviewHide: () => invoke<void>('size_preview_hide'),
   leaveGroup: () => invoke<void>('leave_group'),
   deviceInfo: () => invoke<DeviceInfo>('device_info'),
+  /** Поставить обновление сейчас; на Windows программа закроется и запустится заново. */
+  updateInstall: () => invoke<void>('update_install'),
+  /** Версия, которая уже скачана и поставится сама, или null. */
+  updateReady: () => invoke<string | null>('update_ready'),
   devicesList: () => invoke<GroupDevice[]>('devices_list'),
   deviceRemove: (deviceId: string) => invoke<RekeyResult>('device_remove', { deviceId }),
   groupRekey: () => invoke<RekeyResult>('group_rekey'),

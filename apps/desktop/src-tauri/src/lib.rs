@@ -329,6 +329,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--background"]),
@@ -371,8 +372,13 @@ pub fn run() {
             files::transfers,
             cache::cache_size,
             cache::cache_clear,
+            commands::update_install,
+            commands::update_ready,
         ])
         .setup(|app| {
+            // Первым делом: обновление, скачанное в прошлый раз, ставится до
+            // запуска движка, а после автоматической установки окно не нужно.
+            let after_auto_update = updates::on_startup(app.handle());
             let hide_from_capture = app
                 .state::<AppState>()
                 .settings
@@ -415,27 +421,34 @@ pub fn run() {
 
             // Без группы или при обычном запуске — показываем настройки;
             // из автозагрузки — только трей.
-            if !configured || !std::env::args().any(|a| a == "--background") {
+            // После автоматического обновления — тоже только трей: человек
+            // программу не открывал.
+            if !configured || (!after_auto_update && !std::env::args().any(|a| a == "--background"))
+            {
                 show_settings(app.handle());
             }
             Ok(())
         })
-        .on_window_event(|window, event| match event {
-            // Закрытие окна прячет его: приложение живёт в трее до «Выход».
-            WindowEvent::CloseRequested { api, .. } => {
-                api.prevent_close();
-                let _ = window.hide();
-                // Вместе с настройками прячется и пример окна вставки.
-                if window.label() == "settings" {
-                    settings_window::size_preview_hide(window.app_handle().clone());
+        .on_window_event(|window, event| {
+            // Любое событие окна — признак, что программой пользуются.
+            updates::touch(window.app_handle());
+            match event {
+                // Закрытие окна прячет его: приложение живёт в трее до «Выход».
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    // Вместе с настройками прячется и пример окна вставки.
+                    if window.label() == "settings" {
+                        settings_window::size_preview_hide(window.app_handle().clone());
+                    }
                 }
+                // Окно вставки исчезает, как только уходит фокус: как меню.
+                WindowEvent::Focused(false) if window.label() == "popup" => {
+                    tracing::debug!("окно вставки потеряло фокус, прячу");
+                    let _ = window.hide();
+                }
+                _ => {}
             }
-            // Окно вставки исчезает, как только уходит фокус: как меню.
-            WindowEvent::Focused(false) if window.label() == "popup" => {
-                tracing::debug!("окно вставки потеряло фокус, прячу");
-                let _ = window.hide();
-            }
-            _ => {}
         })
         .build(tauri::generate_context!())
         .expect("приложение не собралось")

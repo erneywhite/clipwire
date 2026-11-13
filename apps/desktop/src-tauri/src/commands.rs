@@ -510,3 +510,16 @@ pub fn history_update(
 pub fn set_window_background(app: AppHandle, color: String) {
     crate::apply_window_background(&app, &color);
 }
+
+/// Поставить обновление сейчас (кнопка в «О программе»). Движок
+/// останавливается так же, как при выходе; на Windows процесс завершается.
+#[tauri::command]
+pub async fn update_install(app: AppHandle) -> CmdResult<()> {
+    crate::updates::install(app).await
+}
+
+/// Версия, которая уже скачана и поставится сама, или `null`.
+#[tauri::command]
+pub fn update_ready(app: AppHandle) -> Option<String> {
+    crate::updates::ready_version(&app)
+}

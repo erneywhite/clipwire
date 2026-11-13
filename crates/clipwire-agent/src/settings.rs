@@ -77,6 +77,9 @@ pub struct Settings {
     /// Файлы до этого размера (МБ) при копировании в группе загружаются на
     /// сервер; 0 — не загружать, файлы остаются только ссылкой на источник.
     pub file_upload_limit_mb: u64,
+    /// Скачивать обновления в фоне и ставить, когда программа не нужна.
+    /// Выключено — обновление ставится только по кнопке.
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -101,6 +104,7 @@ impl Default for Settings {
                 "Bitwarden.exe".into(),
             ],
             file_upload_limit_mb: 100,
+            auto_update: true,
         }
     }
 }
@@ -161,6 +165,10 @@ mod tests {
         assert!(s.sound_on_receive);
         let s: Settings = serde_json::from_str(r#"{"sound_on_receive":false}"#).unwrap();
         assert!(!s.sound_on_receive);
+        // Автообновление по умолчанию включено, в том числе в старом файле без поля.
+        assert!(s.auto_update);
+        let s: Settings = serde_json::from_str(r#"{"auto_update":false}"#).unwrap();
+        assert!(!s.auto_update);
     }
 
     #[test]
