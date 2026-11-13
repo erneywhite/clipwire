@@ -13,6 +13,8 @@ mod sound;
 mod storage;
 mod tray;
 mod updates;
+mod send_to;
+mod winv;
 
 use std::sync::{Arc, Mutex};
 
@@ -329,14 +331,18 @@ pub fn run() {
     // установленной копией, иначе её не проверить, не закрывая рабочую программу.
     // Второй запуск не плодит копию, а открывает настройки у первой.
     #[cfg(not(debug_assertions))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        show_settings(app);
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+        // «Отправить в Clipwire» из Проводника — не повод открывать настройки.
+        if !send_to::handle_args(app, &args) {
+            show_settings(app);
+        }
     }));
     builder
         .manage(state)
         .manage(popup::PopupState::default())
         .manage(link::LinkCache::default())
         .manage(storage::LastWarning::default())
+        .manage(send_to::SendQueue::default())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -419,6 +425,15 @@ pub fn run() {
             if let Err(e) = popup::register_hotkey(app.handle()) {
                 tracing::warn!("{e}");
             }
+            let (win_v, explorer_menu) = {
+                let state = app.state::<AppState>();
+                let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+                (s.win_v, s.explorer_menu)
+            };
+            winv::set(app.handle(), win_v);
+            // Каждый запуск: путь к exe в пункте меню мог смениться.
+            send_to::set_menu(explorer_menu);
+            send_to::handle_args(app.handle(), &std::env::args().collect::<Vec<_>>());
             tray::build(app.handle())?;
             tray::spawn_animator(app.handle().clone());
 

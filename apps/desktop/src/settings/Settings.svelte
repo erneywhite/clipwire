@@ -37,6 +37,7 @@
     { id: 'forever', title: 'Всегда' },
   ]
 
+  const isWindows = navigator.userAgent.includes('Windows')
   let section = $state<Section>('general')
   let s = $state<Settings | null>(null)
   let status = $state<Status>({ kind: 'connecting' })
@@ -456,6 +457,14 @@
             checked={s.auto_update}
             onchange={(v) => save({ auto_update: v })}
           />
+          {#if isWindows}
+            <Toggle
+              label="«Отправить в Clipwire» в меню Проводника"
+              hint="Правый клик по файлам или папке: они попадают в историю и на остальные устройства группы, как после копирования. В Windows 11 пункт находится в «Показать дополнительные параметры»."
+              checked={s.explorer_menu}
+              onchange={(v) => save({ explorer_menu: v })}
+            />
+          {/if}
         </div>
 
         <h2>Оформление</h2>
@@ -676,6 +685,14 @@
               {recording ? 'Нажмите сочетание… (Esc — отмена)' : hotkeyLabel(s.popup_hotkey)}
             </button>
           </div>
+          {#if isWindows}
+            <Toggle
+              label="Открывать по Win+V"
+              hint="Win+V показывает окно Clipwire вместо журнала буфера Windows, своё сочетание тоже работает. В окнах, запущенных от имени администратора, Win+V по-прежнему открывает журнал Windows: вставлять туда Clipwire не может."
+              checked={s.win_v}
+              onchange={(v) => save({ win_v: v })}
+            />
+          {/if}
         </div>
 
         <h2>Размер окна вставки</h2>
