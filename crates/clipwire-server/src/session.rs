@@ -277,6 +277,10 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     Some(ClientMsg::Join { .. } | ClientMsg::JoinWithToken { .. }) => {
                         bail!("повторный Join")
                     }
+                    // shortcut: устройства и смена ключа — вторая волна (docs/devices.md).
+                    Some(ClientMsg::PublishCard(_) | ClientMsg::ListDevices | ClientMsg::Rekey { .. }) => {
+                        tracing::debug!("устройства и смена ключа ещё не поддерживаются");
+                    }
                 }
             }
             out = rx.recv() => {

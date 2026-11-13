@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::blob::BlobId;
 use crate::crypto::{GroupId, JoinSecret, SealedItem};
+use crate::item::DeviceId;
 
 /// ALPN протокола. Меняем номер при несовместимых изменениях формата.
 pub const ALPN: &[u8] = b"clipwire/3";
@@ -47,6 +48,31 @@ pub enum ClientMsg {
         join_secret: JoinSecret,
         token: String,
     },
+    /// Опубликовать свою карточку устройства (`GroupKey::seal_card`). Сервер
+    /// хранит последнюю карточку каждого устройства группы.
+    PublishCard(Vec<u8>),
+    /// Попросить список устройств группы — ответ `Devices`.
+    ListDevices,
+    /// Сменить ключ группы: `new_group` уже создана этим устройством
+    /// (`JoinWithToken` с новым ключом), `envelopes` — новый ключ для каждого
+    /// остающегося устройства (`device::seal_rekey`). Старая группа переходит
+    /// в режим «ключ сменён»: элементы и файлы удаляются, остальным
+    /// подключённым устройствам уходит `Rekeyed` с их пакетом.
+    Rekey {
+        new_group: GroupId,
+        envelopes: Vec<(DeviceId, Vec<u8>)>,
+    },
+}
+
+/// Устройство группы в списке `Devices`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    pub device: DeviceId,
+    /// Зашифрованная карточка (`GroupKey::open_card`); пусто, если устройство
+    /// ещё не публиковало её (старая версия).
+    pub card: Vec<u8>,
+    pub last_seen_ms: i64,
+    pub online: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +88,13 @@ pub enum ServerMsg {
     Deliver(SealedItem),
     /// Старый элемент из истории другого устройства — только в историю.
     Backfill(SealedItem),
+    /// Ответ на `ListDevices`.
+    Devices(Vec<DeviceEntry>),
+    /// Ключ группы сменён: пакет с новым ключом для этого устройства
+    /// (`device::open_rekey`). После него сервер закрывает соединение.
+    Rekeyed { envelope: Vec<u8> },
+    /// Ключ группы сменён, а пакета для этого устройства нет: его исключили.
+    Excluded,
     /// Ошибка. После неё сервер закрывает соединение.
     Error(String),
 }

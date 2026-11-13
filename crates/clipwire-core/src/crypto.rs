@@ -164,6 +164,30 @@ impl From<ItemV2> for Item {
             device_name: i.device_name,
             created_at_ms: i.created_at_ms,
             content: i.content.into(),
+            ext: Vec::new(),
+        }
+    }
+}
+
+/// `Item` до поля `ext` (часть 4 передачи файлов, ноябрь 2026).
+#[derive(Deserialize)]
+struct ItemV3 {
+    id: ItemId,
+    origin: DeviceId,
+    device_name: String,
+    created_at_ms: u64,
+    content: crate::item::Content,
+}
+
+impl From<ItemV3> for Item {
+    fn from(i: ItemV3) -> Self {
+        Item {
+            id: i.id,
+            origin: i.origin,
+            device_name: i.device_name,
+            created_at_ms: i.created_at_ms,
+            content: i.content,
+            ext: Vec::new(),
         }
     }
 }
@@ -179,6 +203,9 @@ fn decode_item(plain: &[u8]) -> Result<Item, CryptoError> {
         Ok(_) => postcard::Error::DeserializeBadEncoding,
         Err(e) => e,
     };
+    if let Ok((item, [])) = postcard::take_from_bytes::<ItemV3>(plain) {
+        return Ok(item.into());
+    }
     match postcard::take_from_bytes::<ItemV2>(plain) {
         Ok((item, [])) => Ok(item.into()),
         _ => Err(err.into()),
@@ -365,6 +392,66 @@ mod tests {
             ("b", None, 0)
         );
         assert!(f.iter().all(|f| !f.p2p));
+    }
+
+    #[test]
+    fn item_without_ext_opens_and_source_app_roundtrips() {
+        // Элемент версии до поля ext: те же поля, без него.
+        #[derive(Serialize)]
+        struct ItemV3Out {
+            id: ItemId,
+            origin: DeviceId,
+            device_name: String,
+            created_at_ms: u64,
+            content: Content,
+        }
+        let old = ItemV3Out {
+            id: ItemId::new(),
+            origin: DeviceId([4; 32]),
+            device_name: "ПК".into(),
+            created_at_ms: 77,
+            content: Content::Text("привет".into()),
+        };
+        let key = GroupKey([2; 32]);
+        let nonce = [3u8; 24];
+        let ciphertext = key
+            .cipher()
+            .encrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: &postcard::to_stdvec(&old).unwrap(),
+                    aad: &aad(&old.id, &old.origin),
+                },
+            )
+            .unwrap();
+        let item = key
+            .open(&SealedItem {
+                id: old.id,
+                origin: old.origin,
+                nonce,
+                ciphertext,
+            })
+            .unwrap();
+        assert_eq!(item.content, Content::Text("привет".into()));
+        assert!(item.ext.is_empty());
+        assert_eq!(item.source_app(), None);
+
+        // Новый элемент с приложением-источником и с неизвестной меткой.
+        use crate::item::{ExtList, SourceApp, ext};
+        let mut it = Item::new(DeviceId([5; 32]), Content::Text("x".into()));
+        let app = SourceApp {
+            name: "Telegram".into(),
+            exe: "Telegram.exe".into(),
+            icon_png: vec![1, 2, 3],
+        };
+        it.ext_set(ext::SOURCE_APP, &app);
+        it.ext.push(crate::item::Ext {
+            tag: 999,
+            data: vec![9; 4],
+        });
+        let back = key.open(&key.seal(&it).unwrap()).unwrap();
+        assert_eq!(back.source_app(), Some(app));
+        assert_eq!(back.ext.len(), 2);
     }
 
     #[test]

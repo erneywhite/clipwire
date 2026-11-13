@@ -283,9 +283,71 @@ pub struct Item {
     pub device_name: String,
     pub created_at_ms: u64,
     pub content: Content,
+    /// Дополнительные сведения по меткам ([`Ext`]). Новое добавляется сюда
+    /// новой меткой, формат элемента при этом не меняется: версии, не знающие
+    /// метку, её пропускают.
+    pub ext: Vec<Ext>,
+}
+
+/// Дополнительное сведение элемента: метка и байты (обычно postcard).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ext {
+    pub tag: u16,
+    pub data: Vec<u8>,
+}
+
+/// Метки [`Ext`].
+pub mod ext {
+    /// Приложение, из которого скопировано: [`super::SourceApp`].
+    pub const SOURCE_APP: u16 = 1;
+}
+
+/// Из какого приложения скопировано.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceApp {
+    /// Понятное имя («Telegram»), из описания exe; если нет — имя файла.
+    pub name: String,
+    /// Имя exe («Telegram.exe»): по нему список исключений и группировка.
+    pub exe: String,
+    /// Маленькая иконка (PNG 32×32, до ~8 КБ); пусто, если не удалось.
+    pub icon_png: Vec<u8>,
+}
+
+/// Поиск и запись сведений по метке — для `Item` и записей истории.
+pub trait ExtList {
+    fn ext_list(&self) -> &[Ext];
+    fn ext_list_mut(&mut self) -> &mut Vec<Ext>;
+
+    fn ext_get<T: serde::de::DeserializeOwned>(&self, tag: u16) -> Option<T> {
+        let e = self.ext_list().iter().find(|e| e.tag == tag)?;
+        postcard::from_bytes(&e.data).ok()
+    }
+
+    fn ext_set<T: Serialize>(&mut self, tag: u16, value: &T) {
+        let Ok(data) = postcard::to_stdvec(value) else {
+            return;
+        };
+        let list = self.ext_list_mut();
+        list.retain(|e| e.tag != tag);
+        list.push(Ext { tag, data });
+    }
+}
+
+impl ExtList for Item {
+    fn ext_list(&self) -> &[Ext] {
+        &self.ext
+    }
+    fn ext_list_mut(&mut self) -> &mut Vec<Ext> {
+        &mut self.ext
+    }
 }
 
 impl Item {
+    /// Приложение-источник, если известно.
+    pub fn source_app(&self) -> Option<SourceApp> {
+        self.ext_get(ext::SOURCE_APP)
+    }
+
     pub fn new(origin: DeviceId, content: Content) -> Self {
         let created_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -297,6 +359,7 @@ impl Item {
             device_name: String::new(),
             created_at_ms,
             content,
+            ext: Vec::new(),
         }
     }
 
@@ -314,6 +377,7 @@ impl Item {
             device_name: String::new(),
             created_at_ms: ms,
             content,
+            ext: Vec::new(),
         }
     }
 }

@@ -184,4 +184,16 @@ mod tests {
         assert!(!dir.join("uploads.json").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn core_device_id_matches_iroh_endpoint_id() {
+        // Карточки устройств подписываются в core через ed25519-dalek, а id
+        // устройства — это id эндпоинта iroh. Они обязаны совпадать.
+        let key = random_key().unwrap();
+        let iroh_id = iroh::SecretKey::from_bytes(&key).public();
+        assert_eq!(
+            clipwire_core::device::device_id(&key).0,
+            *iroh_id.as_bytes()
+        );
+    }
 }
