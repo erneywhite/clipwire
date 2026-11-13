@@ -31,6 +31,9 @@ pub struct Paths {
     pub dir: PathBuf,
 }
 
+/// Начало имени папки, куда при выходе из группы уходит кэш скачанных файлов.
+const TRASH_PREFIX: &str = "files.trash-";
+
 impl Paths {
     /// `%APPDATA%\Clipwire` на Windows, `~/Library/Application Support/Clipwire`
     /// на macOS, `~/.config/clipwire` на Linux. `CLIPWIRE_HOME` переопределяет
@@ -80,6 +83,13 @@ impl Paths {
     /// Выход из группы: ключ, курсор, очередь загрузок, архивы папок в
     /// outbox (всё это уходило в старую группу, в новой им не место) и кэш
     /// скачанных файлов группы: на диске не должно оставаться её следов.
+    ///
+    /// Сначала ключ, курсор и очередь: без них устройство уже не в группе, и
+    /// ошибка здесь — ошибка выхода. Кэш скачанного чистится по возможности:
+    /// скачанный файл может быть открыт в другой программе (на Windows такой
+    /// файл не удалить), и выход из-за этого не должен ломаться. Кэш
+    /// переименовывается в `files.trash-<uuid>` и удаляется; что не удалилось,
+    /// остаётся там и убирается при следующем запуске ([`Paths::clean_trash`]).
     pub fn reset(&self) -> Result<()> {
         let uploads = self.dir.join(crate::blobs::UPLOADS_FILE);
         for p in [self.state(), self.cursor(), uploads] {
@@ -89,19 +99,61 @@ impl Paths {
                 Err(e) => return Err(e).with_context(|| format!("не удалился {}", p.display())),
             }
         }
-        for dir in [
-            crate::blobs::outbox_dir(&self.dir),
-            crate::blobs::files_dir(&self.dir),
-        ] {
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e).with_context(|| format!("не удалился {}", dir.display()));
-                }
+        self.trash_files();
+        let outbox = crate::blobs::outbox_dir(&self.dir);
+        match std::fs::remove_dir_all(&outbox) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("не удалился {}", outbox.display()));
             }
         }
         Ok(())
+    }
+
+    /// Убрать кэш скачанных файлов, не падая на занятых файлах.
+    fn trash_files(&self) {
+        let files = crate::blobs::files_dir(&self.dir);
+        let trash = self
+            .dir
+            .join(format!("{TRASH_PREFIX}{}", uuid::Uuid::now_v7().simple()));
+        let target = match std::fs::rename(&files, &trash) {
+            Ok(()) => trash,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            // Папку с открытым файлом Windows не переименует: удаляем на
+            // месте всё, что получится.
+            Err(e) => {
+                tracing::warn!("кэш файлов не переименовался: {e}");
+                files
+            }
+        };
+        if let Err(e) = std::fs::remove_dir_all(&target) {
+            tracing::warn!(
+                "кэш файлов удалился не целиком ({}): {e}. Остаток уберётся при следующем запуске",
+                target.display()
+            );
+        }
+    }
+
+    /// Удалить остатки кэша, которые не удалились при выходе из группы
+    /// (`files.trash-*`). По возможности: занятое остаётся до следующего раза.
+    /// Возвращает, сколько папок удалено целиком.
+    pub fn clean_trash(&self) -> usize {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with(TRASH_PREFIX) {
+                continue;
+            }
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::info!("остаток кэша пока не удалился: {e}"),
+            }
+        }
+        removed
     }
 
     pub fn load_cursor(&self) -> Option<ItemId> {
@@ -182,6 +234,71 @@ mod tests {
         assert!(paths.load().unwrap().is_none());
         assert!(paths.load_cursor().is_none());
         assert!(!dir.join("uploads.json").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Скачанный файл открыт другой программой без `FILE_SHARE_DELETE`
+    /// (так открывают многие редакторы): выход из группы всё равно проходит,
+    /// а остаток кэша убирается позже.
+    #[cfg(windows)]
+    #[test]
+    fn reset_survives_open_file_in_cache() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+
+        let dir = std::env::temp_dir().join(format!("clipwire-reset-{}", uuid::Uuid::now_v7()));
+        let paths = Paths { dir: dir.clone() };
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("state.bin"), b"x").unwrap();
+        std::fs::write(dir.join("cursor"), b"x").unwrap();
+        std::fs::write(dir.join("uploads.json"), b"[]").unwrap();
+        let cached = dir.join("files").join("ab12").join("отчёт.pdf");
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, b"x").unwrap();
+        std::fs::write(dir.join("files").join("ab12").join("другой.txt"), b"y").unwrap();
+        let open = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&cached)
+            .unwrap();
+
+        paths.reset().unwrap();
+        assert!(!dir.join("state.bin").exists());
+        assert!(!dir.join("cursor").exists());
+        assert!(!dir.join("uploads.json").exists());
+        assert!(!dir.join("files").join("ab12").join("другой.txt").exists());
+        // Открытый файл удалить не дали: он остался в кэше или в корзине.
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("files"))
+            .count();
+        assert_eq!(leftovers, 1);
+
+        drop(open);
+        // Если кэш успел переименоваться, остаток в files.trash-*: его
+        // убирает запуск. Иначе остался на месте, и его добирает повторный выход.
+        paths.clean_trash();
+        paths.reset().unwrap();
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clean_trash_removes_only_leftovers() {
+        let dir = std::env::temp_dir().join(format!("clipwire-trash-{}", uuid::Uuid::now_v7()));
+        let paths = Paths { dir: dir.clone() };
+        std::fs::create_dir_all(dir.join("files.trash-1").join("ab")).unwrap();
+        std::fs::write(dir.join("files.trash-1").join("ab").join("x"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        assert_eq!(paths.clean_trash(), 1);
+        assert!(!dir.join("files.trash-1").exists());
+        assert!(dir.join("files").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 

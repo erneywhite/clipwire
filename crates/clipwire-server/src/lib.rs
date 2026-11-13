@@ -110,6 +110,7 @@ impl Identity {
             }
         };
 
+        config::check_relay_token(&relay_token)?;
         Ok(Self {
             secret_key,
             relay_token,
@@ -181,6 +182,7 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
     });
     let purge_every = PURGE_EVERY
         .min(guards.reserve_ttl)
+        .min(guards.group_idle)
         .max(Duration::from_secs(1));
 
     let purge = {
@@ -204,6 +206,12 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
                     Ok(n) => tracing::info!("удалено брошенных резервов: {n}"),
                     Err(e) => tracing::warn!("очистка резервов не удалась: {e:#}"),
                 }
+                // После чистки истории и файлов: у заброшенной группы их уже нет.
+                match transfer::purge_idle_groups(&shared) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("удалено заброшенных групп: {n}"),
+                    Err(e) => tracing::warn!("очистка групп не удалась: {e:#}"),
+                }
             }
         })
     };
@@ -218,4 +226,40 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
         relay,
         purge,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let mut raw = [0u8; 8];
+        getrandom::fill(&mut raw).unwrap();
+        std::env::temp_dir().join(format!(
+            "clipwire-identity-{tag}-{}",
+            BASE32_NOPAD.encode(&raw).to_lowercase()
+        ))
+    }
+
+    #[test]
+    fn long_relay_token_is_refused_on_start() {
+        let dir = tmp("env");
+        let max = "x".repeat(config::MAX_RELAY_TOKEN_BYTES);
+        let id = Identity::load_or_create(&dir, Some(&max)).unwrap();
+        assert_eq!(id.relay_token, max);
+
+        let long = "x".repeat(config::MAX_RELAY_TOKEN_BYTES + 1);
+        let e = Identity::load_or_create(&dir, Some(&long))
+            .err()
+            .expect("длинный токен должен отклоняться");
+        assert!(format!("{e:#}").contains("не больше 256"), "{e:#}");
+
+        // То же для токена из файла.
+        let dir2 = tmp("file");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("relay.token"), &long).unwrap();
+        assert!(Identity::load_or_create(&dir2, None).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
 }

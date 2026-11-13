@@ -34,7 +34,7 @@ pub enum BlobBegin {
     QuotaExceeded,
     /// Новый файл не влезает в общее место сервера под файлы.
     ServerFull,
-    /// У группы уже слишком много файлов без единой части.
+    /// У устройства-источника уже слишком много файлов без единой части.
     TooManyReserves,
 }
 
@@ -51,6 +51,13 @@ pub enum JoinOutcome {
     /// Группы нет, и на сервере уже предельное число групп.
     TooManyGroups,
 }
+
+/// Условие «группа `g` заброшена» для [`Store::idle_groups`] и
+/// [`Store::delete_idle_group`]: `?1` — время, с которого никто не входил.
+const IDLE_GROUP: &str = "NOT EXISTS (SELECT 1 FROM devices AS d
+                             WHERE d.group_id = g.group_id AND d.last_seen_ms >= ?1)
+     AND NOT EXISTS (SELECT 1 FROM items AS i WHERE i.group_id = g.group_id)
+     AND NOT EXISTS (SELECT 1 FROM blobs AS b WHERE b.group_id = g.group_id)";
 
 /// У какой группы удалить самый старый элемент, когда история всех групп
 /// вместе не влезает в общий предел. `usage` — объём истории и число
@@ -127,6 +134,28 @@ impl Store {
             conn.execute_batch(
                 "ALTER TABLE items ADD COLUMN backfill INTEGER NOT NULL DEFAULT 0;",
             )?;
+        }
+        // Когда файл последний раз трогали (`Reserve` или `Put`): от этого
+        // считается срок резерва. SQLite не берёт в DEFAULT другой столбец,
+        // поэтому старым строкам значение ставится отдельно, равным created_ms.
+        let has_touch: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('blobs') WHERE name = 'last_touch_ms'")?
+            .exists([])?;
+        if !has_touch {
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE blobs ADD COLUMN last_touch_ms INTEGER NOT NULL DEFAULT 0;
+                 UPDATE blobs SET last_touch_ms = created_ms;
+                 COMMIT;",
+            )?;
+        }
+        // Устройство, которое завело файл: предел резервов считается на него.
+        // У старых строк NULL, в предел они не входят.
+        let has_origin: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('blobs') WHERE name = 'origin'")?
+            .exists([])?;
+        if !has_origin {
+            conn.execute_batch("ALTER TABLE blobs ADD COLUMN origin BLOB;")?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -307,11 +336,15 @@ impl Store {
     /// `total_quota` — на весь сервер; обе проверяются в одной транзакции,
     /// так что два одновременных новых файла не проскочат вместе. Истёкший
     /// файл с тем же id удаляется и создаётся заново: его части уже не нужны.
+    /// У уже заведённого файла обновляется `last_touch_ms`: так повторный
+    /// `Reserve` продлевает резерв. `max_reserves` — сколько файлов без единой
+    /// части может держать устройство `origin` (по всем группам).
     #[allow(clippy::too_many_arguments)]
     pub fn blob_begin(
         &self,
         group: &GroupId,
         blob: &BlobId,
+        origin: &DeviceId,
         size: u64,
         now_ms: i64,
         not_before_ms: i64,
@@ -336,7 +369,15 @@ impl Store {
                 )?;
             }
             Some((s, _, _)) if s as u64 != size => return Ok(BlobBegin::SizeMismatch),
-            Some((_, have, _)) => return Ok(BlobBegin::Existing { have: have as u64 }),
+            Some((_, have, _)) => {
+                tx.execute(
+                    "UPDATE blobs SET last_touch_ms = MAX(last_touch_ms, ?3)
+                     WHERE group_id = ?1 AND blob_id = ?2",
+                    params![&group.0[..], &blob.0[..], now_ms],
+                )?;
+                tx.commit()?;
+                return Ok(BlobBegin::Existing { have: have as u64 });
+            }
             None => {}
         }
         // sealed_size(size) = size + max(1, ceil(size / CHUNK)) * OVERHEAD,
@@ -356,18 +397,27 @@ impl Store {
             return Ok(BlobBegin::ServerFull);
         }
         // Файлы без единой части: резервы и только что начатые Put. Каждый
-        // держит квоту, поэтому их число на группу ограничено.
+        // держит квоту, поэтому их число ограничено. Считаем на устройство, а
+        // не на группу: одно устройство с большой пачкой файлов не мешает
+        // остальным устройствам группы.
         let empty: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM blobs WHERE group_id = ?1 AND have = 0 AND created_ms >= ?2",
-            params![&group.0[..], not_before_ms],
+            "SELECT COUNT(*) FROM blobs WHERE origin = ?1 AND have = 0 AND created_ms >= ?2",
+            params![&origin.0[..], not_before_ms],
             |r| r.get(0),
         )?;
         if empty as u64 >= max_reserves as u64 {
             return Ok(BlobBegin::TooManyReserves);
         }
         tx.execute(
-            "INSERT INTO blobs (group_id, blob_id, size, have, created_ms) VALUES (?1, ?2, ?3, 0, ?4)",
-            params![&group.0[..], &blob.0[..], size as i64, now_ms],
+            "INSERT INTO blobs (group_id, blob_id, size, have, created_ms, last_touch_ms, origin)
+             VALUES (?1, ?2, ?3, 0, ?4, ?4, ?5)",
+            params![
+                &group.0[..],
+                &blob.0[..],
+                size as i64,
+                now_ms,
+                &origin.0[..]
+            ],
         )?;
         tx.commit()?;
         Ok(BlobBegin::Created)
@@ -449,13 +499,13 @@ impl Store {
         Ok(out)
     }
 
-    /// Резервы, по которым не пришло ни одной части с момента `older_than_ms`
-    /// и раньше: кандидаты на удаление. Удаляет их [`Store::delete_stale_reserve`]
-    /// под замком записи файла.
+    /// Резервы без единой части, которые последний раз трогали (`Reserve`,
+    /// `Put`) раньше `older_than_ms`: кандидаты на удаление. Удаляет их
+    /// [`Store::delete_stale_reserve`] под замком записи файла.
     pub fn stale_reserves(&self, older_than_ms: i64) -> Result<Vec<(GroupId, BlobId)>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT group_id, blob_id FROM blobs WHERE have = 0 AND created_ms < ?1")?;
+        let mut stmt = conn
+            .prepare("SELECT group_id, blob_id FROM blobs WHERE have = 0 AND last_touch_ms < ?1")?;
         let rows = stmt.query_map(params![older_than_ms], |r| {
             Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
         })?;
@@ -470,8 +520,9 @@ impl Store {
         Ok(out)
     }
 
-    /// Удалить резерв, если он всё ещё без частей и старше `older_than_ms`.
-    /// `true`, если удалён: пока ждали замок, загрузка могла начаться.
+    /// Удалить резерв, если он всё ещё без частей и его не трогали с
+    /// `older_than_ms`. `true`, если удалён: пока ждали замок, загрузка могла
+    /// начаться, а повторный `Reserve` — продлить резерв.
     pub fn delete_stale_reserve(
         &self,
         group: &GroupId,
@@ -479,8 +530,37 @@ impl Store {
         older_than_ms: i64,
     ) -> Result<bool> {
         Ok(self.conn().execute(
-            "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2 AND have = 0 AND created_ms < ?3",
+            "DELETE FROM blobs
+             WHERE group_id = ?1 AND blob_id = ?2 AND have = 0 AND last_touch_ms < ?3",
             params![&group.0[..], &blob.0[..], older_than_ms],
+        )? > 0)
+    }
+
+    /// Заброшенные группы: ни одно устройство не входило с `seen_before_ms`,
+    /// и нет ни элементов, ни файлов. Кандидаты на удаление
+    /// ([`Store::delete_idle_group`]).
+    pub fn idle_groups(&self, seen_before_ms: i64) -> Result<Vec<GroupId>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT group_id FROM groups AS g WHERE {IDLE_GROUP}"
+        ))?;
+        let rows = stmt.query_map(params![seen_before_ms], |r| r.get::<_, Vec<u8>>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(GroupId(
+                row?.try_into().ok().context("битый group_id в базе")?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Удалить группу (и её устройства, каскадом), если она всё ещё
+    /// заброшена: между поиском и удалением в неё могли войти. `true`, если
+    /// удалена.
+    pub fn delete_idle_group(&self, group: &GroupId, seen_before_ms: i64) -> Result<bool> {
+        Ok(self.conn().execute(
+            &format!("DELETE FROM groups AS g WHERE g.group_id = ?2 AND {IDLE_GROUP}"),
+            params![seen_before_ms, &group.0[..]],
         )? > 0)
     }
 
@@ -551,6 +631,9 @@ mod tests {
     use super::*;
     use clipwire_core::blob::sealed_size;
     use clipwire_core::{Content, GroupKey, Item};
+
+    /// Устройство-источник файлов в тестах.
+    const DEV: DeviceId = DeviceId([5; 32]);
 
     fn sealed(key: &GroupKey, text: &str) -> SealedItem {
         key.seal(&Item::new(DeviceId([1; 32]), Content::Text(text.into())))
@@ -661,20 +744,20 @@ mod tests {
         let g = group(&s, 1);
         let b = BlobId([3; 16]);
         assert_eq!(
-            s.blob_begin(&g, &b, 100, 10, 0, u64::MAX, u64::MAX, usize::MAX)
+            s.blob_begin(&g, &b, &DEV, 100, 10, 0, u64::MAX, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::Created
         );
         assert_eq!(s.blob_info(&g, &b, 0).unwrap(), Some((100, 0)));
         s.blob_set_have(&g, &b, 1).unwrap();
         assert_eq!(
-            s.blob_begin(&g, &b, 100, 20, 0, u64::MAX, u64::MAX, usize::MAX)
+            s.blob_begin(&g, &b, &DEV, 100, 20, 0, u64::MAX, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::Existing { have: 1 }
         );
         assert_eq!(s.blob_info(&g, &b, 0).unwrap(), Some((100, 1)));
         assert_eq!(
-            s.blob_begin(&g, &b, 101, 20, 0, u64::MAX, u64::MAX, usize::MAX)
+            s.blob_begin(&g, &b, &DEV, 101, 20, 0, u64::MAX, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::SizeMismatch
         );
@@ -693,6 +776,7 @@ mod tests {
             s.blob_begin(
                 g,
                 &BlobId([n; 16]),
+                &DEV,
                 size,
                 10,
                 0,
@@ -723,6 +807,7 @@ mod tests {
             s.blob_begin(
                 g,
                 &BlobId([n; 16]),
+                &DEV,
                 size,
                 10,
                 0,
@@ -752,13 +837,13 @@ mod tests {
         let (old, new) = (BlobId([1; 16]), BlobId([2; 16]));
         let quota = sealed_size(1000);
         assert_eq!(
-            s.blob_begin(&g, &old, 1000, 100, 0, quota, u64::MAX, usize::MAX)
+            s.blob_begin(&g, &old, &DEV, 1000, 100, 0, quota, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::Created
         );
         // Истёкший файл не занимает квоту и не виден.
         assert_eq!(
-            s.blob_begin(&g, &new, 1000, 200, 150, quota, u64::MAX, usize::MAX)
+            s.blob_begin(&g, &new, &DEV, 1000, 200, 150, quota, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::Created
         );
@@ -774,11 +859,11 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let g = group(&s, 1);
         let b = BlobId([1; 16]);
-        s.blob_begin(&g, &b, 1000, 100, 0, u64::MAX, u64::MAX, usize::MAX)
+        s.blob_begin(&g, &b, &DEV, 1000, 100, 0, u64::MAX, u64::MAX, usize::MAX)
             .unwrap();
         s.blob_set_have(&g, &b, 1).unwrap();
         assert_eq!(
-            s.blob_begin(&g, &b, 5, 200, 150, u64::MAX, u64::MAX, usize::MAX)
+            s.blob_begin(&g, &b, &DEV, 5, 200, 150, u64::MAX, u64::MAX, usize::MAX)
                 .unwrap(),
             BlobBegin::Created
         );
@@ -938,8 +1023,18 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let g = group(&s, 1);
         let begin = |n: u8, now: i64| {
-            s.blob_begin(&g, &BlobId([n; 16]), 10, now, 0, u64::MAX, u64::MAX, 2)
-                .unwrap()
+            s.blob_begin(
+                &g,
+                &BlobId([n; 16]),
+                &DEV,
+                10,
+                now,
+                0,
+                u64::MAX,
+                u64::MAX,
+                2,
+            )
+            .unwrap()
         };
         assert_eq!(begin(1, 100), BlobBegin::Created);
         assert_eq!(begin(2, 200), BlobBegin::Created);
@@ -953,5 +1048,136 @@ mod tests {
         assert!(s.delete_stale_reserve(&g, &BlobId([1; 16]), 250).unwrap());
         assert!(s.stale_reserves(250).unwrap().is_empty());
         assert_eq!(begin(4, 400), BlobBegin::Created);
+    }
+
+    #[test]
+    fn reserves_are_counted_per_device() {
+        let s = Store::in_memory().unwrap();
+        let (g, g2) = (group(&s, 1), group(&s, 2));
+        let other = DeviceId([6; 32]);
+        let begin = |g: &GroupId, dev: &DeviceId, n: u8| {
+            s.blob_begin(g, &BlobId([n; 16]), dev, 10, 10, 0, u64::MAX, u64::MAX, 2)
+                .unwrap()
+        };
+        assert_eq!(begin(&g, &DEV, 1), BlobBegin::Created);
+        // Предел устройства общий для всех его групп.
+        assert_eq!(begin(&g2, &DEV, 2), BlobBegin::Created);
+        assert_eq!(begin(&g, &DEV, 3), BlobBegin::TooManyReserves);
+        // Другому устройству той же группы чужие резервы не мешают.
+        assert_eq!(begin(&g, &other, 3), BlobBegin::Created);
+        assert_eq!(begin(&g, &other, 4), BlobBegin::Created);
+        assert_eq!(begin(&g, &other, 5), BlobBegin::TooManyReserves);
+    }
+
+    #[test]
+    fn touched_reserve_is_not_stale() {
+        let s = Store::in_memory().unwrap();
+        let g = group(&s, 1);
+        let (kept, left) = (BlobId([1; 16]), BlobId([2; 16]));
+        let begin = |b: &BlobId, now: i64| {
+            s.blob_begin(&g, b, &DEV, 10, now, 0, u64::MAX, u64::MAX, usize::MAX)
+                .unwrap()
+        };
+        assert_eq!(begin(&kept, 100), BlobBegin::Created);
+        assert_eq!(begin(&left, 100), BlobBegin::Created);
+        // Повторный Reserve (или Put) продлевает резерв.
+        assert_eq!(begin(&kept, 300), BlobBegin::Existing { have: 0 });
+        assert_eq!(s.stale_reserves(250).unwrap(), vec![(g, left)]);
+        assert!(!s.delete_stale_reserve(&g, &kept, 250).unwrap());
+        assert!(s.delete_stale_reserve(&g, &left, 250).unwrap());
+        // Время назад не откатывается: поздний ответ со старым now_ms срок не
+        // укорачивает.
+        assert_eq!(begin(&kept, 50), BlobBegin::Existing { have: 0 });
+        assert!(s.stale_reserves(250).unwrap().is_empty());
+        // Брошенный — удаляется, когда срок от последнего касания вышел.
+        assert_eq!(s.stale_reserves(301).unwrap(), vec![(g, kept)]);
+    }
+
+    #[test]
+    fn old_database_gets_touch_and_origin_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE groups (group_id BLOB PRIMARY KEY, join_digest BLOB NOT NULL,
+                                  created_ms INTEGER NOT NULL);
+             CREATE TABLE blobs (group_id BLOB NOT NULL, blob_id BLOB NOT NULL,
+                                 size INTEGER NOT NULL, have INTEGER NOT NULL,
+                                 created_ms INTEGER NOT NULL, PRIMARY KEY (group_id, blob_id));
+             INSERT INTO groups VALUES (x'01', x'02', 0);
+             INSERT INTO blobs VALUES (x'01', x'03', 10, 0, 1234);",
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        let (touch, origin): (i64, Option<Vec<u8>>) = s
+            .conn()
+            .query_row("SELECT last_touch_ms, origin FROM blobs", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(touch, 1234);
+        assert_eq!(origin, None);
+    }
+
+    #[test]
+    fn idle_groups_are_found_and_deleted() {
+        let s = Store::in_memory().unwrap();
+        let key = |n: u8| GroupKey([n; 32]);
+        let join = |n: u8, dev: u8, now: i64| {
+            s.join(
+                &key(n).group_id(),
+                &key(n).join_secret(),
+                &DeviceId([dev; 32]),
+                now,
+                true,
+                usize::MAX,
+            )
+            .unwrap()
+        };
+        // 1 — заброшена; 2 — давно, но с элементом; 3 — давно, но с файлом;
+        // 4 — одно из устройств заходило недавно.
+        for n in 1..=4 {
+            join(n, 1, 100);
+        }
+        join(4, 2, 1000);
+        s.push(
+            &key(2).group_id(),
+            &sealed(&key(2), "x"),
+            100,
+            50,
+            false,
+            u64::MAX,
+        )
+        .unwrap();
+        s.blob_begin(
+            &key(3).group_id(),
+            &BlobId([1; 16]),
+            &DEV,
+            10,
+            100,
+            0,
+            u64::MAX,
+            u64::MAX,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(s.idle_groups(500).unwrap(), vec![key(1).group_id()]);
+        // Пока искали, в группу вошли: её не трогаем.
+        join(1, 3, 600);
+        assert!(!s.delete_idle_group(&key(1).group_id(), 500).unwrap());
+        assert!(s.delete_idle_group(&key(1).group_id(), 700).unwrap());
+        // Устройства ушли вместе с группой.
+        assert!(!s.is_known_device(&DeviceId([3; 32])).unwrap());
+        // Место освободилось: предел групп считается по оставшимся.
+        assert_eq!(
+            s.join(
+                &key(9).group_id(),
+                &key(9).join_secret(),
+                &DEV,
+                800,
+                true,
+                4
+            )
+            .unwrap(),
+            JoinOutcome::Created
+        );
     }
 }

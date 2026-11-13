@@ -21,13 +21,17 @@ use crate::store::{JoinOutcome, Store, constant_time_eq};
 /// Сколько ждать первого сообщения `Join` после подключения.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Предел первого кадра до входа в группу. В `Join` два значения по 32 байта,
-/// в `JoinWithToken` ещё токен сервера (32 символа у сгенерированного).
+/// в `JoinWithToken` ещё токен сервера (32 символа у сгенерированного, не
+/// больше [`crate::config::MAX_RELAY_TOKEN_BYTES`] у заданного вручную).
 /// Клиент, который ещё никуда не вошёл, не должен заставлять сервер выделять
 /// под кадр 16 МиБ.
 pub const MAX_JOIN_FRAME: usize = 512;
 /// Насколько время в id элемента может опережать часы сервера: запас на
-/// расхождение часов устройств.
-pub const MAX_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
+/// расхождение часов устройств. Запас большой, сутки: устройство со
+/// спешащими часами иначе молча теряло бы копирования. Курсор клиентов
+/// такой элемент не сдвигает (у них свой предел, `MAX_CURSOR_AHEAD`), а
+/// место самого свежего в истории он занимает не дольше суток.
+pub const MAX_CLOCK_SKEW_MS: i64 = 24 * 60 * 60 * 1000;
 
 pub struct Limits {
     pub max_item_bytes: usize,
@@ -42,6 +46,7 @@ pub struct Limits {
     pub max_reserves: usize,
     pub history_total_bytes: u64,
     pub max_device_conns: usize,
+    pub group_idle: Duration,
 }
 
 impl Limits {
@@ -59,6 +64,7 @@ impl Limits {
             max_reserves: guards.max_reserves,
             history_total_bytes: guards.history_total_bytes,
             max_device_conns: guards.max_device_conns,
+            group_idle: guards.group_idle,
         }
     }
 }
@@ -265,6 +271,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         shared.clone(),
         conn.clone(),
         group,
+        device,
     ));
 
     loop {

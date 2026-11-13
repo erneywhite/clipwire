@@ -1009,10 +1009,11 @@ async fn item_from_the_future_is_dropped() -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as u64;
+    // Дальше суток вперёд — отбрасывается.
     let future = Item::backdated(
         a.device,
         Content::Text("из будущего".into()),
-        now + 3_600_000,
+        now + 25 * 3_600_000,
     );
     write_msg(&mut a.send, &ClientMsg::Push(key.seal(&future)?)).await?;
     write_msg(&mut a.send, &ClientMsg::Backfill(key.seal(&future)?)).await?;
@@ -1022,11 +1023,23 @@ async fn item_from_the_future_is_dropped() -> Result<()> {
         ServerMsg::Deliver(s) => assert_eq!(key.open(&s)?, normal),
         other => anyhow::bail!("ждали Deliver, пришло {other:?}"),
     }
-    // В истории его тоже нет.
+    // Часы спешат на час: элемент принимается, копирование не теряется.
+    let ahead = Item::backdated(
+        a.device,
+        Content::Text("часы спешат".into()),
+        now + 3_600_000,
+    );
+    write_msg(&mut a.send, &ClientMsg::Push(key.seal(&ahead)?)).await?;
+    match b.next().await? {
+        ServerMsg::Deliver(s) => assert_eq!(key.open(&s)?, ahead),
+        other => anyhow::bail!("ждали Deliver, пришло {other:?}"),
+    }
+    // Элемента дальше суток нет и в истории.
     let mut c = Client::connect(&server.info, &relay, "test-token").await?;
     let history = c.join_plain(&key).await?;
-    assert_eq!(history.len(), 1);
+    assert_eq!(history.len(), 2);
     assert_eq!(key.open(&history[0].0)?, normal);
+    assert_eq!(key.open(&history[1].0)?, ahead);
     server.shutdown().await
 }
 
@@ -1074,7 +1087,7 @@ async fn stale_reserve_frees_quota() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reserves_per_group_are_limited() -> Result<()> {
+async fn reserves_per_device_are_limited() -> Result<()> {
     let guards = Guards {
         max_reserves: 2,
         ..Guards::default()
@@ -1082,14 +1095,57 @@ async fn reserves_per_group_are_limited() -> Result<()> {
     let (server, relay) = start_server_guarded(|_| {}, guards).await?;
     let key = GroupKey::generate()?;
     let a = joined(&server.info, &relay, &key).await?;
+    let reserve = |blob| BlobRequest::Reserve { blob, size: 10 };
+    let mut first = None;
     for _ in 0..2 {
         let blob = BlobId::random()?;
-        let mut r = BlobStream::open(&a.conn, BlobRequest::Reserve { blob, size: 10 }).await?;
+        first.get_or_insert(blob);
+        let mut r = BlobStream::open(&a.conn, reserve(blob)).await?;
         assert_eq!(r.reply().await?, BlobReply::Reserved);
     }
+    // Сверх предела — временная ошибка: агент повторит, а не снимет файл.
     let blob = BlobId::random()?;
-    let mut r = BlobStream::open(&a.conn, BlobRequest::Reserve { blob, size: 10 }).await?;
-    assert_eq!(expect_fail(&mut r).await?, BlobFail::QuotaExceeded);
+    let mut r = BlobStream::open(&a.conn, reserve(blob)).await?;
+    assert_eq!(expect_fail(&mut r).await?, BlobFail::Stalled);
+    // Повторный Reserve уже заведённого файла в предел не упирается.
+    let mut r = BlobStream::open(&a.conn, reserve(first.unwrap())).await?;
+    assert_eq!(r.reply().await?, BlobReply::Reserved);
+    // У другого устройства группы свой счёт.
+    let b = joined(&server.info, &relay, &key).await?;
+    let mut r = BlobStream::open(&b.conn, reserve(blob)).await?;
+    assert_eq!(r.reply().await?, BlobReply::Reserved);
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_groups_free_their_slots() -> Result<()> {
+    let guards = Guards {
+        max_groups: 1,
+        group_idle: Duration::from_secs(1),
+        ..Guards::default()
+    };
+    let (server, relay) = start_server_guarded(|_| {}, guards).await?;
+    let (old, new) = (GroupKey::generate()?, GroupKey::generate()?);
+    // Пока устройство группы на связи, группу не трогают.
+    let a = joined(&server.info, &relay, &old).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut c = Client::connect(&server.info, &relay, "test-token").await?;
+    let e = join_error(&mut c, &join_with_token(&new, "test-token")).await?;
+    assert!(e.contains("предельное число групп"), "{e}");
+    // Отключилось — после срока группа без элементов и файлов удаляется.
+    // Эндпоинт закрываем явно: так закрытие соединения точно уходит серверу.
+    a.conn.close(0u32.into(), b"bye");
+    a._ep.close().await;
+    let started = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut c = Client::connect(&server.info, &relay, "test-token").await?;
+        match c.join(&new).await {
+            Ok(_) => break,
+            Err(_) if started.elapsed() < T => {}
+            Err(e) => return Err(e),
+        }
+    }
     server.shutdown().await
 }
 

@@ -6,6 +6,24 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+/// Предел длины токена relay. Токен идёт в первом кадре `JoinWithToken`, а
+/// он ограничен `MAX_JOIN_FRAME` (512 байт) вместе с id группы и секретом.
+pub const MAX_RELAY_TOKEN_BYTES: usize = 256;
+
+/// Проверить токен relay (из `CLIPWIRE_RELAY_TOKEN` или `relay.token`): не
+/// длиннее [`MAX_RELAY_TOKEN_BYTES`].
+pub fn check_relay_token(token: &str) -> Result<()> {
+    if token.len() > MAX_RELAY_TOKEN_BYTES {
+        bail!(
+            "токен relay (CLIPWIRE_RELAY_TOKEN или relay.token) длиной {} байт, а можно \
+             не больше {MAX_RELAY_TOKEN_BYTES}: длинный токен не поместится в первое \
+             сообщение клиента",
+            token.len()
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Каталог для ключа сервера, токена relay и базы.
@@ -106,23 +124,31 @@ pub struct Guards {
     /// пришло ни одной части. Освобождает квоту.
     pub reserve_ttl: Duration,
     /// Сколько файлов без единой части (резервы и только начатые `Put`)
-    /// может держать одна группа.
+    /// может держать одно устройство-источник. Сверх этого `Reserve` и `Put`
+    /// получают временную ошибку `Stalled`, агент повторяет.
     pub max_reserves: usize,
     /// Сколько места под историю элементов на весь сервер, по размеру
     /// шифротекста. Правило вытеснения — в `Store::push`.
     pub history_total_bytes: u64,
     /// Сколько одновременных соединений можно держать с одного устройства.
     pub max_device_conns: usize,
+    /// Через сколько удаляется группа, в которую никто не входил и в которой
+    /// нет ни элементов, ни файлов. Освобождает места под `max_groups`.
+    pub group_idle: Duration,
 }
+
+/// Через сколько удаляется заброшенная группа: 90 дней.
+pub const GROUP_IDLE: Duration = Duration::from_secs(90 * 24 * 3600);
 
 impl Default for Guards {
     fn default() -> Self {
         Self {
             max_groups: 100,
             reserve_ttl: Duration::from_secs(600),
-            max_reserves: 64,
+            max_reserves: 512,
             history_total_bytes: 1024 * 1024 * 1024,
             max_device_conns: 4,
+            group_idle: GROUP_IDLE,
         }
     }
 }
@@ -144,6 +170,7 @@ impl Guards {
             max_reserves: parse("CLIPWIRE_MAX_RESERVES", d.max_reserves)?,
             history_total_bytes: parse("CLIPWIRE_HISTORY_TOTAL_BYTES", d.history_total_bytes)?,
             max_device_conns,
+            group_idle: d.group_idle,
         })
     }
 }

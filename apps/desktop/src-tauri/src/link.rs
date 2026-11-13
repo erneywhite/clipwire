@@ -149,6 +149,8 @@ fn client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .timeout(TIMEOUT)
             .redirect(reqwest::redirect::Policy::custom(
+                // В `previous()` исходный адрес и все пройденные редиректы,
+                // так что его длина — номер текущего редиректа, начиная с 1.
                 |attempt| match redirect_verdict(attempt.url(), attempt.previous().len()) {
                     Redirect::Follow => attempt.follow(),
                     Redirect::Stop => attempt.stop(),
@@ -179,9 +181,10 @@ enum Redirect {
     Refuse(String),
 }
 
-/// Что делать с очередным редиректом на `url`, когда пройдено `hops`.
-fn redirect_verdict(url: &Url, hops: usize) -> Redirect {
-    if hops >= MAX_REDIRECTS {
+/// Что делать с редиректом номер `nth` (с 1) на `url`. Проходится
+/// [`MAX_REDIRECTS`] редиректов, следующий — отказ.
+fn redirect_verdict(url: &Url, nth: usize) -> Redirect {
+    if nth > MAX_REDIRECTS {
         return Redirect::Refuse("слишком много редиректов".into());
     }
     if let Err(e) = check_target(url) {
@@ -662,7 +665,7 @@ mod tests {
     #[test]
     fn redirects_are_checked_at_every_hop() {
         assert_eq!(
-            redirect_verdict(&u("https://example.com/page"), 0),
+            redirect_verdict(&u("https://example.com/page"), 1),
             Redirect::Follow
         );
         assert!(matches!(
@@ -686,8 +689,13 @@ mod tests {
             redirect_verdict(&u("https://example.com/reset?token=abc"), 1),
             Redirect::Stop
         );
-        assert!(matches!(
+        // Пятый редирект ещё проходится, шестой — нет.
+        assert_eq!(
             redirect_verdict(&u("https://example.com/"), MAX_REDIRECTS),
+            Redirect::Follow
+        );
+        assert!(matches!(
+            redirect_verdict(&u("https://example.com/"), MAX_REDIRECTS + 1),
             Redirect::Refuse(_)
         ));
     }
