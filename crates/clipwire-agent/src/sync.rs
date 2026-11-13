@@ -296,6 +296,7 @@ impl Engine {
             "отправляю локальную историю в группу"
         );
         while let Some((content, ms)) = self.backfill.first().cloned() {
+            let content = content.fit(MAX_ITEM_BYTES);
             if content.len() <= MAX_ITEM_BYTES {
                 let item = Item::backdated(self.device, content, ms)
                     .with_device_name(self.device_name.clone());
@@ -321,6 +322,8 @@ impl Engine {
     }
 
     async fn push(&mut self, send: &mut iroh::endpoint::SendStream, c: Content) -> Result<()> {
+        // Огромный HTML из Word не повод не отправить сам текст.
+        let c = c.fit(MAX_ITEM_BYTES);
         if c.len() > MAX_ITEM_BYTES {
             tracing::info!(len = c.len(), "слишком большой элемент, не отправляю");
             return Ok(());

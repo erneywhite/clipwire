@@ -37,6 +37,13 @@ pub fn write(content: &clipwire_core::Content) -> Result<()> {
     match content {
         clipwire_core::Content::Text(t) => write_text(t),
         clipwire_core::Content::Image { png, .. } => write_image(png),
+        #[cfg(windows)]
+        clipwire_core::Content::Rich { text, html, rtf } => {
+            win::write_rich(text, html.as_deref(), rtf.as_deref())
+        }
+        // shortcut: на других ОС пока только текст, форматирование теряется. Этап macOS.
+        #[cfg(not(windows))]
+        clipwire_core::Content::Rich { text, .. } => write_text(text),
         #[allow(unreachable_patterns)]
         _ => anyhow::bail!("этот тип пока не записывается в буфер"),
     }
@@ -215,7 +222,14 @@ mod win {
                     {
                         // Если в буфере и текст, и картинка (Excel, редакторы),
                         // берём текст: он и есть то, что человек копировал.
-                        (ctx.on_change)(Content::Text(text), owner_exe());
+                        // Рядом с текстом бывает HTML и RTF — забираем и их.
+                        let (html, rtf) = read_rich();
+                        let content = if html.is_some() || rtf.is_some() {
+                            Content::Rich { text, html, rtf }
+                        } else {
+                            Content::Text(text)
+                        };
+                        (ctx.on_change)(content, owner_exe());
                     } else if let Some(img) = super::read_image() {
                         (ctx.on_change)(img, owner_exe());
                     }
@@ -265,6 +279,65 @@ mod win {
         if !ptr.is_null() {
             drop(unsafe { Box::from_raw(ptr) });
         }
+    }
+
+    /// Сколько раз пытаться открыть буфер, пока его держит другая программа
+    /// (clipboard-win ждёт между попытками).
+    const OPEN_ATTEMPTS: usize = 10;
+
+    fn formats() -> (Option<u32>, Option<u32>) {
+        use clipboard_win::raw::register_format;
+        (
+            register_format("HTML Format").map(|f| f.get()),
+            register_format("Rich Text Format").map(|f| f.get()),
+        )
+    }
+
+    /// HTML-фрагмент и RTF из буфера, если они там есть. Пустые — как нет.
+    fn read_rich() -> (Option<String>, Option<Vec<u8>>) {
+        use clipboard_win::raw;
+        let (html_f, rtf_f) = formats();
+        let Ok(_clip) = clipboard_win::Clipboard::new_attempts(OPEN_ATTEMPTS) else {
+            tracing::debug!("буфер занят, форматирование не прочиталось");
+            return (None, None);
+        };
+        let html = html_f.filter(|&f| raw::is_format_avail(f)).and_then(|f| {
+            let mut out = Vec::new();
+            raw::get_html(f, &mut out).ok()?;
+            let s = String::from_utf8(out).ok()?;
+            (!s.trim().is_empty()).then_some(s)
+        });
+        let rtf = rtf_f.filter(|&f| raw::is_format_avail(f)).and_then(|f| {
+            let mut out = Vec::new();
+            raw::get_vec(f, &mut out).ok()?;
+            // RTF в буфере обычно с завершающим нулём.
+            while out.last() == Some(&0) {
+                out.pop();
+            }
+            (!out.is_empty()).then_some(out)
+        });
+        (html, rtf)
+    }
+
+    /// Положить текст вместе с HTML и RTF одним заходом: вставляющая программа
+    /// сама выберет самый богатый понятный ей формат.
+    pub fn write_rich(text: &str, html: Option<&str>, rtf: Option<&[u8]>) -> Result<()> {
+        use clipboard_win::options::{DoClear, NoClear};
+        use clipboard_win::raw;
+        let err = |what: &str, e: clipboard_win::ErrorCode| anyhow!("буфер: {what}: {e}");
+        let (html_f, rtf_f) = formats();
+        let _clip = clipboard_win::Clipboard::new_attempts(OPEN_ATTEMPTS)
+            .map_err(|e| err("не открылся", e))?;
+        raw::set_string_with(text, DoClear).map_err(|e| err("текст", e))?;
+        if let (Some(f), Some(h)) = (html_f, html) {
+            raw::set_html_with(f, h, NoClear).map_err(|e| err("HTML", e))?;
+        }
+        if let (Some(f), Some(r)) = (rtf_f, rtf) {
+            let mut bytes = r.to_vec();
+            bytes.push(0);
+            raw::set_without_clear(f, &bytes).map_err(|e| err("RTF", e))?;
+        }
+        Ok(())
     }
 
     /// Форматы, которыми менеджеры паролей и другие программы просят не

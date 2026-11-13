@@ -220,6 +220,11 @@ impl History {
             existing.local = entry.local;
             existing.origin = entry.origin;
             existing.device_name = std::mem::take(&mut entry.device_name);
+            // Тот же текст скопирован уже с форматированием — берём его. Обратно
+            // (вставка без форматирования) форматирование у записи не отнимаем.
+            if matches!(entry.content, Content::Rich { .. }) {
+                existing.content = entry.content;
+            }
             self.write(&existing)?;
             self.entries.insert(0, existing);
             return Ok(());
@@ -264,7 +269,9 @@ impl History {
             .filter(|e| {
                 q.is_empty()
                     || match &e.content {
-                        Content::Text(t) => t.to_lowercase().contains(&q),
+                        Content::Text(t) | Content::Rich { text: t, .. } => {
+                            t.to_lowercase().contains(&q)
+                        }
                         // Картинки находятся по словам «картинка», «скрин» и т. п.
                         Content::Image { .. } => {
                             ["картин", "изображ", "скрин", "снимок", "image", "фото"]
@@ -424,6 +431,25 @@ mod tests {
         dup.seen_ms = 99;
         assert!(!h.merge(dup).unwrap());
         assert_eq!(texts(h.list("", false, 10)), ["новое", "с мака", "старое"]);
+    }
+
+    #[test]
+    fn rich_copy_upgrades_plain_entry_and_plain_does_not_downgrade() {
+        let mut h = History::in_memory();
+        text(&mut h, "жирный", 1);
+        let rich = Content::Rich {
+            text: "жирный".into(),
+            html: Some("<b>жирный</b>".into()),
+            rtf: None,
+        };
+        let mut e = local_entry(DeviceId([1; 32]), "ПК", rich.clone());
+        e.seen_ms = 2;
+        h.add(e).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h.list("", false, 1)[0].content, rich);
+        text(&mut h, "жирный", 3);
+        assert_eq!(h.list("", false, 1)[0].content, rich);
+        assert_eq!(h.list("ЖИР", false, 5).len(), 1);
     }
 
     #[test]

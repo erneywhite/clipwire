@@ -3,7 +3,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, type Entry, type Settings } from '../lib/api'
   import { applyTheme } from '../lib/theme'
-  import { ago, bytesLabel, isUrl, looksLikeCode, sizeLabel } from '../lib/format'
+  import { ago, bytesLabel, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
   import EntryRow from '../lib/EntryRow.svelte'
 
   let query = $state('')
@@ -14,6 +14,8 @@
   // Текст в предпросмотре можно поправить перед вставкой.
   let draft = $state('')
   let editor: HTMLTextAreaElement | undefined = $state()
+  // Форматированный текст в предпросмотре: как выглядит (true) или сам текст для правки.
+  let richView = $state(true)
   const edited = $derived(preview !== null && draft !== preview.entry.text)
   let error = $state('')
   let input: HTMLInputElement | undefined = $state()
@@ -43,14 +45,14 @@
     if (preview) openPreview()
   }
 
-  async function paste(entry: Entry | undefined, intoActive?: boolean) {
+  async function paste(entry: Entry | undefined, intoActive?: boolean, plain?: boolean) {
     if (!entry) return
     // Если это элемент из предпросмотра и его поправили — вставляем изменённый текст.
     const text = preview && preview.entry.id === entry.id && edited ? draft : null
     await closePreview()
     try {
       if (text !== null) await api.pasteText(text, intoActive)
-      else await api.paste(entry.id, intoActive)
+      else await api.paste(entry.id, intoActive, plain)
     } catch (e) {
       error = String(e)
     }
@@ -73,6 +75,7 @@
     const side = preview ? preview.side : await api.preview(true)
     preview = { entry, side }
     draft = entry.text
+    richView = true
   }
 
   async function closePreview() {
@@ -131,8 +134,9 @@
         move(-1)
         return
       case 'Enter':
+        // Shift+Enter — без форматирования.
         e.preventDefault()
-        paste(current)
+        paste(current, undefined, e.shiftKey ? true : undefined)
         return
       case 'Escape':
         e.preventDefault()
@@ -276,22 +280,32 @@
           </button>
         </div>
       {:else}
-      {#if isUrl(preview.entry.text)}
-        <p class="note">Карточки ссылок появятся в следующей версии</p>
+      {#if preview.entry.html}
+        <div class="seg" role="tablist" aria-label="Вид">
+          <button role="tab" aria-selected={richView} onclick={() => (richView = true)}>Форматирование</button>
+          <button role="tab" aria-selected={!richView} onclick={() => (richView = false)}>Текст</button>
+        </div>
       {/if}
-      <textarea
-        bind:this={editor}
-        bind:value={draft}
-        class="editor"
-        class:mono={looksLikeCode(draft)}
-        spellcheck="false"
-        aria-label="Текст элемента, можно поправить перед вставкой"
-      ></textarea>
+      {#if preview.entry.html && richView}
+        <iframe class="rich-view" sandbox="" title="Текст с форматированием" srcdoc={richDoc(preview.entry.html)}></iframe>
+      {:else}
+        {#if isUrl(preview.entry.text)}
+          <p class="note">Карточки ссылок появятся в следующей версии</p>
+        {/if}
+        <textarea
+          bind:this={editor}
+          bind:value={draft}
+          class="editor"
+          class:mono={looksLikeCode(draft)}
+          spellcheck="false"
+          aria-label="Текст элемента, можно поправить перед вставкой"
+        ></textarea>
+      {/if}
       <div class="preview-meta">
         {#if edited}
           изменено · Ctrl+Enter вставить · Ctrl+S сохранить
         {:else}
-          {preview.entry.local ? 'Это устройство' : preview.entry.device_name} · {ago(preview.entry.seen_ms)} · {sizeLabel(preview.entry.chars, preview.entry.lines)}
+          {preview.entry.local ? 'Это устройство' : preview.entry.device_name} · {ago(preview.entry.seen_ms)} · {sizeLabel(preview.entry.chars, preview.entry.lines)}{preview.entry.rich ? ` · ${preview.entry.rich}` : ''}
         {/if}
       </div>
       <div class="actions">
@@ -300,6 +314,9 @@
           <button onclick={saveDraft}>Сохранить в истории</button>
           <button onclick={() => preview && (draft = preview.entry.text)}>Отменить правку</button>
         {:else}
+          {#if preview.entry.rich}
+            <button onclick={() => paste(preview?.entry, undefined, true)}>Без форматирования</button>
+          {/if}
           <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
             {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
           </button>
@@ -465,6 +482,38 @@
   .editor:focus {
     border-color: var(--c-accent);
     background: var(--c-bg);
+  }
+  .seg {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    align-self: flex-start;
+    border-radius: var(--radius-m);
+    background: var(--c-bg);
+  }
+  .seg button {
+    border: 0;
+    background: transparent;
+    color: var(--c-muted);
+    font: inherit;
+    font-size: var(--text-xs);
+    padding: 3px var(--space-2);
+    border-radius: var(--radius-s);
+    cursor: default;
+  }
+  .seg button[aria-selected='true'] {
+    background: var(--c-surface);
+    color: var(--c-text);
+    box-shadow: 0 0 0 1px var(--c-border);
+  }
+  /* Бумага, а не тема: HTML из писем и страниц почти всегда свёрстан под белый фон. */
+  .rich-view {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    border: 1px solid var(--c-border);
+    border-radius: var(--radius-m);
+    background: #fff;
   }
   .image-view {
     flex: 1;

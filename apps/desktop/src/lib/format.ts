@@ -44,6 +44,20 @@ export function looksLikeCode(text: string): boolean {
   return symbols / Math.max(1, text.length) > 0.04 || /^( {2,}|\t)/m.test(text)
 }
 
+/**
+ * Документ для предпросмотра HTML из буфера. Показывается во фрейме с пустым
+ * sandbox (скрипты, формы и переходы запрещены), а CSP внутри не даёт грузить
+ * ничего извне: чужое письмо или страница не «позвонит домой» при просмотре.
+ * Картинки, вложенные прямо в HTML (data:), показываются.
+ */
+export function richDoc(html: string): string {
+  const csp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:"
+  const base =
+    'html,body{margin:0;background:#fff;color:#1d1f23;font:14px/1.45 system-ui,sans-serif;overflow-wrap:anywhere}' +
+    'body{padding:10px 12px}img{max-width:100%;height:auto}table{border-collapse:collapse;max-width:100%}pre{white-space:pre-wrap}'
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><style>${base}</style></head><body>${html}</body></html>`
+}
+
 /** Похоже на ссылку целиком. */
 export function isUrl(text: string): boolean {
   return /^https?:\/\/\S+$/i.test(text.trim())

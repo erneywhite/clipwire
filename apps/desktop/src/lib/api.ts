@@ -45,6 +45,10 @@ export interface Entry {
   thumb: string | null
   /** Полная картинка (data URL) — только из history_get. */
   image: string | null
+  /** Текст с форматированием: «HTML» или «RTF». */
+  rich: 'HTML' | 'RTF' | null
+  /** HTML-фрагмент — только из history_get. */
+  html: string | null
 }
 
 export type Status =
@@ -69,7 +73,8 @@ export const api = {
   pin: (id: string, pinned: boolean) => invoke<void>('history_pin', { id, pinned }),
   remove: (id: string) => invoke<void>('history_delete', { id }),
   clear: (keepPinned: boolean) => invoke<void>('history_clear', { keepPinned }),
-  paste: (id: string, intoActive?: boolean) => invoke<void>('popup_paste', { id, intoActive }),
+  paste: (id: string, intoActive?: boolean, plain?: boolean) =>
+    invoke<void>('popup_paste', { id, intoActive, plain }),
   pasteText: (text: string, intoActive?: boolean) => invoke<void>('popup_paste_text', { text, intoActive }),
   update: (id: string, text: string) => invoke<void>('history_update', { id, text }),
   preview: (open: boolean) => invoke<'left' | 'right'>('popup_preview', { open }),

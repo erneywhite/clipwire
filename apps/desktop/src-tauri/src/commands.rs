@@ -108,6 +108,10 @@ pub struct EntryDto {
     pub thumb: Option<String>,
     /// Полная картинка — только в `history_get`, для предпросмотра.
     pub image: Option<String>,
+    /// Текст с форматированием: «HTML» или «RTF» — для пометки в списке.
+    pub rich: Option<&'static str>,
+    /// HTML-фрагмент — только в `history_get`, для предпросмотра.
+    pub html: Option<String>,
 }
 
 /// Сколько символов текста отдавать в список: хватает на две строки превью.
@@ -122,10 +126,17 @@ fn png_url(png: &[u8]) -> String {
 
 fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool) -> EntryDto {
     let (kind, text, width, height, image) = match &e.content {
-        Content::Text(t) => ("text", t.as_str(), 0, 0, None),
+        Content::Text(t) | Content::Rich { text: t, .. } => ("text", t.as_str(), 0, 0, None),
         Content::Image { width, height, png } => ("image", "", *width, *height, Some(png)),
         #[allow(unreachable_patterns)]
         _ => ("other", "", 0, 0, None),
+    };
+    let (rich, html) = match &e.content {
+        Content::Rich { html, .. } => (
+            Some(if html.is_some() { "HTML" } else { "RTF" }),
+            html.as_ref().filter(|_| full).cloned(),
+        ),
+        _ => (None, None),
     };
     let shown: String = if full {
         text.to_string()
@@ -151,6 +162,8 @@ fn to_dto(e: &Entry, thumb: Option<&[u8]>, full: bool) -> EntryDto {
         } else {
             None
         },
+        rich,
+        html,
     }
 }
 

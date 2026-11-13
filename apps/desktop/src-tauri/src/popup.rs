@@ -191,13 +191,22 @@ pub fn popup_hide(app: AppHandle) {
     hide(&app);
 }
 
-/// Вставить элемент истории по id.
+/// Вставить элемент истории по id. `plain` — без форматирования (Shift+Enter);
+/// не задано — как в настройке «всегда без форматирования».
 #[tauri::command]
 pub async fn popup_paste(
     app: AppHandle,
     id: String,
     into_active: Option<bool>,
+    plain: Option<bool>,
 ) -> Result<(), String> {
+    let plain = plain.unwrap_or_else(|| {
+        app.state::<AppState>()
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .always_plain_text
+    });
     let id: clipwire_core::ItemId = id
         .parse()
         .map(clipwire_core::ItemId)
@@ -210,6 +219,7 @@ pub async fn popup_paste(
             None => return Err("Элемента уже нет в истории".into()),
         }
     };
+    let content = if plain { content.plain() } else { content };
     paste_content(&app, content, into_active).await
 }
 

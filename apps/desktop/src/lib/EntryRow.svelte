@@ -24,6 +24,7 @@
       item.local ? 'Это устройство' : item.device_name || 'Другое устройство',
       ago(item.seen_ms),
       kind === 'image' ? `${item.width}×${item.height} · ${bytesLabel(item.bytes)}` : sizeLabel(item.chars, item.lines),
+      ...(item.rich ? [item.rich] : []),
     ].join(' · '),
   )
 </script>
