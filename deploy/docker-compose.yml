@@ -5,6 +5,15 @@ services:
     build: ..
     image: clipwire-server
     restart: unless-stopped
+    # Ужесточение: файловая система образа только для чтения (пишется лишь том
+    # /data), никаких capabilities и повышения прав.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # SQLite может писать временные файлы в /tmp: он в памяти.
+    tmpfs:
+      - /tmp
     environment:
       CLIPWIRE_PUBLIC_URL: https://clip.example.com
       # Необязательные, значения по умолчанию:
