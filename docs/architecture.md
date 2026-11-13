@@ -207,4 +207,5 @@ Item { id: uuid v7, origin: endpoint_id, created_at, kind: Text|Image|Files, pay
 
 - P2P и файлы — этап 5.
 - Картинки — этап 4.
-- PIN/QR-pairing, история в UI, исключения приложений, автообновление — этап 6.
+- PIN/QR-pairing, история в UI, исключения приложений — этап 6. Автообновление сделано,
+  описано в [updates.md](updates.md).

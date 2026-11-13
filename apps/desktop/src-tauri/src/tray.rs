@@ -210,30 +210,33 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("Clipwire")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_menu_event(|app, e| match e.id.as_ref() {
-            "pause" => {
-                let state = app.state::<AppState>();
-                if let Some(s) = state
-                    .service
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_ref()
-                {
-                    s.set_paused(!s.paused());
-                }
-                publish_status(app);
-            }
-            "settings" => show_settings(app),
-            "update" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(e) = crate::updates::install(app).await {
-                        tracing::warn!("обновление не установилось: {e}");
+        .on_menu_event(|app, e| {
+            crate::updates::touch(app);
+            match e.id.as_ref() {
+                "pause" => {
+                    let state = app.state::<AppState>();
+                    if let Some(s) = state
+                        .service
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        s.set_paused(!s.paused());
                     }
-                });
+                    publish_status(app);
+                }
+                "settings" => show_settings(app),
+                "update" => {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = crate::updates::install(app).await {
+                            tracing::warn!("обновление не установилось: {e}");
+                        }
+                    });
+                }
+                "quit" => app.exit(0),
+                _ => {}
             }
-            "quit" => app.exit(0),
-            _ => {}
         })
         .on_tray_icon_event(|tray, e| {
             if let TrayIconEvent::DoubleClick { .. } = e {

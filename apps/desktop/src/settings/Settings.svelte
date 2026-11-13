@@ -3,7 +3,6 @@
   import { listen } from '@tauri-apps/api/event'
   import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart'
   import { check, type Update } from '@tauri-apps/plugin-updater'
-  import { relaunch } from '@tauri-apps/plugin-process'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { api, type DeviceInfo, type GroupRekeyed, type Retention, type Settings, type Status, type Theme } from '../lib/api'
   import { rekeyedBy } from '../lib/devices'
@@ -66,6 +65,8 @@
   let update = $state<Update | null>(null)
   let updateState = $state<'idle' | 'checking' | 'none' | 'available' | 'installing' | 'error'>('idle')
   let updateError = $state('')
+  /** Версия, скачанная в фоне: поставится сама, когда программа не нужна. */
+  let updateReady = $state<string | null>(null)
 
   const configured = $derived(status.kind !== 'unconfigured' && status.kind !== 'local')
   let retrying = $state(false)
@@ -301,6 +302,7 @@
     try {
       update = await check()
       updateState = update ? 'available' : 'none'
+      updateReady = await api.updateReady()
     } catch (e) {
       updateError = String(e)
       updateState = 'error'
@@ -311,8 +313,9 @@
     if (!update) return
     updateState = 'installing'
     try {
-      await update.downloadAndInstall()
-      await relaunch()
+      // Ставит Rust: движок останавливается так же, как при выходе, и
+      // программа перезапускается уже новой версией.
+      await api.updateInstall()
     } catch (e) {
       updateError = String(e)
       updateState = 'error'
@@ -353,6 +356,7 @@
       listen<Status>('clipwire://status', (e) => (status = e.payload)),
       // Фоновая проверка нашла обновление — сразу показать кнопку в «О программе».
       listen('clipwire://update-available', () => checkUpdates()),
+      listen<string>('clipwire://update-ready', (e) => (updateReady = e.payload)),
       listen<Settings>('clipwire://settings-changed', (e) => {
         s = e.payload
         applyTheme(e.payload.theme, e.payload.mode)
@@ -408,6 +412,12 @@
             hint="Короткий щелчок, когда в историю попадает новое: скопированное здесь или пришедшее с другого устройства."
             checked={s.sound_on_receive}
             onchange={(v) => save({ sound_on_receive: v })}
+          />
+          <Toggle
+            label="Обновляться автоматически"
+            hint="Новая версия скачивается в фоне и ставится, когда вы не пользуетесь Clipwire. Выключено — обновление ставится по кнопке в «О программе» или в меню трея."
+            checked={s.auto_update}
+            onchange={(v) => save({ auto_update: v })}
           />
         </div>
 
@@ -702,7 +712,12 @@
         <div class="card pad">
           {#if updateState === 'available' && update}
             <p>Доступна версия {update.version}</p>
-            <button class="primary" onclick={installUpdate}>Установить и перезапустить</button>
+            {#if s.auto_update && updateReady === update.version}
+              <p class="hint">Уже скачана и установится сама, когда вы закроете окна Clipwire и пару минут не будете им пользоваться.</p>
+            {/if}
+            <button class="primary" onclick={installUpdate}>
+              {s.auto_update && updateReady === update.version ? 'Установить сейчас' : 'Установить и перезапустить'}
+            </button>
           {:else if updateState === 'installing'}
             <p>Скачивание и установка…</p>
           {:else}
