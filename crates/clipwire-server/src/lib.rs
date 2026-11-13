@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clipwire_core::ServerInfo;
-use clipwire_core::proto::ALPN;
+use clipwire_core::proto::{ALPN, ALPN_4};
 use data_encoding::BASE32_NOPAD;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -223,7 +223,10 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
         })
     };
 
+    // Новейший ALPN первым: при выборе TLS берёт первый из списка сервера,
+    // который предложил клиент.
     let router = Router::builder(endpoint)
+        .accept(ALPN_4, ClipwireProtocol(shared.clone()))
         .accept(ALPN, ClipwireProtocol(shared))
         .spawn();
 

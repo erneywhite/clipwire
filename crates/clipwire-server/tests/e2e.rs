@@ -1187,3 +1187,49 @@ async fn connections_per_device_are_limited() -> Result<()> {
     drop(c2);
     server.shutdown().await
 }
+
+/// Клиент, предлагающий оба ALPN, получает `clipwire/4`; на `GetStats` сервер
+/// считает элементы и целиком загруженные файлы группы.
+#[tokio::test]
+async fn new_alpn_and_group_stats() -> Result<()> {
+    use clipwire_core::proto::{ALPN_4, GroupStats};
+    let (server, relay) = start_server().await?;
+    let info = server.info.clone();
+    let key = GroupKey::generate()?;
+
+    // Выбор ALPN: оба предложены — новейший; только старый — старый.
+    let url: RelayUrl = relay.parse()?;
+    let addr = EndpointAddr::new(PublicKey::from_bytes(&info.server_id)?).with_relay_url(url);
+    let ep = endpoint(&relay, "test-token").await?;
+    let opts = iroh::endpoint::ConnectOptions::new().with_additional_alpns(vec![ALPN.to_vec()]);
+    let conn = tokio::time::timeout(T, async {
+        anyhow::Ok(ep.connect_with_opts(addr.clone(), ALPN_4, opts).await?.await?)
+    })
+    .await??;
+    assert_eq!(conn.alpn(), ALPN_4);
+    let old = tokio::time::timeout(T, ep.connect(addr, ALPN)).await??;
+    assert_eq!(old.alpn(), ALPN);
+
+    let mut a = Client::connect(&info, &relay, "test-token").await?;
+    a.join(&key).await?;
+    write_msg(&mut a.send, &ClientMsg::GetStats).await?;
+    match a.next().await? {
+        ServerMsg::Stats(s) => assert_eq!(s, GroupStats::default()),
+        other => anyhow::bail!("ждали Stats, пришло {other:?}"),
+    }
+    a.push_text(&key, "раз").await?;
+    a.push_text(&key, "два").await?;
+    let data = sample(clipwire_core::blob::CHUNK + 10);
+    upload(&a.conn, &key, BlobId([7; 16]), &data).await?;
+    write_msg(&mut a.send, &ClientMsg::GetStats).await?;
+    match a.next().await? {
+        ServerMsg::Stats(s) => {
+            assert_eq!(s.items, 2);
+            assert!(s.item_bytes > 0);
+            assert_eq!(s.files, 1);
+            assert_eq!(s.file_bytes, data.len() as u64);
+        }
+        other => anyhow::bail!("ждали Stats, пришло {other:?}"),
+    }
+    Ok(())
+}

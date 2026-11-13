@@ -320,6 +320,8 @@ pub enum Control {
         config: clipwire_core::GroupConfig,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Что лежит у группы на сервере (`GetStats`).
+    Stats(oneshot::Sender<Result<clipwire_core::proto::GroupStats, String>>),
 }
 
 /// Итог смены ключа на этом устройстве.
@@ -341,6 +343,9 @@ pub struct Controller {
 
 const OFFLINE: &str = "Нет связи с сервером. Попробуйте, когда устройство будет в сети";
 
+/// Сервер 0.1.1 и более ранние не умеют считать, что лежит у группы.
+pub const OLD_SERVER_STATS: &str = "Сервер не сообщает эти цифры: обновите сервер Clipwire";
+
 impl Controller {
     pub fn new(tx: mpsc::Sender<Control>, key: GroupKey, device: DeviceId) -> Self {
         Self { tx, key, device }
@@ -352,6 +357,16 @@ impl Controller {
 
     pub fn group(&self) -> GroupId {
         self.key.group_id()
+    }
+
+    /// Что лежит у группы на сервере.
+    pub async fn server_stats(&self) -> Result<clipwire_core::proto::GroupStats, String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Control::Stats(reply))
+            .await
+            .map_err(|_| OFFLINE.to_string())?;
+        rx.await.map_err(|_| OFFLINE.to_string())?
     }
 
     /// Устройства группы с открытыми карточками.

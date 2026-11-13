@@ -4,10 +4,12 @@
   import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart'
   import { check, type Update } from '@tauri-apps/plugin-updater'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { api, type DeviceInfo, type GroupRekeyed, type Retention, type Settings, type Status, type Theme } from '../lib/api'
+  import { api, type DeviceInfo, type GroupDevice, type GroupRekeyed, type Retention, type Settings, type StatsOverview, type Status, type StorageState, type Theme } from '../lib/api'
   import { rekeyedBy } from '../lib/devices'
   import { applyTheme } from '../lib/theme'
+  import * as fmt from '../lib/format'
   import { bytesLabel } from '../lib/format'
+  import { devicesLabel, historyLabel, serverFilesLabel, serverItemsLabel, storageLabel } from '../lib/overview'
   import { fromEvent, label as hotkeyLabel } from '../lib/hotkey'
   import Toggle from './Toggle.svelte'
   import TitleBar from './TitleBar.svelte'
@@ -186,7 +188,36 @@
 
   // Размер кэша — при каждом открытии раздела: он меняется от скачиваний и чистки.
   $effect(() => {
-    if (section === 'sync') loadCacheSize()
+    if (section === 'sync' || section === 'about') loadCacheSize()
+  })
+
+  // «О программе» → «Состояние». Каждое значение грузится само: старый сервер
+  // или нет связи портят только свою строку.
+  let stats = $state<StatsOverview | null>(null)
+  let groupDevices = $state<GroupDevice[] | null>(null)
+  let devicesError = $state('')
+  let storageState = $state<StorageState | null>(null)
+  let overviewBusy = $state(false)
+
+  async function loadOverview() {
+    overviewBusy = true
+    const tasks: Promise<unknown>[] = [api.statsOverview().then((v) => (stats = v)).catch(() => (stats = null))]
+    if (configured) {
+      tasks.push(
+        api
+          .devicesList()
+          .then((v) => ((groupDevices = v), (devicesError = '')))
+          .catch((e) => ((groupDevices = null), (devicesError = String(e)))),
+        api.storageGet().then((v) => (storageState = v)).catch(() => (storageState = null)),
+      )
+    }
+    await Promise.all(tasks)
+    overviewBusy = false
+  }
+
+  // При открытии раздела и когда меняется связь с сервером.
+  $effect(() => {
+    if (section === 'about' && status.kind) loadOverview()
   })
 
   async function clearHistory() {
@@ -339,6 +370,12 @@
       case 'excluded':
         return 'Устройство исключено из группы'
     }
+  }
+
+  function statusTone(st: Status): 'ok' | 'muted' | 'error' {
+    if (st.kind === 'online') return 'ok'
+    if (st.kind === 'connecting' || st.kind === 'paused' || st.kind === 'local') return 'muted'
+    return 'error'
   }
 
   onMount(() => {
@@ -690,8 +727,88 @@
         </div>
       {:else if section === 'about'}
         <h1>О программе</h1>
+        <div class="card pad">
+          <div class="update-head">
+            <div>
+              <p class="version">Clipwire <span class="mono">{info?.version ?? '—'}</span></p>
+              {#if updateState === 'available' && update}
+                <p class="accent-text">Доступна версия {update.version}</p>
+              {:else if updateState === 'installing'}
+                <p class="hint">Скачивание и установка…</p>
+              {:else if updateState === 'none'}
+                <p class="hint">Установлена последняя версия</p>
+              {/if}
+            </div>
+            {#if updateState === 'available' && update}
+              <button class="primary" onclick={installUpdate}>
+                {s.auto_update && updateReady === update.version ? 'Установить сейчас' : 'Установить и перезапустить'}
+              </button>
+            {:else if updateState !== 'installing'}
+              <button disabled={updateState === 'checking'} onclick={checkUpdates}>
+                {updateState === 'checking' ? 'Проверка…' : 'Проверить обновления'}
+              </button>
+            {/if}
+          </div>
+          {#if updateState === 'available' && update && s.auto_update && updateReady === update.version}
+            <p class="hint">Уже скачана и установится сама, когда вы закроете окна Clipwire и пару минут не будете им пользоваться.</p>
+          {/if}
+          {#if updateState === 'error'}<p class="error">Не удалось проверить обновления: {updateError}</p>{/if}
+          <p class="hint">Обновления скачиваются с GitHub и проверяются по цифровой подписи.</p>
+        </div>
+
+        <div class="section-head">
+          <h2>Состояние</h2>
+          <button class="link small" disabled={overviewBusy} onclick={loadOverview}>{overviewBusy ? 'Обновляю…' : 'Обновить'}</button>
+        </div>
         <div class="card">
-          <div class="kv"><span>Версия</span><span class="mono">{info?.version ?? '—'}</span></div>
+          <div class="kv">
+            <span>Сервер</span>
+            <span class="tone" data-tone={statusTone(status)}>{statusText(status)}</span>
+          </div>
+          {#if configured}
+            {@const storage = storageState ? storageLabel(storageState) : null}
+            <div class="kv">
+              <span>Хранилище файлов</span>
+              <span class="tone" data-tone={storage?.tone ?? 'muted'}>{storage?.text ?? '—'}</span>
+            </div>
+          {/if}
+          <div class="kv">
+            <span>История на этом устройстве</span>
+            <span>{stats ? historyLabel(stats.history_total, stats.history_pinned, fmt) : '—'}</span>
+          </div>
+          <div class="kv">
+            <span>Скачанные файлы</span>
+            <span>{cacheBytes === null ? '—' : cacheBytes === 0 ? 'Нет' : bytesLabel(cacheBytes)}</span>
+          </div>
+          {#if configured}
+            <div class="kv">
+              <span>История группы на сервере</span>
+              {#if stats?.server}
+                <span>{serverItemsLabel(stats.server, fmt)}</span>
+              {:else}
+                <span class="tone" data-tone="muted">{stats?.server_error ?? '—'}</span>
+              {/if}
+            </div>
+            <div class="kv">
+              <span>Файлы на сервере</span>
+              <span>{stats?.server ? serverFilesLabel(stats.server, fmt) : '—'}</span>
+            </div>
+            <div class="kv">
+              <span>Устройств в группе</span>
+              {#if groupDevices}
+                <span>{devicesLabel(groupDevices)}</span>
+              {:else}
+                <span class="tone" data-tone="muted">{devicesError || '—'}</span>
+              {/if}
+            </div>
+          {/if}
+        </div>
+        {#if configured}
+          <p class="hint outside">На сервере всё лежит зашифрованным и удаляется по сроку, заданному на сервере.</p>
+        {/if}
+
+        <h2>О проекте</h2>
+        <div class="card">
           <div class="kv"><span>Исходный код</span><button class="link" onclick={() => openUrl('https://github.com/erneywhite/clipwire')}>github.com/erneywhite/clipwire</button></div>
           <div class="kv"><span>Лицензия</span><span>AGPL-3.0</span></div>
         </div>
@@ -707,27 +824,6 @@
             </svg>
             Buy me a coffee
           </button>
-        </div>
-        <h2>Обновления</h2>
-        <div class="card pad">
-          {#if updateState === 'available' && update}
-            <p>Доступна версия {update.version}</p>
-            {#if s.auto_update && updateReady === update.version}
-              <p class="hint">Уже скачана и установится сама, когда вы закроете окна Clipwire и пару минут не будете им пользоваться.</p>
-            {/if}
-            <button class="primary" onclick={installUpdate}>
-              {s.auto_update && updateReady === update.version ? 'Установить сейчас' : 'Установить и перезапустить'}
-            </button>
-          {:else if updateState === 'installing'}
-            <p>Скачивание и установка…</p>
-          {:else}
-            {#if updateState === 'none'}<p>Установлена последняя версия</p>{/if}
-            {#if updateState === 'error'}<p class="error">Не удалось проверить обновления: {updateError}</p>{/if}
-            <button disabled={updateState === 'checking'} onclick={checkUpdates}>
-              {updateState === 'checking' ? 'Проверка…' : 'Проверить обновления'}
-            </button>
-          {/if}
-          <p class="hint">Обновления скачиваются с GitHub и проверяются по цифровой подписи.</p>
         </div>
       {/if}
     </main>
@@ -1209,5 +1305,48 @@
   button.link:hover {
     background: none;
     text-decoration: underline;
+  }
+  button.link.small {
+    font-size: var(--text-s);
+  }
+  .update-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+  }
+  .update-head p {
+    margin: 0;
+  }
+  .update-head button {
+    align-self: center;
+  }
+  .version {
+    font-weight: 600;
+    margin-bottom: var(--space-1) !important;
+  }
+  .accent-text {
+    color: var(--c-accent);
+  }
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin: var(--space-5) 2px var(--space-2);
+  }
+  .section-head h2 {
+    margin: 0;
+  }
+  .tone[data-tone='ok'] {
+    color: var(--c-text);
+  }
+  .tone[data-tone='error'] {
+    color: var(--c-danger);
+  }
+  .tone[data-tone='warn'] {
+    color: var(--st-connecting);
+  }
+  .tone[data-tone='muted'] {
+    color: var(--c-muted);
   }
 </style>

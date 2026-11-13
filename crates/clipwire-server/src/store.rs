@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use clipwire_core::blob::{CHUNK, OVERHEAD};
+use clipwire_core::proto::GroupStats;
 use clipwire_core::{BlobId, DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
@@ -348,6 +349,38 @@ impl Store {
             out.push(next);
         }
         Ok(out)
+    }
+
+    /// Что лежит у группы на сервере, без просроченного (до `not_before_ms`).
+    /// Файл считается, только если загружен целиком.
+    pub fn group_stats(&self, group: &GroupId, not_before_ms: i64) -> Result<GroupStats> {
+        let conn = self.conn();
+        let (items, item_bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(length(ciphertext)), 0) FROM items
+             WHERE group_id = ?1 AND received_ms >= ?2",
+            params![&group.0[..], not_before_ms],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut files = 0u64;
+        let mut file_bytes = 0u64;
+        let mut stmt =
+            conn.prepare("SELECT size, have FROM blobs WHERE group_id = ?1 AND created_ms >= ?2")?;
+        let rows = stmt.query_map(params![&group.0[..], not_before_ms], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+        })?;
+        for row in rows {
+            let (size, have) = row?;
+            if have >= clipwire_core::blob::chunk_count(size) {
+                files += 1;
+                file_bytes += size;
+            }
+        }
+        Ok(GroupStats {
+            items: items as u64,
+            item_bytes: item_bytes as u64,
+            files,
+            file_bytes,
+        })
     }
 
     /// Удаляет просроченные элементы во всех группах. Возвращает число удалённых.

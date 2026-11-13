@@ -64,6 +64,39 @@ fn controller(app: &AppHandle) -> CmdResult<Controller> {
         .ok_or_else(|| "Устройство не в группе".into())
 }
 
+/// Что лежит в истории здесь и у группы на сервере (раздел «О программе»).
+#[derive(Debug, Clone, Serialize)]
+pub struct StatsDto {
+    pub history_total: usize,
+    pub history_pinned: usize,
+    /// Цифры сервера; `None` — не спрашивали (устройство не в группе).
+    pub server: Option<clipwire_core::proto::GroupStats>,
+    /// Почему цифр сервера нет: нет связи, старый сервер.
+    pub server_error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn stats_overview(app: AppHandle) -> StatsDto {
+    let (history_total, history_pinned) = {
+        let state = app.state::<AppState>();
+        let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        (h.len(), h.pinned_len())
+    };
+    let (server, server_error) = match controller(&app) {
+        Err(_) => (None, None),
+        Ok(ctl) => match ctl.server_stats().await {
+            Ok(s) => (Some(s), None),
+            Err(e) => (None, Some(e)),
+        },
+    };
+    StatsDto {
+        history_total,
+        history_pinned,
+        server,
+        server_error,
+    }
+}
+
 /// Устройства группы: это устройство первым, дальше по имени.
 #[tauri::command]
 pub async fn devices_list(app: AppHandle) -> CmdResult<Vec<DeviceDto>> {

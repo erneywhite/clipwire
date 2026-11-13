@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clipwire_core::device::{DeviceCard, Rekey, open_rekey, rekey_public};
 use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
-use clipwire_core::proto::{ALPN, ClientMsg, DeviceEntry, ServerMsg};
+use clipwire_core::proto::{ALPN, ALPN_4, ClientMsg, DeviceEntry, GroupStats, ServerMsg};
 use clipwire_core::{Content, DeviceId, Ext, ExtList, GroupId, GroupKey, Item, ItemId, SourceApp};
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey, Watcher};
@@ -173,6 +173,10 @@ pub struct Engine {
     /// Команды интерфейса: список устройств и смена ключа.
     control: Option<mpsc::Receiver<Control>>,
     devices_waiters: VecDeque<DevicesWaiter>,
+    /// Ждут ответа `Stats`, по порядку запросов.
+    stats_waiters: VecDeque<tokio::sync::oneshot::Sender<Result<GroupStats, String>>>,
+    /// Сервер выбрал [`ALPN_4`]: знает `GetStats`.
+    stats_supported: bool,
     /// Ключ группы сменён (здесь или на другом устройстве) или устройство
     /// исключено: больше не подключаться, ждать, пока движок снимут.
     terminal: bool,
@@ -239,6 +243,8 @@ impl Engine {
             reserve_failures: 0,
             control: None,
             devices_waiters: VecDeque::new(),
+            stats_waiters: VecDeque::new(),
+            stats_supported: false,
             terminal: false,
             card_check: None,
             cards_off_until: None,
@@ -368,6 +374,9 @@ impl Engine {
                 .await;
             // Ответов на запросы списка из оборвавшейся сессии уже не будет.
             for w in self.devices_waiters.drain(..).flatten() {
+                let _ = w.send(Err("Связь с сервером оборвалась".into()));
+            }
+            for w in self.stats_waiters.drain(..) {
                 let _ = w.send(Err("Связь с сервером оборвалась".into()));
             }
             match res {
@@ -585,6 +594,7 @@ impl Engine {
                 }
             }
         };
+        self.stats_supported = conn.alpn() == ALPN_4;
         // Вошли в старую группу как обычно: `Rekey`, на который не пришёл
         // ответ, до сервера не дошёл, ключ не сменился.
         if self.pending_rekey.take().is_some() {
@@ -706,6 +716,14 @@ impl Engine {
                         write_msg(&mut send, &ClientMsg::ListDevices).await?;
                         self.devices_waiters.push_back(Some(reply));
                     }
+                    Control::Stats(reply) => {
+                        if self.stats_supported {
+                            write_msg(&mut send, &ClientMsg::GetStats).await?;
+                            self.stats_waiters.push_back(reply);
+                        } else {
+                            let _ = reply.send(Err(crate::devices::OLD_SERVER_STATS.into()));
+                        }
+                    }
                     Control::SetGroupConfig { sealed, config, reply } => {
                         if !self.config_supported {
                             let _ = reply.send(Err(
@@ -780,6 +798,12 @@ impl Engine {
             ServerMsg::Excluded => return Err(self.rotated(None)),
             ServerMsg::Error(e) => bail!("сервер: {e}"),
             ServerMsg::GroupConfig(sealed) => self.group_config(key, sealed),
+            ServerMsg::Stats(stats) => match self.stats_waiters.pop_front() {
+                Some(reply) => {
+                    let _ = reply.send(Ok(stats));
+                }
+                None => tracing::debug!("лишний ответ Stats"),
+            },
             other => tracing::debug!("пропускаю {other:?}"),
         }
         Ok(())
@@ -1243,10 +1267,13 @@ fn is_fresh(item: &Item, now_ms: u64, window: Duration) -> bool {
 /// отказал по токену, ждать таймаута бессмысленно, iroh будет повторять с тем
 /// же токеном вечно.
 async fn connect(ep: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
+    // Предлагаем оба ALPN: сервер 0.1.1 выберет `clipwire/3`, новый — `/4`.
+    let opts = iroh::endpoint::ConnectOptions::new().with_additional_alpns(vec![ALPN.to_vec()]);
+    let attempt = async { anyhow::Ok(ep.connect_with_opts(addr, ALPN_4, opts).await?.await?) };
     tokio::select! {
-        r = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN)) => {
+        r = tokio::time::timeout(CONNECT_TIMEOUT, attempt) => {
             match r {
-                Ok(c) => Ok(c?),
+                Ok(c) => c,
                 Err(_) => bail!("таймаут подключения{}", relay_hint(ep)),
             }
         }
@@ -1346,6 +1373,9 @@ fn refuse_control(ctl: Control, why: &str) {
             let _ = reply.send(Err(why.to_string()));
         }
         Control::SetGroupConfig { reply, .. } => {
+            let _ = reply.send(Err(why.to_string()));
+        }
+        Control::Stats(reply) => {
             let _ = reply.send(Err(why.to_string()));
         }
     }

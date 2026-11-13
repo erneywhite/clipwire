@@ -21,6 +21,15 @@ use crate::item::DeviceId;
 /// ALPN протокола. Меняем номер при несовместимых изменениях формата.
 pub const ALPN: &[u8] = b"clipwire/3";
 
+/// Тот же формат, что [`ALPN`], плюс сообщения, которых сервер 0.1.1 не знает
+/// (`GetStats`). Агент предлагает оба ALPN, сервер выбирает новейший из
+/// известных ему: по [`Connection::alpn`] агент узнаёт, что можно спрашивать.
+/// Незнакомое сообщение старый сервер встречает обрывом соединения, поэтому
+/// без такой проверки новые сообщения слать нельзя.
+///
+/// [`Connection::alpn`]: https://docs.rs/iroh/latest/iroh/endpoint/struct.Connection.html#method.alpn
+pub const ALPN_4: &[u8] = b"clipwire/4";
+
 /// Предел одного кадра. Сервер может выставить свой лимит на элемент
 /// меньше, этот нужен, чтобы не выделять память под мусорную длину.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -71,6 +80,21 @@ pub enum ClientMsg {
     /// Попросить настройки группы — ответ `GroupConfig`. Заодно подписывает
     /// соединение на их изменения.
     GetGroupConfig,
+    /// Сколько у группы лежит на сервере — ответ `Stats`. Только по [`ALPN_4`].
+    GetStats,
+}
+
+/// Что лежит на сервере у группы (ответ на `GetStats`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupStats {
+    /// Элементов истории.
+    pub items: u64,
+    /// Их объём в зашифрованном виде, байт.
+    pub item_bytes: u64,
+    /// Файлов в хранилище сервера, загруженных целиком.
+    pub files: u64,
+    /// Их размер, байт.
+    pub file_bytes: u64,
 }
 
 /// Устройство группы в списке `Devices`.
@@ -110,6 +134,8 @@ pub enum ServerMsg {
     /// не задавались. Только в ответ на `GetGroupConfig` и после него при
     /// каждом `SetGroupConfig` с любого устройства группы.
     GroupConfig(Option<Vec<u8>>),
+    /// Ответ на `GetStats`.
+    Stats(GroupStats),
 }
 
 /// Первый кадр потока файла.

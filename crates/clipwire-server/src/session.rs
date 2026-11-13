@@ -1,4 +1,5 @@
-//! Обработка одного подключения агента по ALPN `clipwire/3`.
+//! Обработка одного подключения агента по ALPN `clipwire/3` и `clipwire/4`
+//! (формат один, по второму агент ещё спрашивает `GetStats`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -323,6 +324,10 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         reg.subscribe_config();
                         let config = shared.store.group_config(&group)?;
                         write_msg(&mut send, &ServerMsg::GroupConfig(config)).await?;
+                    }
+                    Some(ClientMsg::GetStats) => {
+                        let stats = shared.store.group_stats(&group, shared.not_before_ms())?;
+                        write_msg(&mut send, &ServerMsg::Stats(stats)).await?;
                     }
                     Some(ClientMsg::ListDevices) => {
                         write_msg(&mut send, &crate::devices::list_devices(shared, &group)?).await?;

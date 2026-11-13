@@ -362,6 +362,7 @@ pub fn run() {
             commands::leave_group,
             commands::device_info,
             devices::devices_list,
+            devices::stats_overview,
             devices::device_remove,
             devices::group_rekey,
             devices::group_retry,

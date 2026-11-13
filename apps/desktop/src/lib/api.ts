@@ -48,6 +48,24 @@ export interface GroupDevice {
   last_seen_ms: number
 }
 
+/** Что лежит у группы на сервере. */
+export interface GroupStats {
+  items: number
+  item_bytes: number
+  /** Файлы, загруженные целиком. */
+  files: number
+  file_bytes: number
+}
+
+/** Счётчики раздела «О программе» (`stats_overview`). */
+export interface StatsOverview {
+  history_total: number
+  history_pinned: number
+  /** null — устройство не в группе или сервер не ответил (см. server_error). */
+  server: GroupStats | null
+  server_error: string | null
+}
+
 /** Итог смены ключа группы. */
 export interface RekeyResult {
   /** Новый код приглашения. */
@@ -270,6 +288,7 @@ export const api = {
   /** Версия, которая уже скачана и поставится сама, или null. */
   updateReady: () => invoke<string | null>('update_ready'),
   devicesList: () => invoke<GroupDevice[]>('devices_list'),
+  statsOverview: () => invoke<StatsOverview>('stats_overview'),
   deviceRemove: (deviceId: string) => invoke<RekeyResult>('device_remove', { deviceId }),
   groupRekey: () => invoke<RekeyResult>('group_rekey'),
   /** После исключения: снять отметку и снова запустить синхронизацию. */

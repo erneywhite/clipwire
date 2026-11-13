@@ -528,6 +528,11 @@ impl History {
         self.entries.len()
     }
 
+    /// Сколько записей закреплено.
+    pub fn pinned_len(&self) -> usize {
+        self.entries.iter().filter(|e| e.pinned).count()
+    }
+
     /// Блобы файлов всех записей: скачанное по ним в кэше ещё нужно.
     pub fn blobs(&self) -> std::collections::HashSet<clipwire_core::BlobId> {
         referenced_blobs(&self.entries)
