@@ -311,7 +311,9 @@ Full description: [docs/storage.md](docs/storage.md).
 - Everything is encrypted end to end. The server sees only ciphertext; the key exists only on
   your devices.
 - The local history is stored in SQLite, and every entry is encrypted with a local key protected
-  by DPAPI on Windows and by a key in the Keychain on macOS. The group key is protected the same way.
+  by DPAPI on Windows, by a key in the Keychain on macOS and by a key in the system password store
+  (Secret Service: GNOME Keyring, KWallet) on Linux. The group key is protected the same way. On
+  a Linux desktop without a password store the keys stay in files only you can read (mode 0600).
 - Content that password managers mark as private is never synced. Programs can also be excluded
   from syncing (password managers are on the list by default).
 - Files downloaded from other devices are marked as coming from the internet, so Windows (and

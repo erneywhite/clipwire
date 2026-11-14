@@ -1,8 +1,8 @@
 //! Защита секретов на диске (ключ группы, ключ устройства, токен relay).
 //!
 //! На Windows — DPAPI: расшифровать файл может только тот же пользователь на
-//! той же машине. На macOS — ключ в связке ключей (см. `imp`). На Linux пока
-//! файл с правами 0600.
+//! той же машине. На macOS — ключ в связке ключей, на Linux — в Secret Service
+//! (gnome-keyring, KWallet, KeePassXC…); файлы шифруются этим ключом (см. [`sealed`]).
 
 #[cfg(windows)]
 mod imp {
@@ -74,6 +74,44 @@ mod imp {
     }
 }
 
+/// Формат файлов под ключом из хранилища ОС (macOS и Linux): [`MAGIC`],
+/// nonce и шифротекст XChaCha20-Poly1305. Старые файлы — открытые, без него.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod sealed {
+    use anyhow::{Result, anyhow};
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+
+    use crate::i18n::tr;
+
+    pub const MAGIC: &[u8; 4] = b"CWK1";
+    const NONCE: usize = 24;
+
+    pub fn seal(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
+        let mut nonce = [0u8; NONCE];
+        getrandom::fill(&mut nonce).map_err(|e| anyhow!("{e}"))?;
+        let ct = XChaCha20Poly1305::new(key.into())
+            .encrypt(&XNonce::from(nonce), data)
+            .map_err(|_| anyhow!("шифрование не удалось"))?;
+        Ok([MAGIC.as_slice(), &nonce, &ct].concat())
+    }
+
+    /// `wrong_key` — текст ошибки (уже переведённый), если ключ не подошёл.
+    pub fn open(key: &[u8; 32], data: &[u8], wrong_key: &str) -> Result<Vec<u8>> {
+        let rest = &data[MAGIC.len()..];
+        anyhow::ensure!(rest.len() > NONCE, tr("файл с секретами повреждён"));
+        let (nonce, ct) = rest.split_at(NONCE);
+        let nonce: [u8; NONCE] = nonce.try_into().expect("длина проверена выше");
+        XChaCha20Poly1305::new(key.into())
+            .decrypt(&XNonce::from(nonce), ct)
+            .map_err(|_| anyhow!(wrong_key.to_string()))
+    }
+
+    pub fn is_sealed(data: &[u8]) -> bool {
+        data.starts_with(MAGIC)
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     //! macOS: как DPAPI на Windows, только ключ — в связке ключей. Там лежит
@@ -89,18 +127,14 @@ mod imp {
     //! Они пишут, как раньше, открыто (файл 0600). Читают зашифрованное все.
 
     use anyhow::{Context, Result, anyhow};
-    use chacha20poly1305::aead::{Aead, KeyInit};
-    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use super::sealed::{is_sealed, open, seal};
     use crate::i18n::tr;
 
     pub const SERVICE: &str = "io.github.erneywhite.clipwire";
     const ACCOUNT: &str = "state-key";
-    /// Начало зашифрованного файла. Старые файлы — открытые, без него.
-    pub const MAGIC: &[u8; 4] = b"CWK1";
-    const NONCE: usize = 24;
 
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
@@ -136,33 +170,6 @@ mod imp {
         Ok(k)
     }
 
-    pub fn seal(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
-        let mut nonce = [0u8; NONCE];
-        getrandom::fill(&mut nonce).map_err(|e| anyhow!("{e}"))?;
-        let ct = XChaCha20Poly1305::new(key.into())
-            .encrypt(&XNonce::from(nonce), data)
-            .map_err(|_| anyhow!("шифрование не удалось"))?;
-        Ok([MAGIC.as_slice(), &nonce, &ct].concat())
-    }
-
-    pub fn open(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
-        let rest = &data[MAGIC.len()..];
-        anyhow::ensure!(rest.len() > NONCE, tr("файл с секретами повреждён"));
-        let (nonce, ct) = rest.split_at(NONCE);
-        let nonce: [u8; NONCE] = nonce.try_into().expect("длина проверена выше");
-        XChaCha20Poly1305::new(key.into())
-            .decrypt(&XNonce::from(nonce), ct)
-            .map_err(|_| {
-                anyhow!(tr(
-                    "файл с секретами не расшифровался: ключ в связке ключей другой"
-                ))
-            })
-    }
-
-    pub fn is_sealed(data: &[u8]) -> bool {
-        data.starts_with(MAGIC)
-    }
-
     pub fn protect(data: &[u8]) -> Result<Vec<u8>> {
         if !ENABLED.load(Ordering::Relaxed) {
             return Ok(data.to_vec());
@@ -174,7 +181,11 @@ mod imp {
         if !is_sealed(data) {
             return Ok(data.to_vec());
         }
-        open(&key(false)?, data)
+        open(
+            &key(false)?,
+            data,
+            tr("файл с секретами не расшифровался: ключ в связке ключей другой"),
+        )
     }
 
     /// Файл записан открыто, а шифрование включено: переписать.
@@ -183,10 +194,146 @@ mod imp {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
 mod imp {
-    // shortcut: на Linux секреты пока лежат открыто в файле 0600.
-    // Переделать на Secret Service вместе с клиентом.
+    //! Linux: ключ Clipwire — в Secret Service (gnome-keyring в GNOME, KWallet
+    //! в KDE, KeePassXC и др.), атрибуты [`ATTRS`]. Файлы шифруются им, как на
+    //! macOS. Хранилище открывается при входе в систему вместе с сеансом.
+    //!
+    //! Шифрует только приложение ([`enable_keychain`]): консольный агент и
+    //! тесты пишут открыто (в CI хранилища нет). Если хранилища нет совсем
+    //! (минимальная оболочка без gnome-keyring), приложение тоже пишет
+    //! открыто в файл 0600 и предупреждает в логе. Читают зашифрованное все.
+
+    use anyhow::{Result, anyhow};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::sealed::{is_sealed, open, seal};
+    use crate::i18n::tr;
+
+    const ATTRS: [(&str, &str); 2] = [
+        ("application", "io.github.erneywhite.clipwire"),
+        ("type", "state-key"),
+    ];
+    /// Хранилище, которого нет, D-Bus ищет до 25 секунд — столько не ждём.
+    const TIMEOUT: Duration = Duration::from_secs(8);
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+    /// Хранилище не ответило: дальше в этом запуске не пробуем.
+    static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+    /// Шифровать новые записи ключом из хранилища (приложение).
+    pub fn enable_keychain() {
+        ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    fn attrs() -> HashMap<&'static str, &'static str> {
+        ATTRS.into_iter().collect()
+    }
+
+    /// Ключ из хранилища; `create` — завести, если его ещё нет.
+    fn fetch(create: bool) -> Result<Option<[u8; 32]>> {
+        use secret_service::EncryptionType;
+        use secret_service::blocking::SecretService;
+        let ss = SecretService::connect(EncryptionType::Dh)?;
+        let found = ss.search_items(attrs())?;
+        let item = match (found.unlocked.into_iter().next(), found.locked.first()) {
+            (Some(item), _) => Some(item),
+            (None, Some(locked)) => {
+                // Хранилище заперто: система спросит пароль.
+                locked.unlock()?;
+                Some(ss.get_item_by_path(locked.item_path.clone())?)
+            }
+            (None, None) => None,
+        };
+        if let Some(item) = item {
+            let v = item.get_secret()?;
+            let k: [u8; 32] = v
+                .try_into()
+                .map_err(|_| anyhow!(tr("ключ Clipwire в хранилище паролей повреждён")))?;
+            return Ok(Some(k));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let k = crate::state::random_key()?;
+        let collection = ss.get_default_collection()?;
+        collection.ensure_unlocked()?;
+        collection.create_item("Clipwire", attrs(), &k, true, "application/octet-stream")?;
+        Ok(Some(k))
+    }
+
+    fn key(create: bool) -> Result<Option<[u8; 32]>> {
+        let mut slot = KEY.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(k) = *slot {
+            return Ok(Some(k));
+        }
+        if UNAVAILABLE.load(Ordering::Relaxed) {
+            return Err(anyhow!(tr("хранилище паролей недоступно")));
+        }
+        // В отдельном потоке: зависший D-Bus не должен вешать запуск.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch(create).map_err(|e| format!("{e:#}")));
+        });
+        let res = match rx.recv_timeout(TIMEOUT) {
+            Ok(r) => r.map_err(|e| anyhow!(e)),
+            Err(_) => Err(anyhow!("нет ответа за {} с", TIMEOUT.as_secs())),
+        };
+        match res {
+            Ok(k) => {
+                *slot = k;
+                Ok(k)
+            }
+            Err(e) => {
+                UNAVAILABLE.store(true, Ordering::Relaxed);
+                Err(e.context(tr("хранилище паролей недоступно")))
+            }
+        }
+    }
+
+    pub fn protect(data: &[u8]) -> Result<Vec<u8>> {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return Ok(data.to_vec());
+        }
+        match key(true) {
+            Ok(Some(k)) => seal(&k, data),
+            Ok(None) => unreachable!("create=true всегда возвращает ключ"),
+            Err(e) => {
+                tracing::warn!("секреты пишутся открыто в файл 0600: {e:#}");
+                Ok(data.to_vec())
+            }
+        }
+    }
+
+    pub fn unprotect(data: &[u8]) -> Result<Vec<u8>> {
+        if !is_sealed(data) {
+            return Ok(data.to_vec());
+        }
+        let k = key(false)?.ok_or_else(|| {
+            anyhow!(tr(
+                "файл с секретами зашифрован, а ключа Clipwire в хранилище паролей нет"
+            ))
+        })?;
+        open(
+            &k,
+            data,
+            tr("файл с секретами не расшифровался: ключ в хранилище паролей другой"),
+        )
+    }
+
+    /// Файл записан открыто, а шифрование включено и хранилище доступно.
+    pub fn needs_upgrade(data: &[u8]) -> bool {
+        ENABLED.load(Ordering::Relaxed) && !is_sealed(data) && !UNAVAILABLE.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+mod imp {
     pub fn protect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
         Ok(data.to_vec())
     }
@@ -196,34 +343,35 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use imp::enable_keychain;
 pub use imp::{protect, unprotect};
 
 /// Расшифровать содержимое файла `path`; если оно лежало в старом виде
-/// (macOS: открыто, до связки ключей), переписать файл защищённым.
+/// (macOS и Linux: открыто, до хранилища ключей), переписать файл защищённым.
 pub fn unprotect_file(path: &std::path::Path, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
     let plain = unprotect(raw)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if imp::needs_upgrade(raw) {
         match protect(&plain).and_then(|sealed| crate::state::write_atomic(path, &sealed)) {
             Ok(()) => {
-                tracing::info!(path = %path.display(), "секреты перенесены под ключ из связки ключей")
+                tracing::info!(path = %path.display(), "секреты перенесены под ключ из хранилища ключей ОС")
             }
             Err(e) => tracing::warn!("{} не переписался защищённым: {e:#}", path.display()),
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = path;
     Ok(plain)
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn mac_seal_format() {
-        use super::imp::{is_sealed, open, seal};
+    fn seal_format() {
+        use super::sealed::{is_sealed, seal};
+        let open = |k: &[u8; 32], d: &[u8]| super::sealed::open(k, d, "x");
         let key = [7u8; 32];
         let sealed = seal(&key, b"group key").unwrap();
         assert!(is_sealed(&sealed));
@@ -259,6 +407,19 @@ mod tests {
         );
         delete_generic_password(super::imp::SERVICE, &account).unwrap();
         assert!(get_generic_password(super::imp::SERVICE, &account).is_err());
+    }
+
+    /// Настоящий Secret Service: включает шифрование, пишет и читает, затем
+    /// удаляет ключ. Запуск в сеансе с gnome-keyring:
+    /// `cargo test -p clipwire-agent --lib secret_service_roundtrip -- --ignored`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "нужен Secret Service (gnome-keyring) в сеансе"]
+    fn secret_service_roundtrip() {
+        super::enable_keychain();
+        let sealed = super::protect(b"group key").unwrap();
+        assert!(super::sealed::is_sealed(&sealed), "хранилище недоступно?");
+        assert_eq!(super::unprotect(&sealed).unwrap(), b"group key");
     }
 
     #[test]

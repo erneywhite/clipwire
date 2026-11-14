@@ -318,6 +318,10 @@ pub fn run() {
     if std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/")) {
         clipwire_agent::secret::enable_keychain();
     }
+    // Linux: секреты под ключом из Secret Service (gnome-keyring, KWallet).
+    // Подписи, как на маке, тут нет, поэтому и у `tauri dev` тоже.
+    #[cfg(target_os = "linux")]
+    clipwire_agent::secret::enable_keychain();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {

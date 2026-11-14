@@ -318,6 +318,22 @@ pub static EN: &[(&str, &str)] = &[
     ),
     ("файл с секретами повреждён", "the secrets file is damaged"),
     (
+        "файл с секретами не расшифровался: ключ в хранилище паролей другой",
+        "the secrets file could not be decrypted: the key in the password store is different",
+    ),
+    (
+        "файл с секретами зашифрован, а ключа Clipwire в хранилище паролей нет",
+        "the secrets file is encrypted, but the Clipwire key is missing from the password store",
+    ),
+    (
+        "ключ Clipwire в хранилище паролей повреждён",
+        "the Clipwire key in the password store is damaged",
+    ),
+    (
+        "хранилище паролей недоступно",
+        "the password store is unavailable",
+    ),
+    (
         "файл с секретами не расшифровался: ключ в связке ключей другой",
         "could not decrypt the secrets file: the key in the keychain is different",
     ),

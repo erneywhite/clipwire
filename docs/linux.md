@@ -160,9 +160,16 @@ sudo apt-get install -y build-essential curl git pkg-config libssl-dev \
 
 ### 5. Секреты (`secret.rs`)
 
-Ключ в Secret Service (gnome-keyring, KWallet) через крейт `keyring` или `secret-service`,
-файлы шифруются им — как сделано на macOS. Если Secret Service нет (голый оконный
-менеджер), остаётся файл 0600 с предупреждением в логе. Старые файлы перенести.
+Сделано: случайный ключ Clipwire лежит в Secret Service (крейт `secret-service`, блокирующий
+API на своём потоке async-io; атрибуты `application=io.github.erneywhite.clipwire`,
+`type=state-key`, подпись «Clipwire»). Файлы шифруются им в том же формате, что на macOS
+(`CWK1`, XChaCha20-Poly1305, общий модуль `secret::sealed`). Запертое хранилище открывается
+с вопросом пароля. Шифрует приложение (`enable_keychain` в `lib.rs`); консольный агент и
+тесты пишут открыто. Хранилища нет или оно не ответило за 8 с — запись открыто в файл 0600 с
+предупреждением, дальше в этом запуске не пробуем. Старые открытые файлы при чтении
+переписываются зашифрованными. Проверено в GNOME 46: тест `secret_service_roundtrip`, запись
+видна в `secret-tool search application io.github.erneywhite.clipwire`, `history.key`
+тестовой установки переехал в `CWK1`.
 
 ### 6. Мелочи
 
