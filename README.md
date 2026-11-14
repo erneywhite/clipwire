@@ -33,7 +33,8 @@ The server is a single Docker container. The client keeps a searchable, encrypte
 a small paste window that opens next to the mouse cursor. Without a server the client still
 works as a local clipboard history on one computer, and you can connect a server later.
 
-There are clients for Windows and macOS (13 Ventura or newer, Apple Silicon and Intel). A Linux client (X11 and Wayland) is in progress, see [docs/linux.md](docs/linux.md).
+There are clients for Windows, macOS (13 Ventura or newer, Apple Silicon and Intel) and Linux
+(x86-64; X11 and Wayland: GNOME, KDE Plasma, Sway, Hyprland and others).
 
 Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneywhite/clipwire/issues).
 
@@ -80,6 +81,24 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
    first paste it explains how to give it and opens the right page of System Settings; until then the
    chosen entry is just put on the clipboard. Updates keep the permission: every version is signed
    with the same certificate.
+
+**Linux.**
+
+1. Download from [Releases](https://github.com/erneywhite/clipwire/releases):
+   - Ubuntu, Debian, Linux Mint, Pop!_OS: `Clipwire_*_linux_amd64.deb`, then
+     `sudo apt install ./Clipwire_*_linux_amd64.deb`;
+   - any other distribution: `Clipwire_*_linux_amd64.AppImage`, then
+     `chmod +x Clipwire_*_linux_amd64.AppImage` and run it.
+2. Start Clipwire from the application menu. It lives in the tray; press Ctrl+Alt+V to open the
+   paste window (on Linux Ctrl+Shift+V is how terminals paste, so the default is different).
+3. **Tray icon in GNOME.** Ubuntu shows tray icons out of the box. On other GNOME distributions
+   (Fedora, Debian) install the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/)
+   extension, otherwise the icon is not shown (Clipwire still works: open it from the menu).
+4. **Wayland.** The paste window opens in the middle of the screen. To have it paste by itself,
+   turn on **Paste into the active window**; the system asks once for permission, see
+   [Paste window](#paste-window). On GNOME the shortcut is added to the system shortcuts
+   automatically; on other Wayland desktops bind `clipwire --popup` to a key yourself.
+5. Keys are kept in the system password store (GNOME Keyring, KWallet).
 
 **Without a server.** History and the paste window work on a single computer. You can connect
 a server at any time: the last 50 entries of the local history go to the group, and the group's
@@ -334,6 +353,10 @@ neither the program nor the clipboard was used for a couple of minutes. If it di
 before you quit, it installs at the next start. After an update you get a notification, and a
 paused sync stays paused. If an installation fails, you are told, and Clipwire does not retry
 that version on its own, only from the button.
+
+On Linux the AppImage updates the same way. The `.deb` package is updated only from the button
+(Settings → About, or the tray menu): installing a package needs your password, and a password
+prompt appearing out of nowhere is a bad habit to teach.
 
 The update is checked against a digital signature, and the version number in the server's reply
 is compared with the version inside the signature, so a tampered file or an old installer under a

@@ -1,4 +1,4 @@
-# Релиз клиента: по тегу vX.Y.Z собирает установщики Windows и macOS,
+# Релиз клиента: по тегу vX.Y.Z собирает установщики Windows, macOS и Linux,
 # подписывает файлы обновления и публикует релиз с latest.json, который читает
 # автообновление.
 #
@@ -43,7 +43,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: Clipwire ${{ github.ref_name }}
           releaseBody: |
-            Windows — файл Clipwire_*_windows_x64-setup.exe. macOS (13 и новее, Apple Silicon и Intel) — Clipwire_*_macos_universal.dmg, первый запуск описан в README. Уже установленные копии обновятся сами.
+            Windows — файл Clipwire_*_windows_x64-setup.exe. macOS (13 и новее, Apple Silicon и Intel) — Clipwire_*_macos_universal.dmg, первый запуск описан в README. Linux — Clipwire_*_linux_amd64.deb (Ubuntu, Debian, Mint) или Clipwire_*_linux_amd64.AppImage (остальные). Уже установленные копии обновятся сами (.deb — по кнопке, с паролем).
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
@@ -116,3 +116,41 @@ jobs:
           REQ="$(codesign -dr - "$APP" 2>&1)"
           echo "$REQ"
           echo "$REQ" | grep -q 'certificate root = H"'
+
+  # После macOS по той же причине: latest.json дописывается по очереди.
+  # Ubuntu 22.04 — старый glibc: пакеты запускаются и на более старых системах.
+  linux:
+    needs: macos
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Системные библиотеки
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm ci
+        working-directory: apps/desktop
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # linuxdeploy — сам AppImage, а FUSE на раннерах нет.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: Clipwire ${{ github.ref_name }}
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          assetNamePattern: '[name]_[version]_linux_[arch][ext]'

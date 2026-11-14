@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name={{name}}
+Comment=Shared clipboard between your computers through your own server
+Comment[ru]={{comment}}
+Keywords=clipboard;copy;paste;sync;history;
+Keywords[ru]=буфер;копировать;вставить;синхронизация;история;
+Categories={{categories}}
+Exec={{exec}}
+Icon={{icon}}
+StartupWMClass=clipwire
+Terminal=false

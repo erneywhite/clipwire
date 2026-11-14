@@ -23,7 +23,9 @@
 //! сами до вызова. Перезапуск делает установщик: шаблон Tauri в `.onInstSuccess`
 //! при `/S` или `/P` вместе с `/R` запускает программу от имени пользователя
 //! (`nsis_tauri_utils::RunAsUser`). На macOS и Linux `install` возвращает
-//! управление, перезапускаемся через `app.restart()`.
+//! управление, перезапускаемся через `app.restart()`. На Linux AppImage
+//! заменяется файлом целиком, а `.deb` плагин ставит через `pkexec dpkg -i` —
+//! это только по кнопке ([`silent_install_possible`]).
 
 use clipwire_agent::i18n::{tr, trf};
 use std::path::{Path, PathBuf};
@@ -367,8 +369,26 @@ fn forget_pending(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("pending.bin"));
 }
 
+/// Можно ли ставить обновление без человека. Пакет `.deb` ставится через
+/// `pkexec dpkg -i` — с вопросом пароля; вопрос, появившийся сам по себе,
+/// пугает и приучает вводить пароль не глядя. Такое обновление — только по
+/// кнопке. AppImage и остальные системы ставятся тихо.
+fn silent_install_possible() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        tauri::utils::platform::bundle_type() != Some(tauri::utils::config::BundleType::Deb)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
 /// `paused` — пауза, которую надо сохранить через перезапуск.
 fn install_pending(app: &AppHandle, dir: &Path, paused: bool) -> Result<(), String> {
+    if !silent_install_possible() {
+        return Ok(());
+    }
     let Some(pending) = read_json::<Pending>(&dir.join("pending.json")) else {
         return Ok(());
     };
@@ -588,7 +608,7 @@ async fn tick(app: &AppHandle) {
         paused: service_paused(app),
         idle: Duration::from_millis(idle_ms),
     };
-    if !can_install(moment) {
+    if !can_install(moment) || !silent_install_possible() {
         return;
     }
     let Some(ready) = state.ready.lock().unwrap_or_else(|e| e.into_inner()).take() else {

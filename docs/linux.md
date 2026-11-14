@@ -191,12 +191,19 @@ API на своём потоке async-io; атрибуты `application=io.gith
 
 ### 7. Сборка и выпуск
 
-- CI уже гоняет Linux. Добавить тесты фронтенда, если ещё нет.
-- `release.yml`: задание `linux` после `macos` (общий `latest.json`), `tauri-action` с
-  `.deb` и AppImage, `assetNamePattern: '[name]_[version]_linux_[arch][ext]'`, в
-  `latest.json` — `linux-x86_64`.
-- README и README.ru.md: установка на Linux, Wayland и его ограничения, расширение
-  AppIndicator, горячая клавиша на Wayland.
+Сделано:
+
+- `tauri.linux.conf.json`: `.deb` и AppImage, исполняемый файл `clipwire` (`mainBinaryName`),
+  в `.deb` секция `utils` и рекомендация проигрывателя звука. Ярлык — свой шаблон
+  `linux/clipwire.desktop` (английский `Comment` и русский `Comment[ru]`, ключевые слова,
+  `StartupWMClass=clipwire`). Общий `longDescription` в `tauri.conf.json`.
+- `release.yml`: задание `linux` на ubuntu-22.04 (старый glibc), после `macos`, файлы
+  `Clipwire_*_linux_amd64.deb` / `.AppImage`; `latest.json` получает `linux-x86_64`
+  (AppImage) и `linux-x86_64-deb`. `APPIMAGE_EXTRACT_AND_RUN=1` — FUSE на раннерах нет.
+- Обновления: AppImage — тихо, как на других ОС; `.deb` плагин ставит через `pkexec dpkg -i`
+  с паролем, поэтому только по кнопке (`updates::silent_install_possible`).
+- Собрано здесь (`npx tauri build`), `.deb` поставлен через `dpkg -i`: пакет, ярлык, значки и
+  `/usr/bin/clipwire` на месте.
 
 ## Как работать в виртуалке
 
