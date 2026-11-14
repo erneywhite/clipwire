@@ -120,6 +120,9 @@ impl Config {
 pub struct Guards {
     /// Сколько групп может быть на сервере. Сверх этого новые не создаются.
     pub max_groups: usize,
+    /// Сколько устройств может быть в одной группе. Новое устройство сверх
+    /// этого не входит; уже известные входят как раньше.
+    pub max_devices: usize,
     /// Через сколько удаляется резерв файла (`Reserve`), по которому не
     /// пришло ни одной части. Освобождает квоту.
     pub reserve_ttl: Duration,
@@ -151,6 +154,7 @@ impl Default for Guards {
     fn default() -> Self {
         Self {
             max_groups: 100,
+            max_devices: 64,
             reserve_ttl: Duration::from_secs(600),
             max_reserves: 512,
             history_total_bytes: 1024 * 1024 * 1024,
@@ -174,6 +178,7 @@ impl Guards {
         }
         Ok(Self {
             max_groups: parse("CLIPWIRE_MAX_GROUPS", d.max_groups)?,
+            max_devices: parse("CLIPWIRE_MAX_DEVICES", d.max_devices)?,
             reserve_ttl: Duration::from_secs(reserve_secs),
             max_reserves: parse("CLIPWIRE_MAX_RESERVES", d.max_reserves)?,
             history_total_bytes: parse("CLIPWIRE_HISTORY_TOTAL_BYTES", d.history_total_bytes)?,

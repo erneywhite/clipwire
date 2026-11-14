@@ -452,6 +452,7 @@ you delete the key, the server's address changes and every device has to be conn
 | `CLIPWIRE_RESERVE_TTL_SECS` | `600` | after how long space reserved for a file is released if the upload never started |
 | `CLIPWIRE_MAX_RESERVES` | `512` | how many files one device may keep reserved without a single uploaded part |
 | `CLIPWIRE_MAX_GROUPS` | `100` | how many groups the server can hold (creating a group needs the server code; groups with no devices are deleted after 90 days) |
+| `CLIPWIRE_MAX_DEVICES` | `64` | how many devices one group can hold; a new device over the limit is refused, known devices still join |
 | `CLIPWIRE_HISTORY_TOTAL_BYTES` | `1073741824` | total limit of item history per server (1 GiB); the excess is evicted from the largest group |
 | `CLIPWIRE_MAX_DEVICE_CONNS` | `4` | simultaneous connections from one device |
 

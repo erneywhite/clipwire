@@ -950,6 +950,27 @@ async fn max_groups_limits_new_groups() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn max_devices_limits_new_devices_in_group() -> Result<()> {
+    let guards = Guards {
+        max_devices: 2,
+        ..Guards::default()
+    };
+    let (server, relay) = start_server_guarded(|_| {}, guards).await?;
+    let key = GroupKey::generate()?;
+    let a = joined(&server.info, &relay, &key).await?;
+    let b = joined(&server.info, &relay, &key).await?;
+    // Третье новое устройство группа не берёт, с понятной причиной.
+    let mut c = Client::connect(&server.info, &relay, "test-token").await?;
+    let e = join_error(&mut c, &join_with_token(&key, "test-token")).await?;
+    assert!(e.contains("предельное число устройств"), "{e}");
+    // Вход уже известных устройств покрыт тестом хранилища
+    // (`new_devices_stop_at_max_devices_but_known_ones_return`): здесь у
+    // каждого соединения свой ключ iroh, то есть новое устройство.
+    drop((a, b));
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn oversized_first_frame_is_rejected() -> Result<()> {
     let (server, relay) = start_server().await?;
     let key = GroupKey::generate()?;

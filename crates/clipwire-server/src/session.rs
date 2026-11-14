@@ -45,6 +45,7 @@ pub struct Limits {
     pub blob_total_quota: u64,
     pub blob_stall: Duration,
     pub max_groups: usize,
+    pub max_devices: usize,
     pub reserve_ttl: Duration,
     pub max_reserves: usize,
     pub history_total_bytes: u64,
@@ -64,6 +65,7 @@ impl Limits {
             blob_total_quota: config.blob_total_quota,
             blob_stall: config.blob_stall,
             max_groups: guards.max_groups,
+            max_devices: guards.max_devices,
             reserve_ttl: guards.reserve_ttl,
             max_reserves: guards.max_reserves,
             history_total_bytes: guards.history_total_bytes,
@@ -231,13 +233,14 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         }
     };
 
-    let outcome = shared.store.join(
+    let outcome = shared.store.join_limited(
         &group,
         &req.secret,
         &device,
         now_ms(),
         may_create,
         shared.limits.max_groups,
+        shared.limits.max_devices,
     )?;
     let reason = match &outcome {
         JoinOutcome::Rotated(r) => {
@@ -252,6 +255,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         JoinOutcome::Denied => Some("неверный секрет группы"),
         JoinOutcome::NoGroup => Some("группы нет; создать группу можно только с кодом сервера"),
         JoinOutcome::TooManyGroups => Some("на сервере уже предельное число групп"),
+        JoinOutcome::TooManyDevices => Some("в группе уже предельное число устройств"),
     };
     if let Some(reason) = reason {
         refuse(&mut send, reason).await;

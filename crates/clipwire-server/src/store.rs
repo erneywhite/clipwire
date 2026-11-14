@@ -58,6 +58,9 @@ pub enum JoinOutcome {
     NoGroup,
     /// Группы нет, и на сервере уже предельное число групп.
     TooManyGroups,
+    /// Секрет совпал, но в группе уже предельное число устройств, а это
+    /// устройство группе ещё не известно.
+    TooManyDevices,
     /// Секрет совпал, но ключ группы сменён: устройству отдаётся только
     /// его пакет нового ключа или «исключено» (`docs/devices.md`).
     Rotated(Rotation),
@@ -187,7 +190,12 @@ impl Store {
     /// `may_create` (вход с токеном сервера) и групп меньше `max_groups`.
     /// Проверка числа групп и вставка идут в одной транзакции, поэтому два
     /// одновременных входа предел не проскочат.
-    pub fn join(
+    ///
+    /// Новое устройство (которого в группе ещё нет) сверх `max_devices`
+    /// получает [`JoinOutcome::TooManyDevices`]: иначе участник завёл бы
+    /// тысячи идентификаторов, и список устройств перерос бы кадр. Уже
+    /// известные устройства входят как раньше.
+    pub fn join_limited(
         &self,
         group: &GroupId,
         secret: &JoinSecret,
@@ -195,6 +203,7 @@ impl Store {
         now_ms: i64,
         may_create: bool,
         max_groups: usize,
+        max_devices: usize,
     ) -> Result<JoinOutcome> {
         let digest = secret.digest();
         let mut conn = self.conn();
@@ -229,6 +238,16 @@ impl Store {
                 if let Some(r) = devices::rotation_in(&tx, group, device)? {
                     return Ok(JoinOutcome::Rotated(r));
                 }
+                if !devices::is_member(&tx, group, device)? {
+                    let members: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM devices WHERE group_id = ?1",
+                        params![&group.0[..]],
+                        |r| r.get(0),
+                    )?;
+                    if members as u64 >= max_devices as u64 {
+                        return Ok(JoinOutcome::TooManyDevices);
+                    }
+                }
                 JoinOutcome::Joined
             }
             Some(_) => return Ok(JoinOutcome::Denied),
@@ -240,6 +259,28 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(outcome)
+    }
+
+    /// [`Store::join_limited`] без предела устройств: для тестов хранилища.
+    #[cfg(test)]
+    pub fn join(
+        &self,
+        group: &GroupId,
+        secret: &JoinSecret,
+        device: &DeviceId,
+        now_ms: i64,
+        may_create: bool,
+        max_groups: usize,
+    ) -> Result<JoinOutcome> {
+        self.join_limited(
+            group,
+            secret,
+            device,
+            now_ms,
+            may_create,
+            max_groups,
+            usize::MAX,
+        )
     }
 
     /// Сохраняет элемент и обрезает историю группы до `keep` последних.
@@ -1028,6 +1069,32 @@ mod tests {
                 .unwrap(),
             JoinOutcome::Joined
         );
+    }
+
+    #[test]
+    fn new_devices_stop_at_max_devices_but_known_ones_return() {
+        let s = Store::in_memory().unwrap();
+        let k = GroupKey([1; 32]);
+        let join = |n: u8| {
+            s.join_limited(
+                &k.group_id(),
+                &k.join_secret(),
+                &DeviceId([n; 32]),
+                0,
+                true,
+                10,
+                2,
+            )
+            .unwrap()
+        };
+        assert_eq!(join(1), JoinOutcome::Created);
+        assert_eq!(join(2), JoinOutcome::Joined);
+        // Третье новое — отказ, строка в базе не появляется.
+        assert_eq!(join(3), JoinOutcome::TooManyDevices);
+        assert_eq!(join(3), JoinOutcome::TooManyDevices);
+        // Известные входят как раньше.
+        assert_eq!(join(1), JoinOutcome::Joined);
+        assert_eq!(join(2), JoinOutcome::Joined);
     }
 
     #[test]
