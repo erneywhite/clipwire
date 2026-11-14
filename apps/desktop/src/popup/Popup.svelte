@@ -46,6 +46,10 @@
   let error = $state('')
   // macOS: нет разрешения «Универсальный доступ», вставить сам не могу.
   let needAccess = $state(false)
+  // Wayland: окно не вставляет само, а только кладёт в буфер.
+  let canX11Paste = $state(true)
+  let portalPaste = $state(false)
+  const canPaste = $derived(canX11Paste || portalPaste)
   let input: HTMLInputElement | undefined = $state()
   let listEl: HTMLUListElement | undefined = $state()
 
@@ -430,6 +434,7 @@
   }
 
   function applySettings(s: Settings) {
+    portalPaste = s.portal_paste && s.paste_into_active
     applyTheme(s.theme, s.mode)
     // При открытом предпросмотре окно шире, а список сохраняет свою ширину.
     document.documentElement.style.setProperty('--popup-w', `${s.popup_width}px`)
@@ -437,6 +442,7 @@
 
   onMount(() => {
     api.settings().then(applySettings)
+    api.deviceInfo().then((i) => (canX11Paste = i.can_paste_into_active)).catch(() => {})
     load()
     const unlisten = [
       listen<Transfer>('clipwire://transfer', (e) => onTransfer(e.payload)),
@@ -543,7 +549,7 @@
     {/if}
 
     <footer class="hints">
-      <span><kbd>↵</kbd> {t('вставить')}</span>
+      <span><kbd>↵</kbd> {canPaste ? t('вставить') : t('в буфер')}</span>
       <span><kbd>␣</kbd> {t('просмотр')}</span>
       {#if editable(current)}
         <span><kbd>{keys('Ctrl E')}</kbd> {t('изменить')}</span>
@@ -708,7 +714,7 @@
     }}
   ></div>
   <div class="menu" role="menu" tabindex="-1" bind:this={menuEl} style:left="{menu.x}px" style:top="{menu.y}px" onkeydown={menuKey}>
-    <button role="menuitem" onclick={() => act(() => paste(m))}>{t('Вставить')}<kbd>Enter</kbd></button>
+    <button role="menuitem" onclick={() => act(() => paste(m))}>{canPaste ? t('Вставить') : t('В буфер')}<kbd>Enter</kbd></button>
     {#if m.kind === 'text' && m.rich}
       <button role="menuitem" onclick={() => act(() => paste(m, undefined, true))}>{t('Без форматирования')}<kbd>Shift Enter</kbd></button>
     {/if}

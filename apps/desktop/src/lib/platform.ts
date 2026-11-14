@@ -8,6 +8,10 @@
 export const isMac =
   typeof document !== 'undefined' && typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform)
 
+/** Окно открыто на Linux. */
+export const isLinux =
+  typeof document !== 'undefined' && typeof navigator !== 'undefined' && /Linux/i.test(navigator.platform)
+
 /** «Ctrl + P» → «⌘P», «Alt+←» → «⌥←», «Shift + Delete» → «⇧Delete» (на маке). */
 export function keys(s: string, mac = isMac): string {
   if (!mac) return s

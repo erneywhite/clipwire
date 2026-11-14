@@ -33,7 +33,8 @@ The server is a single Docker container. The client keeps a searchable, encrypte
 a small paste window that opens next to the mouse cursor. Without a server the client still
 works as a local clipboard history on one computer, and you can connect a server later.
 
-There are clients for Windows and macOS (13 Ventura or newer, Apple Silicon and Intel). Linux is planned.
+There are clients for Windows, macOS (13 Ventura or newer, Apple Silicon and Intel) and Linux
+(x86-64; X11 and Wayland: GNOME, KDE Plasma, Sway, Hyprland and others).
 
 Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneywhite/clipwire/issues).
 
@@ -81,6 +82,25 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
    chosen entry is just put on the clipboard. Updates keep the permission: every version is signed
    with the same certificate.
 
+**Linux.**
+
+1. Download from [Releases](https://github.com/erneywhite/clipwire/releases):
+   - Ubuntu, Debian, Linux Mint, Pop!_OS: `Clipwire_*_linux_amd64.deb`, then
+     `sudo apt install ./Clipwire_*_linux_amd64.deb`;
+   - any other distribution: `Clipwire_*_linux_amd64.AppImage`, then
+     `chmod +x Clipwire_*_linux_amd64.AppImage` and run it.
+2. Start Clipwire from the application menu. It lives in the tray; press Ctrl+Alt+V to open the
+   paste window (on Linux Ctrl+Shift+V is how terminals paste, so the default is different).
+3. **Tray icon in GNOME.** Ubuntu shows tray icons out of the box. On other GNOME distributions
+   (Fedora, Debian) install the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/)
+   extension, otherwise the icon is not shown (Clipwire still works: open it from the menu).
+4. **Wayland.** On GNOME and KDE Plasma the paste window opens next to the tray, elsewhere in the
+   middle of the screen. To have it paste by itself,
+   turn on **Paste into the active window**; the system asks once for permission, see
+   [Paste window](#paste-window). The shortcut is registered with the desktop by itself on GNOME,
+   KDE Plasma and Hyprland; on Sway bind `clipwire --popup` to a key yourself.
+5. Keys are kept in the system password store (GNOME Keyring, KWallet).
+
 **Without a server.** History and the paste window work on a single computer. You can connect
 a server at any time: the last 50 entries of the local history go to the group, and the group's
 history is merged into the local one. The clipboard itself is not touched.
@@ -95,7 +115,31 @@ The invitation code contains the group's encryption key. Share it only with your
 
 ## Paste window
 
-Press Ctrl+Shift+V on Windows or Cmd+Shift+V on macOS (configurable). The window opens next to the mouse cursor.
+Press Ctrl+Shift+V on Windows, Cmd+Shift+V on macOS or Ctrl+Alt+V on Linux (configurable; on Linux
+Ctrl+Shift+V is how terminals paste). The window opens next to the mouse cursor.
+
+On Linux in an Xorg session it works the same way; in terminals it pastes with Ctrl+Shift+V. On Wayland apps can't see the mouse cursor or
+press keys in other windows. On GNOME and KDE Plasma the window opens in the corner next to the
+panel, on the tray side (Clipwire runs its windows through XWayland there, so it can choose where
+they go; set `CLIPWIRE_NATIVE_WAYLAND=1` to keep native Wayland windows). On other Wayland desktops
+it opens in the middle of the screen. Enter only puts the entry on the clipboard; you paste it with Ctrl+V
+yourself.
+
+**Pasting by itself on Wayland.** Turn on **Paste into the active window** under Paste. The
+system then asks once for permission to *control the keyboard* (GNOME calls it "remote desktop" or
+"remote control"). It sounds scarier than it is: this is the standard desktop portal that remote
+access apps use, and it is the only way Wayland lets an app press a key. Clipwire uses it for
+exactly one thing — pressing Ctrl+V right after you pick an entry. It does not see your screen,
+does not read what you type and does nothing in the background. While Clipwire is pasting, GNOME
+shows a remote-control icon in the top bar; it goes away a minute after the last paste. The
+permission is remembered; turn the switch off to revoke it (Clipwire forgets it as well). On Wayland
+Clipwire can't tell which window is active, so it always presses Ctrl+V; terminals paste with
+Ctrl+Shift+V, so there press it yourself (the entry is already on the clipboard). An app's own shortcut doesn't reach
+other apps' windows there, so Clipwire registers it with the desktop and keeps it in sync with its
+settings: on GNOME among the custom keyboard shortcuts, on KDE Plasma in the KDE shortcut service
+(System Settings → Shortcuts → Clipwire), on Hyprland and other desktops with the global shortcuts
+portal (the desktop may ask to confirm once). On Sway, which has none of these, bind
+`clipwire --popup` to a key in its config.
 
 | Keys | Action |
 |---|---|
@@ -217,8 +261,11 @@ turned off under Privacy.
 Each entry shows where it was copied from: a small icon and the program name ("Notepad",
 "Telegram"). The name comes from the exe's description and the 32×32 icon from the exe itself.
 Search also matches the program name. The name and icon travel with the entry, so the other
-devices of the group see the source too. Detection works on Windows and macOS; on macOS a program
-can also be excluded by its bundle id (`org.keepassxc.keepassxc`).
+devices of the group see the source too. Detection works on Windows, macOS and Linux on X11; on macOS a program
+can also be excluded by its bundle id (`org.keepassxc.keepassxc`). On Linux the name and icon
+come from the program's `.desktop` file (Flatpak and Snap included), and a program can be
+excluded by its file name, its `.desktop` id (`org.keepassxc.KeePassXC`) or its name. On Wayland
+the source program isn't known, so the exclusion list has no effect there.
 
 ## Image editor
 
@@ -288,7 +335,9 @@ Full description: [docs/storage.md](docs/storage.md).
 - Everything is encrypted end to end. The server sees only ciphertext; the key exists only on
   your devices.
 - The local history is stored in SQLite, and every entry is encrypted with a local key protected
-  by DPAPI on Windows and by a key in the Keychain on macOS. The group key is protected the same way.
+  by DPAPI on Windows, by a key in the Keychain on macOS and by a key in the system password store
+  (Secret Service: GNOME Keyring, KWallet) on Linux. The group key is protected the same way. On
+  a Linux desktop without a password store the keys stay in files only you can read (mode 0600).
 - Content that password managers mark as private is never synced. Programs can also be excluded
   from syncing (password managers are on the list by default).
 - Files downloaded from other devices are marked as coming from the internet, so Windows (and
@@ -298,7 +347,7 @@ Full description: [docs/storage.md](docs/storage.md).
 - Link cards do not execute the page and do not load single-use links (see
   [Link previews](#link-previews)).
 - Leaving a group also deletes the cache of downloaded files.
-- Settings and keys live in `%APPDATA%\Clipwire`.
+- Settings and keys live in `%APPDATA%\Clipwire` on Windows and in `~/.config/clipwire` on Linux.
 
 ## Updates
 
@@ -309,6 +358,10 @@ neither the program nor the clipboard was used for a couple of minutes. If it di
 before you quit, it installs at the next start. After an update you get a notification, and a
 paused sync stays paused. If an installation fails, you are told, and Clipwire does not retry
 that version on its own, only from the button.
+
+On Linux the AppImage updates the same way. The `.deb` package is updated only from the button
+(Settings → About, or the tray menu): installing a package needs your password, and a password
+prompt appearing out of nowhere is a bad habit to teach.
 
 The update is checked against a digital signature, and the version number in the server's reply
 is compared with the version inside the signature, so a tampered file or an old installer under a
@@ -327,7 +380,7 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
 - Language: English, Русский or as in the system.
 - Launch at login: the program starts minimized to the tray.
 - Copy sound: a short click when something new enters the history. Pasting from the history and
-  copying the same thing again are silent. Windows and macOS.
+  copying the same thing again are silent. On Linux it plays through `pw-play`, `paplay` or `aplay`.
 - History retention, from a day to forever (pinned entries are kept forever).
 - Device name, invitation code (**Show code**), leaving the group.
 - Paste window size (one slider with a live preview next to it) and the hotkey.

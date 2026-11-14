@@ -22,6 +22,9 @@ pub struct PopupState {
     /// PID программы, которая была активной до показа (macOS).
     #[cfg(target_os = "macos")]
     prev_pid: Mutex<Option<i32>>,
+    /// Окно X11, которое было активным до показа (Linux, сессия Xorg).
+    #[cfg(target_os = "linux")]
+    prev_x11: Mutex<Option<u32>>,
     /// Где окно стоит без предпросмотра (физические пиксели) и куда раскрыт предпросмотр.
     base: Mutex<Option<Base>>,
 }
@@ -38,6 +41,87 @@ struct Base {
     area_w: u32,
 }
 
+#[cfg(target_os = "linux")]
+pub mod global_shortcuts;
+#[cfg(target_os = "linux")]
+pub mod gnome_shortcut;
+#[cfg(target_os = "linux")]
+pub mod kde_shortcut;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+mod portal;
+#[cfg(target_os = "linux")]
+pub use linux::use_xwayland;
+#[cfg(target_os = "linux")]
+pub use portal::Portal;
+
+/// Может ли окно вставки само вставить в прежнее окно. Нет — на Wayland:
+/// там элемент только кладётся в буфер.
+pub fn can_paste_into_active() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::can_paste()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// Где открывается окно вставки.
+// На Windows и macOS всегда у курсора, остальное — для Linux на Wayland.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// У курсора мыши (Windows, macOS, Xorg).
+    Cursor,
+    /// В углу у панели, со стороны трея: GNOME и KDE на Wayland. Курсора там
+    /// не видно, а окна Clipwire идут через XWayland (см.
+    /// `linux::use_xwayland`), где место окна задаёт программа.
+    Tray,
+    /// По центру: остальные Wayland-оболочки, место выбирает сама оболочка.
+    Center,
+}
+
+fn placement() -> Placement {
+    #[cfg(target_os = "linux")]
+    {
+        if linux::can_paste() {
+            Placement::Cursor
+        } else if linux::on_xwayland() {
+            Placement::Tray
+        } else {
+            Placement::Center
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Placement::Cursor
+    }
+}
+
+/// Угол у панели: панель — это полоса, на которую рабочая область меньше
+/// экрана. Окно встаёт у неё, справа (там трей); у боковой панели — внизу.
+/// Панели не видно (скрывается сама) — справа сверху. Возвращает точку, от
+/// которой окно отходит внутрь рабочей области.
+fn tray_corner(area: (i32, i32, i32, i32), screen: (i32, i32, i32, i32)) -> (i32, i32) {
+    let (ax, ay, aw, ah) = area;
+    let (sx, sy, sw, sh) = screen;
+    let (right, bottom) = (ax + aw, ay + ah);
+    if ay > sy {
+        (right, ay)
+    } else if bottom < sy + sh {
+        (right, bottom)
+    } else if ax > sx {
+        (ax, bottom)
+    } else if right < sx + sw {
+        (right, bottom)
+    } else {
+        (right, ay)
+    }
+}
+
 fn window(app: &AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window("popup")
 }
@@ -51,6 +135,15 @@ pub fn register_hotkey(app: &AppHandle) -> Result<(), String> {
         .unwrap_or_else(|e| e.into_inner())
         .popup_hotkey
         .clone();
+    // GNOME на Wayland: то же сочетание — в системные, на `clipwire --popup`.
+    #[cfg(target_os = "linux")]
+    {
+        let accel = hotkey.clone();
+        std::thread::spawn(move || gnome_shortcut::sync(&accel));
+        // KDE — через свою службу сочетаний, Hyprland и другие — через портал.
+        kde_shortcut::sync(app, &hotkey);
+        global_shortcuts::sync(app, &hotkey);
+    }
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
     gs.on_shortcut(hotkey.as_str(), |app, _sc, ev| {
@@ -70,6 +163,7 @@ pub fn register_hotkey(app: &AppHandle) -> Result<(), String> {
 }
 
 pub fn toggle(app: &AppHandle) {
+    tracing::debug!("переключаю окно вставки");
     match window(app) {
         // Повторное нажатие закрывает окно, только если оно в фокусе. Видимое,
         // но без фокуса (фокус увели) — показываем заново у курсора.
@@ -99,6 +193,10 @@ pub fn show(app: &AppHandle) {
         *state.prev_pid.lock().unwrap_or_else(|e| e.into_inner()) =
             clipwire_agent::clipboard::front_pid();
     }
+    #[cfg(target_os = "linux")]
+    {
+        *state.prev_x11.lock().unwrap_or_else(|e| e.into_inner()) = linux::foreground();
+    }
 
     let (lw, lh) = {
         let s = app
@@ -113,15 +211,25 @@ pub fn show(app: &AppHandle) {
         )
     };
 
+    let place = placement();
     let cursor = app
         .cursor_position()
         .unwrap_or(PhysicalPosition::new(0.0, 0.0));
-    let monitor = app
-        .monitor_from_point(cursor.x, cursor.y)
-        .ok()
-        .flatten()
-        .or_else(|| app.primary_monitor().ok().flatten());
+    // У трея — на главном мониторе: там панель со значком.
+    let monitor = if place == Placement::Tray {
+        app.primary_monitor().ok().flatten()
+    } else {
+        app.monitor_from_point(cursor.x, cursor.y).ok().flatten()
+    }
+    .or_else(|| app.primary_monitor().ok().flatten())
+    // На Wayland у GTK нет «главного» монитора: тогда первый попавшийся.
+    .or_else(|| {
+        app.available_monitors()
+            .ok()
+            .and_then(|m| m.into_iter().next())
+    });
     let Some(monitor) = monitor else {
+        tracing::debug!("окно вставки: монитор не найден, показываю как есть");
         let _ = w.center();
         let _ = w.show();
         let _ = w.set_focus();
@@ -134,8 +242,19 @@ pub fn show(app: &AppHandle) {
     let (ax, ay) = (area.position.x, area.position.y);
     let (aw, ah) = (area.size.width as i32, area.size.height as i32);
 
-    // По умолчанию справа-снизу от курсора; если не влезает — по другую сторону.
-    let (cx, cy) = (cursor.x as i32, cursor.y as i32);
+    // У курсора — справа-снизу от него; если не влезает — по другую сторону.
+    // У трея и по центру — та же формула от нужной точки.
+    let (cx, cy) = match place {
+        Placement::Cursor => (cursor.x as i32, cursor.y as i32),
+        Placement::Tray => {
+            let m = (monitor.position(), monitor.size());
+            tray_corner(
+                (ax, ay, aw, ah),
+                (m.0.x, m.0.y, m.1.width as i32, m.1.height as i32),
+            )
+        }
+        Placement::Center => (ax + (aw - w_px) / 2 - gap, ay + (ah - h_px) / 2 - gap),
+    };
     let mut x = if cx + gap + w_px <= ax + aw {
         cx + gap
     } else {
@@ -159,7 +278,15 @@ pub fn show(app: &AppHandle) {
         area_w: aw as u32,
     });
     let _ = w.set_size(PhysicalSize::new(w_px as u32, h_px as u32));
-    let _ = w.set_position(PhysicalPosition::new(x, y));
+    match place {
+        // Wayland: окно ставит оболочка, просьба лишь подсказка.
+        Placement::Center => {
+            let _ = w.center();
+        }
+        Placement::Cursor | Placement::Tray => {
+            let _ = w.set_position(PhysicalPosition::new(x, y));
+        }
+    }
     let protect = app
         .state::<AppState>()
         .settings
@@ -169,6 +296,15 @@ pub fn show(app: &AppHandle) {
     let _ = w.set_content_protected(protect);
     let _ = w.show();
     let _ = w.set_focus();
+    #[cfg(target_os = "linux")]
+    if matches!(place, Placement::Cursor | Placement::Tray) {
+        let win = w.clone();
+        let _ = w.run_on_main_thread(move || {
+            if let Some(xid) = linux::xid(&win) {
+                std::thread::spawn(move || linux::raise(xid));
+            }
+        });
+    }
     tracing::debug!(x, y, w = w_px, h = h_px, "окно вставки показано");
     let _ = app.emit_to("popup", "popup://opened", ());
 }
@@ -216,6 +352,7 @@ pub async fn popup_paste(
     plain: Option<bool>,
     files: Option<Vec<usize>>,
 ) -> Result<(), String> {
+    tracing::debug!(%id, ?into_active, ?plain, "вставка из окна");
     let plain = plain.unwrap_or_else(|| {
         app.state::<AppState>()
             .settings
@@ -401,8 +538,44 @@ pub async fn return_and_paste(app: &AppHandle, label: &str, paste: bool) {
     }
     #[cfg(target_os = "macos")]
     mac::return_and_paste(app, label, paste).await;
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let _ = paste;
+    #[cfg(target_os = "linux")]
+    {
+        let prev = *app
+            .state::<PopupState>()
+            .prev_x11
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Wayland: через портал, если человек его включил.
+        let portal = paste
+            && !linux::can_paste()
+            && app
+                .state::<AppState>()
+                .settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .portal_paste;
+        if portal && let Err(e) = app.state::<Portal>().paste().await {
+            tracing::warn!("вставка через портал не удалась: {e}");
+        }
+        if let (true, Some(prev)) = (paste && linux::can_paste(), prev) {
+            // Если сочетание окна вставки совпадает с нажатием вставки (в
+            // терминалах это Ctrl+Shift+V), захват отдал бы нажатие нам. На время
+            // вставки сочетание снимается. Библиотека отправляет отмену захвата
+            // X-серверу только при следующем запросе с ответом — его даёт
+            // регистрация безобидного сочетания.
+            let gs = app.global_shortcut();
+            let _ = gs.unregister_all();
+            let _ = gs.register("Control+Alt+Shift+F24");
+            match tokio::task::spawn_blocking(move || linux::focus_and_paste(prev)).await {
+                Ok(Err(e)) => tracing::warn!("вставка в прежнее окно не удалась: {e}"),
+                Err(e) => tracing::warn!("вставка в прежнее окно не удалась: {e}"),
+                Ok(Ok(())) => {}
+            }
+            if let Err(e) = register_hotkey(app) {
+                tracing::warn!("{e}");
+            }
+        }
+    }
 }
 
 /// Открыть раздел «Универсальный доступ» в Системных настройках.
@@ -614,6 +787,20 @@ mod win {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tray_corner_follows_panel() {
+        use super::tray_corner;
+        let screen = (0, 0, 1920, 1080);
+        // GNOME: панель сверху 32 px.
+        assert_eq!(tray_corner((0, 32, 1920, 1048), screen), (1920, 32));
+        // KDE: панель снизу 44 px.
+        assert_eq!(tray_corner((0, 0, 1920, 1036), screen), (1920, 1036));
+        // Панель слева.
+        assert_eq!(tray_corner((60, 0, 1860, 1080), screen), (60, 1080));
+        // Панели нет.
+        assert_eq!(tray_corner((0, 0, 1920, 1080), screen), (1920, 0));
+    }
+
     use super::{ready_to_paste, select_files};
     use clipwire_agent::history::local_entry;
     use clipwire_core::{Content, DeviceId, FileRef};

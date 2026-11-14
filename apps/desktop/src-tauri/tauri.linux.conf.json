@@ -1,0 +1,22 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "mainBinaryName": "clipwire",
+  "bundle": {
+    "targets": [
+      "deb",
+      "appimage"
+    ],
+    "linux": {
+      "deb": {
+        "section": "utils",
+        "recommends": [
+          "pipewire-bin | pulseaudio-utils | alsa-utils"
+        ],
+        "desktopTemplate": "linux/clipwire.desktop"
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    }
+  }
+}

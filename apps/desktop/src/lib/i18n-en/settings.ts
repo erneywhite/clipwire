@@ -91,6 +91,7 @@ const en: Record<string, string> = {
   "Удалить ключи группы с этого устройства? Локальная история останется.": "Remove the group keys from this device? Local history will stay.",
   "Отключить это устройство от группы": "Disconnect this device from the group",
   "Содержимое, которое менеджеры паролей помечают как приватное, не синхронизируется никогда, эта защита не отключается.": "Content that password managers mark as private is never synced, and this protection can't be turned off.",
+  "На Wayland не видно, из какой программы скопировано, поэтому список не действует. Пароли, помеченные менеджером паролей как приватные, всё равно не синхронизируются.": "On Wayland the app you copied from isn't known, so this list has no effect. Passwords that a password manager marks as private are still never synced.",
   "Не синхронизировать из программ": "Don't sync from these apps",
   "Список пуст": "The list is empty",
   "Добавить": "Add",
@@ -157,6 +158,9 @@ const en: Record<string, string> = {
   "↵ вставить": "↵ paste",
   "␣ просмотр": "␣ preview",
   "Ctrl P закрепить": "Ctrl P pin",
+  "На Wayland для этого система один раз спросит разрешение на управление клавиатурой. Clipwire только нажимает Ctrl+V после выбора элемента. Без разрешения элемент попадает в буфер, вставляете сами.": "On Wayland the system will ask once for permission to control the keyboard. Clipwire only presses Ctrl+V after you pick an item. Without it the item goes to the clipboard and you paste it yourself.",
+  "На Wayland сочетание может не сработать в окнах других программ. Назначьте его в настройках системы («Клавиатура» → «Комбинации клавиш» → своя) на команду {cmd}.": "On Wayland the shortcut may not work in other apps' windows. Assign it in the system settings (Keyboard → Keyboard Shortcuts → Custom) to the command {cmd}.",
+  "Сочетание зарегистрировано и в системе, поэтому работает поверх любых окон. Меняйте его здесь, системное обновится само.": "The shortcut is also registered with the system, so it works over any window. Change it here and the system one updates by itself.",
 }
 
 export default en

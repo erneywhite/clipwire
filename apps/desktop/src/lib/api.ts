@@ -30,12 +30,20 @@ export interface Settings {
   delete_everywhere: boolean
   /** Язык интерфейса: как в системе, русский или английский. */
   language: 'system' | 'ru' | 'en'
+  /** Wayland: вставлять через портал удалённого управления. */
+  portal_paste: boolean
 }
 
 export interface DeviceInfo {
   version: string
   relay_url: string | null
   device_id: string | null
+  /** Программа-источник копирования известна (на Wayland — нет). */
+  knows_source_app: boolean
+  /** Окно вставки само вставляет в прежнее окно (на Wayland — только в буфер). */
+  can_paste_into_active: boolean
+  /** Сочетание окна вставки прописывается в системные (GNOME на Wayland). */
+  system_shortcut: boolean
 }
 
 /** Устройство группы (`devices_list`). */

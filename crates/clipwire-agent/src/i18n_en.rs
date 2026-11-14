@@ -124,6 +124,14 @@ pub static EN: &[(&str, &str)] = &[
     ),
     ("картинка больше 2 МБ", "the image is larger than 2 MB"),
     (
+        "Открыть окно вставки Clipwire",
+        "Open the Clipwire paste window",
+    ),
+    (
+        "Система не дала разрешение. Окно вставки будет только класть элемент в буфер.",
+        "The system didn't grant permission. The paste window will only put the item on the clipboard.",
+    ),
+    (
         "Сочетание {hotkey} не зарегистрировалось: {e}",
         "Could not register the shortcut {hotkey}: {e}",
     ),
@@ -268,6 +276,19 @@ pub static EN: &[(&str, &str)] = &[
         "could not write the image to the clipboard",
     ),
     (
+        "буфер обмена недоступен: нет ни X11, ни Wayland с data-control",
+        "the clipboard is unavailable: neither X11 nor Wayland with data-control",
+    ),
+    (
+        "поток буфера обмена остановился",
+        "the clipboard thread has stopped",
+    ),
+    ("буфер обмена не ответил", "the clipboard did not respond"),
+    (
+        "не удалось занять буфер обмена",
+        "could not take over the clipboard",
+    ),
+    (
         "этот тип пока не записывается в буфер",
         "this kind of content cannot be written to the clipboard yet",
     ),
@@ -300,6 +321,31 @@ pub static EN: &[(&str, &str)] = &[
         "no access to the Clipwire key in the keychain",
     ),
     ("файл с секретами повреждён", "the secrets file is damaged"),
+    (
+        "файл с секретами не расшифровался: ключ в хранилище паролей другой",
+        "the secrets file could not be decrypted: the key in the password store is different",
+    ),
+    (
+        "файл с секретами зашифрован, а ключа Clipwire в хранилище паролей нет",
+        "the secrets file is encrypted, but the Clipwire key is missing from the password store",
+    ),
+    (
+        "ключ Clipwire в хранилище паролей повреждён",
+        "the Clipwire key in the password store is damaged",
+    ),
+    (
+        "хранилище паролей заперто, ключи Clipwire недоступны. Разблокируйте его паролем входа в систему — Clipwire подхватит ключи сам",
+        "the password store is locked, so Clipwire cannot get its keys. Unlock it with your login password and Clipwire will pick the keys up by itself",
+    ),
+    (
+        "хранилище паролей не ответило",
+        "the password store did not respond",
+    ),
+    ("ошибка хранилища паролей", "password store error"),
+    (
+        "хранилище паролей недоступно",
+        "the password store is unavailable",
+    ),
     (
         "файл с секретами не расшифровался: ключ в связке ключей другой",
         "could not decrypt the secrets file: the key in the keychain is different",

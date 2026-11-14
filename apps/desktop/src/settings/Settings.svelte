@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { isMac, keys } from '../lib/platform'
+  import { isLinux, isMac, keys } from '../lib/platform'
   import { onMount } from 'svelte'
   import { t } from '../lib/i18n'
   import { listen } from '@tauri-apps/api/event'
@@ -489,12 +489,22 @@
 
         <h2>{t('Вставка')}</h2>
         <div class="card">
-          <Toggle
-            label={t('Сразу вставлять в активное окно')}
-            hint={t('Двойной клик или Enter вставляет туда, где стоит курсор. Иначе элемент только попадает в буфер.')}
-            checked={s.paste_into_active}
-            onchange={(v) => save({ paste_into_active: v })}
-          />
+          {#if info && !info.can_paste_into_active}
+            <!-- Wayland: сам вставлять можно только с разрешения системы (портал). -->
+            <Toggle
+              label={t('Сразу вставлять в активное окно')}
+              hint={t('На Wayland для этого система один раз спросит разрешение на управление клавиатурой. Clipwire только нажимает Ctrl+V после выбора элемента. Без разрешения элемент попадает в буфер, вставляете сами.')}
+              checked={s.portal_paste && s.paste_into_active}
+              onchange={(v) => save(v ? { portal_paste: true, paste_into_active: true } : { portal_paste: false })}
+            />
+          {:else}
+            <Toggle
+              label={t('Сразу вставлять в активное окно')}
+              hint={t('Двойной клик или Enter вставляет туда, где стоит курсор. Иначе элемент только попадает в буфер.')}
+              checked={s.paste_into_active}
+              onchange={(v) => save({ paste_into_active: v })}
+            />
+          {/if}
         </div>
 
         <h2>{t('Хранить историю')}</h2>
@@ -645,12 +655,15 @@
       {:else if section === 'privacy'}
         <h1>{t('Приватность')}</h1>
         <div class="card">
-          <Toggle
-            label={t('Скрывать окна при демонстрации экрана')}
-            hint={t('Окна Clipwire не попадут в запись экрана и трансляцию.')}
-            checked={s.hide_from_capture}
-            onchange={(v) => save({ hide_from_capture: v })}
-          />
+          <!-- На Linux окно не может попросить систему не показывать его в записи экрана. -->
+          {#if !isLinux}
+            <Toggle
+              label={t('Скрывать окна при демонстрации экрана')}
+              hint={t('Окна Clipwire не попадут в запись экрана и трансляцию.')}
+              checked={s.hide_from_capture}
+              onchange={(v) => save({ hide_from_capture: v })}
+            />
+          {/if}
           <Toggle
             label={t('Загружать карточки ссылок')}
             hint={t('По пробелу подгружается заголовок и картинка страницы. Похожие на одноразовые ссылки не загружаются никогда.')}
@@ -661,6 +674,9 @@
         <p class="hint outside">{t('Содержимое, которое менеджеры паролей помечают как приватное, не синхронизируется никогда, эта защита не отключается.')}</p>
 
         <h2>{t('Не синхронизировать из программ')}</h2>
+        {#if info && !info.knows_source_app}
+          <p class="hint outside">{t('На Wayland не видно, из какой программы скопировано, поэтому список не действует. Пароли, помеченные менеджером паролей как приватные, всё равно не синхронизируются.')}</p>
+        {/if}
         <div class="card pad">
           <ul class="apps">
             {#each s.ignored_apps as app (app)}
@@ -673,7 +689,7 @@
             {/each}
           </ul>
           <form class="add" onsubmit={(e) => { e.preventDefault(); addApp() }}>
-            <input bind:value={newApp} placeholder={isMac ? 'KeePassXC' : 'KeePass.exe'} spellcheck="false" aria-label={t('Имя программы')} />
+            <input bind:value={newApp} placeholder={isMac ? 'KeePassXC' : isLinux ? 'keepassxc' : 'KeePass.exe'} spellcheck="false" aria-label={t('Имя программы')} />
             <button type="submit" disabled={!newApp.trim()}>{t('Добавить')}</button>
           </form>
         </div>
@@ -687,6 +703,11 @@
             </button>
           </div>
         </div>
+        {#if info?.system_shortcut}
+          <p class="hint outside">{t('Сочетание зарегистрировано и в системе, поэтому работает поверх любых окон. Меняйте его здесь, системное обновится само.')}</p>
+        {:else if info && !info.can_paste_into_active}
+          <p class="hint outside">{t('На Wayland сочетание может не сработать в окнах других программ. Назначьте его в настройках системы («Клавиатура» → «Комбинации клавиш» → своя) на команду {cmd}.', { cmd: 'clipwire --popup' })}</p>
+        {/if}
 
         <h2>{t('Размер окна вставки')}</h2>
         <div

@@ -66,6 +66,8 @@ const en: Record<string, string> = {
   'Здесь появится всё, что копируется на ваших устройствах': 'Everything you copy on your devices will show up here',
   'История буфера': 'Clipboard history',
   'вставить': 'paste',
+  'в буфер': 'to clipboard',
+  'В буфер': 'To clipboard',
   'просмотр': 'preview',
   'изменить': 'edit',
   'закрепить': 'pin',

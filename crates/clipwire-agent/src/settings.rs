@@ -86,6 +86,9 @@ pub struct Settings {
     pub delete_everywhere: bool,
     /// Язык интерфейса: `system`, `ru` или `en`.
     pub language: String,
+    /// Wayland: вставлять через портал удалённого управления (система один
+    /// раз спрашивает разрешение). Выключено — окно вставки только кладёт в буфер.
+    pub portal_paste: bool,
 }
 
 impl Default for Settings {
@@ -99,7 +102,7 @@ impl Default for Settings {
             always_plain_text: false,
             popup_width: 380,
             popup_height: 520,
-            popup_hotkey: "CommandOrControl+Shift+V".into(),
+            popup_hotkey: default_hotkey().into(),
             sound_on_receive: true,
             link_previews: true,
             hide_from_capture: false,
@@ -108,7 +111,18 @@ impl Default for Settings {
             auto_update: true,
             delete_everywhere: false,
             language: "system".into(),
+            portal_paste: false,
         }
+    }
+}
+
+/// Сочетание окна вставки. На Linux Ctrl+Shift+V — вставка во всех
+/// терминалах: захватив его, программа сломала бы её.
+fn default_hotkey() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "CommandOrControl+Alt+V"
+    } else {
+        "CommandOrControl+Shift+V"
     }
 }
 
@@ -118,6 +132,18 @@ impl Default for Settings {
 fn default_ignored_apps() -> Vec<String> {
     let names: &[&str] = if cfg!(target_os = "macos") {
         &["KeePassXC", "1Password", "Bitwarden"]
+    } else if cfg!(target_os = "linux") {
+        // Имена исполняемых файлов: KeePass 2 запускается через Mono, и
+        // владельцем считается сам KeePass.exe; «secrets» — Secrets из GNOME,
+        // «seahorse» — «Пароли и ключи».
+        &[
+            "keepassxc",
+            "KeePass.exe",
+            "1password",
+            "bitwarden",
+            "secrets",
+            "seahorse",
+        ]
     } else {
         &[
             "KeePass.exe",
@@ -136,10 +162,39 @@ pub fn default_device_name() -> String {
     if let Some(name) = mac_computer_name() {
         return name;
     }
+    #[cfg(target_os = "linux")]
+    if let Some(name) = linux_hostname() {
+        return name;
+    }
     ["COMPUTERNAME", "HOSTNAME"]
         .iter()
         .find_map(|v| std::env::var(v).ok().filter(|s| !s.trim().is_empty()))
         .unwrap_or_else(|| tr("Это устройство").into())
+}
+
+/// Имя компьютера на Linux: «красивое» из `/etc/machine-info` (его задают
+/// «Настройки» → «О системе» в GNOME и `hostnamectl --pretty`), иначе
+/// `/etc/hostname`. Переменной `HOSTNAME` у программ из меню обычно нет.
+#[cfg(target_os = "linux")]
+fn linux_hostname() -> Option<String> {
+    let pretty = std::fs::read_to_string("/etc/machine-info")
+        .ok()
+        .and_then(|t| pretty_hostname(&t));
+    pretty.or_else(|| {
+        std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// `PRETTY_HOSTNAME=` из `machine-info` (значение может быть в кавычках).
+#[cfg(any(target_os = "linux", test))]
+fn pretty_hostname(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("PRETTY_HOSTNAME="))
+        .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// `SCDynamicStoreCopyComputerName`: имя, которое человек видит и задаёт в
@@ -196,6 +251,30 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pretty_hostname_from_machine_info() {
+        use super::pretty_hostname;
+        assert_eq!(
+            pretty_hostname("CHASSIS=laptop\nPRETTY_HOSTNAME=\"Ноутбук Ивана\"\n").as_deref(),
+            Some("Ноутбук Ивана")
+        );
+        assert_eq!(
+            pretty_hostname("PRETTY_HOSTNAME=work\n").as_deref(),
+            Some("work")
+        );
+        assert_eq!(pretty_hostname("PRETTY_HOSTNAME=\n"), None);
+        assert_eq!(pretty_hostname("CHASSIS=vm\n"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_device_name_is_not_placeholder() {
+        assert_ne!(
+            super::default_device_name(),
+            crate::i18n::tr("Это устройство")
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn mac_device_name_is_computer_name() {

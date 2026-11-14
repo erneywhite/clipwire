@@ -446,6 +446,26 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
         let _ = crate::popup::register_hotkey(&app);
         return Err(e);
     }
+    #[cfg(target_os = "linux")]
+    if old.portal_paste != settings.portal_paste {
+        let portal = app.state::<crate::popup::Portal>();
+        if settings.portal_paste {
+            if let Err(e) = portal.enable().await {
+                tracing::warn!("портал удалённого управления: {e}");
+                let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+                s.portal_paste = false;
+                let _ = s.save(&state.paths.dir);
+                let s = s.clone();
+                let _ = app.emit("clipwire://settings-changed", &s);
+                return Err(tr(
+                    "Система не дала разрешение. Окно вставки будет только класть элемент в буфер.",
+                )
+                .into());
+            }
+        } else {
+            portal.disable().await;
+        }
+    }
     if old.language != settings.language {
         clipwire_agent::i18n::set_language(&settings.language);
         crate::tray::retranslate(&app);
@@ -481,6 +501,12 @@ pub struct DeviceInfo {
     pub relay_url: Option<String>,
     /// Короткий отпечаток устройства (первые байты endpoint ID).
     pub device_id: Option<String>,
+    /// Программа-источник копирования известна (на Wayland — нет).
+    pub knows_source_app: bool,
+    /// Окно вставки само вставляет в прежнее окно (на Wayland — только в буфер).
+    pub can_paste_into_active: bool,
+    /// Сочетание окна вставки прописывается в системные (GNOME на Wayland).
+    pub system_shortcut: bool,
 }
 
 #[tauri::command]
@@ -502,6 +528,14 @@ pub fn device_info(app: AppHandle) -> DeviceInfo {
         version: app.package_info().version.to_string(),
         relay_url: agent.map(|a| a.invite.server.relay_url),
         device_id,
+        knows_source_app: clipwire_agent::clipboard::knows_source_app(),
+        can_paste_into_active: crate::popup::can_paste_into_active(),
+        #[cfg(target_os = "linux")]
+        system_shortcut: crate::popup::gnome_shortcut::applies()
+            || crate::popup::kde_shortcut::bound()
+            || crate::popup::global_shortcuts::bound(),
+        #[cfg(not(target_os = "linux"))]
+        system_shortcut: false,
     }
 }
 

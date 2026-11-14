@@ -6,12 +6,15 @@
 //! тот же код работает и в Tauri, и в консольном агенте.
 //!
 //! macOS: опрос `changeCount` у `NSPasteboard`, см. [`mac`].
+//!
+//! Linux: X11 (`XFixes`) или Wayland data-control, см. [`linux`].
 
+#[cfg(any(windows, target_os = "macos"))]
 use crate::i18n::tr;
 use anyhow::Result;
 
 /// Записать текст в буфер ОС.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 pub fn write_text(text: &str) -> Result<()> {
     use anyhow::Context;
     with_retry(|c| c.set_text(text)).context(tr("не удалось записать в буфер"))?;
@@ -26,7 +29,7 @@ pub fn write_text(text: &str) -> Result<()> {
 
 /// Записать картинку (PNG) в буфер ОС. `width` и `height` — размеры из
 /// элемента: PNG с другими настоящими размерами не пишем.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 pub fn write_image(png: &[u8], width: u32, height: u32) -> Result<()> {
     use anyhow::Context;
     let img = crate::image::decode_png_sized(png, width, height)?;
@@ -51,7 +54,31 @@ pub fn write_image(png: &[u8], width: u32, height: u32) -> Result<()> {
     mac::write_image(png)
 }
 
+/// Записать текст в буфер ОС.
+#[cfg(target_os = "linux")]
+pub fn write_text(text: &str) -> Result<()> {
+    linux::write(&clipwire_core::Content::Text(text.to_string()))
+}
+
+/// Записать картинку (PNG) в буфер ОС. `width` и `height` — размеры из
+/// элемента: PNG с другими настоящими размерами не пишем.
+#[cfg(target_os = "linux")]
+pub fn write_image(png: &[u8], width: u32, height: u32) -> Result<()> {
+    linux::write(&clipwire_core::Content::Image {
+        png: png.to_vec(),
+        width,
+        height,
+    })
+}
+
 /// Записать в буфер любое содержимое.
+#[cfg(target_os = "linux")]
+pub fn write(content: &clipwire_core::Content) -> Result<()> {
+    linux::write(content)
+}
+
+/// Записать в буфер любое содержимое.
+#[cfg(any(windows, target_os = "macos"))]
 pub fn write(content: &clipwire_core::Content) -> Result<()> {
     match content {
         clipwire_core::Content::Text(t) => write_text(t),
@@ -64,9 +91,6 @@ pub fn write(content: &clipwire_core::Content) -> Result<()> {
         clipwire_core::Content::Rich { text, html, rtf } => {
             mac::write_rich(text, html.as_deref(), rtf.as_deref())
         }
-        // shortcut: на Linux пока только текст, форматирование теряется.
-        #[cfg(not(any(windows, target_os = "macos")))]
-        clipwire_core::Content::Rich { text, .. } => write_text(text),
         #[cfg(windows)]
         clipwire_core::Content::Files(files) => win::write_files(files),
         #[cfg(target_os = "macos")]
@@ -77,6 +101,22 @@ pub fn write(content: &clipwire_core::Content) -> Result<()> {
 }
 
 /// Прочитать картинку из буфера ОС, если там картинка.
+#[cfg(target_os = "linux")]
+pub fn read_image() -> Option<clipwire_core::Content> {
+    linux::read().filter(|c| matches!(c, clipwire_core::Content::Image { .. }))
+}
+
+/// Текст из буфера ОС (у форматированного — его простой текст).
+#[cfg(target_os = "linux")]
+pub fn read_text() -> Option<String> {
+    match linux::read()? {
+        clipwire_core::Content::Text(t) | clipwire_core::Content::Rich { text: t, .. } => Some(t),
+        _ => None,
+    }
+}
+
+/// Прочитать картинку из буфера ОС, если там картинка.
+#[cfg(any(windows, target_os = "macos"))]
 pub fn read_image() -> Option<clipwire_core::Content> {
     let img = match with_retry(|c| c.get_image()) {
         Ok(img) => img,
@@ -98,6 +138,7 @@ pub fn read_image() -> Option<clipwire_core::Content> {
 /// В момент копирования буфер одновременно читают все менеджеры буфера
 /// (история Windows, Ditto, другой Clipwire), и первая попытка часто
 /// натыкается на «занято» — это не значит, что данных нет.
+#[cfg(any(windows, target_os = "macos"))]
 fn with_retry<T>(
     mut f: impl FnMut(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
 ) -> Result<T, arboard::Error> {
@@ -114,6 +155,7 @@ fn with_retry<T>(
     Err(last)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub fn read_text() -> Option<String> {
     match with_retry(|c| c.get_text()) {
         Ok(t) => Some(t),
@@ -271,7 +313,6 @@ pub struct WatchOptions {
 
 /// Описание локального файла или папки для элемента буфера: имя, размер,
 /// время изменения, у картинок — размеры в пикселях.
-#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn local_file_ref(p: &std::path::Path) -> clipwire_core::FileRef {
     let meta = std::fs::metadata(p).ok();
     let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
@@ -883,17 +924,22 @@ mod win {
     }
 }
 
-/// Заглушка для ОС без клиента (этап 4): слежения нет.
-#[cfg(not(any(windows, target_os = "macos")))]
-pub struct Watcher;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{Backend, Watcher, backend};
 
-#[cfg(not(any(windows, target_os = "macos")))]
-impl Watcher {
-    pub fn start(
-        _opts: WatchOptions,
-        _on_change: impl FnMut(clipwire_core::Content, Option<String>) + Send + 'static,
-    ) -> Result<Self> {
-        anyhow::bail!("слежение за буфером на этой ОС ещё не реализовано")
+/// Известна ли программа, из которой скопировано: от этого зависят значок
+/// источника и список «не синхронизировать из программ». На Wayland буфер
+/// приходит без владельца (на GNOME — через мост XWayland от имени оболочки).
+pub fn knows_source_app() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        backend() == Some(Backend::X11) && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
     }
 }
 

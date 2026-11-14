@@ -9,7 +9,8 @@
 //! На macOS путь ведёт внутрь пакета `.app`: имя (как в Finder) и иконка
 //! берутся у пакета, для исключений есть ещё bundle id.
 //!
-//! На Linux пока только имя файла, без иконки.
+//! На Linux имя и иконка берутся из `.desktop`-файла программы (см.
+//! `source_app/linux.rs`), для исключений есть ещё id этого файла.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -40,8 +41,8 @@ pub fn lookup(exe_path: &str) -> Option<SourceApp> {
 
 /// Имена, по которым программу можно внести в список «не синхронизировать»:
 /// имя exe, а на macOS ещё bundle id и имя пакета («KeePassXC»,
-/// «org.keepassxc.keepassxc»).
-#[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+/// «org.keepassxc.keepassxc»), на Linux — id `.desktop`-файла и имя из него.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_mut))]
 pub fn ignore_keys(exe_path: &str) -> Vec<String> {
     let mut keys: Vec<String> = file_name(exe_path).into_iter().collect();
     #[cfg(target_os = "macos")]
@@ -51,6 +52,12 @@ pub fn ignore_keys(exe_path: &str) -> Vec<String> {
             && !keys.contains(&app.name)
         {
             keys.push(app.name);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    for k in platform::extra_keys(exe_path) {
+        if !keys.contains(&k) {
+            keys.push(k);
         }
     }
     keys
@@ -328,10 +335,14 @@ mod platform {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+#[path = "source_app/linux.rs"]
+mod platform;
+#[cfg(target_os = "linux")]
+pub use platform::exe_of_pid;
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 mod platform {
-    // shortcut: на Linux пока только имя файла; имя и иконку из .desktop-файла
-    // добавить вместе с клиентом.
     pub fn read(_path: &str) -> (Option<String>, Option<Vec<u8>>) {
         (None, None)
     }
