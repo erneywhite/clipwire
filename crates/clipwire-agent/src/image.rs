@@ -1,5 +1,6 @@
 //! Картинки: буфер ОС отдаёт пиксели RGBA, по сети и в истории они живут в PNG.
 
+use crate::i18n::{tr, trf};
 use std::io::Cursor;
 
 use anyhow::{Context, Result};
@@ -18,7 +19,10 @@ pub const THUMB_SIDE: u32 = 320;
 pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
     anyhow::ensure!(
         (width as u64) * (height as u64) <= MAX_PIXELS,
-        "картинка {width}×{height} слишком большая"
+        trf(
+            "картинка {width}×{height} слишком большая",
+            &[("width", &width), ("height", &height)]
+        )
     );
     let mut out = Vec::new();
     image::codecs::png::PngEncoder::new_with_quality(
@@ -27,7 +31,7 @@ pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
         image::codecs::png::FilterType::Adaptive,
     )
     .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
-    .context("не удалось закодировать PNG")?;
+    .context(tr("не удалось закодировать PNG"))?;
     Ok(out)
 }
 
@@ -51,14 +55,17 @@ fn decode_limited<R: std::io::BufRead + std::io::Seek>(
     r.limits(limits());
     let (w, h) = r
         .into_dimensions()
-        .context("заголовок картинки не читается")?;
+        .context(tr("заголовок картинки не читается"))?;
     anyhow::ensure!(
         (w as u64) * (h as u64) <= MAX_PIXELS,
-        "картинка {w}×{h} слишком большая"
+        trf(
+            "картинка {width}×{height} слишком большая",
+            &[("width", &w), ("height", &h)]
+        )
     );
     let mut r = open()?;
     r.limits(limits());
-    r.decode().context("картинка не читается")
+    r.decode().context(tr("картинка не читается"))
 }
 
 /// PNG → RGBA для записи в буфер.
@@ -69,7 +76,7 @@ pub fn decode_png(png: &[u8]) -> Result<RgbaImage> {
             image::ImageFormat::Png,
         ))
     })
-    .context("PNG повреждён")?;
+    .context(tr("PNG повреждён"))?;
     Ok(img.to_rgba8())
 }
 
@@ -79,9 +86,15 @@ pub fn decode_png_sized(png: &[u8], width: u32, height: u32) -> Result<RgbaImage
     let img = decode_png(png)?;
     anyhow::ensure!(
         img.dimensions() == (width, height),
-        "размеры картинки {}×{} не совпадают с заявленными {width}×{height}",
-        img.width(),
-        img.height()
+        trf(
+            "размеры картинки {w}×{h} не совпадают с заявленными {width}×{height}",
+            &[
+                ("w", &img.width()),
+                ("h", &img.height()),
+                ("width", &width),
+                ("height", &height)
+            ]
+        )
     );
     Ok(img)
 }
@@ -129,10 +142,10 @@ pub fn file_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
 
 /// Миниатюра файла-картинки.
 pub fn thumbnail_file(path: &std::path::Path) -> Result<Vec<u8>> {
-    let meta = std::fs::metadata(path).context("файл недоступен")?;
+    let meta = std::fs::metadata(path).context(tr("файл недоступен"))?;
     anyhow::ensure!(
         meta.len() <= MAX_IMAGE_FILE,
-        "файл-картинка слишком большой"
+        tr("файл-картинка слишком большой")
     );
     let img = decode_limited(|| Ok(image::ImageReader::open(path)?.with_guessed_format()?))?;
     thumb_of(img.to_rgba8())
@@ -150,7 +163,7 @@ fn thumb_of(img: RgbaImage) -> Result<Vec<u8>> {
     let mut out = Cursor::new(Vec::new());
     small
         .write_to(&mut out, image::ImageFormat::Png)
-        .context("не удалось сохранить миниатюру")?;
+        .context(tr("не удалось сохранить миниатюру"))?;
     Ok(out.into_inner())
 }
 

@@ -5,6 +5,7 @@
 //! когда ключ сменился или устройство исключили. Сами сообщения серверу шлёт
 //! движок (`sync.rs`), команды ему передаются через [`Controller`].
 
+use crate::i18n::tr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -118,10 +119,12 @@ pub fn plan_rekey(
 ) -> Result<RekeyPlan> {
     if let Some(r) = remove {
         if r == me {
-            bail!("Это устройство так не удалить. Чтобы выйти, отключитесь от группы");
+            bail!(tr(
+                "Это устройство так не удалить. Чтобы выйти, отключитесь от группы"
+            ));
         }
         if !devices.iter().any(|d| d.device == r) {
-            bail!("Такого устройства нет в группе");
+            bail!(tr("Такого устройства нет в группе"));
         }
     }
     let mut plan = RekeyPlan {
@@ -379,10 +382,14 @@ pub struct Controller {
     pub(crate) times: Arc<SyncTimes>,
 }
 
-const OFFLINE: &str = "Нет связи с сервером. Попробуйте, когда устройство будет в сети";
+pub(crate) fn offline() -> &'static str {
+    tr("Нет связи с сервером. Попробуйте, когда устройство будет в сети")
+}
 
 /// Сервер 0.1.1 и более ранние не умеют считать, что лежит у группы.
-pub const OLD_SERVER_STATS: &str = "Сервер не сообщает эти цифры: обновите сервер Clipwire";
+pub fn old_server_stats() -> &'static str {
+    tr("Сервер не сообщает эти цифры: обновите сервер Clipwire")
+}
 
 impl Controller {
     pub fn new(tx: mpsc::Sender<Control>, key: GroupKey, device: DeviceId) -> Self {
@@ -433,8 +440,8 @@ impl Controller {
         self.tx
             .send(Control::Link(reply))
             .await
-            .map_err(|_| OFFLINE.to_string())?;
-        rx.await.map_err(|_| OFFLINE.to_string())?
+            .map_err(|_| offline().to_string())?;
+        rx.await.map_err(|_| offline().to_string())?
     }
 
     pub fn device(&self) -> DeviceId {
@@ -451,8 +458,8 @@ impl Controller {
         self.tx
             .send(Control::Stats(reply))
             .await
-            .map_err(|_| OFFLINE.to_string())?;
-        rx.await.map_err(|_| OFFLINE.to_string())?
+            .map_err(|_| offline().to_string())?;
+        rx.await.map_err(|_| offline().to_string())?
     }
 
     /// Устройства группы с открытыми карточками.
@@ -461,8 +468,8 @@ impl Controller {
         self.tx
             .send(Control::ListDevices(reply))
             .await
-            .map_err(|_| OFFLINE.to_string())?;
-        let entries = rx.await.map_err(|_| OFFLINE.to_string())??;
+            .map_err(|_| offline().to_string())?;
+        let entries = rx.await.map_err(|_| offline().to_string())??;
         Ok(open_entries(&self.key, entries))
     }
 
@@ -472,8 +479,8 @@ impl Controller {
         self.tx
             .send(Control::Rekey { remove, reply })
             .await
-            .map_err(|_| OFFLINE.to_string())?;
-        rx.await.map_err(|_| OFFLINE.to_string())?
+            .map_err(|_| offline().to_string())?;
+        rx.await.map_err(|_| offline().to_string())?
     }
 }
 

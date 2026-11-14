@@ -174,15 +174,21 @@ mod tests {
     /// Строковые литералы, стоящие первым аргументом `tr(` / `trf(`.
     fn calls(src: &str) -> Vec<String> {
         let mut out = Vec::new();
-        for pat in ["tr(\"", "trf(\""] {
+        for pat in ["tr(", "trf("] {
             let mut rest = src;
             while let Some(i) = rest.find(pat) {
-                // Не часть другого имени (`attr("`, `ctrf("`).
+                // Не часть другого имени (`attr(`, `ctrf(`).
                 let prev = rest[..i].chars().last();
                 rest = &rest[i + pat.len()..];
                 if prev.is_some_and(|c| c.is_alphanumeric() || c == '_') {
                     continue;
                 }
+                // Литерал первым аргументом, возможно с переносом после `(`.
+                let trimmed = rest.trim_start();
+                let Some(after) = trimmed.strip_prefix('"') else {
+                    continue;
+                };
+                rest = after;
                 let mut lit = String::new();
                 let mut chars = rest.chars();
                 while let Some(c) = chars.next() {

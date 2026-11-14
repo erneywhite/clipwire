@@ -7,6 +7,7 @@
 //! `blob_size` известен сразу, а сам архив собирается позже, при первом
 //! запросе получателя, и сверяется с этим размером.
 
+use crate::i18n::{tr, trf};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
@@ -63,9 +64,15 @@ pub enum ScanError {
 impl std::fmt::Display for ScanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooMany => write!(f, "в папке больше {MAX_ENTRIES} файлов и папок"),
-            Self::TooDeep => write!(f, "папка вложена глубже {MAX_DEPTH} уровней"),
-            Self::Io(e) => write!(f, "папка не читается: {e}"),
+            Self::TooMany => f.write_str(&trf(
+                "в папке больше {max} файлов и папок",
+                &[("max", &MAX_ENTRIES)],
+            )),
+            Self::TooDeep => f.write_str(&trf(
+                "папка вложена глубже {max} уровней",
+                &[("max", &MAX_DEPTH)],
+            )),
+            Self::Io(e) => f.write_str(&trf("папка не читается: {e}", &[("e", e)])),
         }
     }
 }
@@ -95,7 +102,7 @@ fn scan_dir_limited(
     if !meta.is_dir() {
         return Err(ScanError::Io(io::Error::new(
             io::ErrorKind::NotADirectory,
-            "это не папка",
+            tr("это не папка"),
         )));
     }
     let mut scan = DirScan::default();
@@ -188,7 +195,7 @@ impl<R: Read> Read for Exact<R> {
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "файл стал короче после копирования",
+                tr("файл стал короче после копирования"),
             ));
         }
         self.left -= n as u64;
@@ -224,12 +231,14 @@ fn write_tar<W: Write>(entries: &[DirEntry], w: W, real: bool) -> Result<W> {
             EntryKind::Dir => b.append_data(&mut h, &e.rel, io::empty())?,
             EntryKind::File { size, mtime } if real => {
                 let f = File::open(&e.path)
-                    .with_context(|| format!("не открылся {}", e.path.display()))?;
+                    .with_context(|| trf("не открылся {path}", &[("path", &e.path.display())]))?;
                 let m = f.metadata()?;
                 ensure!(
                     m.len() == size && mtime_secs(&m) == mtime,
-                    "файл {} изменился после копирования",
-                    e.rel
+                    trf(
+                        "файл {name} изменился после копирования",
+                        &[("name", &e.rel)]
+                    )
                 );
                 b.append_data(
                     &mut h,
@@ -261,14 +270,15 @@ pub fn build_archive(entries: &[DirEntry], dest: &Path) -> Result<u64> {
     }
     let tmp = with_suffix(dest, ".tmp");
     let res = (|| {
-        let f = File::create(&tmp).with_context(|| format!("не создался {}", tmp.display()))?;
+        let f = File::create(&tmp)
+            .with_context(|| trf("не создался {path}", &[("path", &tmp.display())]))?;
         let w = write_tar(entries, BufWriter::new(f), true)?;
         let f = w.into_inner().map_err(|e| anyhow!("{e}"))?;
         f.sync_all()?;
         let len = f.metadata()?.len();
         drop(f);
         std::fs::rename(&tmp, dest)
-            .with_context(|| format!("не переименовался {}", tmp.display()))?;
+            .with_context(|| trf("не переименовался {path}", &[("path", &tmp.display())]))?;
         Ok(len)
     })();
     if res.is_err() {
@@ -293,12 +303,18 @@ fn safe_parts(path: &Path) -> Result<Vec<String>> {
             Component::Normal(s) => out.push(s.to_string_lossy().into_owned()),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                bail!("в архиве запись с недопустимым путём: {}", path.display())
+                bail!(trf(
+                    "в архиве запись с недопустимым путём: {path}",
+                    &[("path", &path.display())]
+                ))
             }
         }
     }
-    ensure!(!out.is_empty(), "в архиве запись с пустым путём");
-    ensure!(out.len() <= MAX_DEPTH, "в архиве слишком глубокая запись");
+    ensure!(!out.is_empty(), tr("в архиве запись с пустым путём"));
+    ensure!(
+        out.len() <= MAX_DEPTH,
+        tr("в архиве слишком глубокая запись")
+    );
     Ok(out)
 }
 
@@ -379,9 +395,10 @@ pub fn unpack_archive(archive: &Path, dest: &Path) -> Result<()> {
     let res = unpack_into(archive, &tmp).and_then(|()| {
         if dest.exists() {
             std::fs::remove_dir_all(dest)
-                .with_context(|| format!("не удалилась старая {}", dest.display()))?;
+                .with_context(|| trf("не удалилась старая {path}", &[("path", &dest.display())]))?;
         }
-        std::fs::rename(&tmp, dest).with_context(|| format!("не переименовалась {}", tmp.display()))
+        std::fs::rename(&tmp, dest)
+            .with_context(|| trf("не переименовалась {path}", &[("path", &tmp.display())]))
     });
     if res.is_err() {
         let _ = std::fs::remove_dir_all(&tmp);
@@ -391,7 +408,8 @@ pub fn unpack_archive(archive: &Path, dest: &Path) -> Result<()> {
 
 fn unpack_into(archive: &Path, dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
-    let f = File::open(archive).with_context(|| format!("не открылся {}", archive.display()))?;
+    let f = File::open(archive)
+        .with_context(|| trf("не открылся {path}", &[("path", &archive.display())]))?;
     let mut ar = tar::Archive::new(io::BufReader::new(f));
     ar.set_preserve_permissions(false);
     ar.set_unpack_xattrs(false);
@@ -401,7 +419,10 @@ fn unpack_into(archive: &Path, dir: &Path) -> Result<()> {
     for entry in ar.entries()? {
         let mut entry = entry?;
         n += 1;
-        ensure!(n <= MAX_ENTRIES, "в архиве больше {MAX_ENTRIES} записей");
+        ensure!(
+            n <= MAX_ENTRIES,
+            trf("в архиве больше {max} записей", &[("max", &MAX_ENTRIES)])
+        );
         let ty = entry.header().entry_type();
         let parts = safe_parts(&entry.path()?)?;
         match ty {
@@ -411,11 +432,14 @@ fn unpack_into(archive: &Path, dir: &Path) -> Result<()> {
                 if let Some(p) = target.parent() {
                     std::fs::create_dir_all(p)?;
                 }
-                entry
-                    .unpack(&target)
-                    .with_context(|| format!("не распаковался {}", target.display()))?;
+                entry.unpack(&target).with_context(|| {
+                    trf("не распаковался {path}", &[("path", &target.display())])
+                })?;
             }
-            other => bail!("в архиве недопустимая запись ({other:?}): ссылка или устройство"),
+            other => bail!(trf(
+                "в архиве недопустимая запись ({kind}): ссылка или устройство",
+                &[("kind", &format!("{other:?}"))]
+            )),
         }
     }
     Ok(())

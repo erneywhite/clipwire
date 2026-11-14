@@ -1,5 +1,6 @@
 //! Окно вставки у курсора: показ, позиционирование, предпросмотр и вставка.
 
+use clipwire_agent::i18n::{tr, trf};
 use std::sync::Mutex;
 
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
@@ -55,7 +56,12 @@ pub fn register_hotkey(app: &AppHandle) -> Result<(), String> {
             toggle(app);
         }
     })
-    .map_err(|e| format!("Сочетание {hotkey} не зарегистрировалось: {e}"))?;
+    .map_err(|e| {
+        trf(
+            "Сочетание {hotkey} не зарегистрировалось: {e}",
+            &[("hotkey", &hotkey), ("e", &e)],
+        )
+    })?;
     tracing::info!("окно вставки: {hotkey}");
     Ok(())
 }
@@ -212,13 +218,13 @@ pub async fn popup_paste(
     let id: clipwire_core::ItemId = id
         .parse()
         .map(clipwire_core::ItemId)
-        .map_err(|_| "Неверный id элемента".to_string())?;
+        .map_err(|_| tr("Неверный id элемента").to_string())?;
     let entry = {
         let state = app.state::<AppState>();
         let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
         match h.get(id) {
             Some(e) => e.clone(),
-            None => return Err("Элемента уже нет в истории".into()),
+            None => return Err(tr("Элемента уже нет в истории").into()),
         }
     };
     // Наверх истории поднимается исходная запись целиком: если отдать туда
@@ -273,10 +279,10 @@ fn select_files(
         return Ok((entry, false));
     };
     if only.is_empty() {
-        return Err("Не выбрано ни одного файла".into());
+        return Err(tr("Не выбрано ни одного файла").into());
     }
     if let Some(&bad) = only.iter().find(|&&i| i >= all.len()) {
-        return Err(format!("В записи нет файла №{}", bad + 1));
+        return Err(trf("В записи нет файла №{n}", &[("n", &(bad + 1))]));
     }
     let total = all.len();
     let mut i = 0;

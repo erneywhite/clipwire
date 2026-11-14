@@ -11,6 +11,7 @@
 //! Тип для протокола определяется по содержимому, поэтому как PDF или медиа
 //! файл открывается только с подходящей сигнатурой в начале.
 
+use clipwire_agent::i18n::{tr, trf};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -44,7 +45,7 @@ const NONE: FilePreview = FilePreview {
 #[tauri::command]
 pub fn file_preview(app: AppHandle, path: String) -> Result<FilePreview, String> {
     if !in_history(&app, &path) {
-        return Err("Этого файла нет в истории".into());
+        return Err(tr("Этого файла нет в истории").into());
     }
     let p = Path::new(&path);
     if !p.is_file() {
@@ -62,7 +63,7 @@ pub fn file_preview(app: AppHandle, path: String) -> Result<FilePreview, String>
         // если в окнах появится сторонний контент.
         app.asset_protocol_scope()
             .allow_file(p)
-            .map_err(|e| format!("Файл не открылся для просмотра: {e}"))?;
+            .map_err(|e| trf("Файл не открылся для просмотра: {e}", &[("e", &e)]))?;
         return Ok(FilePreview {
             kind,
             text: None,
@@ -102,25 +103,24 @@ fn entry(app: &AppHandle, id: &str) -> Result<Entry, String> {
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
     h.get(id)
         .cloned()
-        .ok_or_else(|| "Элемента уже нет в истории".into())
+        .ok_or_else(|| tr("Элемента уже нет в истории").into())
 }
 
 /// Текст ошибки про файлы, которых на сервере нет (папки, большие файлы).
 fn only_on_source(e: &Entry, files: &[&FileRef]) -> String {
     let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
-    format!(
-        "Есть только на устройстве «{}»: {}",
-        e.device_name,
-        names.join(", ")
+    trf(
+        "Есть только на устройстве «{device}»: {files}",
+        &[("device", &e.device_name), ("files", &names.join(", "))],
     )
 }
 
 /// Текст ошибки про свои файлы, которых нет ни на месте, ни на сервере.
 fn gone_here(files: &[&FileRef]) -> String {
     let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
-    format!(
-        "Файла нет на месте, его переместили или удалили: {}",
-        names.join(", ")
+    trf(
+        "Файла нет на месте, его переместили или удалили: {files}",
+        &[("files", &names.join(", "))],
     )
 }
 
@@ -190,7 +190,9 @@ async fn download(app: &AppHandle, e: &Entry, files: &[FileRef]) -> Result<Vec<P
         let svc = state.service.lock().unwrap_or_else(|e| e.into_inner());
         svc.as_ref().and_then(|s| s.blobs())
     }
-    .ok_or("Устройство не в группе: файлы с других устройств не скачать")?;
+    .ok_or(tr(
+        "Устройство не в группе: файлы с других устройств не скачать",
+    ))?;
     // Где лежат файлы (сервер или внешнее хранилище группы) — метка записи.
     let places = clipwire_agent::storage::external::places(&e.ext);
     let res = blobs.download_all_at(files, e.origin, &places).await;
@@ -214,10 +216,14 @@ async fn download(app: &AppHandle, e: &Entry, files: &[FileRef]) -> Result<Vec<P
 /// сети». Остальные ошибки показываются как есть, всей цепочкой.
 fn download_error(err: &anyhow::Error, device: &str) -> String {
     match err.chain().find_map(|c| c.downcast_ref::<P2pError>()) {
-        Some(P2pError::Offline) => format!("{err}: устройство «{device}» не в сети"),
-        Some(P2pError::Denied) => {
-            format!("{err}: устройство «{device}» не пустило, у него другой ключ группы")
-        }
+        Some(P2pError::Offline) => trf(
+            "{err}: устройство «{device}» не в сети",
+            &[("err", &err), ("device", &device)],
+        ),
+        Some(P2pError::Denied) => trf(
+            "{err}: устройство «{device}» не пустило, у него другой ключ группы",
+            &[("err", &err), ("device", &device)],
+        ),
         _ => format!("{err:#}"),
     }
 }
@@ -236,7 +242,7 @@ pub fn paths_replaced(orig: &[FileRef], here: &[FileRef]) -> bool {
 /// получить (нет на сервере, не скачался) — ошибка и ничего не возвращается.
 pub async fn fetch_for_paste(app: &AppHandle, e: &Entry) -> Result<Vec<FileRef>, String> {
     let Content::Files(files) = &e.content else {
-        return Err("В записи нет файлов".into());
+        return Err(tr("В записи нет файлов").into());
     };
     let dir = files_dir(&app.state::<AppState>().paths.dir);
     let plan = plan(e, files, &dir);
@@ -266,7 +272,7 @@ fn with_local_paths(
     for (f, s) in files.iter().zip(plan) {
         let p = match s {
             Source::Here(p) => p,
-            Source::Fetch => fetched.next().ok_or("Файл не скачался")?,
+            Source::Fetch => fetched.next().ok_or(tr("Файл не скачался"))?,
             Source::Missing => return Err(only_on_source(e, &[f])),
         };
         out.push(FileRef {
@@ -301,7 +307,7 @@ pub fn bump(app: &AppHandle, e: &Entry) {
 pub async fn files_download(app: AppHandle, id: String) -> Result<(), String> {
     let e = entry(&app, &id)?;
     let Content::Files(files) = &e.content else {
-        return Err("В записи нет файлов".into());
+        return Err(tr("В записи нет файлов").into());
     };
     let dir = files_dir(&app.state::<AppState>().paths.dir);
     let plan = plan(&e, files, &dir);
@@ -322,14 +328,14 @@ pub async fn files_download(app: AppHandle, id: String) -> Result<(), String> {
 pub fn folder_open(app: AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
     if !in_history(&app, &path) {
-        return Err("Этой папки нет в истории".into());
+        return Err(tr("Этой папки нет в истории").into());
     }
     if !Path::new(&path).is_dir() {
-        return Err("Папки нет на месте: её переместили или удалили".into());
+        return Err(tr("Папки нет на месте: её переместили или удалили").into());
     }
     app.opener()
         .open_path(&path, None::<&str>)
-        .map_err(|e| format!("Папка не открылась: {e}"))
+        .map_err(|e| trf("Папка не открылась: {e}", &[("e", &e)]))
 }
 
 /// Текущие передачи файлов — начальное состояние окна.

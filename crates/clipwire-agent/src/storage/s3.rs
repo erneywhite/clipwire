@@ -5,6 +5,7 @@
 //! хэшем. Только HTTPS; HTTP — лишь для `localhost` и адресов локальной сети
 //! (свой MinIO дома), интерфейс тогда предупреждает ([`S3Store::insecure`]).
 
+use crate::i18n::{tr, trf};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -61,32 +62,42 @@ pub(crate) struct Prepared {
 
 impl S3Store {
     pub fn new(cfg: S3Config) -> Result<Self, StoreError> {
-        let url = Url::parse(cfg.endpoint.trim())
-            .map_err(|e| StoreError::Config(format!("адрес «{}»: {e}", cfg.endpoint)))?;
+        let url = Url::parse(cfg.endpoint.trim()).map_err(|e| {
+            StoreError::Config(trf(
+                "адрес «{endpoint}»: {e}",
+                &[("endpoint", &cfg.endpoint), ("e", &e)],
+            ))
+        })?;
         let host = url
             .host_str()
-            .ok_or_else(|| StoreError::Config("в адресе нет хоста".into()))?
+            .ok_or_else(|| StoreError::Config(tr("в адресе нет хоста").into()))?
             .to_string();
         let insecure = match url.scheme() {
             "https" => false,
             "http" if is_local_host(&host) => true,
             "http" => {
                 return Err(StoreError::Config(
-                    "по HTTP можно только к localhost и адресам локальной сети, нужен HTTPS".into(),
+                    tr("по HTTP можно только к localhost и адресам локальной сети, нужен HTTPS")
+                        .into(),
                 ));
             }
-            s => return Err(StoreError::Config(format!("схема «{s}» не поддерживается"))),
+            s => {
+                return Err(StoreError::Config(trf(
+                    "схема «{s}» не поддерживается",
+                    &[("s", &s)],
+                )));
+            }
         };
         if cfg.bucket.trim().is_empty() {
-            return Err(StoreError::Config("не указан бакет".into()));
+            return Err(StoreError::Config(tr("не указан бакет").into()));
         }
         if cfg.access_key.is_empty() || cfg.secret_key.is_empty() {
-            return Err(StoreError::Config("не указан ключ доступа".into()));
+            return Err(StoreError::Config(tr("не указан ключ доступа").into()));
         }
         if !cfg.path_style && cfg.bucket.contains('.') && !insecure {
             // Сертификат *.endpoint не покрывает bucket.с.точками.endpoint.
             return Err(StoreError::Config(
-                "бакет с точкой в имени работает только с адресацией endpoint/bucket".into(),
+                tr("бакет с точкой в имени работает только с адресацией endpoint/bucket").into(),
             ));
         }
         crate::storage::s3::install_crypto();
@@ -95,7 +106,7 @@ impl S3Store {
             .connect_timeout(CONNECT_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| StoreError::Other(format!("HTTP-клиент не собрался: {e}")))?;
+            .map_err(|e| StoreError::Other(trf("HTTP-клиент не собрался: {e}", &[("e", &e)])))?;
         Ok(Self {
             scheme: url.scheme().to_string(),
             host,
@@ -221,7 +232,7 @@ impl S3Store {
         let mut resp = req.send().await.map_err(net)?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        let what = key.unwrap_or("список");
+        let what = key.unwrap_or(tr("список"));
         // Тело читается частями с подсчётом: хранилище недоверенное, и
         // объект на гигабайты не должен оказаться в памяти целиком.
         if resp.content_length().is_some_and(|n| n > max_body) {
@@ -292,7 +303,10 @@ fn s3_error(status: StatusCode, body: &[u8]) -> StoreError {
             StoreError::Auth(detail)
         }
         (_, "AuthorizationHeaderMalformed" | "PermanentRedirect" | "InvalidBucketName") => {
-            StoreError::Config(format!("{detail}: проверьте адрес, регион и имя бакета"))
+            StoreError::Config(trf(
+                "{detail}: проверьте адрес, регион и имя бакета",
+                &[("detail", &detail)],
+            ))
         }
         (403, _) => StoreError::Forbidden(detail),
         (301 | 307 | 400, _) => StoreError::Config(detail),
@@ -476,22 +490,25 @@ impl ObjectStore for S3Store {
                     }
                 }
                 if out.len() > super::MAX_LIST {
-                    return Err(StoreError::Corrupt(format!(
-                        "в {dir} больше {} объектов",
-                        super::MAX_LIST
+                    return Err(StoreError::Corrupt(trf(
+                        "в {dir} больше {max} объектов",
+                        &[("dir", &dir), ("max", &super::MAX_LIST)],
                     )));
                 }
                 match next {
                     // Повтор токена — список по кругу.
                     Some(t) if !seen_tokens.insert(t.clone()) => {
-                        return Err(StoreError::Corrupt("список объектов пошёл по кругу".into()));
+                        return Err(StoreError::Corrupt(
+                            tr("список объектов пошёл по кругу").into(),
+                        ));
                     }
                     Some(t) => token = Some(t),
                     None => return Ok(out),
                 }
             }
-            Err(StoreError::Corrupt(format!(
-                "список {dir} длиннее {MAX_LIST_PAGES} страниц"
+            Err(StoreError::Corrupt(trf(
+                "список {dir} длиннее {pages} страниц",
+                &[("dir", &dir), ("pages", &MAX_LIST_PAGES)],
             )))
         })
     }

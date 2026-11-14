@@ -5,12 +5,13 @@
 //! без опроса. Поток не зависит от GUI-фреймворка приложения, поэтому один и
 //! тот же код работает и в Tauri, и в консольном агенте.
 
+use crate::i18n::tr;
 use anyhow::Result;
 
 /// Записать текст в буфер ОС.
 pub fn write_text(text: &str) -> Result<()> {
     use anyhow::Context;
-    with_retry(|c| c.set_text(text)).context("не удалось записать в буфер")?;
+    with_retry(|c| c.set_text(text)).context(tr("не удалось записать в буфер"))?;
     Ok(())
 }
 
@@ -28,7 +29,7 @@ pub fn write_image(png: &[u8], width: u32, height: u32) -> Result<()> {
             bytes: std::borrow::Cow::Borrowed(&raw),
         })
     })
-    .context("не удалось записать картинку в буфер")?;
+    .context(tr("не удалось записать картинку в буфер"))?;
     Ok(())
 }
 
@@ -47,7 +48,7 @@ pub fn write(content: &clipwire_core::Content) -> Result<()> {
         #[cfg(windows)]
         clipwire_core::Content::Files(files) => win::write_files(files),
         #[allow(unreachable_patterns)]
-        _ => anyhow::bail!("этот тип пока не записывается в буфер"),
+        _ => anyhow::bail!(tr("этот тип пока не записывается в буфер")),
     }
 }
 
@@ -285,6 +286,7 @@ pub use win::Watcher;
 
 #[cfg(windows)]
 mod win {
+    use crate::i18n::{tr, trf};
     use std::sync::mpsc as std_mpsc;
 
     use anyhow::{Context, Result, anyhow};
@@ -700,14 +702,16 @@ mod win {
             .collect();
         anyhow::ensure!(
             missing.is_empty(),
-            "файлов уже нет на месте: {}",
-            missing.join(", ")
+            trf(
+                "файлов уже нет на месте: {files}",
+                &[("files", &missing.join(", "))]
+            )
         );
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         let _clip = clipboard_win::Clipboard::new_attempts(OPEN_ATTEMPTS)
-            .map_err(|e| anyhow!("буфер не открылся: {e}"))?;
+            .map_err(|e| anyhow!(trf("буфер не открылся: {e}", &[("e", &e)])))?;
         clipboard_win::raw::set_file_list_with(&paths, DoClear)
-            .map_err(|e| anyhow!("файлы не записались в буфер: {e}"))?;
+            .map_err(|e| anyhow!(trf("файлы не записались в буфер: {e}", &[("e", &e)])))?;
         Ok(())
     }
 
@@ -716,11 +720,13 @@ mod win {
     pub fn write_rich(text: &str, html: Option<&str>, rtf: Option<&[u8]>) -> Result<()> {
         use clipboard_win::options::{DoClear, NoClear};
         use clipboard_win::raw;
-        let err = |what: &str, e: clipboard_win::ErrorCode| anyhow!("буфер: {what}: {e}");
+        let err = |what: &str, e: clipboard_win::ErrorCode| {
+            anyhow!(trf("буфер: {what}: {e}", &[("what", &what), ("e", &e)]))
+        };
         let (html_f, rtf_f) = formats();
         let _clip = clipboard_win::Clipboard::new_attempts(OPEN_ATTEMPTS)
-            .map_err(|e| err("не открылся", e))?;
-        raw::set_string_with(text, DoClear).map_err(|e| err("текст", e))?;
+            .map_err(|e| err(tr("не открылся"), e))?;
+        raw::set_string_with(text, DoClear).map_err(|e| err(tr("текст"), e))?;
         if let (Some(f), Some(h)) = (html_f, html) {
             raw::set_html_with(f, h, NoClear).map_err(|e| err("HTML", e))?;
         }

@@ -9,6 +9,7 @@
 //! входит: у него свой потоковый протокол (`blobs.rs`), выбор между ними —
 //! в [`crate::blobs::Blobs`].
 
+use crate::i18n::{tr, trf};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -57,18 +58,27 @@ impl StoreError {
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Auth(d) => write!(f, "неверный ключ доступа или пароль ({d})"),
-            Self::NoBucket(d) => write!(f, "бакета или папки нет ({d})"),
-            Self::Forbidden(d) => write!(f, "нет прав на запись или чтение ({d})"),
-            Self::HostKey { expected, got } => write!(
-                f,
-                "не тот ключ хоста: сервер прислал {got}, а подтверждён {expected}"
-            ),
-            Self::Timeout => f.write_str("хранилище не ответило вовремя"),
-            Self::Network(d) => write!(f, "нет связи с хранилищем ({d})"),
-            Self::Config(d) => write!(f, "настройки хранилища не годятся: {d}"),
-            Self::Corrupt(d) => write!(f, "хранилище отдало испорченные данные: {d}"),
-            Self::Other(d) => write!(f, "ошибка хранилища: {d}"),
+            Self::Auth(d) => {
+                f.write_str(&trf("неверный ключ доступа или пароль ({d})", &[("d", d)]))
+            }
+            Self::NoBucket(d) => f.write_str(&trf("бакета или папки нет ({d})", &[("d", d)])),
+            Self::Forbidden(d) => {
+                f.write_str(&trf("нет прав на запись или чтение ({d})", &[("d", d)]))
+            }
+            Self::HostKey { expected, got } => f.write_str(&trf(
+                "не тот ключ хоста: сервер прислал {got}, а подтверждён {expected}",
+                &[("got", got), ("expected", expected)],
+            )),
+            Self::Timeout => f.write_str(tr("хранилище не ответило вовремя")),
+            Self::Network(d) => f.write_str(&trf("нет связи с хранилищем ({d})", &[("d", d)])),
+            Self::Config(d) => {
+                f.write_str(&trf("настройки хранилища не годятся: {d}", &[("d", d)]))
+            }
+            Self::Corrupt(d) => f.write_str(&trf(
+                "хранилище отдало испорченные данные: {d}",
+                &[("d", d)],
+            )),
+            Self::Other(d) => f.write_str(&trf("ошибка хранилища: {d}", &[("d", d)])),
         }
     }
 }
@@ -96,7 +106,10 @@ pub const MAX_DEPTH: usize = 2;
 
 /// Отказ, если объект больше предела.
 pub(crate) fn too_large(name: &str, max: u64) -> StoreError {
-    StoreError::Corrupt(format!("объект {name} больше {max} байт"))
+    StoreError::Corrupt(trf(
+        "объект {name} больше {max} байт",
+        &[("name", &name), ("max", &max)],
+    ))
 }
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StoreError>> + Send + 'a>>;
@@ -159,8 +172,9 @@ pub(crate) fn check_name(name: &str) -> Result<(), StoreError> {
     if ok {
         Ok(())
     } else {
-        Err(StoreError::Other(format!(
-            "недопустимое имя объекта {name:?}"
+        Err(StoreError::Other(trf(
+            "недопустимое имя объекта {name}",
+            &[("name", &format!("{name:?}"))],
         )))
     }
 }

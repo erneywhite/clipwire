@@ -6,6 +6,7 @@
 //! загрузка не закончена, ждать, опрашивая раз в секунду; 10 минут без новой
 //! части — загрузка брошена. Плюс проверка подключения и чистка по сроку.
 
+use crate::i18n::{tr, trf};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -71,7 +72,7 @@ pub async fn get_meta(
         Some(raw) => key
             .open_meta(blob, &raw)
             .map(Some)
-            .map_err(|e| StoreError::Corrupt(format!("meta файла: {e}"))),
+            .map_err(|e| StoreError::Corrupt(trf("meta файла: {e}", &[("e", &e)]))),
     }
 }
 
@@ -276,15 +277,18 @@ pub async fn download(
         }
     };
     if meta.size != size {
-        return Err(anyhow!(
-            "во внешнем хранилище файл другого размера: {} байт вместо {size}",
-            meta.size
-        )
+        return Err(anyhow!(trf(
+            "во внешнем хранилище файл другого размера: {actual} байт вместо {size}",
+            &[("actual", &meta.size), ("size", &size)]
+        ))
         .into());
     }
-    let mut w = PartWriter::open(dest, size)
-        .await
-        .map_err(|e| anyhow!("не открылся {}: {e}", dest.display()))?;
+    let mut w = PartWriter::open(dest, size).await.map_err(|e| {
+        anyhow!(trf(
+            "не открылся {path}: {e}",
+            &[("path", &dest.display()), ("e", &e)]
+        ))
+    })?;
     let bkey = key.blob_key(blob);
     progress(w.done_bytes());
     let mut meta_missing = 0;
@@ -320,16 +324,18 @@ pub async fn download(
                         .await
                         .is_ok_and(|h| h.is_some())
                     {
-                        return Err(anyhow!(
-                            "часть {index} пропала из внешнего хранилища (удалена по сроку?)"
-                        )
+                        return Err(anyhow!(trf(
+                            "часть {index} пропала из внешнего хранилища (удалена по сроку?)",
+                            &[("index", &index)]
+                        ))
                         .into());
                     }
                     unreadable += 1;
                     if unreadable >= UNREADABLE_AFTER {
-                        return Err(anyhow!(
-                            "часть {index} есть во внешнем хранилище, но не читается"
-                        )
+                        return Err(anyhow!(trf(
+                            "часть {index} есть во внешнем хранилище, но не читается",
+                            &[("index", &index)]
+                        ))
                         .into());
                     }
                     meta_missing = 0;
@@ -342,10 +348,10 @@ pub async fn download(
             Err(e) => return Err(anyhow!("{e}").into()),
         }
         if last_progress.elapsed() >= waits.stall {
-            return Err(anyhow!(
-                "загрузка файла остановилась на источнике: за {} мин не появилось ни одной части",
-                waits.stall.as_secs() / 60
-            )
+            return Err(anyhow!(trf(
+                "загрузка файла остановилась на источнике: за {min} мин не появилось ни одной части",
+                &[("min", &(waits.stall.as_secs() / 60))]
+            ))
             .into());
         }
         tokio::time::sleep(waits.poll).await;
@@ -412,16 +418,20 @@ pub async fn probe_store(store: &dyn ObjectStore, group: &GroupId) -> Result<(),
     let deleted = store.delete(&name).await;
     match back? {
         Some(d) if d == data => {}
-        Some(_) => return Err(StoreError::Other("прочитано не то, что записано".into())),
+        Some(_) => {
+            return Err(StoreError::Other(
+                tr("прочитано не то, что записано").into(),
+            ));
+        }
         None => {
             return Err(StoreError::Other(
-                "записанный объект не читается обратно".into(),
+                tr("записанный объект не читается обратно").into(),
             ));
         }
     }
     deleted?;
     if store.head(&name).await?.is_some() {
-        return Err(StoreError::Forbidden("объект не удалился".into()));
+        return Err(StoreError::Forbidden(tr("объект не удалился").into()));
     }
     Ok(())
 }

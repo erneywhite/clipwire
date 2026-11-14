@@ -2,6 +2,7 @@
 //! изменения буфера и отдаёт наружу чужие. С буфером ОС сам не работает —
 //! это делает платформенный слой, поэтому движок тестируется без GUI.
 
+use crate::i18n::{tr, trf};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -333,7 +334,7 @@ impl Engine {
         let url: RelayUrl = server
             .relay_url
             .parse()
-            .with_context(|| format!("кривой адрес relay {}", server.relay_url))?;
+            .with_context(|| trf("кривой адрес relay {url}", &[("url", &server.relay_url)]))?;
         // Один эндпоинт и для сервера, и для прямых соединений устройств
         // группы: входящие принимаются только с ALPN `clipwire-p2p/1`.
         let ep = Endpoint::builder(presets::Minimal)
@@ -344,7 +345,7 @@ impl Engine {
             .alpns(vec![P2P_ALPN.to_vec()])
             .bind()
             .await
-            .context("не поднялся iroh-эндпоинт")?;
+            .context(tr("не поднялся iroh-эндпоинт"))?;
         let uploads = self.blobs.clone();
         let uploader = async move {
             if let Some(b) = uploads {
@@ -394,10 +395,10 @@ impl Engine {
                 .await;
             // Ответов на запросы списка из оборвавшейся сессии уже не будет.
             for w in self.devices_waiters.drain(..).flatten() {
-                let _ = w.send(Err("Связь с сервером оборвалась".into()));
+                let _ = w.send(Err(tr("Связь с сервером оборвалась").into()));
             }
             for w in self.stats_waiters.drain(..) {
-                let _ = w.send(Err("Связь с сервером оборвалась".into()));
+                let _ = w.send(Err(tr("Связь с сервером оборвалась").into()));
             }
             match res {
                 // Сессия кончается без ошибки, только когда закрыт канал локальных изменений.
@@ -453,7 +454,7 @@ impl Engine {
                     },
                     ctl = next_control(&mut control) => match ctl {
                         Control::Delete(note) => self.queue_delete(note),
-                        ctl => refuse_control(ctl, OFFLINE),
+                        ctl => refuse_control(ctl, crate::devices::offline()),
                     },
                 }
             }
@@ -473,7 +474,7 @@ impl Engine {
                 c = local.recv() => if c.is_none() { return },
                 ctl = next_control(control) => refuse_control(
                     ctl,
-                    "Ключ группы сменён, устройство переподключается",
+                    tr("Ключ группы сменён, устройство переподключается"),
                 ),
             }
         }
@@ -505,12 +506,12 @@ impl Engine {
             Some(n) => {
                 tracing::info!(by_me = n.by_me, "ключ группы сменён, перехожу на новый");
                 self.emit(Event::Rekeyed(n));
-                anyhow!("ключ группы сменён")
+                anyhow!(tr("ключ группы сменён"))
             }
             None => {
                 tracing::info!("устройство исключили из группы");
                 self.emit(Event::Excluded { old });
-                anyhow!("устройство исключили из группы")
+                anyhow!(tr("устройство исключили из группы"))
             }
         }
     }
@@ -611,7 +612,7 @@ impl Engine {
                     // Если на первый вход сервер отказал внятно, его причина
                     // понятнее второй.
                     Err(second) => match first {
-                        JoinFail::Refused(e) => bail!("сервер отказал: {e}"),
+                        JoinFail::Refused(e) => bail!(trf("сервер отказал: {e}", &[("e", &e)])),
                         _ => bail!("{second}"),
                     },
                 }
@@ -625,7 +626,7 @@ impl Engine {
         if self.pending_rekey.take().is_some() {
             tracing::warn!("смена ключа не дошла до сервера");
             self.emit(Event::RekeyLost(
-                "Ключ не сменился: сервер не получил запрос. Попробуйте ещё раз".into(),
+                tr("Ключ не сменился: сервер не получил запрос. Попробуйте ещё раз").into(),
             ));
         }
         // История идёт по элементу; таймаут на каждый, а не на всю: с
@@ -634,13 +635,13 @@ impl Engine {
         loop {
             match tokio::time::timeout(CONNECT_TIMEOUT, read_msg(&mut recv))
                 .await
-                .context("сервер не дослал историю")??
+                .context(tr("сервер не дослал историю"))??
             {
                 Some(ServerMsg::History { item, backfill }) => history.push((item, backfill)),
                 Some(ServerMsg::HistoryEnd) => break,
-                Some(ServerMsg::Error(e)) => bail!("сервер: {e}"),
+                Some(ServerMsg::Error(e)) => bail!(trf("сервер: {e}", &[("e", &e)])),
                 Some(other) => bail!("неожиданное сообщение в истории: {other:?}"),
-                None => bail!("сервер закрыл соединение"),
+                None => bail!(tr("сервер закрыл соединение")),
             }
         }
         self.apply_history(history);
@@ -732,7 +733,7 @@ impl Engine {
                             self.request_list(&mut send).await?;
                         }
                     }
-                    None => bail!("сервер закрыл соединение"),
+                    None => bail!(tr("сервер закрыл соединение")),
                 },
                 _ = refresh.tick(), if self.cards_on() => {
                     self.request_list(&mut send).await?;
@@ -754,18 +755,18 @@ impl Engine {
                             write_msg(&mut send, &ClientMsg::GetStats).await?;
                             self.stats_waiters.push_back(reply);
                         } else {
-                            let _ = reply.send(Err(crate::devices::OLD_SERVER_STATS.into()));
+                            let _ = reply.send(Err(crate::devices::old_server_stats().into()));
                         }
                     }
                     Control::SetGroupConfig { sealed, config, reply } => {
                         if !self.config_supported {
                             let _ = reply.send(Err(
-                                "Сервер не поддерживает настройки группы: обновите сервер Clipwire".into(),
+                                tr("Сервер не поддерживает настройки группы: обновите сервер Clipwire").into(),
                             ));
                         } else if let Err(e) =
                             write_msg(&mut send, &ClientMsg::SetGroupConfig(sealed)).await
                         {
-                            let _ = reply.send(Err(format!("Настройки не сохранились: {e}")));
+                            let _ = reply.send(Err(trf("Настройки не сохранились: {e}", &[("e", &e)])));
                             return Err(e.into());
                         } else {
                             if let Some(b) = &self.blobs {
@@ -785,7 +786,7 @@ impl Engine {
                                 // Старая группа уже закрыла поток. Новый движок
                                 // запустит тот, кто сохранит новый ключ.
                                 conn.close(0u32.into(), b"rekeyed");
-                                bail!("ключ группы сменён на этом устройстве");
+                                bail!(tr("ключ группы сменён на этом устройстве"));
                             }
                             Ok(Err(refused)) => {
                                 let _ = reply.send(Err(refused));
@@ -795,9 +796,9 @@ impl Engine {
                                 // станет ясно при повторном входе в старую
                                 // группу (свой `Rekeyed` или обычный вход).
                                 let msg = if self.pending_rekey.is_some() {
-                                    "Ответ сервера не пришёл, проверяю…".to_string()
+                                    tr("Ответ сервера не пришёл, проверяю…").to_string()
                                 } else {
-                                    format!("Ключ не сменился: {e:#}")
+                                    trf("Ключ не сменился: {e}", &[("e", &format!("{e:#}"))])
                                 };
                                 let _ = reply.send(Err(msg));
                                 return Err(e);
@@ -829,7 +830,7 @@ impl Engine {
             ServerMsg::Devices(list) => self.answer_devices(list),
             ServerMsg::Rekeyed { envelope } => return Err(self.rotated(Some(envelope))),
             ServerMsg::Excluded => return Err(self.rotated(None)),
-            ServerMsg::Error(e) => bail!("сервер: {e}"),
+            ServerMsg::Error(e) => bail!(trf("сервер: {e}", &[("e", &e)])),
             ServerMsg::GroupConfig(sealed) => self.group_config(key, sealed),
             ServerMsg::Deleted(sealed) => match key.open_delete(&sealed) {
                 Ok(note) => self.emit(Event::Deleted(note)),
@@ -892,14 +893,14 @@ impl Engine {
         loop {
             let msg = tokio::time::timeout(CONNECT_TIMEOUT, read_msg::<_, ServerMsg>(recv))
                 .await
-                .context("сервер не прислал список устройств")??;
+                .context(tr("сервер не прислал список устройств"))??;
             match msg {
                 Some(ServerMsg::Devices(list)) if self.devices_waiters.is_empty() => {
                     self.learn(&list);
                     return Ok(list);
                 }
                 Some(m) => self.handle_msg(key, m)?,
-                None => bail!("сервер закрыл соединение"),
+                None => bail!(tr("сервер закрыл соединение")),
             }
         }
     }
@@ -938,7 +939,7 @@ impl Engine {
         let conn2 = connect(ep, addr).await?;
         let (mut send2, mut recv2) = join(&conn2, &new_key, Some(&self.token()))
             .await
-            .map_err(|e| anyhow!("не удалось создать новую группу: {e}"))?;
+            .map_err(|e| anyhow!(trf("не удалось создать новую группу: {e}", &[("e", &e)])))?;
         let card = crate::devices::sealed_card(
             &new_key,
             &self.state.device_key,
@@ -964,12 +965,12 @@ impl Engine {
         loop {
             match tokio::time::timeout(CONNECT_TIMEOUT, read_msg::<_, ServerMsg>(&mut recv2))
                 .await
-                .context("новая группа не ответила")??
+                .context(tr("новая группа не ответила"))??
             {
                 Some(ServerMsg::Devices(_)) => break,
-                Some(ServerMsg::Error(e)) => bail!("новая группа: {e}"),
+                Some(ServerMsg::Error(e)) => bail!(trf("новая группа: {e}", &[("e", &e)])),
                 Some(_) => {}
-                None => bail!("сервер закрыл соединение с новой группой"),
+                None => bail!(tr("сервер закрыл соединение с новой группой")),
             }
         }
 
@@ -992,13 +993,13 @@ impl Engine {
         let res = loop {
             let msg = tokio::time::timeout(CONNECT_TIMEOUT, read_msg::<_, ServerMsg>(recv))
                 .await
-                .context("сервер не ответил на смену ключа")??;
+                .context(tr("сервер не ответил на смену ключа"))??;
             match msg {
                 None => break Ok(()),
                 Some(ServerMsg::Error(e)) => {
                     // Отказ: ничего не изменилось.
                     self.pending_rekey = None;
-                    break Err(anyhow!("сервер отказал: {e}"));
+                    break Err(anyhow!(trf("сервер отказал: {e}", &[("e", &e)])));
                 }
                 Some(m) => {
                     if let Err(e) = self.handle_msg(&old_key, m) {
@@ -1272,7 +1273,10 @@ impl Engine {
                             content: f.content,
                             ext,
                         });
-                        bail!("файлы не зарезервировались: {}", f.error);
+                        bail!(trf(
+                            "файлы не зарезервировались: {error}",
+                            &[("error", &f.error)]
+                        ));
                     }
                 }
             }
@@ -1354,10 +1358,16 @@ async fn connect(ep: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
         r = tokio::time::timeout(CONNECT_TIMEOUT, attempt) => {
             match r {
                 Ok(c) => c,
-                Err(_) => bail!("таймаут подключения{}", relay_hint(ep)),
+                Err(_) => bail!(trf(
+                    "таймаут подключения{hint}",
+                    &[("hint", &relay_hint(ep))]
+                )),
             }
         }
-        reason = relay_denied(ep) => bail!("relay отказал в доступе: {reason}"),
+        reason = relay_denied(ep) => bail!(trf(
+            "relay отказал в доступе: {reason}",
+            &[("reason", &reason)]
+        )),
     }
 }
 
@@ -1380,10 +1390,10 @@ enum JoinFail {
 impl std::fmt::Display for JoinFail {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            JoinFail::Refused(e) => write!(f, "сервер отказал: {e}"),
-            JoinFail::Closed(e) => write!(f, "сервер закрыл соединение: {e}"),
+            JoinFail::Refused(e) => f.write_str(&trf("сервер отказал: {e}", &[("e", e)])),
+            JoinFail::Closed(e) => f.write_str(&trf("сервер закрыл соединение: {e}", &[("e", e)])),
             JoinFail::Other(e) => write!(f, "{e:#}"),
-            JoinFail::Rotated(_) => write!(f, "ключ группы сменён"),
+            JoinFail::Rotated(_) => f.write_str(tr("ключ группы сменён")),
         }
     }
 }
@@ -1415,7 +1425,7 @@ async fn join(
         .map_err(|e| JoinFail::Closed(e.to_string()))?;
     let reply = tokio::time::timeout(CONNECT_TIMEOUT, read_msg(&mut recv))
         .await
-        .map_err(|_| JoinFail::Other(anyhow::anyhow!("сервер не ответил на вход")))?;
+        .map_err(|_| JoinFail::Other(anyhow::anyhow!(tr("сервер не ответил на вход"))))?;
     match reply {
         Ok(Some(ServerMsg::Joined)) => Ok((send, recv)),
         Ok(Some(ServerMsg::Error(e))) => Err(JoinFail::Refused(e)),
@@ -1424,12 +1434,10 @@ async fn join(
         Ok(Some(other)) => Err(JoinFail::Other(anyhow::anyhow!(
             "неожиданный ответ сервера: {other:?}"
         ))),
-        Ok(None) => Err(JoinFail::Closed("без ответа".into())),
+        Ok(None) => Err(JoinFail::Closed(tr("без ответа").into())),
         Err(e) => Err(JoinFail::Closed(e.to_string())),
     }
 }
-
-const OFFLINE: &str = "Нет связи с сервером. Попробуйте, когда устройство будет в сети";
 
 /// Следующая команда интерфейса. Без канала команд (или когда его закрыли)
 /// не заканчивается никогда.
@@ -1499,7 +1507,7 @@ fn relay_hint(ep: &Endpoint) -> String {
     ep.home_relay_status()
         .get()
         .iter()
-        .find_map(|s| s.last_error().map(|e| format!(" (relay: {e})")))
+        .find_map(|s| s.last_error().map(|e| trf(" (relay: {e})", &[("e", &e)])))
         .unwrap_or_default()
 }
 

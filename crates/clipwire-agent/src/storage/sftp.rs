@@ -11,6 +11,7 @@
 //! Запись — во временный файл и переименование: читающий не увидит
 //! полуобъекта. Папки создаются по мере надобности.
 
+use crate::i18n::{tr, trf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -117,18 +118,19 @@ fn is_refusal(e: &SftpError) -> bool {
 impl SftpStore {
     pub fn new(cfg: SftpConfig) -> Result<Self, StoreError> {
         if cfg.host.trim().is_empty() {
-            return Err(StoreError::Config("не указан сервер".into()));
+            return Err(StoreError::Config(tr("не указан сервер").into()));
         }
         if cfg.user.trim().is_empty() {
-            return Err(StoreError::Config("не указан пользователь".into()));
+            return Err(StoreError::Config(tr("не указан пользователь").into()));
         }
         if let SftpAuth::Key {
             private_key,
             passphrase,
         } = &cfg.auth
         {
-            russh::keys::decode_secret_key(private_key, passphrase.as_deref())
-                .map_err(|e| StoreError::Auth(format!("закрытый ключ не прочитался: {e}")))?;
+            russh::keys::decode_secret_key(private_key, passphrase.as_deref()).map_err(|e| {
+                StoreError::Auth(trf("закрытый ключ не прочитался: {e}", &[("e", &e)]))
+            })?;
         }
         Ok(Self {
             cfg,
@@ -210,14 +212,14 @@ impl SftpStore {
         .map_err(|_| StoreError::Timeout)?
         .map_err(|e| StoreError::Network(e.to_string()))?;
         if !auth.success() {
-            return Err(StoreError::Auth(format!(
-                "сервер не принял вход пользователя «{}»",
-                self.cfg.user
+            return Err(StoreError::Auth(trf(
+                "сервер не принял вход пользователя «{user}»",
+                &[("user", &self.cfg.user)],
             )));
         }
         let sftp = SftpSession::new(open_sftp_channel(&handle).await?)
             .await
-            .map_err(|e| StoreError::Other(format!("сервер не дал SFTP: {e}")))?;
+            .map_err(|e| StoreError::Other(trf("сервер не дал SFTP: {e}", &[("e", &e)])))?;
         sftp.set_timeout(OP_TIMEOUT_SECS);
         // shortcut: без второго канала (MaxSessions 1) чтение папки не
         // ограничено по ходу, предел проверяется после ответа сервера; переделать,
@@ -299,7 +301,7 @@ impl SftpStore {
         match probe.connect().await {
             Err(StoreError::HostKey { got, .. }) => Ok(got),
             Err(e) => Err(e),
-            Ok(_) => Err(StoreError::Other("сервер не прислал ключ хоста".into())),
+            Ok(_) => Err(StoreError::Other(tr("сервер не прислал ключ хоста").into())),
         }
     }
 }
@@ -342,9 +344,9 @@ async fn read_dir_any(
         }
         *seen += 1;
         if *seen > super::MAX_LIST {
-            return Err(StoreError::Corrupt(format!(
-                "в папке {dir} больше {} записей",
-                super::MAX_LIST
+            return Err(StoreError::Corrupt(trf(
+                "в папке {dir} больше {max} записей",
+                &[("dir", &dir), ("max", &super::MAX_LIST)],
             )));
         }
         out.push((n, e.metadata()));
@@ -460,7 +462,10 @@ async fn write_file(sftp: &SftpSession, path: &str, data: &[u8]) -> Result<(), S
 }
 
 fn too_many(dir: &str) -> StoreError {
-    StoreError::Corrupt(format!("в {dir} больше {} объектов", super::MAX_LIST))
+    StoreError::Corrupt(trf(
+        "в {dir} больше {max} объектов",
+        &[("dir", &dir), ("max", &super::MAX_LIST)],
+    ))
 }
 
 fn parent(path: &str) -> Option<&str> {

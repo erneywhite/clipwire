@@ -3,6 +3,7 @@
 //! Используется и приложением (Tauri), и консольным `clipwire-agent run`.
 //! Наружу отдаёт события для интерфейса и простые команды (пауза, запись в буфер).
 
+use crate::i18n::{tr, trf};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -751,7 +752,13 @@ fn assign_blobs_until(
         match prepare_folder(f, blob, limit_mb, outbox, cancel) {
             Ok(true) => built.push(blob),
             Ok(false) => {}
-            Err(reason) => failed.push((blob, format!("«{}»: {reason}", f.name))),
+            Err(reason) => failed.push((
+                blob,
+                trf(
+                    "«{name}»: {reason}",
+                    &[("name", &f.name), ("reason", &reason)],
+                ),
+            )),
         }
     }
     if cancel.load(Ordering::SeqCst) {
@@ -788,7 +795,7 @@ fn prepare_folder(
         built = true;
         if len != tar {
             let _ = std::fs::remove_file(crate::blobs::outbox_path(outbox, blob));
-            anyhow::bail!("архив папки собрался не того размера");
+            anyhow::bail!(tr("архив папки собрался не того размера"));
         }
     }
     f.blob = Some(blob);

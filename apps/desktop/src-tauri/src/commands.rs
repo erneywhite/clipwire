@@ -4,6 +4,7 @@
 //! текст должен быть понятен человеку.
 
 use clipwire_agent::history::Entry;
+use clipwire_agent::i18n::tr;
 use clipwire_agent::settings::Settings;
 use clipwire_agent::state::{AgentState, random_key};
 use clipwire_core::{Content, GroupKey, Invite, ItemId, ServerInfo};
@@ -44,14 +45,14 @@ pub fn invite_code(state: State<'_, AppState>) -> CmdResult<String> {
         .paths
         .load()
         .map_err(err)?
-        .ok_or("Устройство ещё не в группе")?;
+        .ok_or(tr("Устройство ещё не в группе"))?;
     Ok(agent.invite.encode())
 }
 
 fn ensure_unconfigured(app: &AppHandle) -> CmdResult<()> {
     let state = app.state::<AppState>();
     if state.paths.load().map_err(err)?.is_some() {
-        return Err("Устройство уже в группе".into());
+        return Err(tr("Устройство уже в группе").into());
     }
     Ok(())
 }
@@ -306,7 +307,7 @@ fn to_dto(
 pub fn parse_id(id: &str) -> CmdResult<ItemId> {
     id.parse()
         .map(ItemId)
-        .map_err(|_| "Неверный id элемента".to_string())
+        .map_err(|_| tr("Неверный id элемента").to_string())
 }
 
 #[tauri::command]
@@ -339,7 +340,7 @@ pub fn history_get(state: State<'_, AppState>, id: String) -> CmdResult<EntryDto
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
     h.get(id)
         .map(|e| to_dto(e, h.thumb(e.id), true, &files_dir, &uploaded))
-        .ok_or_else(|| "Элемента уже нет в истории".into())
+        .ok_or_else(|| tr("Элемента уже нет в истории").into())
 }
 
 #[tauri::command]
