@@ -103,18 +103,30 @@ impl Default for Settings {
             sound_on_receive: true,
             link_previews: true,
             hide_from_capture: false,
-            ignored_apps: vec![
-                "KeePass.exe".into(),
-                "KeePassXC.exe".into(),
-                "1Password.exe".into(),
-                "Bitwarden.exe".into(),
-            ],
+            ignored_apps: default_ignored_apps(),
             file_upload_limit_mb: 100,
             auto_update: true,
             delete_everywhere: false,
             language: "system".into(),
         }
     }
+}
+
+/// Менеджеры паролей, которые не синхронизируются по умолчанию. Большинство и
+/// так помечает пароли приватными, список — запас на случай, если нет. Имена —
+/// как их видит `service::is_ignored` (без `.exe` / `.app`).
+fn default_ignored_apps() -> Vec<String> {
+    let names: &[&str] = if cfg!(target_os = "macos") {
+        &["KeePassXC", "1Password", "Bitwarden"]
+    } else {
+        &[
+            "KeePass.exe",
+            "KeePassXC.exe",
+            "1Password.exe",
+            "Bitwarden.exe",
+        ]
+    };
+    names.iter().map(|s| s.to_string()).collect()
 }
 
 /// Имя компьютера из окружения ОС.

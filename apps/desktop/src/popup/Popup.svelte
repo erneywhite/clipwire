@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isMac, keys } from '../lib/platform'
   import { onMount, tick } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
   import { api, type Entry, type FileInfo, type KindFilter, type Settings, type Transfer } from '../lib/api'
@@ -413,9 +414,13 @@
     } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyP') {
       e.preventDefault()
       togglePin(current)
-    } else if (e.key === 'Delete' && (e.shiftKey || query === '')) {
+    } else if (
+      (e.key === 'Delete' && (e.shiftKey || query === '')) ||
+      (isMac && e.metaKey && e.key === 'Backspace')
+    ) {
       // При пустом поиске Delete удаляет запись; с текстом в поиске он стирает
-      // символ, тогда удаление — Shift+Delete.
+      // символ, тогда удаление — Shift+Delete. На маке клавиша «delete» — это
+      // Backspace, удаление записи — ⌘⌫, как «в корзину» в Finder.
       e.preventDefault()
       remove(current)
     } else if ((e.ctrlKey || e.metaKey) && /^Digit[1-9]$/.test(e.code)) {
@@ -541,11 +546,11 @@
       <span><kbd>↵</kbd> {t('вставить')}</span>
       <span><kbd>␣</kbd> {t('просмотр')}</span>
       {#if editable(current)}
-        <span><kbd>Ctrl E</kbd> {t('изменить')}</span>
+        <span><kbd>{keys('Ctrl E')}</kbd> {t('изменить')}</span>
       {:else}
-        <span><kbd>Ctrl P</kbd> {t('закрепить')}</span>
+        <span><kbd>{keys('Ctrl P')}</kbd> {t('закрепить')}</span>
       {/if}
-      <span><kbd>Del</kbd> {t('удалить')}</span>
+      <span><kbd>{isMac ? '⌘⌫' : 'Del'}</kbd> {t('удалить')}</span>
     </footer>
   </section>
 
@@ -709,7 +714,7 @@
     {/if}
     <button role="menuitem" onclick={() => act(openPreview)}>{t('Просмотр')}<kbd>{t('Пробел')}</kbd></button>
     {#if editable(m)}
-      <button role="menuitem" onclick={() => act(() => edit(m))}>{t('Изменить')}<kbd>Ctrl E</kbd></button>
+      <button role="menuitem" onclick={() => act(() => edit(m))}>{t('Изменить')}<kbd>{keys('Ctrl E')}</kbd></button>
     {/if}
     {#if m.kind === 'text' && isUrl(m.text)}
       <button role="menuitem" onclick={() => act(() => openUrl(m.text.trim()))}>{t('Открыть в браузере')}</button>
@@ -717,7 +722,7 @@
     {#if m.kind === 'files' && m.files[0]?.local_path}
       <button role="menuitem" onclick={() => act(() => showInFolder(m.files[0]))}>{t('Показать в папке')}</button>
     {/if}
-    <button role="menuitem" onclick={() => act(() => togglePin(m))}>{m.pinned ? t('Открепить') : t('Закрепить')}<kbd>Ctrl P</kbd></button>
+    <button role="menuitem" onclick={() => act(() => togglePin(m))}>{m.pinned ? t('Открепить') : t('Закрепить')}<kbd>{keys('Ctrl P')}</kbd></button>
     <hr />
     <button role="menuitem" class="danger" onclick={() => remove(m)}>{t('Удалить')}<kbd>Del</kbd></button>
   </div>

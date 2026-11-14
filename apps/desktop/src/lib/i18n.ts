@@ -5,6 +5,7 @@
 // перевода. Язык выбирается при запуске окна (`main.ts`); при смене языка
 // окна перезагружаются, поэтому реактивность здесь не нужна.
 import en from './i18n-en.ts'
+import { keys } from './platform.ts'
 
 export type Lang = 'ru' | 'en'
 /** Выбор в настройках: «как в системе» или конкретный язык. */
@@ -34,9 +35,10 @@ function fill(s: string, vars?: Vars): string {
   return s.replace(/\{(\w+)\}/g, (m, k: string) => (k in vars ? String(vars[k]) : m))
 }
 
-/** Перевести строку; `{имя}` в тексте подставляется из `vars`. */
+/** Перевести строку; `{имя}` в тексте подставляется из `vars`. Подписи
+ * клавиш («Ctrl+P») на маке становятся значками (⌘P), см. `platform.ts`. */
 export function t(ru: string, vars?: Vars): string {
-  return fill(current === 'en' ? (en[ru] ?? ru) : ru, vars)
+  return keys(fill(current === 'en' ? (en[ru] ?? ru) : ru, vars))
 }
 
 /**

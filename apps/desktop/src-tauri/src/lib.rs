@@ -400,6 +400,11 @@ pub fn run() {
             commands::update_ready,
         ])
         .setup(|app| {
+            // Утилита строки меню: без иконки в Dock и в Cmd+Tab. В собранном
+            // пакете то же задаёт LSUIElement (Info.plist), здесь — для
+            // `tauri dev` и чтобы не мелькала иконка при запуске.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             // Первым делом: обновление, скачанное в прошлый раз, ставится до
             // запуска движка, а после автоматической установки окно не нужно.
             let after_update = updates::on_startup(app.handle());
@@ -492,4 +497,41 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod config_tests {
+    /// `tauri.macos.conf.json` при слиянии заменяет массив окон целиком, поэтому
+    /// там копия окон из `tauri.conf.json`. Отличаться она может только
+    /// заголовком macOS, иначе правка основного конфига потеряется на маке.
+    #[test]
+    fn mac_windows_match_base_config() {
+        let read = |name: &str| -> serde_json::Value {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let base = read("tauri.conf.json")["app"]["windows"].clone();
+        let mut mac = read("tauri.macos.conf.json")["app"]["windows"].clone();
+        const MAC_ONLY: [&str; 3] = ["titleBarStyle", "hiddenTitle", "trafficLightPosition"];
+        let (base, mac) = (base.as_array().unwrap(), mac.as_array_mut().unwrap());
+        assert_eq!(base.len(), mac.len(), "число окон");
+        for (b, m) in base.iter().zip(mac.iter_mut()) {
+            let m = m.as_object_mut().unwrap();
+            let styled = m.contains_key("titleBarStyle");
+            for k in MAC_ONLY {
+                m.remove(k);
+            }
+            // Окна со «светофором» на маке — с системной рамкой.
+            if styled {
+                assert_eq!(m.remove("decorations"), Some(serde_json::Value::Bool(true)));
+                m.insert("decorations".into(), b["decorations"].clone());
+            }
+            assert_eq!(
+                &serde_json::Value::Object(m.clone()),
+                b,
+                "окно {}",
+                b["label"]
+            );
+        }
+    }
 }

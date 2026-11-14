@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isMac, keys } from '../lib/platform'
   import { onMount } from 'svelte'
   import { t } from '../lib/i18n'
   import { listen } from '@tauri-apps/api/event'
@@ -672,7 +673,7 @@
             {/each}
           </ul>
           <form class="add" onsubmit={(e) => { e.preventDefault(); addApp() }}>
-            <input bind:value={newApp} placeholder="KeePass.exe" spellcheck="false" aria-label={t('Имя программы')} />
+            <input bind:value={newApp} placeholder={isMac ? 'KeePassXC' : 'KeePass.exe'} spellcheck="false" aria-label={t('Имя программы')} />
             <button type="submit" disabled={!newApp.trim()}>{t('Добавить')}</button>
           </form>
         </div>
@@ -729,7 +730,7 @@
 
         <h2>{t('В окне вставки')}</h2>
         <div class="card">
-          {#each [['↑ ↓', t('выбрать')], [t('Enter, двойной клик'), t('вставить')], ['Ctrl + 1…9', t('вставить элемент по номеру')], [t('Пробел'), t('предпросмотр (при пустом поиске)')], ['Ctrl + P', t('закрепить')], ['Delete', t('удалить из истории (при пустом поиске)')], ['Shift + Delete', t('удалить, когда в поиске есть текст')], [t('Правый клик, клавиша меню'), t('действия с записью')], ['Tab', t('История ↔ Закреплённое')], ['Alt + ← →', t('фильтр: текст, ссылки, картинки, файлы')], ['Esc', t('закрыть')]] as [k, v] (k)}
+          {#each [['↑ ↓', t('выбрать')], [t('Enter, двойной клик'), t('вставить')], [keys('Ctrl + 1…9'), t('вставить элемент по номеру')], [t('Пробел'), t('предпросмотр (при пустом поиске)')], [keys('Ctrl + P'), t('закрепить')], ...(isMac ? [['⌘⌫', t('удалить из истории')]] : [['Delete', t('удалить из истории (при пустом поиске)')], ['Shift + Delete', t('удалить, когда в поиске есть текст')]]), [t('Правый клик, клавиша меню'), t('действия с записью')], ['Tab', t('История ↔ Закреплённое')], [keys('Alt + ← →'), t('фильтр: текст, ссылки, картинки, файлы')], ['Esc', t('закрыть')]] as [k, v] (k)}
             <div class="kv"><span class="mono">{k}</span><span>{v}</span></div>
           {/each}
         </div>

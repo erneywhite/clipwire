@@ -1,9 +1,12 @@
 <script lang="ts">
   // Своя полоса заголовка вместо системной: знак, название, свернуть, развернуть,
   // закрыть. Перетаскивание и двойной клик (развернуть) — через data-tauri-drag-region.
+  // На маке кнопки — системный «светофор» слева поверх полосы (titleBarStyle
+  // Overlay в tauri.macos.conf.json), свои не рисуются.
   import { t } from '../lib/i18n'
   import { invoke } from '@tauri-apps/api/core'
   import { getCurrentWindow } from '@tauri-apps/api/window'
+  import { isMac } from '../lib/platform'
 
   let { title = 'Clipwire' }: { title?: string } = $props()
   const win = getCurrentWindow()
@@ -18,7 +21,7 @@
   })
 </script>
 
-<header class="bar" data-tauri-drag-region>
+<header class="bar" class:mac={isMac} data-tauri-drag-region>
   <span class="brand" data-tauri-drag-region>
     <svg viewBox="0 0 256 256" aria-hidden="true">
       <path class="sheet" d="M58 28 H118 L146 56 V148 Q146 166 128 166 H58 Q40 166 40 148 V46 Q40 28 58 28 Z" />
@@ -31,6 +34,7 @@
     </svg>
     {title}
   </span>
+  {#if !isMac}
   <div class="controls">
     <button aria-label={t('Свернуть')} onclick={() => win.minimize()}>
       <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 5h8" /></svg>
@@ -46,6 +50,7 @@
       <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 1l8 8M9 1l-8 8" /></svg>
     </button>
   </div>
+  {/if}
 </header>
 
 <style>
@@ -58,6 +63,10 @@
     background: var(--c-surface);
     border-bottom: 1px solid var(--c-border);
     padding-left: var(--space-3);
+  }
+  /* Место под «светофор» macOS (три кнопки по 12 px с промежутками). */
+  .bar.mac {
+    padding-left: 78px;
   }
   .brand {
     display: flex;

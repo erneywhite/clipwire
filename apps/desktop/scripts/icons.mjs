@@ -49,6 +49,27 @@ for (const [panel, { sheets, wire }] of Object.entries(panels)) {
     }
   }
 }
+// macOS: шаблонные значки строки меню — только чёрный и прозрачность, цвет
+// под тему подставляет сама система. Состояние не цветом: обычный, приглушённый
+// провод (подключение, пауза, пульсация обновления) и перечёркнутый (нет связи).
+// 36 px — строка меню 18 pt на Retina.
+const slash = `
+  <defs><mask id="slashcut"><rect width="256" height="256" fill="#fff"/>
+    <path d="M28 238 L238 28" stroke="#000" stroke-width="52" stroke-linecap="round"/></mask></defs>`
+const macTray = {
+  on: trayTpl.replaceAll('SHEETS', '#000').replaceAll('WIRE', '#000'),
+  dim: trayTpl.replaceAll('SHEETS', '#000').replaceAll('WIRE', '#00000059'),
+  off: trayTpl
+    .replaceAll('SHEETS', '#000')
+    .replaceAll('WIRE', '#00000059')
+    .replace(/(<svg[^>]*>)/, `$1${slash}<g mask="url(#slashcut)">`)
+    .replace('</svg>', '</g><path d="M28 238 L238 28" stroke="#000" stroke-width="22" stroke-linecap="round"/></svg>'),
+}
+for (const [name, svg] of Object.entries(macTray)) {
+  writeFileSync(join(trayOut, `mac-${name}.png`), render(svg, 36))
+  n++
+}
+
 // Картинки установщика NSIS: он понимает только BMP (24 бита, без сжатия).
 function bmp(rgba, w, h) {
   const row = Math.ceil((w * 3) / 4) * 4

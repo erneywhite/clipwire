@@ -1,0 +1,86 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "app": {
+    "windows": [
+      {
+        "label": "settings",
+        "title": "Clipwire",
+        "url": "index.html",
+        "width": 760,
+        "height": 720,
+        "minWidth": 640,
+        "minHeight": 460,
+        "visible": false,
+        "center": true,
+        "backgroundColor": "#1c1e22",
+        "decorations": true,
+        "shadow": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 14,
+          "y": 18
+        }
+      },
+      {
+        "label": "popup",
+        "title": "Clipwire",
+        "url": "index.html",
+        "width": 380,
+        "height": 520,
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": true,
+        "focus": false,
+        "backgroundColor": "#1c1e22"
+      },
+      {
+        "label": "preview",
+        "title": "Clipwire",
+        "url": "index.html",
+        "width": 380,
+        "height": 520,
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "skipTaskbar": true,
+        "focus": false,
+        "focusable": false,
+        "shadow": true,
+        "backgroundColor": "#1c1e22"
+      },
+      {
+        "label": "editor",
+        "title": "Clipwire — редактор",
+        "url": "index.html",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 640,
+        "minHeight": 420,
+        "visible": false,
+        "center": true,
+        "decorations": true,
+        "shadow": true,
+        "backgroundColor": "#1c1e22",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 14,
+          "y": 18
+        }
+      }
+    ]
+  },
+  "bundle": {
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    }
+  }
+}
