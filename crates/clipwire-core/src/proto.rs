@@ -30,6 +30,11 @@ pub const ALPN: &[u8] = b"clipwire/3";
 /// [`Connection::alpn`]: https://docs.rs/iroh/latest/iroh/endpoint/struct.Connection.html#method.alpn
 pub const ALPN_4: &[u8] = b"clipwire/4";
 
+/// Как [`ALPN_4`], плюс удаление записей на всех устройствах (`Delete`,
+/// `Deleted`). Сервер шлёт `Deleted` только соединениям с этим ALPN: старый
+/// клиент на незнакомом варианте `ServerMsg` оборвёт соединение.
+pub const ALPN_5: &[u8] = b"clipwire/5";
+
 /// Предел одного кадра. Сервер может выставить свой лимит на элемент
 /// меньше, этот нужен, чтобы не выделять память под мусорную длину.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -82,6 +87,10 @@ pub enum ClientMsg {
     GetGroupConfig,
     /// Сколько у группы лежит на сервере — ответ `Stats`. Только по [`ALPN_4`].
     GetStats,
+    /// Записка об удалении (`GroupKey::seal_delete`, до
+    /// `delete::MAX_DELETE_BYTES`). Сервер хранит её в пределах своего срока
+    /// хранения и раздаёт остальным `Deleted`. Только по [`ALPN_5`].
+    Delete(Vec<u8>),
 }
 
 /// Что лежит на сервере у группы (ответ на `GetStats`).
@@ -141,6 +150,10 @@ pub enum ServerMsg {
     GroupConfig(Option<Vec<u8>>),
     /// Ответ на `GetStats`.
     Stats(GroupStats),
+    /// Записка об удалении с другого устройства. Приходит сразу и после
+    /// `HistoryEnd` — все хранящиеся, чтобы устройство, бывшее не в сети,
+    /// тоже удалило. Только соединениям по [`ALPN_5`].
+    Deleted(Vec<u8>),
 }
 
 /// Первый кадр потока файла.

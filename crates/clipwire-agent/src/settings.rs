@@ -80,6 +80,9 @@ pub struct Settings {
     /// Скачивать обновления в фоне и ставить, когда программа не нужна.
     /// Выключено — обновление ставится только по кнопке.
     pub auto_update: bool,
+    /// Удаление записи уходит на остальные устройства группы. Выключено —
+    /// удаляется только здесь.
+    pub delete_everywhere: bool,
 }
 
 impl Default for Settings {
@@ -105,6 +108,7 @@ impl Default for Settings {
             ],
             file_upload_limit_mb: 100,
             auto_update: true,
+            delete_everywhere: false,
         }
     }
 }

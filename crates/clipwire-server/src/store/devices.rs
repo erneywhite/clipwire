@@ -226,7 +226,7 @@ impl Store {
                 blobs.push(BlobId(b?.try_into().ok().context("битый blob_id в базе")?));
             }
         }
-        for table in ["items", "blobs", "cards", "group_config"] {
+        for table in ["items", "blobs", "cards", "group_config", "deletes"] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE group_id = ?1"),
                 params![&group.0[..]],
@@ -261,6 +261,7 @@ impl Store {
                 "items",
                 "blobs",
                 "group_config",
+                "deletes",
             ] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE group_id = ?1"),

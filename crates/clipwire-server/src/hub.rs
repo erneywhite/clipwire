@@ -23,6 +23,8 @@ struct Member {
     /// Соединение спрашивало `GetGroupConfig` и получает новые настройки.
     /// Клиенты 0.1.0 этого сообщения не знают, им `GroupConfig` слать нельзя.
     config_sub: Arc<AtomicBool>,
+    /// Соединение по `clipwire/5`: знает `Deleted`.
+    deletes_sub: Arc<AtomicBool>,
 }
 
 type Groups = HashMap<GroupId, HashMap<u64, Member>>;
@@ -43,12 +45,18 @@ pub struct Registration<'a> {
     /// и не зависит от очереди сообщений.
     pub kick: Arc<Notify>,
     config_sub: Arc<AtomicBool>,
+    deletes_sub: Arc<AtomicBool>,
 }
 
 impl Registration<'_> {
     /// Подписать соединение на настройки группы (`GetGroupConfig`).
     pub fn subscribe_config(&self) {
         self.config_sub.store(true, Ordering::Relaxed);
+    }
+
+    /// Соединение знает `Deleted` (`clipwire/5`) и получает записки.
+    pub fn subscribe_deletes(&self) {
+        self.deletes_sub.store(true, Ordering::Relaxed);
     }
 }
 
@@ -80,6 +88,7 @@ impl Hub {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let kick = Arc::new(Notify::new());
         let config_sub = Arc::new(AtomicBool::new(false));
+        let deletes_sub = Arc::new(AtomicBool::new(false));
         self.lock().entry(group).or_default().insert(
             id,
             Member {
@@ -87,6 +96,7 @@ impl Hub {
                 tx,
                 kick: kick.clone(),
                 config_sub: config_sub.clone(),
+                deletes_sub: deletes_sub.clone(),
             },
         );
         Registration {
@@ -95,6 +105,7 @@ impl Hub {
             id,
             kick,
             config_sub,
+            deletes_sub,
         }
     }
 
@@ -132,23 +143,37 @@ impl Hub {
     /// Рассылает сообщение всем соединениям группы, кроме `except`.
     /// Возвращает число получателей.
     pub fn broadcast(&self, group: &GroupId, except: u64, msg: &ServerMsg) -> usize {
-        self.send_to(group, except, msg, false)
+        self.send_to(group, except, msg, |_| true)
     }
 
     /// То же, но только соединениям, подписанным на настройки группы
     /// ([`Registration::subscribe_config`]).
     pub fn broadcast_config(&self, group: &GroupId, except: u64, msg: &ServerMsg) -> usize {
-        self.send_to(group, except, msg, true)
+        self.send_to(group, except, msg, |m| m.config_sub.load(Ordering::Relaxed))
     }
 
-    fn send_to(&self, group: &GroupId, except: u64, msg: &ServerMsg, config_only: bool) -> usize {
+    /// То же, но только соединениям по `clipwire/5`
+    /// ([`Registration::subscribe_deletes`]).
+    pub fn broadcast_deletes(&self, group: &GroupId, except: u64, msg: &ServerMsg) -> usize {
+        self.send_to(group, except, msg, |m| {
+            m.deletes_sub.load(Ordering::Relaxed)
+        })
+    }
+
+    fn send_to(
+        &self,
+        group: &GroupId,
+        except: u64,
+        msg: &ServerMsg,
+        pick: impl Fn(&Member) -> bool,
+    ) -> usize {
         let groups = self.lock();
         let Some(members) = groups.get(group) else {
             return 0;
         };
         let mut sent = 0;
         for (&id, m) in members {
-            if id == except || (config_only && !m.config_sub.load(Ordering::Relaxed)) {
+            if id == except || !pick(m) {
                 continue;
             }
             match m.tx.try_send(msg.clone()) {

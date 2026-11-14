@@ -145,6 +145,11 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
                 }
                 let _ = handle.emit("clipwire://history-changed", ());
             }
+            UiEvent::Deleted(_) => {
+                // Скачанные копии удалённых записей больше не нужны.
+                crate::cache::prune_later(&handle);
+                let _ = handle.emit("clipwire://history-changed", ());
+            }
             UiEvent::Transfer(t) => {
                 let _ = handle.emit("clipwire://transfer", &t);
             }

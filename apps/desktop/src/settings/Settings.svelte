@@ -569,6 +569,14 @@
               <input value={s.device_name} onchange={(e) => save({ device_name: e.currentTarget.value.trim() || s!.device_name })} />
             </label>
           </div>
+          <div class="card">
+            <Toggle
+              label="Удалять на всех устройствах"
+              hint="Запись, удалённая здесь, пропадает и на остальных устройствах группы, в том числе на выключенных: они удалят её, когда подключатся (если не пройдёт больше срока хранения на сервере). Закреплённое на другом устройстве остаётся. Выключено — удаление только здесь."
+              checked={s.delete_everywhere}
+              onchange={(v) => save({ delete_everywhere: v })}
+            />
+          </div>
 
           <h2>Файлы</h2>
           <div class="card pad">

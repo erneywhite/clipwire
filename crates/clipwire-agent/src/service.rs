@@ -29,6 +29,8 @@ pub enum UiEvent {
     /// В историю влились элементы без записи в буфер: с других устройств
     /// или виртуальные файлы, дочитанные после смены буфера.
     HistoryMerged(usize),
+    /// Записи удалили на другом устройстве группы: столько ушло из истории.
+    Deleted(usize),
     /// Прогресс загрузки или скачивания файла (не чаще раза в 200 мс на файл
     /// плюс финальное).
     Transfer(Transfer),
@@ -422,6 +424,17 @@ impl Service {
                         Event::Rekeyed(n) => on_event(UiEvent::Rekeyed(n)),
                         Event::Excluded { old } => on_event(UiEvent::Excluded { old }),
                         Event::RekeyLost(why) => on_event(UiEvent::RekeyLost(why)),
+                        Event::Deleted(note) => {
+                            let removed = history
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .delete_remote(&note.hashes, note.at_ms);
+                            match removed {
+                                Ok(0) => {}
+                                Ok(n) => on_event(UiEvent::Deleted(n)),
+                                Err(e) => tracing::warn!("удаление с другого устройства: {e:#}"),
+                            }
+                        }
                         Event::KnownDevices(cards) => {
                             if let Some(g) = group
                                 && let Err(e) = crate::devices::save_known(&paths, g, &cards)

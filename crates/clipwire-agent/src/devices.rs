@@ -326,6 +326,9 @@ pub enum Control {
     Stats(oneshot::Sender<Result<clipwire_core::proto::GroupStats, String>>),
     /// Как сейчас идёт связь с сервером.
     Link(oneshot::Sender<Result<LinkInfo, String>>),
+    /// Удалить записи на остальных устройствах (`Delete`). Без связи движок
+    /// отправит после входа.
+    Delete(clipwire_core::delete::DeleteNote),
 }
 
 /// Путь до сервера: напрямую (UDP) или через relay, и задержка.
@@ -404,6 +407,24 @@ impl Controller {
             self.times.sent_ms.load(Relaxed),
             self.times.received_ms.load(Relaxed),
         )
+    }
+
+    /// Удалить записи с этим содержимым на остальных устройствах группы.
+    /// Не ждёт отправки: без связи записка уйдёт после входа.
+    pub fn delete_everywhere(&self, hashes: Vec<[u8; 32]>) {
+        if hashes.is_empty() {
+            return;
+        }
+        let at_ms = crate::history::now_ms();
+        for chunk in hashes.chunks(clipwire_core::delete::MAX_DELETE_HASHES) {
+            let note = clipwire_core::delete::DeleteNote {
+                hashes: chunk.to_vec(),
+                at_ms,
+            };
+            if self.tx.try_send(Control::Delete(note)).is_err() {
+                tracing::warn!("удаление не передано движку: очередь занята или движок остановлен");
+            }
+        }
     }
 
     /// Как сейчас идёт связь с сервером.

@@ -26,6 +26,8 @@ export interface Settings {
   file_upload_limit_mb: number
   /** Скачивать обновления в фоне и ставить, когда программа не нужна. */
   auto_update: boolean
+  /** Удаление записи уходит на остальные устройства группы. */
+  delete_everywhere: boolean
 }
 
 export interface DeviceInfo {

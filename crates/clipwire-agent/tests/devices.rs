@@ -416,3 +416,42 @@ async fn rekey_by_unknown_device_counts_as_exclusion() -> Result<()> {
     }
     server.shutdown().await
 }
+
+/// Удаление на одном устройстве доходит до другого: сразу, если оно в сети,
+/// и после входа, если удалили, пока оно было не в сети.
+#[tokio::test]
+async fn delete_reaches_other_devices() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::new("A", &info, &key)?;
+    let mut b = Agent::new("B", &info, &key)?;
+    a.online().await?;
+    b.online().await?;
+
+    let hash = Content::Text("пароль".into()).hash();
+    a.ctl.delete_everywhere(vec![hash]);
+    let note = b
+        .wait(|e| match e {
+            Event::Deleted(n) => Some(n.clone()),
+            _ => None,
+        })
+        .await?;
+    assert_eq!(note.hashes, vec![hash]);
+
+    // B не в сети: удаление ждёт на сервере и приходит после входа.
+    b.stop().await?;
+    let hash2 = Content::Text("второй".into()).hash();
+    a.ctl.delete_everywhere(vec![hash2]);
+    // Дать записке дойти до сервера.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    b.restart(&info, &key).await?;
+    let got = b
+        .wait(|e| match e {
+            Event::Deleted(n) if n.hashes == vec![hash2] => Some(()),
+            _ => None,
+        })
+        .await;
+    assert!(got.is_ok(), "записка не пришла после входа");
+    drop(server);
+    Ok(())
+}

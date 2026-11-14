@@ -363,12 +363,30 @@ pub fn history_pin(
 #[tauri::command]
 pub fn history_delete(app: AppHandle, state: State<'_, AppState>, id: String) -> CmdResult<()> {
     let id = parse_id(&id)?;
-    state
-        .history
+    let hash = {
+        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        let hash = h.get(id).map(|e| e.content.hash());
+        h.delete(id).map_err(err)?;
+        hash
+    };
+    // Удаление уходит на остальные устройства группы, если это включено в
+    // настройках (там закреплённое не трогается). Без группы — только здесь.
+    let everywhere = state
+        .settings
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .delete(id)
-        .map_err(err)?;
+        .delete_everywhere;
+    if let Some(hash) = hash
+        && everywhere
+        && let Some(ctl) = state
+            .service
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|s| s.controller())
+    {
+        ctl.delete_everywhere(vec![hash]);
+    }
     crate::cache::prune_later(&app);
     let _ = app.emit("clipwire://history-changed", ());
     Ok(())

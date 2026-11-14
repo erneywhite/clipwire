@@ -1244,3 +1244,73 @@ async fn new_alpn_and_group_stats() -> Result<()> {
     }
     Ok(())
 }
+
+impl Client {
+    /// Подключиться по выбранному ALPN (`clipwire/5` и т. п.).
+    async fn connect_alpn(info: &ServerInfo, relay_url: &str, alpn: &[u8]) -> Result<Self> {
+        let ep = endpoint(relay_url, "test-token").await?;
+        let url: RelayUrl = relay_url.parse()?;
+        let addr = EndpointAddr::new(PublicKey::from_bytes(&info.server_id)?).with_relay_url(url);
+        let conn = tokio::time::timeout(T, ep.connect(addr, alpn))
+            .await
+            .context("таймаут подключения")??;
+        let (send, recv) = conn.open_bi().await?;
+        let device = DeviceId(*ep.id().as_bytes());
+        Ok(Self {
+            _ep: ep,
+            conn,
+            device,
+            send,
+            recv,
+        })
+    }
+}
+
+/// Записка об удалении: сразу всем по `clipwire/5`, кроме отправителя, и
+/// при входе после истории; соединениям по старым ALPN — никогда.
+#[tokio::test]
+async fn deletes_reach_v5_only() -> Result<()> {
+    use clipwire_core::proto::{ALPN_4, ALPN_5};
+    let (server, relay) = start_server().await?;
+    let info = server.info.clone();
+    let key = GroupKey::generate()?;
+
+    let mut a = Client::connect_alpn(&info, &relay, ALPN_5).await?;
+    a.join(&key).await?;
+    let mut b = Client::connect_alpn(&info, &relay, ALPN_5).await?;
+    b.join(&key).await?;
+    let mut old = Client::connect_alpn(&info, &relay, ALPN_4).await?;
+    old.join(&key).await?;
+
+    write_msg(&mut a.send, &ClientMsg::Delete(b"note-1".to_vec())).await?;
+    match b.next().await? {
+        ServerMsg::Deleted(n) => assert_eq!(n, b"note-1"),
+        other => anyhow::bail!("ждали Deleted, пришло {other:?}"),
+    }
+    // Ни отправителю, ни старому клиенту ничего: проверяем по следующему
+    // элементу, который приходит всем.
+    let mut c = Client::connect_alpn(&info, &relay, ALPN_5).await?;
+    c.join(&key).await?;
+    match c.next().await? {
+        ServerMsg::Deleted(n) => assert_eq!(n, b"note-1", "записка при входе"),
+        other => anyhow::bail!("ждали Deleted при входе, пришло {other:?}"),
+    }
+    b.push_text(&key, "после удаления").await?;
+    for (name, cl) in [("отправитель", &mut a), ("старый клиент", &mut old)]
+    {
+        match cl.next().await? {
+            ServerMsg::Deliver(_) => {}
+            other => anyhow::bail!("{name}: ждали Deliver, пришло {other:?}"),
+        }
+    }
+    // Слишком большая записка — отказ и разрыв.
+    let big = vec![0u8; clipwire_core::delete::MAX_DELETE_BYTES + 1];
+    write_msg(&mut a.send, &ClientMsg::Delete(big)).await?;
+    loop {
+        match a.next().await {
+            Ok(ServerMsg::Error(_)) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}

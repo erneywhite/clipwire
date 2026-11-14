@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clipwire_core::ServerInfo;
-use clipwire_core::proto::{ALPN, ALPN_4};
+use clipwire_core::proto::{ALPN, ALPN_4, ALPN_5};
 use data_encoding::BASE32_NOPAD;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -193,6 +193,9 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
             let mut tick = tokio::time::interval(purge_every);
             loop {
                 tick.tick().await;
+                if let Err(e) = shared.store.purge_expired_deletes(shared.not_before_ms()) {
+                    tracing::warn!("очистка записок об удалении не удалась: {e:#}");
+                }
                 match shared.store.purge_expired(shared.not_before_ms()) {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("удалено просроченных элементов: {n}"),
@@ -226,6 +229,7 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
     // Новейший ALPN первым: при выборе TLS берёт первый из списка сервера,
     // который предложил клиент.
     let router = Router::builder(endpoint)
+        .accept(ALPN_5, ClipwireProtocol(shared.clone()))
         .accept(ALPN_4, ClipwireProtocol(shared.clone()))
         .accept(ALPN, ClipwireProtocol(shared))
         .spawn();

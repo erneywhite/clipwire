@@ -6,6 +6,7 @@
 
 pub mod blob;
 pub mod crypto;
+pub mod delete;
 pub mod device;
 pub mod invite;
 pub mod item;

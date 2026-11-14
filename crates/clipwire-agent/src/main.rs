@@ -161,6 +161,7 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
                 Event::Excluded { .. } => eprintln!("сервер сообщил, что устройство исключено"),
                 Event::KnownDevices(_) => {}
                 Event::RekeyLost(why) => eprintln!("{why}"),
+                Event::Deleted(n) => eprintln!("удалено на другом устройстве: {}", n.hashes.len()),
             }
         }
         task.await??;
@@ -213,6 +214,7 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
             UiEvent::Received(_) => eprintln!("получено с другого устройства"),
             UiEvent::HistoryMerged(n) => eprintln!("в историю добавлено без записи в буфер: {n}"),
             UiEvent::NewEntry => {}
+            UiEvent::Deleted(n) => eprintln!("удалено с другого устройства: {n}"),
             UiEvent::Transfer(t) => match t.state {
                 TransferState::Active => {}
                 TransferState::Done => eprintln!("файл {} передан", t.blob),

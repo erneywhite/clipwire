@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use clipwire_core::delete::MAX_DELETE_BYTES;
 use clipwire_core::proto::io::{IoError, read_msg, read_msg_limited, write_msg};
-use clipwire_core::proto::{ClientMsg, ServerMsg};
+use clipwire_core::proto::{ALPN_5, ClientMsg, ServerMsg};
 use clipwire_core::storage::MAX_CONFIG_BYTES;
 use clipwire_core::{DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
 use iroh::endpoint::Connection;
@@ -275,6 +276,15 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
 
     let (tx, mut rx) = mpsc::channel(QUEUE);
     let reg = shared.hub.register(group, device, tx);
+    // Записки об удалении — только клиентам по `clipwire/5`; старые оборвут
+    // соединение на незнакомом `Deleted`. Регистрация раньше записок: удаление,
+    // пришедшее между ними, придёт и рассылкой, повтор безвреден.
+    if conn.alpn() == ALPN_5 {
+        reg.subscribe_deletes();
+        for note in shared.store.deletes(&group, not_before)? {
+            write_msg(&mut send, &ServerMsg::Deleted(note)).await?;
+        }
+    }
     // Ключ могли сменить между входом и регистрацией: тогда `Rekey` нас не
     // разбудил, будим себя сами.
     if shared.store.rotation(&group, &device)?.is_some() {
@@ -324,6 +334,16 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         reg.subscribe_config();
                         let config = shared.store.group_config(&group)?;
                         write_msg(&mut send, &ServerMsg::GroupConfig(config)).await?;
+                    }
+                    Some(ClientMsg::Delete(note)) => {
+                        if note.len() > MAX_DELETE_BYTES {
+                            refuse(&mut send, "записка об удалении слишком большая").await;
+                            bail!("записка об удалении {} байт", note.len());
+                        }
+                        if shared.store.add_delete(&group, &note, now_ms())? {
+                            let n = shared.hub.broadcast_deletes(&group, reg.id, &ServerMsg::Deleted(note));
+                            tracing::info!(group = %short(&group), receivers = n, "удаление записей");
+                        }
                     }
                     Some(ClientMsg::GetStats) => {
                         let mut stats = shared.store.group_stats(&group, shared.not_before_ms())?;

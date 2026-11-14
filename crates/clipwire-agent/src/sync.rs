@@ -7,10 +7,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use clipwire_core::delete::DeleteNote;
 use clipwire_core::device::{DeviceCard, Rekey, open_rekey, rekey_public};
 use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
-use clipwire_core::proto::{ALPN, ALPN_4, ClientMsg, DeviceEntry, GroupStats, ServerMsg};
+use clipwire_core::proto::{ALPN, ALPN_4, ALPN_5, ClientMsg, DeviceEntry, GroupStats, ServerMsg};
 use clipwire_core::{Content, DeviceId, Ext, ExtList, GroupId, GroupKey, Item, ItemId, SourceApp};
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey, Watcher};
@@ -118,6 +119,9 @@ pub enum Event {
     /// Ответ на `Rekey` потерялся, а при повторном входе оказалось, что сервер
     /// запрос не получил: ключ не сменился. Текст для человека.
     RekeyLost(String),
+    /// Запись удалили на другом устройстве (или здесь, пока устройство было
+    /// не в сети, — тогда повтор безвреден): удалить из своей истории.
+    Deleted(DeleteNote),
 }
 
 /// Кто ждёт ответа `Devices`, по порядку запросов: команда интерфейса или
@@ -175,8 +179,14 @@ pub struct Engine {
     devices_waiters: VecDeque<DevicesWaiter>,
     /// Ждут ответа `Stats`, по порядку запросов.
     stats_waiters: VecDeque<tokio::sync::oneshot::Sender<Result<GroupStats, String>>>,
-    /// Сервер выбрал [`ALPN_4`]: знает `GetStats`.
+    /// Сервер выбрал [`ALPN_4`] или новее: знает `GetStats`.
     stats_supported: bool,
+    /// Сервер выбрал [`ALPN_5`]: знает `Delete`.
+    deletes_supported: bool,
+    /// Удаления, сделанные без связи: уйдут после входа.
+    // shortcut: только в памяти; удаление без связи и перезапуск до входа —
+    // и оно останется только здесь. Хранить на диске, если будут жалобы.
+    pending_deletes: Vec<DeleteNote>,
     /// Когда последний раз элемент ушёл и пришёл (для «О программе»).
     times: Arc<crate::devices::SyncTimes>,
     /// Ключ группы сменён (здесь или на другом устройстве) или устройство
@@ -247,6 +257,8 @@ impl Engine {
             devices_waiters: VecDeque::new(),
             stats_waiters: VecDeque::new(),
             stats_supported: false,
+            deletes_supported: false,
+            pending_deletes: Vec::new(),
             times: Arc::default(),
             terminal: false,
             card_check: None,
@@ -439,7 +451,10 @@ impl Engine {
                         Some(c) => self.replace_pending(c),
                         None => { ep.close().await; return Ok(()); }
                     },
-                    ctl = next_control(&mut control) => refuse_control(ctl, OFFLINE),
+                    ctl = next_control(&mut control) => match ctl {
+                        Control::Delete(note) => self.queue_delete(note),
+                        ctl => refuse_control(ctl, OFFLINE),
+                    },
                 }
             }
             backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -602,7 +617,9 @@ impl Engine {
                 }
             }
         };
-        self.stats_supported = conn.alpn() == ALPN_4;
+        let alpn = conn.alpn();
+        self.stats_supported = alpn == ALPN_4 || alpn == ALPN_5;
+        self.deletes_supported = alpn == ALPN_5;
         // Вошли в старую группу как обычно: `Rekey`, на который не пришёл
         // ответ, до сервера не дошёл, ключ не сменился.
         if self.pending_rekey.take().is_some() {
@@ -658,6 +675,7 @@ impl Engine {
             self.push(&conn, &mut send, c).await?;
         }
         self.send_backfill(&mut send).await?;
+        self.send_deletes(&key, &mut send).await?;
         let storage = self.blobs.as_ref().map(|b| b.storage().clone());
 
         loop {
@@ -726,6 +744,10 @@ impl Engine {
                     }
                     Control::Link(reply) => {
                         let _ = reply.send(Ok(link_info(&conn)));
+                    }
+                    Control::Delete(note) => {
+                        self.queue_delete(note);
+                        self.send_deletes(&key, &mut send).await?;
                     }
                     Control::Stats(reply) => {
                         if self.stats_supported {
@@ -809,6 +831,10 @@ impl Engine {
             ServerMsg::Excluded => return Err(self.rotated(None)),
             ServerMsg::Error(e) => bail!("сервер: {e}"),
             ServerMsg::GroupConfig(sealed) => self.group_config(key, sealed),
+            ServerMsg::Deleted(sealed) => match key.open_delete(&sealed) {
+                Ok(note) => self.emit(Event::Deleted(note)),
+                Err(e) => tracing::warn!("записка об удалении не открылась: {e}"),
+            },
             ServerMsg::Stats(stats) => match self.stats_waiters.pop_front() {
                 Some(reply) => {
                     let _ = reply.send(Ok(stats));
@@ -1153,6 +1179,43 @@ impl Engine {
     /// отправка вытесненного уже начиналась, его резервы на сервере
     /// отменяются при следующем соединении. Архивы его папок из outbox
     /// удаляются: загружать их некому.
+    /// Запомнить удаление до отправки. Предел — чтобы долгий офлайн не копил
+    /// записки бесконечно; старые теряются первыми.
+    fn queue_delete(&mut self, note: DeleteNote) {
+        const MAX_PENDING: usize = 50;
+        if self.pending_deletes.len() >= MAX_PENDING {
+            self.pending_deletes.remove(0);
+        }
+        self.pending_deletes.push(note);
+    }
+
+    /// Отправить накопленные удаления. Старый сервер их не знает: тогда они
+    /// остаются только на этом устройстве.
+    async fn send_deletes(
+        &mut self,
+        key: &GroupKey,
+        send: &mut iroh::endpoint::SendStream,
+    ) -> Result<()> {
+        if self.pending_deletes.is_empty() {
+            return Ok(());
+        }
+        if !self.deletes_supported {
+            tracing::info!(
+                n = self.pending_deletes.len(),
+                "сервер не знает удаления на всех устройствах, удалено только здесь"
+            );
+            self.pending_deletes.clear();
+            return Ok(());
+        }
+        for note in std::mem::take(&mut self.pending_deletes) {
+            match key.seal_delete(&note) {
+                Ok(sealed) => write_msg(send, &ClientMsg::Delete(sealed)).await?,
+                Err(e) => tracing::warn!("записка об удалении не зашифровалась: {e}"),
+            }
+        }
+        Ok(())
+    }
+
     fn replace_pending(&mut self, c: Outgoing) {
         let reserved = std::mem::take(&mut self.pending_reserved);
         if let Some(old) = self.pending.replace(c)
@@ -1282,9 +1345,11 @@ fn is_fresh(item: &Item, now_ms: u64, window: Duration) -> bool {
 /// отказал по токену, ждать таймаута бессмысленно, iroh будет повторять с тем
 /// же токеном вечно.
 async fn connect(ep: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
-    // Предлагаем оба ALPN: сервер 0.1.1 выберет `clipwire/3`, новый — `/4`.
-    let opts = iroh::endpoint::ConnectOptions::new().with_additional_alpns(vec![ALPN.to_vec()]);
-    let attempt = async { anyhow::Ok(ep.connect_with_opts(addr, ALPN_4, opts).await?.await?) };
+    // Предлагаем все ALPN: сервер выберет новейший из известных ему
+    // (0.1.1 — `clipwire/3`, 0.1.2 — `/4`).
+    let opts = iroh::endpoint::ConnectOptions::new()
+        .with_additional_alpns(vec![ALPN_4.to_vec(), ALPN.to_vec()]);
+    let attempt = async { anyhow::Ok(ep.connect_with_opts(addr, ALPN_5, opts).await?.await?) };
     tokio::select! {
         r = tokio::time::timeout(CONNECT_TIMEOUT, attempt) => {
             match r {
@@ -1406,6 +1471,8 @@ fn refuse_control(ctl: Control, why: &str) {
         Control::Link(reply) => {
             let _ = reply.send(Err(why.to_string()));
         }
+        // Удаление на этом устройстве уже сделано, в группу оно не уйдёт.
+        Control::Delete(_) => tracing::info!("удаление не ушло в группу: {why}"),
     }
 }
 

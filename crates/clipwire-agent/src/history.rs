@@ -532,6 +532,30 @@ impl History {
         Ok(())
     }
 
+    /// Удаление с другого устройства: убрать записи с этими хэшами, кроме
+    /// закреплённых (закрепы у каждого устройства свои) и появившихся после
+    /// удаления (то же содержимое скопировали снова). Возвращает, сколько
+    /// удалено.
+    pub fn delete_remote(&mut self, hashes: &[[u8; 32]], at_ms: i64) -> Result<usize> {
+        // Часы устройств расходятся; запас, чтобы запись, удалённую сразу
+        // после копирования на другом устройстве, всё же удалить.
+        const SKEW_MS: i64 = 5_000;
+        let mut ids = Vec::new();
+        for h in hashes {
+            if let Some(&id) = self.by_hash.get(h)
+                && let Some(e) = self.get(id)
+                && !e.pinned
+                && e.seen_ms <= at_ms.saturating_add(SKEW_MS)
+            {
+                ids.push(id);
+            }
+        }
+        for id in &ids {
+            self.delete(*id)?;
+        }
+        Ok(ids.len())
+    }
+
     pub fn delete(&mut self, id: ItemId) -> Result<()> {
         self.conn.execute(
             "DELETE FROM entries WHERE id = ?1",
@@ -1028,5 +1052,27 @@ mod tests {
         for c in [&text, &link, &img, &pic, &doc] {
             assert!(Kind::All.matches(c));
         }
+    }
+
+    #[test]
+    fn delete_remote_skips_pinned_and_newer() {
+        let dir = std::env::temp_dir().join(format!("clipwire-delrem-{}", uuid::Uuid::now_v7()));
+        let mut h = History::open(&dir).unwrap();
+        let old = text(&mut h, "старое", 1_000);
+        let pinned = text(&mut h, "закреп", 1_000);
+        h.set_pinned(pinned, true).unwrap();
+        let newer = text(&mut h, "снова", 100_000);
+        let hashes: Vec<_> = ["старое", "закреп", "снова", "нет такого"]
+            .iter()
+            .map(|t| Content::Text((*t).into()).hash())
+            .collect();
+        assert_eq!(h.delete_remote(&hashes, 50_000).unwrap(), 1);
+        assert!(h.get(old).is_none());
+        assert!(h.get(pinned).is_some(), "закреплённое не трогаем");
+        assert!(
+            h.get(newer).is_some(),
+            "скопированное после удаления остаётся"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

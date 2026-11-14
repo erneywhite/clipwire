@@ -16,6 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 mod config;
+mod deletes;
 mod devices;
 pub use devices::{RekeyLimits, RekeyOutcome, Rotation};
 
@@ -170,6 +171,7 @@ impl Store {
         }
         devices::migrate(&conn)?;
         config::migrate(&conn)?;
+        deletes::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
