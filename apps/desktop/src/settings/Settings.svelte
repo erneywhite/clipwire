@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { isMac, keys } from '../lib/platform'
+  import { isLinux, isMac, keys } from '../lib/platform'
   import { onMount } from 'svelte'
   import { t } from '../lib/i18n'
   import { listen } from '@tauri-apps/api/event'
@@ -661,6 +661,9 @@
         <p class="hint outside">{t('Содержимое, которое менеджеры паролей помечают как приватное, не синхронизируется никогда, эта защита не отключается.')}</p>
 
         <h2>{t('Не синхронизировать из программ')}</h2>
+        {#if info && !info.knows_source_app}
+          <p class="hint outside">{t('На Wayland не видно, из какой программы скопировано, поэтому список не действует. Пароли, помеченные менеджером паролей как приватные, всё равно не синхронизируются.')}</p>
+        {/if}
         <div class="card pad">
           <ul class="apps">
             {#each s.ignored_apps as app (app)}
@@ -673,7 +676,7 @@
             {/each}
           </ul>
           <form class="add" onsubmit={(e) => { e.preventDefault(); addApp() }}>
-            <input bind:value={newApp} placeholder={isMac ? 'KeePassXC' : 'KeePass.exe'} spellcheck="false" aria-label={t('Имя программы')} />
+            <input bind:value={newApp} placeholder={isMac ? 'KeePassXC' : isLinux ? 'keepassxc' : 'KeePass.exe'} spellcheck="false" aria-label={t('Имя программы')} />
             <button type="submit" disabled={!newApp.trim()}>{t('Добавить')}</button>
           </form>
         </div>

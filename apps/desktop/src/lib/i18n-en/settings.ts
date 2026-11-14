@@ -91,6 +91,7 @@ const en: Record<string, string> = {
   "Удалить ключи группы с этого устройства? Локальная история останется.": "Remove the group keys from this device? Local history will stay.",
   "Отключить это устройство от группы": "Disconnect this device from the group",
   "Содержимое, которое менеджеры паролей помечают как приватное, не синхронизируется никогда, эта защита не отключается.": "Content that password managers mark as private is never synced, and this protection can't be turned off.",
+  "На Wayland не видно, из какой программы скопировано, поэтому список не действует. Пароли, помеченные менеджером паролей как приватные, всё равно не синхронизируются.": "On Wayland the app you copied from isn't known, so this list has no effect. Passwords that a password manager marks as private are still never synced.",
   "Не синхронизировать из программ": "Don't sync from these apps",
   "Список пуст": "The list is empty",
   "Добавить": "Add",

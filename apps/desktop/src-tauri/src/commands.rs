@@ -481,6 +481,8 @@ pub struct DeviceInfo {
     pub relay_url: Option<String>,
     /// Короткий отпечаток устройства (первые байты endpoint ID).
     pub device_id: Option<String>,
+    /// Программа-источник копирования известна (на Wayland — нет).
+    pub knows_source_app: bool,
 }
 
 #[tauri::command]
@@ -502,6 +504,7 @@ pub fn device_info(app: AppHandle) -> DeviceInfo {
         version: app.package_info().version.to_string(),
         relay_url: agent.map(|a| a.invite.server.relay_url),
         device_id,
+        knows_source_app: clipwire_agent::clipboard::knows_source_app(),
     }
 }
 

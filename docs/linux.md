@@ -71,10 +71,28 @@ sudo apt-get install -y build-essential curl git pkg-config libssl-dev \
 
 ### 2. Программа-источник (`source_app.rs`)
 
-X11: активное окно (`_NET_ACTIVE_WINDOW`) → `_NET_WM_PID` → `/proc/<pid>/exe`; имя и иконка
-из `.desktop`-файла по `WM_CLASS` (`/usr/share/applications`, `~/.local/share/applications`,
-Flatpak и Snap). Исключения в настройках — по имени `.desktop` и имени файла программы.
-Wayland: источник неизвестен, исключения не работают — показать это в настройках.
+Сделано (`source_app/linux.rs`):
+
+- **Кто скопировал.** Владелец буфера X11 → процесс через расширение XRes
+  (`LOCAL_CLIENT_PID`; точнее, чем активное окно: копировать можно и из фона) →
+  `/proc/<pid>/exe`. У Flatpak путь внутри песочницы (`/app/…`) переводится в настоящий
+  по `app-path` из `/.flatpak-info`. У скриптов (Python, Mono, Java, gjs…) берётся путь
+  скрипта, а не интерпретатора: KeePass 2 так и остаётся `KeePass.exe`.
+- **Имя и значок** из `.desktop`-файла. Файлы ищутся в `$XDG_DATA_HOME` и
+  `$XDG_DATA_DIRS`, плюс экспорты Flatpak и `/var/lib/snapd/desktop`. Сопоставление по
+  убыванию надёжности: id Flatpak-приложения, имя снапа, программа из `Exec`/`TryExec`
+  (через `PATH`, ссылки раскрыты; `env …` и `flatpak run --command=` понимаются), обёртка в
+  той же папке (`google-chrome` и `chrome`), `StartupWMClass`, имя файла и id.
+  Имя локализуется по `Name[ru]` или через gettext (`X-Ubuntu-Gettext-Domain`, языковые
+  пакеты Ubuntu). Значок ищется в теме значков сессии (`gsettings`, у KDE — `kdeglobals`),
+  её родителях и `hicolor`; SVG рисуется `resvg` в 32×32. Проверено на GNOME 46: Firefox из
+  snap, Терминал (`gnome-terminal-server`), Текстовый редактор, Файлы, Настройки.
+- **Исключения** понимают имя файла, id `.desktop`-файла (`org.keepassxc.KeePassXC`) и имя
+  программы. По умолчанию на Linux: `keepassxc`, `KeePass.exe`, `1password`, `bitwarden`,
+  `secrets`, `seahorse`.
+- **Wayland:** владелец буфера неизвестен (на GNOME буфером владеет сама оболочка через мост
+  XWayland), исключения не работают. В настройках под списком программ это написано
+  (`DeviceInfo.knows_source_app`).
 
 ### 3. Вставка в активное окно (`apps/desktop/src-tauri/src/popup.rs`)
 

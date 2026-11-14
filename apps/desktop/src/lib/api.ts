@@ -36,6 +36,8 @@ export interface DeviceInfo {
   version: string
   relay_url: string | null
   device_id: string | null
+  /** Программа-источник копирования известна (на Wayland — нет). */
+  knows_source_app: boolean
 }
 
 /** Устройство группы (`devices_list`). */

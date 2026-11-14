@@ -929,6 +929,20 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{Backend, Watcher, backend};
 
+/// Известна ли программа, из которой скопировано: от этого зависят значок
+/// источника и список «не синхронизировать из программ». На Wayland буфер
+/// приходит без владельца (на GNOME — через мост XWayland от имени оболочки).
+pub fn knows_source_app() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        backend() == Some(Backend::X11) && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

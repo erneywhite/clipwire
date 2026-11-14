@@ -51,6 +51,8 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
 # Буфер обмена: X11 (Xorg и XWayland в GNOME) и Wayland data-control (KDE,
 # wlroots), см. docs/linux.md.
 percent-encoding = "2.3.2"
+# Значки программ из тем значков: у программ GNOME они чаще всего только в SVG.
+resvg = { version = "0.45", default-features = false }
 rustix = { version = "1.1.6", features = ["event", "pipe", "fs", "process"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }

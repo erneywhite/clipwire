@@ -217,8 +217,11 @@ turned off under Privacy.
 Each entry shows where it was copied from: a small icon and the program name ("Notepad",
 "Telegram"). The name comes from the exe's description and the 32×32 icon from the exe itself.
 Search also matches the program name. The name and icon travel with the entry, so the other
-devices of the group see the source too. Detection works on Windows and macOS; on macOS a program
-can also be excluded by its bundle id (`org.keepassxc.keepassxc`).
+devices of the group see the source too. Detection works on Windows, macOS and Linux on X11; on macOS a program
+can also be excluded by its bundle id (`org.keepassxc.keepassxc`). On Linux the name and icon
+come from the program's `.desktop` file (Flatpak and Snap included), and a program can be
+excluded by its file name, its `.desktop` id (`org.keepassxc.KeePassXC`) or its name. On Wayland
+the source program isn't known, so the exclusion list has no effect there.
 
 ## Image editor
 

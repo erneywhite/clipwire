@@ -634,16 +634,12 @@ impl Server {
         };
         let reply = self.conn.res_query_client_ids(&[spec]).ok()?.reply().ok()?;
         let pid = *reply.ids.first()?.value.first()?;
-        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-        let name = exe.file_name()?.to_string_lossy();
+        let exe = crate::source_app::exe_of_pid(pid)?;
+        let name = crate::source_app::file_name(&exe)?;
         if is_compositor(&name) {
             return None;
         }
-        Some(
-            exe.to_string_lossy()
-                .trim_end_matches(" (deleted)")
-                .to_string(),
-        )
+        Some(exe)
     }
 }
 

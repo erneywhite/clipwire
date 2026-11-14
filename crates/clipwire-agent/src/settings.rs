@@ -118,6 +118,18 @@ impl Default for Settings {
 fn default_ignored_apps() -> Vec<String> {
     let names: &[&str] = if cfg!(target_os = "macos") {
         &["KeePassXC", "1Password", "Bitwarden"]
+    } else if cfg!(target_os = "linux") {
+        // Имена исполняемых файлов: KeePass 2 запускается через Mono, и
+        // владельцем считается сам KeePass.exe; «secrets» — Secrets из GNOME,
+        // «seahorse» — «Пароли и ключи».
+        &[
+            "keepassxc",
+            "KeePass.exe",
+            "1password",
+            "bitwarden",
+            "secrets",
+            "seahorse",
+        ]
     } else {
         &[
             "KeePass.exe",
