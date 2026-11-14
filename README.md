@@ -111,9 +111,11 @@ does not read what you type and does nothing in the background. While Clipwire i
 shows a remote-control icon in the top bar; it goes away a minute after the last paste. The
 permission is remembered; turn the switch off to revoke it (Clipwire forgets it as well). On Wayland
 Clipwire can't tell which window is active, so it always presses Ctrl+V; terminals paste with
-Ctrl+Shift+V, so there press it yourself (the entry is already on the clipboard). The app's own shortcut may not
-reach other apps' windows there: assign a system shortcut (GNOME: Settings → Keyboard → Keyboard
-Shortcuts → Custom) to the command `clipwire --popup`.
+Ctrl+Shift+V, so there press it yourself (the entry is already on the clipboard). An app's own shortcut doesn't reach
+other apps' windows there, so on GNOME Clipwire adds its shortcut to the system ones (Settings →
+Keyboard → Keyboard Shortcuts → Custom → Clipwire) and keeps it in sync with its settings. On other
+Wayland desktops (KDE Plasma, Sway, Hyprland…) assign a system shortcut to the command
+`clipwire --popup` yourself.
 
 | Keys | Action |
 |---|---|

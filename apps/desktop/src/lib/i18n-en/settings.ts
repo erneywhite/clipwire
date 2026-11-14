@@ -160,6 +160,7 @@ const en: Record<string, string> = {
   "Ctrl P закрепить": "Ctrl P pin",
   "На Wayland для этого система один раз спросит разрешение на управление клавиатурой. Clipwire только нажимает Ctrl+V после выбора элемента. Без разрешения элемент попадает в буфер, вставляете сами.": "On Wayland the system will ask once for permission to control the keyboard. Clipwire only presses Ctrl+V after you pick an item. Without it the item goes to the clipboard and you paste it yourself.",
   "На Wayland сочетание может не сработать в окнах других программ. Назначьте его в настройках системы («Клавиатура» → «Комбинации клавиш» → своя) на команду {cmd}.": "On Wayland the shortcut may not work in other apps' windows. Assign it in the system settings (Keyboard → Keyboard Shortcuts → Custom) to the command {cmd}.",
+  "Сочетание прописано и в системные («Настройки» → «Клавиатура» → «Комбинации клавиш» → Clipwire): так оно работает поверх любых окон. Меняйте его здесь, системное обновится само.": "The shortcut is also added to the system ones (Settings → Keyboard → Keyboard Shortcuts → Clipwire), so it works over any window. Change it here and the system one updates by itself.",
 }
 
 export default en

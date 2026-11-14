@@ -700,7 +700,9 @@
             </button>
           </div>
         </div>
-        {#if info && !info.can_paste_into_active}
+        {#if info?.system_shortcut}
+          <p class="hint outside">{t('Сочетание прописано и в системные («Настройки» → «Клавиатура» → «Комбинации клавиш» → Clipwire): так оно работает поверх любых окон. Меняйте его здесь, системное обновится само.')}</p>
+        {:else if info && !info.can_paste_into_active}
           <p class="hint outside">{t('На Wayland сочетание может не сработать в окнах других программ. Назначьте его в настройках системы («Клавиатура» → «Комбинации клавиш» → своя) на команду {cmd}.', { cmd: 'clipwire --popup' })}</p>
         {/if}
 

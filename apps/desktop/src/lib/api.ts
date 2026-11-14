@@ -42,6 +42,8 @@ export interface DeviceInfo {
   knows_source_app: boolean
   /** Окно вставки само вставляет в прежнее окно (на Wayland — только в буфер). */
   can_paste_into_active: boolean
+  /** Сочетание окна вставки прописывается в системные (GNOME на Wayland). */
+  system_shortcut: boolean
 }
 
 /** Устройство группы (`devices_list`). */

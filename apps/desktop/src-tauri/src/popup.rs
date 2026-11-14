@@ -42,6 +42,8 @@ struct Base {
 }
 
 #[cfg(target_os = "linux")]
+pub mod gnome_shortcut;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod portal;
@@ -74,6 +76,12 @@ pub fn register_hotkey(app: &AppHandle) -> Result<(), String> {
         .unwrap_or_else(|e| e.into_inner())
         .popup_hotkey
         .clone();
+    // GNOME на Wayland: то же сочетание — в системные, на `clipwire --popup`.
+    #[cfg(target_os = "linux")]
+    {
+        let accel = hotkey.clone();
+        std::thread::spawn(move || gnome_shortcut::sync(&accel));
+    }
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
     gs.on_shortcut(hotkey.as_str(), |app, _sc, ev| {
