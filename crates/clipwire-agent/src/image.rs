@@ -68,6 +68,14 @@ fn decode_limited<R: std::io::BufRead + std::io::Seek>(
     r.decode().context(tr("картинка не читается"))
 }
 
+/// Картинка неизвестного формата из байтов (буфер Linux, иконки) → RGBA, с
+/// теми же пределами, что у остальных путей: размеры из заголовка проверяются
+/// до выделения памяти.
+pub fn decode_bytes(data: &[u8]) -> Result<RgbaImage> {
+    let img = decode_limited(|| Ok(image::ImageReader::new(Cursor::new(data)).with_guessed_format()?))?;
+    Ok(img.to_rgba8())
+}
+
 /// PNG → RGBA для записи в буфер.
 pub fn decode_png(png: &[u8]) -> Result<RgbaImage> {
     let img = decode_limited(|| {
@@ -132,6 +140,11 @@ pub fn image_mime(name: &str) -> Option<&'static str> {
 /// Размеры картинки по заголовку файла, без декодирования. `None` — не картинка.
 pub fn file_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
     image_mime(&path.file_name()?.to_string_lossy())?;
+    // Только обычные файлы: открытие FIFO или устройства по пути из
+    // uri-list повесило бы поток буфера.
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
     image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
@@ -143,6 +156,7 @@ pub fn file_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
 /// Миниатюра файла-картинки.
 pub fn thumbnail_file(path: &std::path::Path) -> Result<Vec<u8>> {
     let meta = std::fs::metadata(path).context(tr("файл недоступен"))?;
+    anyhow::ensure!(meta.is_file(), tr("файл недоступен"));
     anyhow::ensure!(
         meta.len() <= MAX_IMAGE_FILE,
         tr("файл-картинка слишком большой")
@@ -276,5 +290,21 @@ mod tests {
         let png = encode_png(40, 24, &checker(40, 24)).unwrap();
         assert!(decode_png_sized(&png, 40, 24).is_ok());
         assert!(decode_png_sized(&png, 4000, 2400).is_err());
+    }
+
+    #[test]
+    fn decode_bytes_guesses_format_and_rejects_bomb() {
+        let png = encode_png(8, 4, &checker(8, 4)).unwrap();
+        assert_eq!(decode_bytes(&png).unwrap().dimensions(), (8, 4));
+        assert!(decode_bytes(&png_bomb()).is_err());
+        assert!(decode_bytes(b"not an image").is_err());
+    }
+
+    #[test]
+    fn file_dimensions_skips_non_regular_files() {
+        let dir = std::env::temp_dir().join(format!("clipwire-fd-{}.png", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(file_dimensions(&dir), None);
+        let _ = std::fs::remove_dir(dir);
     }
 }
