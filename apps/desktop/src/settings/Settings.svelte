@@ -491,8 +491,11 @@
         <div class="card">
           <Toggle
             label={t('Сразу вставлять в активное окно')}
-            hint={t('Двойной клик или Enter вставляет туда, где стоит курсор. Иначе элемент только попадает в буфер.')}
-            checked={s.paste_into_active}
+            hint={info && !info.can_paste_into_active
+              ? t('На Wayland программам не дают нажимать клавиши в чужих окнах: окно вставки кладёт элемент в буфер, вставьте его сами.')
+              : t('Двойной клик или Enter вставляет туда, где стоит курсор. Иначе элемент только попадает в буфер.')}
+            disabled={!!info && !info.can_paste_into_active}
+            checked={s.paste_into_active && info?.can_paste_into_active !== false}
             onchange={(v) => save({ paste_into_active: v })}
           />
         </div>
@@ -690,6 +693,9 @@
             </button>
           </div>
         </div>
+        {#if info && !info.can_paste_into_active}
+          <p class="hint outside">{t('На Wayland сочетание может не сработать в окнах других программ. Назначьте его в настройках системы («Клавиатура» → «Комбинации клавиш» → своя) на команду {cmd}.', { cmd: 'clipwire --popup' })}</p>
+        {/if}
 
         <h2>{t('Размер окна вставки')}</h2>
         <div

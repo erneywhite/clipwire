@@ -97,6 +97,12 @@ The invitation code contains the group's encryption key. Share it only with your
 
 Press Ctrl+Shift+V on Windows or Cmd+Shift+V on macOS (configurable). The window opens next to the mouse cursor.
 
+On Linux in an Xorg session it works the same way. On Wayland apps can't see the mouse cursor or
+press keys in other windows, so the window opens in the middle of the screen and Enter only puts
+the entry on the clipboard; you paste it with Ctrl+V yourself. The app's own shortcut may not
+reach other apps' windows there: assign a system shortcut (GNOME: Settings → Keyboard → Keyboard
+Shortcuts → Custom) to the command `clipwire --popup`.
+
 | Keys | Action |
 |---|---|
 | Up, Down, mouse | select |

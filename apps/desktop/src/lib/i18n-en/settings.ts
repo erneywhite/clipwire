@@ -158,6 +158,8 @@ const en: Record<string, string> = {
   "↵ вставить": "↵ paste",
   "␣ просмотр": "␣ preview",
   "Ctrl P закрепить": "Ctrl P pin",
+  "На Wayland программам не дают нажимать клавиши в чужих окнах: окно вставки кладёт элемент в буфер, вставьте его сами.": "On Wayland apps can't press keys in other windows: the paste window puts the item on the clipboard, and you paste it yourself.",
+  "На Wayland сочетание может не сработать в окнах других программ. Назначьте его в настройках системы («Клавиатура» → «Комбинации клавиш» → своя) на команду {cmd}.": "On Wayland the shortcut may not work in other apps' windows. Assign it in the system settings (Keyboard → Keyboard Shortcuts → Custom) to the command {cmd}.",
 }
 
 export default en

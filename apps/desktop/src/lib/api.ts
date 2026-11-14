@@ -38,6 +38,8 @@ export interface DeviceInfo {
   device_id: string | null
   /** Программа-источник копирования известна (на Wayland — нет). */
   knows_source_app: boolean
+  /** Окно вставки само вставляет в прежнее окно (на Wayland — только в буфер). */
+  can_paste_into_active: boolean
 }
 
 /** Устройство группы (`devices_list`). */

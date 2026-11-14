@@ -22,6 +22,9 @@ pub struct PopupState {
     /// PID программы, которая была активной до показа (macOS).
     #[cfg(target_os = "macos")]
     prev_pid: Mutex<Option<i32>>,
+    /// Окно X11, которое было активным до показа (Linux, сессия Xorg).
+    #[cfg(target_os = "linux")]
+    prev_x11: Mutex<Option<u32>>,
     /// Где окно стоит без предпросмотра (физические пиксели) и куда раскрыт предпросмотр.
     base: Mutex<Option<Base>>,
 }
@@ -36,6 +39,22 @@ struct Base {
     /// Границы рабочей области монитора.
     area_x: i32,
     area_w: u32,
+}
+
+#[cfg(target_os = "linux")]
+mod linux;
+
+/// Может ли окно вставки само вставить в прежнее окно. Нет — на Wayland:
+/// там элемент только кладётся в буфер.
+pub fn can_paste_into_active() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::can_paste()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
 }
 
 fn window(app: &AppHandle) -> Option<WebviewWindow> {
@@ -99,6 +118,10 @@ pub fn show(app: &AppHandle) {
         *state.prev_pid.lock().unwrap_or_else(|e| e.into_inner()) =
             clipwire_agent::clipboard::front_pid();
     }
+    #[cfg(target_os = "linux")]
+    {
+        *state.prev_x11.lock().unwrap_or_else(|e| e.into_inner()) = linux::foreground();
+    }
 
     let (lw, lh) = {
         let s = app
@@ -134,8 +157,15 @@ pub fn show(app: &AppHandle) {
     let (ax, ay) = (area.position.x, area.position.y);
     let (aw, ah) = (area.size.width as i32, area.size.height as i32);
 
+    // На Wayland программа не знает, где курсор, и не двигает свои окна:
+    // окно по центру экрана (ставит его туда сама оболочка).
+    let at_cursor = can_paste_into_active();
     // По умолчанию справа-снизу от курсора; если не влезает — по другую сторону.
-    let (cx, cy) = (cursor.x as i32, cursor.y as i32);
+    let (cx, cy) = if at_cursor {
+        (cursor.x as i32, cursor.y as i32)
+    } else {
+        (ax + (aw - w_px) / 2 - gap, ay + (ah - h_px) / 2 - gap)
+    };
     let mut x = if cx + gap + w_px <= ax + aw {
         cx + gap
     } else {
@@ -159,7 +189,11 @@ pub fn show(app: &AppHandle) {
         area_w: aw as u32,
     });
     let _ = w.set_size(PhysicalSize::new(w_px as u32, h_px as u32));
-    let _ = w.set_position(PhysicalPosition::new(x, y));
+    if at_cursor {
+        let _ = w.set_position(PhysicalPosition::new(x, y));
+    } else {
+        let _ = w.center();
+    }
     let protect = app
         .state::<AppState>()
         .settings
@@ -401,8 +435,21 @@ pub async fn return_and_paste(app: &AppHandle, label: &str, paste: bool) {
     }
     #[cfg(target_os = "macos")]
     mac::return_and_paste(app, label, paste).await;
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let _ = paste;
+    #[cfg(target_os = "linux")]
+    {
+        let prev = *app
+            .state::<PopupState>()
+            .prev_x11
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let (true, Some(prev)) = (paste && linux::can_paste(), prev) {
+            match tokio::task::spawn_blocking(move || linux::focus_and_paste(prev)).await {
+                Ok(Err(e)) => tracing::warn!("вставка в прежнее окно не удалась: {e}"),
+                Err(e) => tracing::warn!("вставка в прежнее окно не удалась: {e}"),
+                Ok(Ok(())) => {}
+            }
+        }
+    }
 }
 
 /// Открыть раздел «Универсальный доступ» в Системных настройках.

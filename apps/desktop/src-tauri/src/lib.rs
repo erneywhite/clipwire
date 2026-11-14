@@ -346,9 +346,16 @@ pub fn run() {
     // Один экземпляр — только в релизе: dev-сборка должна запускаться рядом с
     // установленной копией, иначе её не проверить, не закрывая рабочую программу.
     // Второй запуск не плодит копию, а открывает настройки у первой.
+    // `clipwire --popup` открывает у первой окно вставки: на Wayland глобальные
+    // клавиши программам не даются, и сочетание назначается в настройках
+    // системы на эту команду.
     #[cfg(not(debug_assertions))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        show_settings(app);
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+        if args.iter().any(|a| a == "--popup") {
+            popup::show(app);
+        } else {
+            show_settings(app);
+        }
     }));
     builder
         .manage(state)
@@ -466,7 +473,10 @@ pub fn run() {
             // окно при каждом входе в систему ни к чему, а сбой синхронизации
             // виден по значку в трее.
             let background = std::env::args().any(|a| a == "--background");
-            if !background && !after_update.after_auto {
+            let popup = std::env::args().any(|a| a == "--popup");
+            if popup {
+                popup::show(app.handle());
+            } else if !background && !after_update.after_auto {
                 show_settings(app.handle());
             }
             Ok(())

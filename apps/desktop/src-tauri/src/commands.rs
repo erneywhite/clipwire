@@ -483,6 +483,8 @@ pub struct DeviceInfo {
     pub device_id: Option<String>,
     /// Программа-источник копирования известна (на Wayland — нет).
     pub knows_source_app: bool,
+    /// Окно вставки само вставляет в прежнее окно (на Wayland — только в буфер).
+    pub can_paste_into_active: bool,
 }
 
 #[tauri::command]
@@ -505,6 +507,7 @@ pub fn device_info(app: AppHandle) -> DeviceInfo {
         relay_url: agent.map(|a| a.invite.server.relay_url),
         device_id,
         knows_source_app: clipwire_agent::clipboard::knows_source_app(),
+        can_paste_into_active: crate::popup::can_paste_into_active(),
     }
 }
 
