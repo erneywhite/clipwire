@@ -64,9 +64,10 @@
     border-bottom: 1px solid var(--c-border);
     padding-left: var(--space-3);
   }
-  /* Место под «светофор» macOS (три кнопки по 12 px с промежутками). */
+  /* Место под «светофор» macOS: кнопки занимают ~70 px от края, дальше
+     такой же зазор, как между кнопками и краем окна. */
   .bar.mac {
-    padding-left: 78px;
+    padding-left: 92px;
   }
   .brand {
     display: flex;

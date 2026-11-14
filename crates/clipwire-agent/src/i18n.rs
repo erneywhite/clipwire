@@ -34,7 +34,17 @@ pub fn system_is_russian() -> bool {
         let id = unsafe { windows_sys_ui_language() };
         id & 0x3ff == 0x19
     }
-    #[cfg(not(windows))]
+    // У программ, запущенных из Finder, переменных LANG нет: язык — первый
+    // из «Предпочитаемых языков» системы.
+    #[cfg(target_os = "macos")]
+    {
+        objc2::rc::autoreleasepool(|_| {
+            objc2_foundation::NSLocale::preferredLanguages()
+                .firstObject()
+                .is_some_and(|l| l.to_string().to_ascii_lowercase().starts_with("ru"))
+        })
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         ["LC_ALL", "LC_MESSAGES", "LANG"]
             .iter()
@@ -95,6 +105,22 @@ pub fn trn(n: u64, ru: [&str; 3], en: [&str; 2]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// На маке язык берётся из настроек системы, а не из окружения.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_system_language_ignores_env() {
+        let out = std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleLanguages"])
+            .output()
+            .unwrap();
+        let first = String::from_utf8_lossy(&out.stdout)
+            .split(['"', ',', '(', '\n', ' '])
+            .find(|s| s.chars().any(|c| c.is_ascii_alphabetic()))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert_eq!(system_is_russian(), first.starts_with("ru"), "{first}");
+    }
 
     #[test]
     fn plural_and_fallback() {

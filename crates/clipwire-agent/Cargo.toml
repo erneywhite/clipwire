@@ -40,7 +40,7 @@ windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Da
 
 [target."cfg(target_os = \"macos\")".dependencies]
 objc2 = "0.6.5"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSDictionary", "NSString", "NSURL", "NSPathUtilities", "NSBundle", "NSFileManager", "NSGeometry"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSDictionary", "NSString", "NSURL", "NSPathUtilities", "NSBundle", "NSFileManager", "NSGeometry", "NSLocale"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSImageRep", "NSBitmapImageRep", "NSWorkspace", "NSRunningApplication", "libc", "NSImage", "NSGraphicsContext", "objc2-core-graphics"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGImage"] }
 
