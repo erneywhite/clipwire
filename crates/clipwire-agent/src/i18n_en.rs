@@ -268,6 +268,19 @@ pub static EN: &[(&str, &str)] = &[
         "could not write the image to the clipboard",
     ),
     (
+        "буфер обмена недоступен: нет ни X11, ни Wayland с data-control",
+        "the clipboard is unavailable: neither X11 nor Wayland with data-control",
+    ),
+    (
+        "поток буфера обмена остановился",
+        "the clipboard thread has stopped",
+    ),
+    ("буфер обмена не ответил", "the clipboard did not respond"),
+    (
+        "не удалось занять буфер обмена",
+        "could not take over the clipboard",
+    ),
+    (
         "этот тип пока не записывается в буфер",
         "this kind of content cannot be written to the clipboard yet",
     ),
