@@ -12,7 +12,10 @@ use clipwire_core::delete::DeleteNote;
 use clipwire_core::device::{DeviceCard, Rekey, open_rekey, rekey_public};
 use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
-use clipwire_core::proto::{ALPN, ALPN_4, ALPN_5, ClientMsg, DeviceEntry, GroupStats, ServerMsg};
+use clipwire_core::proto::{
+    ALPN, ALPN_4, ALPN_5, ALPN_6, ClientMsg, DeviceEntry, GroupStats, ServerMsg, knows_deletes,
+    knows_stats,
+};
 use clipwire_core::{Content, DeviceId, Ext, ExtList, GroupId, GroupKey, Item, ItemId, SourceApp};
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey, Watcher};
@@ -123,6 +126,9 @@ pub enum Event {
     /// Запись удалили на другом устройстве (или здесь, пока устройство было
     /// не в сети, — тогда повтор безвреден): удалить из своей истории.
     Deleted(DeleteNote),
+    /// Устройство группы подключилось, отключилось или обновило карточку
+    /// (сервер по `clipwire/6`): открытый список устройств стоит перечитать.
+    DevicesChanged,
 }
 
 /// Кто ждёт ответа `Devices`, по порядку запросов: команда интерфейса или
@@ -182,7 +188,7 @@ pub struct Engine {
     stats_waiters: VecDeque<tokio::sync::oneshot::Sender<Result<GroupStats, String>>>,
     /// Сервер выбрал [`ALPN_4`] или новее: знает `GetStats`.
     stats_supported: bool,
-    /// Сервер выбрал [`ALPN_5`]: знает `Delete`.
+    /// Сервер выбрал [`ALPN_5`] или новее: знает `Delete`.
     deletes_supported: bool,
     /// Удаления, сделанные без связи: уйдут после входа.
     // shortcut: только в памяти; удаление без связи и перезапуск до входа —
@@ -619,8 +625,8 @@ impl Engine {
             }
         };
         let alpn = conn.alpn();
-        self.stats_supported = alpn == ALPN_4 || alpn == ALPN_5;
-        self.deletes_supported = alpn == ALPN_5;
+        self.stats_supported = knows_stats(alpn);
+        self.deletes_supported = knows_deletes(alpn);
         // Вошли в старую группу как обычно: `Rekey`, на который не пришёл
         // ответ, до сервера не дошёл, ключ не сменился.
         if self.pending_rekey.take().is_some() {
@@ -836,6 +842,7 @@ impl Engine {
                 Ok(note) => self.emit(Event::Deleted(note)),
                 Err(e) => tracing::warn!("записка об удалении не открылась: {e}"),
             },
+            ServerMsg::DevicesChanged => self.emit(Event::DevicesChanged),
             ServerMsg::Stats(stats) => match self.stats_waiters.pop_front() {
                 Some(reply) => {
                     let _ = reply.send(Ok(stats));
@@ -1350,10 +1357,13 @@ fn is_fresh(item: &Item, now_ms: u64, window: Duration) -> bool {
 /// же токеном вечно.
 async fn connect(ep: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
     // Предлагаем все ALPN: сервер выберет новейший из известных ему
-    // (0.1.1 — `clipwire/3`, 0.1.2 — `/4`).
-    let opts = iroh::endpoint::ConnectOptions::new()
-        .with_additional_alpns(vec![ALPN_4.to_vec(), ALPN.to_vec()]);
-    let attempt = async { anyhow::Ok(ep.connect_with_opts(addr, ALPN_5, opts).await?.await?) };
+    // (0.1.1 — `clipwire/3`, 0.1.2 — `/4`, 0.1.3 — `/5`).
+    let opts = iroh::endpoint::ConnectOptions::new().with_additional_alpns(vec![
+        ALPN_5.to_vec(),
+        ALPN_4.to_vec(),
+        ALPN.to_vec(),
+    ]);
+    let attempt = async { anyhow::Ok(ep.connect_with_opts(addr, ALPN_6, opts).await?.await?) };
     tokio::select! {
         r = tokio::time::timeout(CONNECT_TIMEOUT, attempt) => {
             match r {

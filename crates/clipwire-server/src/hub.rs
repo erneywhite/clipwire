@@ -25,6 +25,8 @@ struct Member {
     config_sub: Arc<AtomicBool>,
     /// Соединение по `clipwire/5`: знает `Deleted`.
     deletes_sub: Arc<AtomicBool>,
+    /// Соединение по `clipwire/6`: знает `DevicesChanged`.
+    devices_sub: Arc<AtomicBool>,
 }
 
 type Groups = HashMap<GroupId, HashMap<u64, Member>>;
@@ -46,6 +48,7 @@ pub struct Registration<'a> {
     pub kick: Arc<Notify>,
     config_sub: Arc<AtomicBool>,
     deletes_sub: Arc<AtomicBool>,
+    devices_sub: Arc<AtomicBool>,
 }
 
 impl Registration<'_> {
@@ -58,6 +61,11 @@ impl Registration<'_> {
     pub fn subscribe_deletes(&self) {
         self.deletes_sub.store(true, Ordering::Relaxed);
     }
+
+    /// Соединение знает `DevicesChanged` (`clipwire/6`).
+    pub fn subscribe_devices(&self) {
+        self.devices_sub.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Drop for Registration<'_> {
@@ -67,6 +75,9 @@ impl Drop for Registration<'_> {
             members.remove(&self.id);
             if members.is_empty() {
                 groups.remove(&self.group);
+            } else {
+                // Устройство ушло со связи: остальным пора обновить список.
+                send_devices_changed(members, u64::MAX);
             }
         }
     }
@@ -89,6 +100,7 @@ impl Hub {
         let kick = Arc::new(Notify::new());
         let config_sub = Arc::new(AtomicBool::new(false));
         let deletes_sub = Arc::new(AtomicBool::new(false));
+        let devices_sub = Arc::new(AtomicBool::new(false));
         self.lock().entry(group).or_default().insert(
             id,
             Member {
@@ -97,6 +109,7 @@ impl Hub {
                 kick: kick.clone(),
                 config_sub: config_sub.clone(),
                 deletes_sub: deletes_sub.clone(),
+                devices_sub: devices_sub.clone(),
             },
         );
         Registration {
@@ -106,6 +119,7 @@ impl Hub {
             kick,
             config_sub,
             deletes_sub,
+            devices_sub,
         }
     }
 
@@ -160,6 +174,14 @@ impl Hub {
         })
     }
 
+    /// Сообщить соединениям по `clipwire/6`, кроме `except`, что устройства
+    /// группы поменялись (`DevicesChanged`). Возвращает число получателей.
+    pub fn devices_changed(&self, group: &GroupId, except: u64) -> usize {
+        self.lock()
+            .get(group)
+            .map_or(0, |members| send_devices_changed(members, except))
+    }
+
     fn send_to(
         &self,
         group: &GroupId,
@@ -183,6 +205,21 @@ impl Hub {
         }
         sent
     }
+}
+
+fn send_devices_changed(members: &HashMap<u64, Member>, except: u64) -> usize {
+    let mut sent = 0;
+    for (&id, m) in members {
+        if id == except || !m.devices_sub.load(Ordering::Relaxed) {
+            continue;
+        }
+        // Полная очередь — не беда: значит, соединение и так отстаёт, а
+        // список устройств оно перечитает при следующем `DevicesChanged`.
+        if m.tx.try_send(ServerMsg::DevicesChanged).is_ok() {
+            sent += 1;
+        }
+    }
+    sent
 }
 
 #[cfg(test)]
@@ -227,6 +264,30 @@ mod tests {
         assert!(ra.try_recv().is_err());
         assert_eq!(rb.try_recv().unwrap(), msg);
         assert!(rc.try_recv().is_err());
+    }
+
+    #[test]
+    fn devices_changed_goes_to_v6_and_on_leave() {
+        let hub = Hub::default();
+        let g = GroupId([1; 32]);
+        let (ta, mut ra) = mpsc::channel(4);
+        let (tb, mut rb) = mpsc::channel(4);
+        let (tc, mut rc) = mpsc::channel(4);
+        let a = hub.register(g, DeviceId([1; 32]), ta);
+        let b = hub.register(g, DeviceId([2; 32]), tb);
+        let _old = hub.register(g, DeviceId([3; 32]), tc);
+        a.subscribe_devices();
+        b.subscribe_devices();
+        // Новое устройство (b) не получает о себе, старый клиент — вообще.
+        assert_eq!(hub.devices_changed(&g, b.id), 1);
+        assert_eq!(ra.try_recv().unwrap(), ServerMsg::DevicesChanged);
+        assert!(rb.try_recv().is_err());
+        assert!(rc.try_recv().is_err());
+        // Отключение b: узнаёт a.
+        drop(b);
+        assert_eq!(ra.try_recv().unwrap(), ServerMsg::DevicesChanged);
+        assert!(rc.try_recv().is_err());
+        assert_eq!(hub.devices_changed(&GroupId([9; 32]), 0), 0);
     }
 
     #[tokio::test]

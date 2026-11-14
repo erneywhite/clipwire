@@ -237,7 +237,8 @@ picture becomes a new history entry and goes to the other devices; the original 
 Under Sync you see the devices in the group: name, OS, a short fingerprint, whether the device is
 online and when it was last seen. Every device publishes its name and OS itself in an encrypted
 card signed with its key, so the server cannot read or forge them. A device running an old
-Clipwire version shows up as "unknown device".
+Clipwire version shows up as "unknown device". The list updates by itself when a device
+connects, disconnects or is renamed (server 0.1.4 or newer).
 
 **Removing a device.** A lost or sold computer can be removed with **Remove**. The group key is
 replaced, the remaining devices get the new key on their own (switched-off ones when they come

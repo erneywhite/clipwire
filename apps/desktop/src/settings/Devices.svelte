@@ -88,6 +88,13 @@
     copied = true
   }
 
+  // Вход устройства и его карточка приходят почти разом: одно чтение на пачку.
+  let reloadTimer: ReturnType<typeof setTimeout> | undefined
+  function loadSoon() {
+    clearTimeout(reloadTimer)
+    reloadTimer = setTimeout(load, 300)
+  }
+
   onMount(() => {
     // Список обновляется, когда сервис снова на связи (в том числе после
     // смены ключа): раньше движок ответить не может.
@@ -104,9 +111,14 @@
         checking = false
         error = e.payload
       }),
+      // Сервер сообщил, что устройство подключилось, ушло или переименовалось.
+      listen('clipwire://devices-changed', loadSoon),
     ]
     load()
-    return () => unlisten.forEach((p) => p.then((f) => f()))
+    return () => {
+      clearTimeout(reloadTimer)
+      unlisten.forEach((p) => p.then((f) => f()))
+    }
   })
 </script>
 

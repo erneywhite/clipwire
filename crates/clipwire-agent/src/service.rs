@@ -32,6 +32,8 @@ pub enum UiEvent {
     HistoryMerged(usize),
     /// Записи удалили на другом устройстве группы: столько ушло из истории.
     Deleted(usize),
+    /// Устройство группы подключилось, отключилось или обновило карточку.
+    DevicesChanged,
     /// Прогресс загрузки или скачивания файла (не чаще раза в 200 мс на файл
     /// плюс финальное).
     Transfer(Transfer),
@@ -425,6 +427,7 @@ impl Service {
                         Event::Rekeyed(n) => on_event(UiEvent::Rekeyed(n)),
                         Event::Excluded { old } => on_event(UiEvent::Excluded { old }),
                         Event::RekeyLost(why) => on_event(UiEvent::RekeyLost(why)),
+                        Event::DevicesChanged => on_event(UiEvent::DevicesChanged),
                         Event::Deleted(note) => {
                             let removed = history
                                 .lock()

@@ -1314,3 +1314,58 @@ async fn deletes_reach_v5_only() -> Result<()> {
     }
     Ok(())
 }
+
+/// `DevicesChanged`: соединения по `clipwire/6` узнают о входе, новой
+/// карточке и уходе других устройств; по `clipwire/5` и ниже — никогда, и
+/// `Deleted` по `clipwire/6` по-прежнему приходит.
+#[tokio::test]
+async fn devices_changed_reaches_v6_only() -> Result<()> {
+    use clipwire_core::proto::{ALPN_5, ALPN_6};
+    let (server, relay) = start_server().await?;
+    let info = server.info.clone();
+    let key = GroupKey::generate()?;
+
+    let mut a = Client::connect_alpn(&info, &relay, ALPN_6).await?;
+    a.join(&key).await?;
+    let mut old = Client::connect_alpn(&info, &relay, ALPN_5).await?;
+    old.join(&key).await?;
+    match a.next().await.context("шаг 1")? {
+        ServerMsg::DevicesChanged => {}
+        other => anyhow::bail!("вход старого клиента: ждали DevicesChanged, пришло {other:?}"),
+    }
+
+    let mut b = Client::connect_alpn(&info, &relay, ALPN_6).await?;
+    b.join(&key).await?;
+    match a.next().await.context("шаг 2")? {
+        ServerMsg::DevicesChanged => {}
+        other => anyhow::bail!("вход b: ждали DevicesChanged, пришло {other:?}"),
+    }
+    write_msg(&mut b.send, &ClientMsg::PublishCard(b"card".to_vec())).await?;
+    match a.next().await.context("шаг 3")? {
+        ServerMsg::DevicesChanged => {}
+        other => anyhow::bail!("карточка b: ждали DevicesChanged, пришло {other:?}"),
+    }
+    // Удаление по v6 работает, как по v5.
+    write_msg(&mut b.send, &ClientMsg::Delete(b"note".to_vec())).await?;
+    match a.next().await.context("шаг 4")? {
+        ServerMsg::Deleted(n) => assert_eq!(n, b"note"),
+        other => anyhow::bail!("ждали Deleted, пришло {other:?}"),
+    }
+    // Закрыть явно: простой drop сервер заметит только по таймауту.
+    b.conn.close(0u32.into(), b"bye");
+    b._ep.close().await;
+    match a.next().await.context("шаг 5")? {
+        ServerMsg::DevicesChanged => {}
+        other => anyhow::bail!("уход b: ждали DevicesChanged, пришло {other:?}"),
+    }
+    // Старый клиент ничего этого не получал: первым к нему приходит элемент.
+    a.push_text(&key, "проверка").await?;
+    loop {
+        match old.next().await? {
+            ServerMsg::Deliver(_) => break,
+            ServerMsg::Deleted(_) => {}
+            other => anyhow::bail!("старый клиент: пришло {other:?}"),
+        }
+    }
+    Ok(())
+}
