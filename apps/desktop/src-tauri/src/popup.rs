@@ -70,6 +70,8 @@ pub fn can_paste_into_active() -> bool {
 }
 
 /// Где открывается окно вставки.
+// На Windows и macOS всегда у курсора, остальное — для Linux на Wayland.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Placement {
     /// У курсора мыши (Windows, macOS, Xorg).
