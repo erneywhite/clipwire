@@ -18,7 +18,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypeFileURL,
     NSPasteboardTypeHTML, NSPasteboardTypePNG, NSPasteboardTypeRTF, NSPasteboardTypeString,
-    NSPasteboardTypeTIFF, NSPasteboardWriting, NSWorkspace,
+    NSPasteboardTypeTIFF, NSPasteboardWriting, NSRunningApplication, NSWorkspace,
 };
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSString, NSURL};
 
@@ -257,9 +257,40 @@ fn read_files(pb: &NSPasteboard) -> Option<Vec<FileRef>> {
 }
 
 /// Полный путь исполняемого файла активной программы.
+///
+/// `NSWorkspace.frontmostApplication` вне главного потока застывает на
+/// первом ответе (обновляется уведомлениями главного цикла событий), а
+/// поток слежения — не главный. `GetFrontProcess` отвечает верно из любого
+/// потока. shortcut: он устарел с macOS 10.9, но работает (проверено на
+/// macOS 27); если пропадёт — спрашивать `frontmostApplication` в главном
+/// потоке через очередь GCD.
 fn frontmost_exe() -> Option<String> {
-    let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    let app = front_pid()
+        .and_then(NSRunningApplication::runningApplicationWithProcessIdentifier)
+        .or_else(|| NSWorkspace::sharedWorkspace().frontmostApplication())?;
     Some(app.executableURL()?.path()?.to_string())
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct ProcessSerialNumber {
+    high: u32,
+    low: u32,
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn GetFrontProcess(psn: *mut ProcessSerialNumber) -> i16;
+    fn GetProcessPID(psn: *const ProcessSerialNumber, pid: *mut i32) -> i32;
+}
+
+/// PID активной программы.
+fn front_pid() -> Option<i32> {
+    let mut psn = ProcessSerialNumber::default();
+    let mut pid = 0;
+    // SAFETY: обе функции только пишут в переданные структуры.
+    let ok = unsafe { GetFrontProcess(&mut psn) == 0 && GetProcessPID(&psn, &mut pid) == 0 };
+    (ok && pid > 0).then_some(pid)
 }
 
 /// Записать в общий буфер и запомнить его новую версию.
@@ -399,6 +430,14 @@ mod tests {
         assert_eq!(classify(&[URL, TEXT]), Kind::Text);
         assert_eq!(classify::<&str>(&[]), Kind::Empty);
         assert_eq!(classify(&["com.apple.unknown"]), Kind::Empty);
+    }
+
+    #[test]
+    fn frontmost_is_real_executable() {
+        // На машине без окон (CI) программы может не найтись — это не ошибка.
+        if let Some(exe) = frontmost_exe() {
+            assert!(std::path::Path::new(&exe).is_file(), "{exe}");
+        }
     }
 
     fn private_pb() -> Retained<NSPasteboard> {

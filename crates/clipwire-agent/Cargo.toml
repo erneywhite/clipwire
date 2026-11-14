@@ -41,7 +41,7 @@ windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Da
 [target."cfg(target_os = \"macos\")".dependencies]
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSDictionary", "NSString", "NSURL", "NSPathUtilities"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSImageRep", "NSBitmapImageRep", "NSWorkspace", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSImageRep", "NSBitmapImageRep", "NSWorkspace", "NSRunningApplication", "libc"] }
 
 [target."cfg(windows)".dev-dependencies]
 # Для тестов: реализация IDataObject через #[implement].
