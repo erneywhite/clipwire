@@ -218,6 +218,9 @@ Clipwire в список (системный запрос macOS показыва
 - Попутно: `history.key` писался с правами 0644, теперь 0600 (`write_atomic`).
 - Проверка самой связки — тест `keychain_roundtrip`, выключен (`--ignored`): из
   сессии Claude связка недоступна (`-25308`), запускать руками.
+- Пересборка с той же подписью (другой хэш кода, включённый hardened runtime) доступ к
+  ключу не теряет: связка ничего не спросила (проверено Erney). Значит, запрос не
+  появится и после обновлений.
 
 ### 6. Мелочи
 
@@ -260,7 +263,10 @@ Clipwire в список (системный запрос macOS показыва
   работает. После сборки шаг «Проверка подписи» падает, если требование — не
   `certificate root` (то есть подпись ad-hoc). shortcut: проверка идёт после загрузки в
   релиз; если упадёт — удалить файлы macOS из релиза руками.
-- `tauri.macos.conf.json`: `bundle.targets` = app, dmg; `minimumSystemVersion` 13.0.
+- `tauri.macos.conf.json`: `bundle.targets` = app, dmg; `minimumSystemVersion` 13.0. Локально
+  `npx tauri build --target universal-apple-darwin` собирает `Clipwire_<версия>_universal.dmg`
+  (~29 МБ, arm64 + x86_64). При сборке `.dmg` сборщик открывает образ в Finder, чтобы
+  расставить иконки, — окна мелькают, это нормально.
 - README и README.ru.md: установка из `.dmg`, первый запуск без нотаризации («Всё равно
   открыть» или `xattr -dr com.apple.quarantine`), «Универсальный доступ», связка
   ключей, Cmd+Shift+V, Gatekeeper.
