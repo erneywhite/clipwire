@@ -495,6 +495,9 @@ pub fn run() {
                     }
                 }
                 // Окно вставки исчезает, как только уходит фокус: как меню.
+                WindowEvent::Focused(true) if window.label() == "popup" => {
+                    tracing::debug!("окно вставки получило фокус");
+                }
                 WindowEvent::Focused(false) if window.label() == "popup" => {
                     tracing::debug!("окно вставки потеряло фокус, прячу");
                     let _ = window.hide();

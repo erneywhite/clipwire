@@ -232,5 +232,5 @@ Wayland, Xwayland запущен как `:0`):
 | Пароль не уходит | Wayland | — (нужен KeePassXC, позже) | |
 | Пришедший текст вставляется | Wayland | Ctrl+V в «Текстовом редакторе» после отправки с устройства 2 | ✅ вставилось |
 | То же в Xorg | Xorg | Пачка 2 повторно в «Ubuntu on Xorg» | |
-| Пачка 3: окно вставки на Wayland | Wayland | `clipwire`, затем Ctrl+Alt+V через своё сочетание GNOME на `clipwire --popup`; Enter, Ctrl+V в редакторе | |
+| Пачка 3: окно вставки на Wayland | Wayland | `clipwire`, затем Ctrl+Alt+V через своё сочетание GNOME на `clipwire --popup`; Enter, Ctrl+V в редакторе | ✅ окно по центру и с фокусом, Enter и двойной клик кладут в буфер, Ctrl+V вставляет. Сам не вставляет — так задумано |
 | Пачка 3: источник и вставка на X11 | Xephyr (`clipwire-xorg-test`) | Копирование в редакторе → значок и имя в окне; Ctrl+Alt+V → Enter вставляет в редактор и терминал | |

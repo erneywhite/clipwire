@@ -259,6 +259,7 @@ pub async fn popup_paste(
     plain: Option<bool>,
     files: Option<Vec<usize>>,
 ) -> Result<(), String> {
+    tracing::debug!(%id, ?into_active, ?plain, "вставка из окна");
     let plain = plain.unwrap_or_else(|| {
         app.state::<AppState>()
             .settings
