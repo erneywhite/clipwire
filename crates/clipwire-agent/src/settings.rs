@@ -162,10 +162,39 @@ pub fn default_device_name() -> String {
     if let Some(name) = mac_computer_name() {
         return name;
     }
+    #[cfg(target_os = "linux")]
+    if let Some(name) = linux_hostname() {
+        return name;
+    }
     ["COMPUTERNAME", "HOSTNAME"]
         .iter()
         .find_map(|v| std::env::var(v).ok().filter(|s| !s.trim().is_empty()))
         .unwrap_or_else(|| tr("Это устройство").into())
+}
+
+/// Имя компьютера на Linux: «красивое» из `/etc/machine-info` (его задают
+/// «Настройки» → «О системе» в GNOME и `hostnamectl --pretty`), иначе
+/// `/etc/hostname`. Переменной `HOSTNAME` у программ из меню обычно нет.
+#[cfg(target_os = "linux")]
+fn linux_hostname() -> Option<String> {
+    let pretty = std::fs::read_to_string("/etc/machine-info")
+        .ok()
+        .and_then(|t| pretty_hostname(&t));
+    pretty.or_else(|| {
+        std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// `PRETTY_HOSTNAME=` из `machine-info` (значение может быть в кавычках).
+#[cfg(any(target_os = "linux", test))]
+fn pretty_hostname(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("PRETTY_HOSTNAME="))
+        .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// `SCDynamicStoreCopyComputerName`: имя, которое человек видит и задаёт в
@@ -222,6 +251,30 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pretty_hostname_from_machine_info() {
+        use super::pretty_hostname;
+        assert_eq!(
+            pretty_hostname("CHASSIS=laptop\nPRETTY_HOSTNAME=\"Ноутбук Ивана\"\n").as_deref(),
+            Some("Ноутбук Ивана")
+        );
+        assert_eq!(
+            pretty_hostname("PRETTY_HOSTNAME=work\n").as_deref(),
+            Some("work")
+        );
+        assert_eq!(pretty_hostname("PRETTY_HOSTNAME=\n"), None);
+        assert_eq!(pretty_hostname("CHASSIS=vm\n"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_device_name_is_not_placeholder() {
+        assert_ne!(
+            super::default_device_name(),
+            crate::i18n::tr("Это устройство")
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn mac_device_name_is_computer_name() {

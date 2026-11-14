@@ -323,7 +323,7 @@ Full description: [docs/storage.md](docs/storage.md).
 - Link cards do not execute the page and do not load single-use links (see
   [Link previews](#link-previews)).
 - Leaving a group also deletes the cache of downloaded files.
-- Settings and keys live in `%APPDATA%\Clipwire`.
+- Settings and keys live in `%APPDATA%\Clipwire` on Windows and in `~/.config/clipwire` on Linux.
 
 ## Updates
 
@@ -352,7 +352,7 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
 - Language: English, Русский or as in the system.
 - Launch at login: the program starts minimized to the tray.
 - Copy sound: a short click when something new enters the history. Pasting from the history and
-  copying the same thing again are silent. Windows and macOS.
+  copying the same thing again are silent. On Linux it plays through `pw-play`, `paplay` or `aplay`.
 - History retention, from a day to forever (pinned entries are kept forever).
 - Device name, invitation code (**Show code**), leaving the group.
 - Paste window size (one slider with a live preview next to it) and the hotkey.
