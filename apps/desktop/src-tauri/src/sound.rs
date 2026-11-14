@@ -80,7 +80,9 @@ pub fn play_copy() {
             let dir = std::env::var_os("XDG_RUNTIME_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
-            let path = dir.join(format!("clipwire-copy-{}.wav", std::process::id()));
+            // Имя постоянное: файлы не копятся от запуска к запуску, а
+            // содержимое у всех копий одинаковое.
+            let path = dir.join("clipwire-copy.wav");
             std::fs::write(&path, COPY_WAV)
                 .map_err(|e| tracing::debug!("звук копирования не записался: {e}"))
                 .ok()
