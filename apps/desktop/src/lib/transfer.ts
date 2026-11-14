@@ -2,6 +2,7 @@
 // Rust шлёт событие clipwire://transfer на каждый файл (blob), здесь из них
 // собирается одна сводка на запись.
 import type { FileInfo, Transfer } from './api'
+import { t } from './i18n.ts'
 
 /** Передачи по blob: последнее известное состояние каждого файла. */
 export type TransferMap = Record<string, Transfer>
@@ -33,22 +34,22 @@ export function percentOf(done: number, total: number): number {
 export function entryProgress(files: Pick<FileInfo, 'blob'>[], transfers: TransferMap): Progress | null {
   const list = files.flatMap((f) => (f.blob && transfers[f.blob] ? [transfers[f.blob]] : []))
   if (list.length === 0) return null
-  const failed = list.find((t) => t.state === 'failed')
-  const active = list.filter((t) => t.state === 'active')
+  const failed = list.find((x) => x.state === 'failed')
+  const active = list.filter((x) => x.state === 'active')
   if (!failed && active.length === 0) return null
-  const direction = (failed ?? active.find((t) => t.direction === 'down') ?? active[0]).direction
-  const same = list.filter((t) => t.direction === direction)
-  const total = same.reduce((n, t) => n + t.total, 0)
+  const direction = (failed ?? active.find((x) => x.direction === 'down') ?? active[0]).direction
+  const same = list.filter((x) => x.direction === direction)
+  const total = same.reduce((n, x) => n + x.total, 0)
   // Готовый файл засчитывается целиком, даже если последнее событие о нём
   // пришло с done чуть меньше total.
-  const done = same.reduce((n, t) => n + (t.state === 'done' ? t.total : Math.min(t.done, t.total)), 0)
+  const done = same.reduce((n, x) => n + (x.state === 'done' ? x.total : Math.min(x.done, x.total)), 0)
   return {
     direction,
     done,
     total,
     percent: percentOf(done, total),
-    active: same.some((t) => t.state === 'active'),
-    error: failed?.error || (failed ? 'неизвестная ошибка' : null),
+    active: same.some((x) => x.state === 'active'),
+    error: failed?.error || (failed ? t('неизвестная ошибка') : null),
   }
 }
 
@@ -63,15 +64,15 @@ export function allUploaded(files: Pick<FileInfo, 'blob' | 'uploaded'>[], transf
   return (
     sent.length > 0 &&
     sent.every((f) => {
-      const t = transfers[f.blob!]
-      return f.uploaded || (t.direction === 'up' && t.state === 'done')
+      const x = transfers[f.blob!]
+      return f.uploaded || (x.direction === 'up' && x.state === 'done')
     })
   )
 }
 
 /** Подпись для меты строки: «↑ 45%», «↓ 12%», «не отправлено: причина». */
 export function progressLabel(p: Progress): string {
-  if (p.error) return `${p.direction === 'up' ? 'не отправлено' : 'не скачано'}: ${p.error}`
+  if (p.error) return p.direction === 'up' ? t('не отправлено: {error}', { error: p.error }) : t('не скачано: {error}', { error: p.error })
   return `${p.direction === 'up' ? '↑' : '↓'} ${p.percent}%`
 }
 
@@ -107,8 +108,8 @@ export function onlyThere(f: FileInfo): boolean {
  */
 export function fetchLabel(f: FileInfo, device: string): string | null {
   if (!canDownload(f)) return null
-  if (isDirect(f)) return `напрямую с устройства «${device}»`
-  return f.remote ? 'не скачан' : 'нет на месте, копия на сервере'
+  if (isDirect(f)) return t('напрямую с устройства «{device}»', { device })
+  return f.remote ? t('не скачан') : t('нет на месте, копия на сервере')
 }
 
 /** Свой файл пропал с места, и копии на сервере нет: вставить нечего. */

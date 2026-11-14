@@ -1,6 +1,7 @@
 // Подписи для элементов истории.
+import { t, tn, lang } from './i18n.ts'
 
-/** Русское множественное число: plural(5, ['символ', 'символа', 'символов']). */
+/** Русское множественное число: plural(5, ['символ', 'символа', 'символов']). Для подписей — `tn()` из i18n. */
 export function plural(n: number, forms: [string, string, string]): string {
   const a = Math.abs(n) % 100
   const b = a % 10
@@ -13,36 +14,37 @@ export function plural(n: number, forms: [string, string, string]): string {
 /** «сейчас», «5 мин», «3 ч», «вчера», «12 нояб.». */
 export function ago(ms: number, now = Date.now()): string {
   const s = Math.max(0, Math.round((now - ms) / 1000))
-  if (s < 60) return 'сейчас'
+  if (s < 60) return t('сейчас')
   const m = Math.round(s / 60)
-  if (m < 60) return `${m} мин`
+  if (m < 60) return t('{m} мин', { m })
   const h = Math.round(m / 60)
   const d = new Date(ms)
   const today = new Date(now)
   const yesterday = new Date(now - 86_400_000)
-  if (d.toDateString() === today.toDateString()) return `${h} ч`
-  if (d.toDateString() === yesterday.toDateString()) return 'вчера'
-  return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' })
+  if (d.toDateString() === today.toDateString()) return t('{h} ч', { h })
+  if (d.toDateString() === yesterday.toDateString()) return t('вчера')
+  return d.toLocaleDateString(lang() === 'en' ? 'en-GB' : 'ru-RU', { day: 'numeric', month: 'short' })
 }
 
 export function sizeLabel(chars: number, lines: number): string {
-  if (lines > 1) return `${lines} ${plural(lines, ['строка', 'строки', 'строк'])}`
-  return `${chars} ${plural(chars, ['символ', 'символа', 'символов'])}`
+  if (lines > 1) return tn(lines, ['строка', 'строки', 'строк'], ['line', 'lines'])
+  return tn(chars, ['символ', 'символа', 'символов'], ['character', 'characters'])
 }
 
 /** «340 КБ», «1,2 МБ». */
 export function bytesLabel(n: number): string {
-  if (n < 1024) return `${n} Б`
-  if (n < 1024 * 1024) return `${Math.round(n / 1024)} КБ`
-  if (n < 1024 ** 3) return `${(n / 1024 / 1024).toFixed(1).replace('.', ',')} МБ`
-  return `${(n / 1024 ** 3).toFixed(1).replace('.', ',')} ГБ`
+  const dec = (x: number) => (lang() === 'en' ? x.toFixed(1) : x.toFixed(1).replace('.', ','))
+  if (n < 1024) return t('{n} Б', { n })
+  if (n < 1024 * 1024) return t('{n} КБ', { n: Math.round(n / 1024) })
+  if (n < 1024 ** 3) return t('{n} МБ', { n: dec(n / 1024 / 1024) })
+  return t('{n} ГБ', { n: dec(n / 1024 ** 3) })
 }
 
 /** Подпись для набора файлов: «Отчёт.pdf», «3 файла: a.pdf, b.png, c.txt». */
 export function filesLabel(files: { name: string }[]): string {
   if (files.length === 1) return files[0].name
   const n = files.length
-  return `${n} ${plural(n, ['файл', 'файла', 'файлов'])}: ${files.map((f) => f.name).join(', ')}`
+  return `${tn(n, ['файл', 'файла', 'файлов'], ['file', 'files'])}: ${files.map((f) => f.name).join(', ')}`
 }
 
 /**
@@ -50,7 +52,7 @@ export function filesLabel(files: { name: string }[]): string {
  * пиксели. У папок из старых записей размер не считался (0): тогда просто «папка».
  */
 export function filesMeta(files: { size: number; is_dir: boolean }[], bytes: number, w: number, h: number): string {
-  if (files.length === 1 && files[0].is_dir) return bytes > 0 ? `папка · ${bytesLabel(bytes)}` : 'папка'
+  if (files.length === 1 && files[0].is_dir) return bytes > 0 ? `${t('папка')} · ${bytesLabel(bytes)}` : t('папка')
   const parts = []
   if (w && h) parts.push(`${w}×${h}`)
   parts.push(bytesLabel(bytes))

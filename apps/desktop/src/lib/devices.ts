@@ -1,6 +1,7 @@
 // Подписи и тексты подтверждений для раздела «Устройства группы».
 import type { GroupDevice, StorageKind } from './api'
 import type * as format from './format'
+import { t, tn, lang } from './i18n.ts'
 
 /** Функции из `format.ts`. Передаются параметром, чтобы модуль запускался в
  *  Node для тестов без сборки (импорт без расширения Node не находит). */
@@ -9,23 +10,30 @@ export type Fmt = Pick<typeof format, 'ago' | 'plural'>
 /** Ответ на смену ключа потерялся: результат придёт событием. */
 export const CHECKING = 'Ответ сервера не пришёл, проверяю…'
 
+/** То же на языке интерфейса. `CHECKING` вычисляется при загрузке модуля, до выбора языка. */
+export function checking(): string {
+  return t('Ответ сервера не пришёл, проверяю…')
+}
+
 /** Сообщение после смены ключа на другом устройстве. */
 export function rekeyedBy(name: string): string {
   const n = name.trim()
-  return n ? `Ключ группы сменило устройство «${n}»` : 'Ключ группы сменён на другом устройстве'
+  return n ? t('Ключ группы сменило устройство «{n}»', { n }) : t('Ключ группы сменён на другом устройстве')
 }
 
 /** Имя для показа: из карточки или «Неизвестное устройство». */
 export function deviceTitle(d: GroupDevice): string {
-  return d.name?.trim() || 'Неизвестное устройство'
+  return d.name?.trim() || t('Неизвестное устройство')
 }
 
 /** «в сети», «был в сети: 5 мин», «не в сети». */
 export function seenLabel(d: GroupDevice, { ago }: Fmt, now = Date.now()): string {
-  if (d.online) return 'в сети'
-  if (!d.last_seen_ms) return 'не в сети'
+  if (d.online) return t('в сети')
+  if (!d.last_seen_ms) return t('не в сети')
   const a = ago(d.last_seen_ms, now)
-  return a === 'сейчас' ? 'не в сети' : `был в сети: ${a}`
+  if (a === t('сейчас')) return t('не в сети')
+  // По-английски «last seen 5 min ago», но «last seen yesterday».
+  return lang() === 'en' && /^\d/.test(a) ? t('был в сети: {a} назад', { a }) : t('был в сети: {a}', { a })
 }
 
 /** Устройства, которые не получат новый ключ: без карточки и не удаляемое. */
@@ -41,26 +49,28 @@ export function leftOut(list: GroupDevice[], removeId: string | null): GroupDevi
 export function exposedAccessText(kind: StorageKind | null, removing = true, lost = 0): string {
   const fix =
     kind === 's3'
-      ? 'Смените ключ S3 у поставщика хранилища и сохраните новый в настройках «Хранилище файлов».'
+      ? t('Смените ключ S3 у поставщика хранилища и сохраните новый в настройках «Хранилище файлов».')
       : kind === 'sftp'
-        ? 'Смените пароль или ключ SSH на сервере и сохраните новые в настройках «Хранилище файлов».'
+        ? t('Смените пароль или ключ SSH на сервере и сохраните новые в настройках «Хранилище файлов».')
         : ''
   if (!fix || (!removing && lost === 0)) return ''
-  const unknown = lost === 1 ? 'у устройства без карточки' : 'у устройств без карточки'
-  const who = removing && lost > 0 ? `у исключённого устройства и ${unknown}` : removing ? 'у исключённого устройства' : unknown
-  return `Внимание: ${who} остались доступы к хранилищу файлов. ${fix}`
+  const unknown = lost === 1 ? t('у устройства без карточки') : t('у устройств без карточки')
+  const who = removing && lost > 0 ? t('у исключённого устройства и {unknown}', { unknown }) : removing ? t('у исключённого устройства') : unknown
+  return t('Внимание: {who} остались доступы к хранилищу файлов. {fix}', { who, fix })
 }
 
 /**
  * Объяснение перед подтверждением: что будет с удаляемым и с остальными.
  * `storage` — вид хранилища файлов группы (`null` — не знаем).
  */
-export function confirmText(list: GroupDevice[], removeId: string | null, { plural }: Fmt, storage: StorageKind | null = null): string[] {
+export function confirmText(list: GroupDevice[], removeId: string | null, _fmt: Fmt, storage: StorageKind | null = null): string[] {
   const out: string[] = []
   const target = list.find((d) => d.id === removeId)
   if (target) {
     out.push(
-      `«${deviceTitle(target)}» потеряет доступ к группе: не получит новые элементы и файлы и не сможет вернуться по старому коду приглашения. То, что уже есть на нём, останется.`,
+      t('«{name}» потеряет доступ к группе: не получит новые элементы и файлы и не сможет вернуться по старому коду приглашения. То, что уже есть на нём, останется.', {
+        name: deviceTitle(target),
+      }),
     )
   }
   const lost = leftOut(list, removeId)
@@ -71,17 +81,22 @@ export function confirmText(list: GroupDevice[], removeId: string | null, { plur
   const others = list.filter((d) => !d.me && d.known && d.id !== removeId)
   if (others.length > 0) {
     out.push(
-      `${others.length} ${plural(others.length, ['устройство получит', 'устройства получат', 'устройств получат'])} новый ключ сами, когда будут в сети.`,
+      tn(
+        others.length,
+        ['устройство получит новый ключ сами, когда будет в сети.', 'устройства получат новый ключ сами, когда будут в сети.', 'устройств получат новый ключ сами, когда будут в сети.'],
+        ['{n} device will get the new key on its own when it comes online.', '{n} devices will get the new key on their own when they come online.'],
+      ),
     )
   }
   if (lost.length > 0) {
     const ids = lost.map((d) => d.fingerprint).join(', ')
     out.push(
-      `Внимание: ${lost.length} ${plural(lost.length, ['устройство', 'устройства', 'устройств'])} без карточки (${ids}) новый ключ не получат. Их придётся подключить заново по новому коду.`,
+      t('Внимание: {count} без карточки ({ids}) новый ключ не получат. Их придётся подключить заново по новому коду.', {
+        count: tn(lost.length, ['устройство', 'устройства', 'устройств'], ['device', 'devices']),
+        ids,
+      }),
     )
   }
-  out.push(
-    'История группы на сервере удалится, локальная история на устройствах останется. Код приглашения сменится, старый перестанет работать.',
-  )
+  out.push(t('История группы на сервере удалится, локальная история на устройствах останется. Код приглашения сменится, старый перестанет работать.'))
   return out
 }

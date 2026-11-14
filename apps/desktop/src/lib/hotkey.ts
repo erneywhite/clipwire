@@ -1,6 +1,8 @@
 // Сочетание клавиш: из события клавиатуры в формат плагина global-shortcut
 // ("CommandOrControl+Shift+V") и обратно в подпись для людей ("Ctrl + Shift + V").
 
+import { t } from './i18n.ts'
+
 const isMac = /Mac/i.test(navigator.platform)
 
 /** Основная клавиша из KeyboardEvent.code; null — клавиша не годится для сочетания. */
@@ -52,7 +54,7 @@ export function label(accel: string): string {
         case 'Shift':
           return isMac ? '⇧' : 'Shift'
         case 'Space':
-          return 'Пробел'
+          return t('Пробел')
         default:
           return p
       }
