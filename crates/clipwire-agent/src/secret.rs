@@ -198,18 +198,28 @@ mod imp {
 mod imp {
     //! Linux: ключ Clipwire — в Secret Service (gnome-keyring в GNOME, KWallet
     //! в KDE, KeePassXC и др.), атрибуты [`ATTRS`]. Файлы шифруются им, как на
-    //! macOS. Хранилище открывается при входе в систему вместе с сеансом.
+    //! macOS.
     //!
     //! Шифрует только приложение ([`enable_keychain`]): консольный агент и
-    //! тесты пишут открыто (в CI хранилища нет). Если хранилища нет совсем
-    //! (минимальная оболочка без gnome-keyring), приложение тоже пишет
-    //! открыто в файл 0600 и предупреждает в логе. Читают зашифрованное все.
+    //! тесты пишут открыто (в CI хранилища нет). Читают зашифрованное все.
+    //!
+    //! Сбои ([`Failure`]):
+    //! - хранилища нет совсем (нет имени на шине) — больше не пробуем, новые
+    //!   секреты пишутся открыто в файл 0600 с предупреждением в логе;
+    //! - связка заперта и человек отказался её открыть, хранилище не ответило,
+    //!   прочая ошибка — пробуем снова, но не чаще раза в [`retry_after`];
+    //!   секреты не понижаются до открытого текста — запись возвращает ошибку.
+    //!
+    //! Таймаут [`TIMEOUT`] — только на подключение и поиск ключа (служба,
+    //! которой нет, D-Bus ищет до 25 секунд). Окно пароля при запертой связке
+    //! ждём столько, сколько человек думает.
 
     use anyhow::{Result, anyhow};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use super::sealed::{is_sealed, open, seal};
     use crate::i18n::tr;
@@ -218,13 +228,80 @@ mod imp {
         ("application", "io.github.erneywhite.clipwire"),
         ("type", "state-key"),
     ];
-    /// Хранилище, которого нет, D-Bus ищет до 25 секунд — столько не ждём.
     const TIMEOUT: Duration = Duration::from_secs(8);
 
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
-    /// Хранилище не ответило: дальше в этом запуске не пробуем.
-    static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+    /// Последний сбой и когда он был.
+    static FAILED: Mutex<Option<(Failure, Instant)>> = Mutex::new(None);
+
+    /// Почему ключ не получен.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Failure {
+        /// Secret Service нет на шине.
+        Absent,
+        /// Связка заперта, а человек не стал её открывать.
+        Dismissed,
+        /// Служба не ответила за [`TIMEOUT`].
+        Timeout,
+        Other,
+    }
+
+    /// Через сколько пробовать снова; `None` — больше не пробовать.
+    pub fn retry_after(f: Failure) -> Option<Duration> {
+        match f {
+            Failure::Absent => None,
+            Failure::Dismissed | Failure::Timeout => Some(Duration::from_secs(60)),
+            Failure::Other => Some(Duration::from_secs(30)),
+        }
+    }
+
+    /// Пробовать ли снова, если последний сбой `last` был `since` назад.
+    pub fn may_try(last: Option<(Failure, Duration)>) -> bool {
+        match last {
+            None => true,
+            Some((f, since)) => retry_after(f).is_some_and(|d| since >= d),
+        }
+    }
+
+    /// Можно ли записать секрет открыто (файл 0600): только если хранилища нет.
+    pub fn plain_allowed(f: Failure) -> bool {
+        f == Failure::Absent
+    }
+
+    /// Ошибка хранилища: понятный текст для человека и вид сбоя.
+    #[derive(Debug)]
+    pub struct KeystoreError {
+        pub failure: Failure,
+        pub detail: String,
+    }
+
+    impl std::fmt::Display for KeystoreError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let text = match self.failure {
+                Failure::Absent => tr("хранилище паролей недоступно"),
+                Failure::Dismissed => tr(
+                    "хранилище паролей заперто, ключи Clipwire недоступны. Разблокируйте его паролем входа в систему — Clipwire подхватит ключи сам",
+                ),
+                Failure::Timeout => tr("хранилище паролей не ответило"),
+                Failure::Other => tr("ошибка хранилища паролей"),
+            };
+            if self.detail.is_empty() || self.failure == Failure::Dismissed {
+                f.write_str(text)
+            } else {
+                write!(f, "{text}: {}", self.detail)
+            }
+        }
+    }
+
+    impl std::error::Error for KeystoreError {}
+
+    fn fail(failure: Failure, detail: impl Into<String>) -> KeystoreError {
+        KeystoreError {
+            failure,
+            detail: detail.into(),
+        }
+    }
 
     /// Шифровать новые записи ключом из хранилища (приложение).
     pub fn enable_keychain() {
@@ -235,63 +312,108 @@ mod imp {
         ATTRS.into_iter().collect()
     }
 
+    fn classify(e: &secret_service::Error) -> Failure {
+        use secret_service::Error as E;
+        let gone = |name: &str| {
+            name.contains("ServiceUnknown")
+                || name.contains("NameHasNoOwner")
+                || name.contains("not provided by any .service")
+        };
+        match e {
+            E::Unavailable => Failure::Absent,
+            E::Prompt | E::PromptDisconnected | E::Locked => Failure::Dismissed,
+            E::Zbus(z) if gone(&z.to_string()) => Failure::Absent,
+            E::ZbusFdo(z) if gone(&z.to_string()) => Failure::Absent,
+            _ => Failure::Other,
+        }
+    }
+
+    enum Msg {
+        /// Подключились и поискали — дальше может быть окно пароля.
+        Searched,
+        Done(Result<Option<[u8; 32]>, KeystoreError>),
+    }
+
     /// Ключ из хранилища; `create` — завести, если его ещё нет.
-    fn fetch(create: bool) -> Result<Option<[u8; 32]>> {
+    fn fetch(create: bool, tx: &mpsc::Sender<Msg>) -> Result<Option<[u8; 32]>, KeystoreError> {
         use secret_service::EncryptionType;
         use secret_service::blocking::SecretService;
-        let ss = SecretService::connect(EncryptionType::Dh)?;
-        let found = ss.search_items(attrs())?;
+        let err = |e: secret_service::Error| fail(classify(&e), e.to_string());
+        let ss = SecretService::connect(EncryptionType::Dh).map_err(err)?;
+        let found = ss.search_items(attrs()).map_err(err)?;
+        let _ = tx.send(Msg::Searched);
         let item = match (found.unlocked.into_iter().next(), found.locked.first()) {
             (Some(item), _) => Some(item),
             (None, Some(locked)) => {
-                // Хранилище заперто: система спросит пароль.
-                locked.unlock()?;
-                Some(ss.get_item_by_path(locked.item_path.clone())?)
+                // Связка заперта: система спросит пароль, ждём человека.
+                locked.unlock().map_err(err)?;
+                Some(ss.get_item_by_path(locked.item_path.clone()).map_err(err)?)
             }
             (None, None) => None,
         };
         if let Some(item) = item {
-            let v = item.get_secret()?;
-            let k: [u8; 32] = v
-                .try_into()
-                .map_err(|_| anyhow!(tr("ключ Clipwire в хранилище паролей повреждён")))?;
+            let v = item.get_secret().map_err(err)?;
+            let k: [u8; 32] = v.try_into().map_err(|_| {
+                fail(
+                    Failure::Other,
+                    tr("ключ Clipwire в хранилище паролей повреждён"),
+                )
+            })?;
             return Ok(Some(k));
         }
         if !create {
             return Ok(None);
         }
-        let k = crate::state::random_key()?;
-        let collection = ss.get_default_collection()?;
-        collection.ensure_unlocked()?;
-        collection.create_item("Clipwire", attrs(), &k, true, "application/octet-stream")?;
+        let k = crate::state::random_key().map_err(|e| fail(Failure::Other, e.to_string()))?;
+        let collection = ss.get_default_collection().map_err(err)?;
+        collection.ensure_unlocked().map_err(err)?;
+        collection
+            .create_item("Clipwire", attrs(), &k, true, "application/octet-stream")
+            .map_err(err)?;
         Ok(Some(k))
     }
 
-    fn key(create: bool) -> Result<Option<[u8; 32]>> {
+    fn key(create: bool) -> Result<Option<[u8; 32]>, KeystoreError> {
+        // Пока один поток ждёт окно пароля, остальные ждут его результат, а не
+        // открывают второе окно.
         let mut slot = KEY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(k) = *slot {
             return Ok(Some(k));
         }
-        if UNAVAILABLE.load(Ordering::Relaxed) {
-            return Err(anyhow!(tr("хранилище паролей недоступно")));
+        let last = *FAILED.lock().unwrap_or_else(|e| e.into_inner());
+        if !may_try(last.map(|(f, at)| (f, at.elapsed()))) {
+            let f = last.map(|(f, _)| f).unwrap_or(Failure::Other);
+            return Err(fail(f, String::new()));
         }
         // В отдельном потоке: зависший D-Bus не должен вешать запуск.
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(fetch(create).map_err(|e| format!("{e:#}")));
+            let res = fetch(create, &tx);
+            let _ = tx.send(Msg::Done(res));
         });
         let res = match rx.recv_timeout(TIMEOUT) {
-            Ok(r) => r.map_err(|e| anyhow!(e)),
-            Err(_) => Err(anyhow!("нет ответа за {} с", TIMEOUT.as_secs())),
+            Ok(Msg::Done(r)) => r,
+            // Нашли, где ключ; дальше, возможно, окно пароля — без срока.
+            Ok(Msg::Searched) => match rx.recv() {
+                Ok(Msg::Done(r)) => r,
+                _ => Err(fail(Failure::Other, "поток хранилища остановился")),
+            },
+            Err(_) => Err(fail(
+                Failure::Timeout,
+                format!("нет ответа за {} с", TIMEOUT.as_secs()),
+            )),
         };
+        let mut failed = FAILED.lock().unwrap_or_else(|e| e.into_inner());
         match res {
             Ok(k) => {
+                *failed = None;
                 *slot = k;
                 Ok(k)
             }
             Err(e) => {
-                UNAVAILABLE.store(true, Ordering::Relaxed);
-                Err(e.context(tr("хранилище паролей недоступно")))
+                tracing::warn!(failure = ?e.failure, "ключ Clipwire не получен: {e}");
+                *failed = Some((e.failure, Instant::now()));
+                Err(e)
             }
         }
     }
@@ -303,10 +425,11 @@ mod imp {
         match key(true) {
             Ok(Some(k)) => seal(&k, data),
             Ok(None) => unreachable!("create=true всегда возвращает ключ"),
-            Err(e) => {
-                tracing::warn!("секреты пишутся открыто в файл 0600: {e:#}");
+            Err(e) if plain_allowed(e.failure) => {
+                tracing::warn!("хранилища паролей нет, секреты пишутся открыто в файл 0600");
                 Ok(data.to_vec())
             }
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -326,9 +449,14 @@ mod imp {
         )
     }
 
-    /// Файл записан открыто, а шифрование включено и хранилище доступно.
+    /// Файл записан открыто, а шифрование включено и хранилище не известно
+    /// как отсутствующее.
     pub fn needs_upgrade(data: &[u8]) -> bool {
-        ENABLED.load(Ordering::Relaxed) && !is_sealed(data) && !UNAVAILABLE.load(Ordering::Relaxed)
+        let absent = FAILED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|(f, _)| f == Failure::Absent);
+        ENABLED.load(Ordering::Relaxed) && !is_sealed(data) && !absent
     }
 }
 
@@ -346,6 +474,23 @@ mod imp {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use imp::enable_keychain;
 pub use imp::{protect, unprotect};
+
+/// Ошибка — временная беда с хранилищем ключей ОС (связка заперта, служба
+/// не ответила): через сколько пробовать снова. `None` — ошибка другая или
+/// повторять бессмысленно.
+pub fn retry_hint(e: &anyhow::Error) -> Option<std::time::Duration> {
+    #[cfg(target_os = "linux")]
+    {
+        e.chain()
+            .find_map(|c| c.downcast_ref::<imp::KeystoreError>())
+            .and_then(|k| imp::retry_after(k.failure))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = e;
+        None
+    }
+}
 
 /// Расшифровать содержимое файла `path`; если оно лежало в старом виде
 /// (macOS и Linux: открыто, до хранилища ключей), переписать файл защищённым.
@@ -407,6 +552,44 @@ mod tests {
         );
         delete_generic_password(super::imp::SERVICE, &account).unwrap();
         assert!(get_generic_password(super::imp::SERVICE, &account).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn keystore_retry_rules() {
+        use super::imp::{Failure, may_try, plain_allowed, retry_after};
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        // Сбоя не было — пробуем.
+        assert!(may_try(None));
+        // Хранилища нет — не пробуем никогда, но писать открыто можно.
+        assert!(!may_try(Some((Failure::Absent, s(3600)))));
+        assert!(plain_allowed(Failure::Absent));
+        // Отказ открыть связку и молчание службы — повтор через минуту,
+        // открытым текстом не пишем.
+        for f in [Failure::Dismissed, Failure::Timeout, Failure::Other] {
+            assert!(!plain_allowed(f));
+            let d = retry_after(f).unwrap();
+            assert!(!may_try(Some((f, d - s(1)))), "{f:?}");
+            assert!(may_try(Some((f, d))), "{f:?}");
+        }
+        assert_eq!(retry_after(Failure::Dismissed), Some(s(60)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn keystore_error_is_found_and_readable() {
+        let e = anyhow::Error::new(super::imp::KeystoreError {
+            failure: super::imp::Failure::Dismissed,
+            detail: String::new(),
+        })
+        .context("не читается state.bin");
+        assert_eq!(
+            super::retry_hint(&e),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert!(format!("{e:#}").contains("заперто"));
+        assert_eq!(super::retry_hint(&anyhow::anyhow!("другое")), None);
     }
 
     /// Настоящий Secret Service: включает шифрование, пишет и читает, затем

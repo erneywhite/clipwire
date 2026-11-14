@@ -92,6 +92,48 @@ pub fn current_status(app: &AppHandle) -> StatusDto {
     }
 }
 
+/// Синхронизация не запустилась из-за запертой связки ключей или молчащего
+/// хранилища: пробовать снова, пока не получится. Человек может открыть
+/// связку сам — тогда всё заработает без перезапуска.
+fn retry_service_later(app: &AppHandle, e: &anyhow::Error) {
+    let Some(wait) = clipwire_agent::secret::retry_hint(e) else {
+        return;
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut wait = wait;
+        loop {
+            tokio::time::sleep(wait).await;
+            let running = app
+                .state::<AppState>()
+                .service
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            if running {
+                return;
+            }
+            let a = app.clone();
+            let res = tokio::task::spawn_blocking(move || start_service(&a)).await;
+            match res {
+                Ok(Ok(_)) => {
+                    tracing::info!("синхронизация запустилась после повтора");
+                    publish_status(&app);
+                    return;
+                }
+                Ok(Err(e)) => match clipwire_agent::secret::retry_hint(&e) {
+                    Some(w) => wait = w,
+                    None => {
+                        tracing::error!("синхронизация не запустилась: {e:#}");
+                        return;
+                    }
+                },
+                Err(_) => return,
+            }
+        }
+    });
+}
+
 /// Сообщить трею и окнам, что статус поменялся.
 pub fn publish_status(app: &AppHandle) {
     let st = current_status(app);
@@ -201,7 +243,20 @@ fn load_state() -> anyhow::Result<AppState> {
     });
     let settings = Settings::load(&paths.dir);
     clipwire_agent::i18n::set_language(&settings.language);
-    let history = History::open(&paths.dir)?;
+    // Связка ключей заперта и человек не открыл её (или служба не ответила):
+    // без ключа истории работать нельзя, поэтому ждём и спрашиваем снова.
+    let history = loop {
+        match History::open(&paths.dir) {
+            Ok(h) => break h,
+            Err(e) => match clipwire_agent::secret::retry_hint(&e) {
+                Some(wait) => {
+                    tracing::warn!("история не открылась, пробую снова через {wait:?}: {e:#}");
+                    std::thread::sleep(wait);
+                }
+                None => return Err(e),
+            },
+        }
+    };
     Ok(AppState {
         ignored_apps: Arc::new(Mutex::new(settings.ignored_apps.clone())),
         upload_limit_mb: Arc::new(settings.file_upload_limit_mb.into()),
@@ -476,6 +531,7 @@ pub fn run() {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             if let Err(e) = started {
                 tracing::error!("синхронизация не запустилась: {e:#}");
+                retry_service_later(app.handle(), &e);
             }
             // Перед установкой обновления синхронизация стояла на паузе.
             if after_update.paused {

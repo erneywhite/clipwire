@@ -334,6 +334,15 @@ pub static EN: &[(&str, &str)] = &[
         "the Clipwire key in the password store is damaged",
     ),
     (
+        "хранилище паролей заперто, ключи Clipwire недоступны. Разблокируйте его паролем входа в систему — Clipwire подхватит ключи сам",
+        "the password store is locked, so Clipwire cannot get its keys. Unlock it with your login password and Clipwire will pick the keys up by itself",
+    ),
+    (
+        "хранилище паролей не ответило",
+        "the password store did not respond",
+    ),
+    ("ошибка хранилища паролей", "password store error"),
+    (
         "хранилище паролей недоступно",
         "the password store is unavailable",
     ),
