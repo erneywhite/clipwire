@@ -1,6 +1,7 @@
 <script lang="ts">
   // Окно вставки на примерах — для превью размера в настройках. Показывается
   // в отдельном окне рядом с настройками, которое не забирает фокус.
+  import { t } from '../lib/i18n'
   import EntryRow from '../lib/EntryRow.svelte'
   import type { Entry } from '../lib/api'
   import type { TransferMap } from '../lib/transfer'
@@ -29,7 +30,8 @@
       </svg>`,
     )
   // Образец файла с другого устройства: идёт скачивание, видна полоса прогресса.
-  const sampleFile = { name: 'Отчёт за ноябрь.pdf', path: '/Users/me/Отчёт за ноябрь.pdf', size: 2_400_000, is_dir: false, exists: false, blob: '0'.repeat(32), p2p: false, blob_size: 2_400_000, local_path: null, remote: true, uploaded: false }
+  const fileName = t('Отчёт за ноябрь.pdf')
+  const sampleFile = { name: fileName, path: `/Users/me/${fileName}`, size: 2_400_000, is_dir: false, exists: false, blob: '0'.repeat(32), p2p: false, blob_size: 2_400_000, local_path: null, remote: true, uploaded: false }
   const sampleTransfers: TransferMap = {
     [sampleFile.blob]: { blob: sampleFile.blob, direction: 'down', done: 1_100_000, total: 2_400_000, state: 'active', error: null },
   }
@@ -37,26 +39,26 @@
     { ...base, id: '1', kind: 'image', text: '', chars: 0, seen_ms: now - 1 * min, local: false, device_name: 'MacBook', width: 1920, height: 1080, bytes: 348_000, thumb: sampleShot },
     { ...base, id: '2', kind: 'text', text: 'https://github.com/erneywhite/clipwire', chars: 38, seen_ms: now - 4 * min },
     { ...base, id: 'f', kind: 'files', text: '', chars: 0, seen_ms: now - 6 * min, local: false, device_name: 'MacBook', bytes: sampleFile.size, files: [sampleFile] },
-    { ...base, id: '3', kind: 'text', text: 'docker compose pull && docker compose up -d', chars: 43, seen_ms: now - 9 * min, source_app: { name: 'Терминал', icon: null } },
-    { ...base, id: '4', kind: 'text', text: 'Созвон завтра в 10:00, ссылку пришлю утром', chars: 42, seen_ms: now - 25 * min, local: false, device_name: 'MacBook', pinned: true },
-    { ...base, id: '5', kind: 'text', text: 'Ответ клиенту: заказ отправлен, номер для отслеживания пришлю отдельным письмом сегодня вечером', chars: 96, lines: 1, seen_ms: now - 50 * min },
+    { ...base, id: '3', kind: 'text', text: 'docker compose pull && docker compose up -d', chars: 43, seen_ms: now - 9 * min, source_app: { name: t('Терминал'), icon: null } },
+    { ...base, id: '4', kind: 'text', text: t('Созвон завтра в 10:00, ссылку пришлю утром'), chars: 42, seen_ms: now - 25 * min, local: false, device_name: 'MacBook', pinned: true },
+    { ...base, id: '5', kind: 'text', text: t('Ответ клиенту: заказ отправлен, номер для отслеживания пришлю отдельным письмом сегодня вечером'), chars: 96, lines: 1, seen_ms: now - 50 * min },
     { ...base, id: '6', kind: 'text', text: 'SELECT id, name\nFROM devices\nWHERE last_seen > now() - interval 1 day;', chars: 70, lines: 3, seen_ms: now - 80 * min },
-    { ...base, id: '7', kind: 'text', text: 'Адрес доставки: Рига, Бривибас 1', chars: 32, seen_ms: now - 130 * min },
+    { ...base, id: '7', kind: 'text', text: t('Адрес доставки: Рига, Бривибас 1'), chars: 32, seen_ms: now - 130 * min },
   ]
 </script>
 
 <div class="frame" style:width={fill ? '100vw' : `${width}px`} style:height={fill ? '100vh' : `${height}px`} aria-hidden="true">
   <div class="search">
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4.5 4.5" /></svg>
-    <span>Найти в буфере</span>
+    <span>{t('Найти в буфере')}</span>
   </div>
-  <div class="tabs"><span class="on">История</span><span>Закреплённое</span></div>
+  <div class="tabs"><span class="on">{t('История')}</span><span>{t('Закреплённое')}</span></div>
   <ul class="list">
     {#each samples as item, i (item.id)}
       <EntryRow {item} transfers={sampleTransfers} index={i} selected={i === 0} />
     {/each}
   </ul>
-  <div class="hints"><span>↵ вставить</span><span>␣ просмотр</span><span>Ctrl P закрепить</span><span>Esc</span></div>
+  <div class="hints"><span>{t('↵ вставить')}</span><span>{t('␣ просмотр')}</span><span>{t('Ctrl P закрепить')}</span><span>Esc</span></div>
 </div>
 
 <style>

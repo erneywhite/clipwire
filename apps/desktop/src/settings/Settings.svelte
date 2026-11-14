@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
+  import { t } from '../lib/i18n'
   import { listen } from '@tauri-apps/api/event'
   import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart'
   import { check, type Update } from '@tauri-apps/plugin-updater'
@@ -18,23 +19,23 @@
 
   type Section = 'general' | 'sync' | 'privacy' | 'keys' | 'about'
   const sections: { id: Section; title: string; icon: string }[] = [
-    { id: 'general', title: 'Основные', icon: 'M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0' },
-    { id: 'sync', title: 'Синхронизация', icon: 'M4 12a8 8 0 0 1 14-5.3M20 12a8 8 0 0 1-14 5.3M18 3v4h-4M6 21v-4h4' },
-    { id: 'privacy', title: 'Приватность', icon: 'M6 11V8a6 6 0 0 1 12 0v3M5 11h14v10H5z' },
-    { id: 'keys', title: 'Клавиши', icon: 'M3 7h18v10H3zM7 11h0M11 11h0M15 11h0M8 14h8' },
-    { id: 'about', title: 'О программе', icon: 'M12 8h0M11 12h1v5h1M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z' },
+    { id: 'general', title: t('Основные'), icon: 'M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0' },
+    { id: 'sync', title: t('Синхронизация'), icon: 'M4 12a8 8 0 0 1 14-5.3M20 12a8 8 0 0 1-14 5.3M18 3v4h-4M6 21v-4h4' },
+    { id: 'privacy', title: t('Приватность'), icon: 'M6 11V8a6 6 0 0 1 12 0v3M5 11h14v10H5z' },
+    { id: 'keys', title: t('Клавиши'), icon: 'M3 7h18v10H3zM7 11h0M11 11h0M15 11h0M8 14h8' },
+    { id: 'about', title: t('О программе'), icon: 'M12 8h0M11 12h1v5h1M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z' },
   ]
   const themes: { id: Theme; title: string }[] = [
-    { id: 'graphite', title: 'Графит' },
-    { id: 'paper', title: 'Бумага' },
-    { id: 'signal', title: 'Сигнал' },
+    { id: 'graphite', title: t('Графит') },
+    { id: 'paper', title: t('Бумага') },
+    { id: 'signal', title: t('Сигнал') },
   ]
   const retentions: { id: Retention; title: string }[] = [
-    { id: 'day', title: 'День' },
-    { id: 'week', title: 'Неделя' },
-    { id: 'month', title: 'Месяц' },
-    { id: 'year', title: 'Год' },
-    { id: 'forever', title: 'Всегда' },
+    { id: 'day', title: t('День') },
+    { id: 'week', title: t('Неделя') },
+    { id: 'month', title: t('Месяц') },
+    { id: 'year', title: t('Год') },
+    { id: 'forever', title: t('Всегда') },
   ]
 
   let section = $state<Section>('general')
@@ -150,7 +151,7 @@
 
   async function copy(text: string) {
     await api.copyQuietly(text)
-    flash('Скопировано')
+    flash(t('Скопировано'))
   }
 
   async function leave() {
@@ -176,8 +177,8 @@
       cacheBytes = r.size
       flash(
         r.failed > 0
-          ? `Удалено не всё: ${r.failed} — файлы открыты в другой программе`
-          : 'Кэш скачанного очищен',
+          ? t('Удалено не всё: {failed} — файлы открыты в другой программе', { failed: r.failed })
+          : t('Кэш скачанного очищен'),
       )
     } catch (e) {
       error = String(e)
@@ -223,7 +224,7 @@
   async function clearHistory() {
     await api.clear(true)
     confirmClear = false
-    flash('История очищена, закреплённое осталось')
+    flash(t('История очищена, закреплённое осталось'))
   }
 
   async function toggleAutostart(on: boolean) {
@@ -254,10 +255,10 @@
   // Размер окна вставки одним числом: ширина и высота растут вместе.
   const SIZE = { w0: 320, w1: 560, h0: 400, h1: 760 }
   function valueToSize(v: number) {
-    const t = v / 100
+    const k = v / 100
     return {
-      w: Math.round((SIZE.w0 + (SIZE.w1 - SIZE.w0) * t) / 10) * 10,
-      h: Math.round((SIZE.h0 + (SIZE.h1 - SIZE.h0) * t) / 10) * 10,
+      w: Math.round((SIZE.w0 + (SIZE.w1 - SIZE.w0) * k) / 10) * 10,
+      h: Math.round((SIZE.h0 + (SIZE.h1 - SIZE.h0) * k) / 10) * 10,
     }
   }
   function sizeToValue(w: number) {
@@ -356,19 +357,19 @@
   function statusText(st: Status): string {
     switch (st.kind) {
       case 'online':
-        return 'На связи с сервером'
+        return t('На связи с сервером')
       case 'connecting':
-        return 'Подключение…'
+        return t('Подключение…')
       case 'paused':
-        return 'На паузе'
+        return t('На паузе')
       case 'offline':
-        return `Нет связи: ${st.detail}`
+        return t('Нет связи: {detail}', { detail: st.detail })
       case 'local':
-        return 'Только это устройство'
+        return t('Только это устройство')
       case 'unconfigured':
-        return 'Синхронизация не запустилась'
+        return t('Синхронизация не запустилась')
       case 'excluded':
-        return 'Устройство исключено из группы'
+        return t('Устройство исключено из группы')
     }
   }
 
@@ -402,7 +403,7 @@
       listen<GroupRekeyed>('clipwire://group-rekeyed', (e) => {
         invite = ''
         createdInvite = ''
-        if (!e.payload.by_me) notice = `${rekeyedBy(e.payload.by)}. Старый код приглашения больше не действует.`
+        if (!e.payload.by_me) notice = t('{who}. Старый код приглашения больше не действует.', { who: rekeyedBy(e.payload.by) })
         refresh()
       }),
       listen('clipwire://group-excluded', () => {
@@ -423,7 +424,7 @@
   <div class="window">
   <TitleBar />
   <div class="layout">
-    <nav aria-label="Разделы настроек">
+    <nav aria-label={t('Разделы настроек')}>
       {#each sections as sec (sec.id)}
         <button class:active={section === sec.id} onclick={() => (section = sec.id)} aria-current={section === sec.id}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d={sec.icon} /></svg>
@@ -441,61 +442,61 @@
       {#if notice}<p class="notice" role="status">{notice}</p>{/if}
 
       {#if section === 'general'}
-        <h1>Основные</h1>
+        <h1>{t('Основные')}</h1>
         <div class="card">
-          <Toggle label="Запускать при входе в систему" checked={autostart} onchange={toggleAutostart} />
+          <Toggle label={t('Запускать при входе в систему')} checked={autostart} onchange={toggleAutostart} />
           <Toggle
-            label="Звук при копировании"
-            hint="Короткий щелчок, когда в историю попадает новое: скопированное здесь или пришедшее с другого устройства."
+            label={t('Звук при копировании')}
+            hint={t('Короткий щелчок, когда в историю попадает новое: скопированное здесь или пришедшее с другого устройства.')}
             checked={s.sound_on_receive}
             onchange={(v) => save({ sound_on_receive: v })}
           />
           <Toggle
-            label="Обновляться автоматически"
-            hint="Новая версия скачивается в фоне и ставится, когда вы не пользуетесь Clipwire. Выключено — обновление ставится по кнопке в «О программе» или в меню трея."
+            label={t('Обновляться автоматически')}
+            hint={t('Новая версия скачивается в фоне и ставится, когда вы не пользуетесь Clipwire. Выключено — обновление ставится по кнопке в «О программе» или в меню трея.')}
             checked={s.auto_update}
             onchange={(v) => save({ auto_update: v })}
           />
         </div>
 
-        <h2>Язык</h2>
+        <h2>{t('Язык')}</h2>
         <div class="card pad">
           <!-- Названия языков — на самих языках, их не переводим. -->
-          <div class="segmented" role="radiogroup" aria-label="Язык">
-            {#each [['system', 'Как в системе'], ['ru', 'Русский'], ['en', 'English']] as [id, title] (id)}
+          <div class="segmented" role="radiogroup" aria-label={t('Язык')}>
+            {#each [['system', t('Как в системе')], ['ru', 'Русский'], ['en', 'English']] as [id, title] (id)}
               <button role="radio" aria-checked={s.language === id} class:on={s.language === id} onclick={() => save({ language: id as Settings['language'] })}>{title}</button>
             {/each}
           </div>
         </div>
 
-        <h2>Оформление</h2>
+        <h2>{t('Оформление')}</h2>
         <div class="card pad">
           <div class="themes">
-            {#each themes as t (t.id)}
-              <button class="theme" class:on={s.theme === t.id} data-preview={t.id} onclick={() => save({ theme: t.id })} aria-pressed={s.theme === t.id}>
+            {#each themes as th (th.id)}
+              <button class="theme" class:on={s.theme === th.id} data-preview={th.id} onclick={() => save({ theme: th.id })} aria-pressed={s.theme === th.id}>
                 <span class="swatch" aria-hidden="true"><span></span></span>
-                {t.title}
+                {th.title}
               </button>
             {/each}
           </div>
-          <div class="segmented" role="radiogroup" aria-label="Режим">
-            {#each [['system', 'Как в системе'], ['light', 'Светлая'], ['dark', 'Тёмная']] as [id, title] (id)}
+          <div class="segmented" role="radiogroup" aria-label={t('Режим')}>
+            {#each [['system', t('Как в системе')], ['light', t('Светлая')], ['dark', t('Тёмная')]] as [id, title] (id)}
               <button role="radio" aria-checked={s.mode === id} class:on={s.mode === id} onclick={() => save({ mode: id as Settings['mode'] })}>{title}</button>
             {/each}
           </div>
         </div>
 
-        <h2>Вставка</h2>
+        <h2>{t('Вставка')}</h2>
         <div class="card">
           <Toggle
-            label="Сразу вставлять в активное окно"
-            hint="Двойной клик или Enter вставляет туда, где стоит курсор. Иначе элемент только попадает в буфер."
+            label={t('Сразу вставлять в активное окно')}
+            hint={t('Двойной клик или Enter вставляет туда, где стоит курсор. Иначе элемент только попадает в буфер.')}
             checked={s.paste_into_active}
             onchange={(v) => save({ paste_into_active: v })}
           />
         </div>
 
-        <h2>Хранить историю</h2>
+        <h2>{t('Хранить историю')}</h2>
         <div class="card pad">
           <input
             type="range"
@@ -504,94 +505,89 @@
             step="1"
             value={retentions.findIndex((r) => r.id === s?.retention)}
             oninput={(e) => save({ retention: retentions[Number(e.currentTarget.value)].id })}
-            aria-label="Срок хранения истории"
+            aria-label={t('Срок хранения истории')}
           />
           <div class="ticks">
             {#each retentions as r (r.id)}<span class:on={s.retention === r.id}>{r.title}</span>{/each}
           </div>
-          <p class="hint">Закреплённое хранится всегда. История лежит только на этом устройстве и зашифрована.</p>
+          <p class="hint">{t('Закреплённое хранится всегда. История лежит только на этом устройстве и зашифрована.')}</p>
           {#if confirmClear}
             <div class="confirm">
-              <span>Удалить всю историю, кроме закреплённого?</span>
-              <button class="danger" onclick={clearHistory}>Удалить</button>
-              <button onclick={() => (confirmClear = false)}>Отмена</button>
+              <span>{t('Удалить всю историю, кроме закреплённого?')}</span>
+              <button class="danger" onclick={clearHistory}>{t('Удалить')}</button>
+              <button onclick={() => (confirmClear = false)}>{t('Отмена')}</button>
             </div>
           {:else}
-            <button onclick={() => (confirmClear = true)}>Очистить историю</button>
+            <button onclick={() => (confirmClear = true)}>{t('Очистить историю')}</button>
           {/if}
         </div>
       {:else if section === 'sync'}
-        <h1>Синхронизация</h1>
+        <h1>{t('Синхронизация')}</h1>
         {#if status.kind === 'excluded'}
           <div class="card pad">
-            <h2 class="in-card">Устройство исключено из группы</h2>
+            <h2 class="in-card">{t('Устройство исключено из группы')}</h2>
             <p class="hint">
-              Сервер сообщил, что этого устройства больше нет в группе: его удалили на другом устройстве, ключ
-              группы сменили, пока оно было не в сети дольше 30 дней, или новый ключ пришёл от устройства, которого
-              здесь не видели. Синхронизация остановлена. Ключ группы и история остались на этом устройстве.
+              {t('Сервер сообщил, что этого устройства больше нет в группе: его удалили на другом устройстве, ключ группы сменили, пока оно было не в сети дольше 30 дней, или новый ключ пришёл от устройства, которого здесь не видели. Синхронизация остановлена. Ключ группы и история остались на этом устройстве.')}
             </p>
             <p class="hint">
-              Если вы этого не делали, попробуйте снова. Если устройство и правда удалили, выйдите из группы и
-              подключитесь заново по новому коду приглашения.
+              {t('Если вы этого не делали, попробуйте снова. Если устройство и правда удалили, выйдите из группы и подключитесь заново по новому коду приглашения.')}
             </p>
             <div class="buttons">
-              <button class="danger" disabled={retrying} onclick={leave}>Выйти из группы</button>
-              <button disabled={retrying} onclick={retry}>{retrying ? 'Подключаю…' : 'Попробовать снова'}</button>
+              <button class="danger" disabled={retrying} onclick={leave}>{t('Выйти из группы')}</button>
+              <button disabled={retrying} onclick={retry}>{retrying ? t('Подключаю…') : t('Попробовать снова')}</button>
             </div>
           </div>
         {:else if !configured}
           <p class="lead">
-            Сейчас Clipwire работает только на этом устройстве: история и окно вставки есть, синхронизации нет.
-            Чтобы буфер был общим с другими компьютерами, подключите сервер. Группу создаёт первое устройство,
-            остальные подключаются по коду приглашения.
+            {t('Сейчас Clipwire работает только на этом устройстве: история и окно вставки есть, синхронизации нет. Чтобы буфер был общим с другими компьютерами, подключите сервер. Группу создаёт первое устройство, остальные подключаются по коду приглашения.')}
           </p>
           <div class="card pad">
-            <h2 class="in-card">Это первое устройство</h2>
-            <p class="hint">Код сервера печатает сервер Clipwire при запуске, строка начинается с <code>cwserver1-</code>.</p>
+            <h2 class="in-card">{t('Это первое устройство')}</h2>
+            <p class="hint">{t('Код сервера печатает сервер Clipwire при запуске, строка начинается с')} <code>cwserver1-</code>.</p>
             <textarea bind:value={serverCode} rows="3" placeholder="cwserver1-…" spellcheck="false"></textarea>
-            <button class="primary" disabled={busy || !serverCode.trim()} onclick={createGroup}>Создать группу</button>
+            <button class="primary" disabled={busy || !serverCode.trim()} onclick={createGroup}>{t('Создать группу')}</button>
           </div>
           <div class="card pad">
-            <h2 class="in-card">Подключить к группе</h2>
-            <p class="hint">Код приглашения берётся на любом устройстве группы: Синхронизация → «Показать код».</p>
+            <h2 class="in-card">{t('Подключить к группе')}</h2>
+            <p class="hint">{t('Код приглашения берётся на любом устройстве группы: Синхронизация → «Показать код».')}</p>
             <textarea bind:value={inviteInput} rows="3" placeholder="clipwire1-…" spellcheck="false"></textarea>
-            <button class="primary" disabled={busy || !inviteInput.trim()} onclick={joinGroup}>Подключить</button>
+            <button class="primary" disabled={busy || !inviteInput.trim()} onclick={joinGroup}>{t('Подключить')}</button>
           </div>
         {:else}
           {#if createdInvite}
             <div class="card pad accent">
-              <h2 class="in-card">Группа создана</h2>
-              <p class="hint">Этот код вставьте на остальных устройствах. В нём ключ шифрования группы: передавайте его только себе.</p>
+              <h2 class="in-card">{t('Группа создана')}</h2>
+              <p class="hint">{t('Этот код вставьте на остальных устройствах. В нём ключ шифрования группы: передавайте его только себе.')}</p>
               <code class="code selectable">{createdInvite}</code>
-              <button onclick={() => copy(createdInvite)}>Скопировать код</button>
+              <button onclick={() => copy(createdInvite)}>{t('Скопировать код')}</button>
             </div>
           {/if}
           <div class="card">
-            <div class="kv"><span>Состояние</span><span>{statusText(status)}</span></div>
-            <div class="kv"><span>Сервер</span><span class="mono">{info?.relay_url ?? '—'}</span></div>
-            <div class="kv"><span>Отпечаток устройства</span><span class="mono">{info?.device_id ?? '—'}</span></div>
+            <div class="kv"><span>{t('Состояние')}</span><span>{statusText(status)}</span></div>
+            <div class="kv"><span>{t('Сервер')}</span><span class="mono">{info?.relay_url ?? '—'}</span></div>
+            <div class="kv"><span>{t('Отпечаток устройства')}</span><span class="mono">{info?.device_id ?? '—'}</span></div>
           </div>
 
-          <h2>Это устройство</h2>
+          <h2>{t('Это устройство')}</h2>
           <div class="card pad">
             <label class="field">
-              <span>Имя, которое видят остальные устройства</span>
+              <span>{t('Имя, которое видят остальные устройства')}</span>
               <input value={s.device_name} onchange={(e) => save({ device_name: e.currentTarget.value.trim() || s!.device_name })} />
             </label>
           </div>
           <div class="card">
             <Toggle
-              label="Удалять на всех устройствах"
-              hint="Запись, удалённая здесь, пропадает и на остальных устройствах группы, в том числе на выключенных: они удалят её, когда подключатся (если не пройдёт больше срока хранения на сервере). Закреплённое на другом устройстве остаётся. Выключено — удаление только здесь."
+              label={t('Удалять на всех устройствах')}
+              hint={t('Запись, удалённая здесь, пропадает и на остальных устройствах группы, в том числе на выключенных: они удалят её, когда подключатся (если не пройдёт больше срока хранения на сервере). Закреплённое на другом устройстве остаётся. Выключено — удаление только здесь.')}
               checked={s.delete_everywhere}
               onchange={(v) => save({ delete_everywhere: v })}
             />
           </div>
 
-          <h2>Файлы</h2>
+          <h2>{t('Файлы')}</h2>
           <div class="card pad">
             <label class="field">
-              <span>Загружать в хранилище файлы до N МБ</span>
+              <span>{t('Загружать в хранилище файлы до N МБ')}</span>
               <input
                 class="num"
                 type="number"
@@ -603,105 +599,100 @@
               />
             </label>
             <p class="hint">
-              Скопированные файлы такого размера сразу уходят зашифрованными в хранилище группы (сервер
-              Clipwire или своё, см. «Хранилище файлов»), и другие устройства вставляют их, даже когда этот
-              компьютер выключен. 0 — не загружать. Файлы крупнее порога
-              другие устройства берут напрямую с этого компьютера, пока он в сети.
+              {t('Скопированные файлы такого размера сразу уходят зашифрованными в хранилище группы (сервер Clipwire или своё, см. «Хранилище файлов»), и другие устройства вставляют их, даже когда этот компьютер выключен. 0 — не загружать. Файлы крупнее порога другие устройства берут напрямую с этого компьютера, пока он в сети.')}
             </p>
             <div class="cache">
-              <span>Скачанные файлы занимают <span class="mono">{cacheBytes === null ? '—' : bytesLabel(cacheBytes)}</span></span>
-              <button disabled={cacheBusy || !cacheBytes} onclick={clearCache}>Очистить кэш скачанного</button>
+              <span>{t('Скачанные файлы занимают')} <span class="mono">{cacheBytes === null ? '—' : bytesLabel(cacheBytes)}</span></span>
+              <button disabled={cacheBusy || !cacheBytes} onclick={clearCache}>{t('Очистить кэш скачанного')}</button>
             </div>
             <p class="hint">
-              Здесь лежат файлы, скачанные с других устройств и с сервера. Копия удаляется сама, когда
-              удаляется её запись в истории. Очистка не трогает то, что скачивается прямо сейчас; удалённое
-              скачается заново при вставке.
+              {t('Здесь лежат файлы, скачанные с других устройств и с сервера. Копия удаляется сама, когда удаляется её запись в истории. Очистка не трогает то, что скачивается прямо сейчас; удалённое скачается заново при вставке.')}
             </p>
           </div>
 
           <Storage />
 
-          <h2>Добавить устройство</h2>
+          <h2>{t('Добавить устройство')}</h2>
           <div class="card pad">
-            <p class="hint">Код приглашения содержит ключ шифрования группы. Кто его увидел, тот может читать ваш буфер.</p>
+            <p class="hint">{t('Код приглашения содержит ключ шифрования группы. Кто его увидел, тот может читать ваш буфер.')}</p>
             {#if invite}
               <code class="code selectable">{invite}</code>
               <div class="buttons">
-                <button onclick={() => copy(invite)}>Скопировать код</button>
-                <button onclick={() => (invite = '')}>Скрыть</button>
+                <button onclick={() => copy(invite)}>{t('Скопировать код')}</button>
+                <button onclick={() => (invite = '')}>{t('Скрыть')}</button>
               </div>
             {:else}
-              <button onclick={async () => (invite = await api.inviteCode())}>Показать код</button>
+              <button onclick={async () => (invite = await api.inviteCode())}>{t('Показать код')}</button>
             {/if}
           </div>
 
           <Devices onRekeyed={() => ((invite = ''), (createdInvite = ''))} />
 
-          <h2>Отключить</h2>
+          <h2>{t('Отключить')}</h2>
           <div class="card pad">
             {#if confirmLeave}
               <div class="confirm">
-                <span>Удалить ключи группы с этого устройства? Локальная история останется.</span>
-                <button class="danger" onclick={leave}>Отключить</button>
-                <button onclick={() => (confirmLeave = false)}>Отмена</button>
+                <span>{t('Удалить ключи группы с этого устройства? Локальная история останется.')}</span>
+                <button class="danger" onclick={leave}>{t('Отключить')}</button>
+                <button onclick={() => (confirmLeave = false)}>{t('Отмена')}</button>
               </div>
             {:else}
-              <button onclick={() => (confirmLeave = true)}>Отключить это устройство от группы</button>
+              <button onclick={() => (confirmLeave = true)}>{t('Отключить это устройство от группы')}</button>
             {/if}
           </div>
         {/if}
       {:else if section === 'privacy'}
-        <h1>Приватность</h1>
+        <h1>{t('Приватность')}</h1>
         <div class="card">
           <Toggle
-            label="Скрывать окна при демонстрации экрана"
-            hint="Окна Clipwire не попадут в запись экрана и трансляцию."
+            label={t('Скрывать окна при демонстрации экрана')}
+            hint={t('Окна Clipwire не попадут в запись экрана и трансляцию.')}
             checked={s.hide_from_capture}
             onchange={(v) => save({ hide_from_capture: v })}
           />
           <Toggle
-            label="Загружать карточки ссылок"
-            hint="По пробелу подгружается заголовок и картинка страницы. Похожие на одноразовые ссылки не загружаются никогда."
+            label={t('Загружать карточки ссылок')}
+            hint={t('По пробелу подгружается заголовок и картинка страницы. Похожие на одноразовые ссылки не загружаются никогда.')}
             checked={s.link_previews}
             onchange={(v) => save({ link_previews: v })}
           />
         </div>
-        <p class="hint outside">Содержимое, которое менеджеры паролей помечают как приватное, не синхронизируется никогда, эта защита не отключается.</p>
+        <p class="hint outside">{t('Содержимое, которое менеджеры паролей помечают как приватное, не синхронизируется никогда, эта защита не отключается.')}</p>
 
-        <h2>Не синхронизировать из программ</h2>
+        <h2>{t('Не синхронизировать из программ')}</h2>
         <div class="card pad">
           <ul class="apps">
             {#each s.ignored_apps as app (app)}
               <li>
                 <span class="mono">{app}</span>
-                <button aria-label="Убрать {app}" onclick={() => save({ ignored_apps: s!.ignored_apps.filter((a) => a !== app) })}>✕</button>
+                <button aria-label={t('Убрать {app}', { app })} onclick={() => save({ ignored_apps: s!.ignored_apps.filter((a) => a !== app) })}>✕</button>
               </li>
             {:else}
-              <li class="hint">Список пуст</li>
+              <li class="hint">{t('Список пуст')}</li>
             {/each}
           </ul>
           <form class="add" onsubmit={(e) => { e.preventDefault(); addApp() }}>
-            <input bind:value={newApp} placeholder="KeePass.exe" spellcheck="false" aria-label="Имя программы" />
-            <button type="submit" disabled={!newApp.trim()}>Добавить</button>
+            <input bind:value={newApp} placeholder="KeePass.exe" spellcheck="false" aria-label={t('Имя программы')} />
+            <button type="submit" disabled={!newApp.trim()}>{t('Добавить')}</button>
           </form>
         </div>
       {:else if section === 'keys'}
-        <h1>Клавиши</h1>
+        <h1>{t('Клавиши')}</h1>
         <div class="card">
           <div class="kv">
-            <span>Окно вставки</span>
+            <span>{t('Окно вставки')}</span>
             <button class="key" class:rec={recording} onclick={() => (recording = !recording)}>
-              {recording ? 'Нажмите сочетание… (Esc — отмена)' : hotkeyLabel(s.popup_hotkey)}
+              {recording ? t('Нажмите сочетание… (Esc — отмена)') : hotkeyLabel(s.popup_hotkey)}
             </button>
           </div>
         </div>
 
-        <h2>Размер окна вставки</h2>
+        <h2>{t('Размер окна вставки')}</h2>
         <div
           bind:this={sizeCard}
           class="card pad"
           role="group"
-          aria-label="Размер окна вставки"
+          aria-label={t('Размер окна вставки')}
           onmouseenter={() => previewShow()}
           onmouseleave={() => previewHide()}
         >
@@ -718,11 +709,11 @@
             }}
             onfocus={() => previewShow()}
             onblur={() => previewHide()}
-            aria-label="Размер окна вставки"
+            aria-label={t('Размер окна вставки')}
           />
-          <div class="ticks"><span>Компактное</span><span>{demoSize.w} × {demoSize.h}</span><span>Просторное</span></div>
+          <div class="ticks"><span>{t('Компактное')}</span><span>{demoSize.w} × {demoSize.h}</span><span>{t('Просторное')}</span></div>
           <div class="size-preview">
-            <div class="screen" style:aspect-ratio="{screenW} / {screenH}" title="Ваш экран в масштабе">
+            <div class="screen" style:aspect-ratio="{screenW} / {screenH}" title={t('Ваш экран в масштабе')}>
               <div
                 class="screen-popup"
                 style:width="{(demoSize.w / screenW) * 100}%"
@@ -731,88 +722,87 @@
               <span class="cursor" aria-hidden="true"></span>
             </div>
             <p class="hint">
-              Пока курсор над этим блоком, рядом с настройками показан пример окна вставки в настоящем
-              размере. Схема слева — ваш экран и окно на нём в той же пропорции.
+              {t('Пока курсор над этим блоком, рядом с настройками показан пример окна вставки в настоящем размере. Схема слева — ваш экран и окно на нём в той же пропорции.')}
             </p>
           </div>
         </div>
 
-        <h2>В окне вставки</h2>
+        <h2>{t('В окне вставки')}</h2>
         <div class="card">
-          {#each [['↑ ↓', 'выбрать'], ['Enter, двойной клик', 'вставить'], ['Ctrl + 1…9', 'вставить элемент по номеру'], ['Пробел', 'предпросмотр (при пустом поиске)'], ['Ctrl + P', 'закрепить'], ['Delete', 'удалить из истории (при пустом поиске)'], ['Shift + Delete', 'удалить, когда в поиске есть текст'], ['Правый клик, клавиша меню', 'действия с записью'], ['Tab', 'История ↔ Закреплённое'], ['Alt + ← →', 'фильтр: текст, ссылки, картинки, файлы'], ['Esc', 'закрыть']] as [k, v] (k)}
+          {#each [['↑ ↓', t('выбрать')], [t('Enter, двойной клик'), t('вставить')], ['Ctrl + 1…9', t('вставить элемент по номеру')], [t('Пробел'), t('предпросмотр (при пустом поиске)')], ['Ctrl + P', t('закрепить')], ['Delete', t('удалить из истории (при пустом поиске)')], ['Shift + Delete', t('удалить, когда в поиске есть текст')], [t('Правый клик, клавиша меню'), t('действия с записью')], ['Tab', t('История ↔ Закреплённое')], ['Alt + ← →', t('фильтр: текст, ссылки, картинки, файлы')], ['Esc', t('закрыть')]] as [k, v] (k)}
             <div class="kv"><span class="mono">{k}</span><span>{v}</span></div>
           {/each}
         </div>
       {:else if section === 'about'}
-        <h1>О программе</h1>
+        <h1>{t('О программе')}</h1>
         <div class="card pad">
           <div class="update-head">
             <div>
               <p class="version">Clipwire <span class="mono">{info?.version ?? '—'}</span></p>
               {#if updateState === 'available' && update}
-                <p class="accent-text">Доступна версия {update.version}</p>
+                <p class="accent-text">{t('Доступна версия {version}', { version: update.version })}</p>
               {:else if updateState === 'installing'}
-                <p class="hint">Скачивание и установка…</p>
+                <p class="hint">{t('Скачивание и установка…')}</p>
               {:else if updateState === 'none'}
-                <p class="hint">Установлена последняя версия</p>
+                <p class="hint">{t('Установлена последняя версия')}</p>
               {/if}
             </div>
             {#if updateState === 'available' && update}
               <button class="primary" onclick={installUpdate}>
-                {s.auto_update && updateReady === update.version ? 'Установить сейчас' : 'Установить и перезапустить'}
+                {s.auto_update && updateReady === update.version ? t('Установить сейчас') : t('Установить и перезапустить')}
               </button>
             {:else if updateState !== 'installing'}
               <button disabled={updateState === 'checking'} onclick={checkUpdates}>
-                {updateState === 'checking' ? 'Проверка…' : 'Проверить обновления'}
+                {updateState === 'checking' ? t('Проверка…') : t('Проверить обновления')}
               </button>
             {/if}
           </div>
           {#if updateState === 'available' && update && s.auto_update && updateReady === update.version}
-            <p class="hint">Уже скачана и установится сама, когда вы закроете окна Clipwire и пару минут не будете им пользоваться.</p>
+            <p class="hint">{t('Уже скачана и установится сама, когда вы закроете окна Clipwire и пару минут не будете им пользоваться.')}</p>
           {/if}
-          {#if updateState === 'error'}<p class="error">Не удалось проверить обновления: {updateError}</p>{/if}
-          <p class="hint">Обновления скачиваются с GitHub и проверяются по цифровой подписи.</p>
+          {#if updateState === 'error'}<p class="error">{t('Не удалось проверить обновления: {error}', { error: updateError })}</p>{/if}
+          <p class="hint">{t('Обновления скачиваются с GitHub и проверяются по цифровой подписи.')}</p>
         </div>
 
         <div class="section-head">
-          <h2>Состояние</h2>
-          <button class="link small" disabled={overviewBusy} onclick={loadOverview}>{overviewBusy ? 'Обновляю…' : 'Обновить'}</button>
+          <h2>{t('Состояние')}</h2>
+          <button class="link small" disabled={overviewBusy} onclick={loadOverview}>{overviewBusy ? t('Обновляю…') : t('Обновить')}</button>
         </div>
         <div class="card">
           <div class="kv">
-            <span>Сервер</span>
+            <span>{t('Сервер')}</span>
             <span class="tone" data-tone={statusTone(status)}>{statusText(status)}</span>
           </div>
           {#if configured && stats?.link}
             <div class="kv">
-              <span>Связь</span>
+              <span>{t('Связь')}</span>
               <span>{linkLabel(stats.link)}</span>
             </div>
           {/if}
           {#if configured && stats}
             <div class="kv">
-              <span>Синхронизация</span>
+              <span>{t('Синхронизация')}</span>
               <span>{lastSyncLabel(stats.last_sent_ms, stats.last_received_ms, fmt)}</span>
             </div>
           {/if}
           {#if configured}
             {@const storage = storageState ? storageLabel(storageState) : null}
             <div class="kv">
-              <span>Хранилище файлов</span>
+              <span>{t('Хранилище файлов')}</span>
               <span class="tone" data-tone={storage?.tone ?? 'muted'}>{storage?.text ?? '—'}</span>
             </div>
           {/if}
           <div class="kv">
-            <span>История на этом устройстве</span>
+            <span>{t('История на этом устройстве')}</span>
             <span>{stats ? historyLabel(stats.history_total, stats.history_pinned, fmt) : '—'}</span>
           </div>
           <div class="kv">
-            <span>Скачанные файлы</span>
-            <span>{cacheBytes === null ? '—' : cacheBytes === 0 ? 'Нет' : bytesLabel(cacheBytes)}</span>
+            <span>{t('Скачанные файлы')}</span>
+            <span>{cacheBytes === null ? '—' : cacheBytes === 0 ? t('Нет') : bytesLabel(cacheBytes)}</span>
           </div>
           {#if configured}
             <div class="kv">
-              <span>История группы на сервере</span>
+              <span>{t('История группы на сервере')}</span>
               {#if stats?.server}
                 <span>{serverItemsLabel(stats.server, fmt)}</span>
               {:else}
@@ -820,18 +810,18 @@
               {/if}
             </div>
             <div class="kv">
-              <span>Файлы на сервере</span>
+              <span>{t('Файлы на сервере')}</span>
               <span>{stats?.server ? serverFilesLabel(stats.server, fmt) : '—'}</span>
             </div>
             {#if stats?.server}
               {@const q = quotaLabel(stats.server, fmt)}
               <div class="kv">
-                <span>Место под файлы группы</span>
+                <span>{t('Место под файлы группы')}</span>
                 <span class="tone" data-tone={q.tone}>{q.text}</span>
               </div>
             {/if}
             <div class="kv">
-              <span>Устройств в группе</span>
+              <span>{t('Устройств в группе')}</span>
               {#if groupDevices}
                 <span>{devicesLabel(groupDevices)}</span>
               {:else}
@@ -841,18 +831,18 @@
           {/if}
         </div>
         {#if configured}
-          <p class="hint outside">На сервере всё лежит зашифрованным и удаляется по сроку, заданному на сервере.</p>
+          <p class="hint outside">{t('На сервере всё лежит зашифрованным и удаляется по сроку, заданному на сервере.')}</p>
         {/if}
 
-        <h2>О проекте</h2>
+        <h2>{t('О проекте')}</h2>
         <div class="card">
-          <div class="kv"><span>Исходный код</span><button class="link" onclick={() => openUrl('https://github.com/erneywhite/clipwire')}>github.com/erneywhite/clipwire</button></div>
-          <div class="kv"><span>Лицензия</span><span>AGPL-3.0</span></div>
+          <div class="kv"><span>{t('Исходный код')}</span><button class="link" onclick={() => openUrl('https://github.com/erneywhite/clipwire')}>github.com/erneywhite/clipwire</button></div>
+          <div class="kv"><span>{t('Лицензия')}</span><span>AGPL-3.0</span></div>
         </div>
         <div class="card pad donate">
           <div>
-            <p class="donate-title">Нравится Clipwire?</p>
-            <p class="hint">Программа бесплатная. Если она экономит вам время, можно угостить автора кофе: это правда помогает её развивать.</p>
+            <p class="donate-title">{t('Нравится Clipwire?')}</p>
+            <p class="hint">{t('Программа бесплатная. Если она экономит вам время, можно угостить автора кофе: это правда помогает её развивать.')}</p>
           </div>
           <button class="kofi" onclick={() => openUrl('https://ko-fi.com/erneywhite')}>
             <svg viewBox="0 0 24 24" aria-hidden="true">
