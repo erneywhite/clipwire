@@ -3,6 +3,9 @@ import { invoke } from '@tauri-apps/api/core'
 
 export type Theme = 'graphite' | 'paper' | 'signal'
 export type Mode = 'system' | 'light' | 'dark'
+/** Фильтр окна вставки по типу записи. */
+export type KindFilter = 'all' | 'text' | 'link' | 'image' | 'files'
+
 export type Retention = 'day' | 'week' | 'month' | 'year' | 'forever'
 
 export interface Settings {
@@ -274,8 +277,8 @@ export const api = {
   inviteCode: () => invoke<string>('invite_code'),
   createGroup: (serverCode: string) => invoke<string>('create_group', { serverCode }),
   joinGroup: (inviteCode: string) => invoke<void>('join_group', { inviteCode }),
-  list: (query: string, pinnedOnly: boolean, limit = 200) =>
-    invoke<Entry[]>('history_list', { query, pinnedOnly, limit }),
+  list: (query: string, pinnedOnly: boolean, kind: KindFilter = 'all', limit = 200) =>
+    invoke<Entry[]>('history_list', { query, pinnedOnly, kind, limit }),
   get: (id: string) => invoke<Entry>('history_get', { id }),
   pin: (id: string, pinned: boolean) => invoke<void>('history_pin', { id, pinned }),
   remove: (id: string) => invoke<void>('history_delete', { id }),

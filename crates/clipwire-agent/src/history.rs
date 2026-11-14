@@ -121,6 +121,46 @@ impl From<EntryV2> for Entry {
     }
 }
 
+/// Фильтр окна вставки по типу записи.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    #[default]
+    All,
+    /// Текст, кроме одиночных ссылок.
+    Text,
+    /// Текст из одной ссылки http(s).
+    Link,
+    /// Картинки и скопированные файлы-картинки.
+    Image,
+    /// Файлы и папки.
+    Files,
+}
+
+/// Текст целиком — одна ссылка, как `isUrl` в окне.
+pub fn is_url(text: &str) -> bool {
+    let t = text.trim();
+    let lower = t.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://"))
+        && t.len() > "http://".len()
+        && !t.chars().any(char::is_whitespace)
+}
+
+impl Kind {
+    pub fn matches(self, c: &Content) -> bool {
+        match (self, c) {
+            (Kind::All, _) => true,
+            (Kind::Text, Content::Text(t) | Content::Rich { text: t, .. }) => !is_url(t),
+            (Kind::Link, Content::Text(t) | Content::Rich { text: t, .. }) => is_url(t),
+            (Kind::Image, Content::Image { .. }) => true,
+            // Файл-картинка считается картинкой (так же решено для превью).
+            (Kind::Image, Content::Files(f)) => !f.is_empty() && f.iter().all(|f| f.width > 0),
+            (Kind::Files, Content::Files(_)) => true,
+            _ => false,
+        }
+    }
+}
+
 pub struct History {
     conn: Connection,
     cipher: XChaCha20Poly1305,
@@ -415,10 +455,22 @@ impl History {
 
     /// Список для окна вставки: новые первыми, поиск без учёта регистра.
     pub fn list(&self, query: &str, pinned_only: bool, limit: usize) -> Vec<&Entry> {
+        self.list_kind(query, pinned_only, Kind::All, limit)
+    }
+
+    /// То же с фильтром по типу записи.
+    pub fn list_kind(
+        &self,
+        query: &str,
+        pinned_only: bool,
+        kind: Kind,
+        limit: usize,
+    ) -> Vec<&Entry> {
         let q = query.trim().to_lowercase();
         self.entries
             .iter()
             .filter(|e| !pinned_only || e.pinned)
+            .filter(|e| kind.matches(&e.content))
             .filter(|e| {
                 q.is_empty()
                     || match &e.content {
@@ -939,5 +991,42 @@ mod tests {
         assert_eq!(texts(h.list("", false, 10)), ["p"]);
         h.clear(false).unwrap();
         assert!(h.is_empty());
+    }
+
+    #[test]
+    fn kind_filter() {
+        use clipwire_core::FileRef;
+        let file = |name: &str, width: u32| FileRef {
+            name: name.into(),
+            path: format!("/tmp/{name}"),
+            size: 1,
+            is_dir: false,
+            width,
+            height: width,
+            modified_ms: 0,
+            blob: None,
+            blob_size: 0,
+            p2p: false,
+        };
+        let text = Content::Text("привет".into());
+        let link = Content::Text(" https://example.com/a?b=1 ".into());
+        let two_links = Content::Text("https://a.com https://b.com".into());
+        let img = Content::Image {
+            width: 1,
+            height: 1,
+            png: vec![1],
+        };
+        let pic = Content::Files(vec![file("a.png", 10)]);
+        let doc = Content::Files(vec![file("a.pdf", 0)]);
+        assert!(Kind::Text.matches(&text) && !Kind::Link.matches(&text));
+        assert!(Kind::Link.matches(&link) && !Kind::Text.matches(&link));
+        assert!(Kind::Text.matches(&two_links), "две ссылки — уже текст");
+        assert!(Kind::Image.matches(&img) && Kind::Image.matches(&pic));
+        assert!(!Kind::Image.matches(&doc));
+        assert!(Kind::Files.matches(&pic) && Kind::Files.matches(&doc));
+        assert!(!Kind::Files.matches(&img));
+        for c in [&text, &link, &img, &pic, &doc] {
+            assert!(Kind::All.matches(c));
+        }
     }
 }

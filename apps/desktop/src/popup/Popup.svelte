@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
-  import { api, type Entry, type FileInfo, type Settings, type Transfer } from '../lib/api'
+  import { api, type Entry, type FileInfo, type KindFilter, type Settings, type Transfer } from '../lib/api'
   import { applyTheme } from '../lib/theme'
   import { ago, bytesLabel, filesMeta, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
   import { canDownload, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
@@ -14,6 +14,24 @@
 
   let query = $state('')
   let tab = $state<'all' | 'pinned'>('all')
+  // Фильтр по типу: 'all' — без фильтра. Повторный клик по выбранному снимает его.
+  let kind = $state<KindFilter>('all')
+  const kinds: { id: Exclude<KindFilter, 'all'>; title: string; icon: string }[] = [
+    { id: 'text', title: 'Текст', icon: 'M5 7h14M5 12h14M5 17h9' },
+    { id: 'link', title: 'Ссылки', icon: 'M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1' },
+    { id: 'image', title: 'Картинки', icon: 'M4 5h16v14H4zM4 16l5-5 4 4 2-2 5 5' },
+    { id: 'files', title: 'Файлы', icon: 'M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM14 3v5h5' },
+  ]
+  function setKind(k: KindFilter) {
+    kind = kind === k ? 'all' : k
+    reload()
+  }
+  /** Alt+← / Alt+→: следующий фильтр по кругу, включая «все». */
+  function cycleKind(d: number) {
+    const order: KindFilter[] = ['all', ...kinds.map((k) => k.id)]
+    kind = order[(order.indexOf(kind) + d + order.length) % order.length]
+    reload()
+  }
   let items = $state<Entry[]>([])
   let sel = $state(0)
   let preview = $state<{ entry: Entry; side: 'left' | 'right' } | null>(null)
@@ -120,7 +138,7 @@
   // действия — новый запрос, смена вкладки, новое открытие окна, новая вставка.
   async function load() {
     try {
-      items = await api.list(query, tab === 'pinned')
+      items = await api.list(query, tab === 'pinned', kind)
       if (sel >= items.length) sel = Math.max(0, items.length - 1)
       if (loadFailed) {
         loadFailed = false
@@ -381,6 +399,11 @@
         }
         return
     }
+    if (e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      e.preventDefault()
+      cycleKind(e.key === 'ArrowRight' ? 1 : -1)
+      return
+    }
     if ((e.ctrlKey || e.metaKey) && e.code === 'KeyE') {
       e.preventDefault()
       edit(current)
@@ -419,6 +442,9 @@
         pasting = false
         fetching = null
         query = ''
+        // Фильтр — на один показ: в новый раз окно открывается со всем подряд.
+        kind = 'all'
+        menu = null
         sel = 0
         preview = null
         error = ''
@@ -461,6 +487,19 @@
     <div class="tabs" role="tablist">
       <button role="tab" aria-selected={tab === 'all'} onclick={() => { tab = 'all'; reload() }}>История</button>
       <button role="tab" aria-selected={tab === 'pinned'} onclick={() => { tab = 'pinned'; reload() }}>Закреплённое</button>
+      <span class="kinds" role="group" aria-label="Тип записей">
+        {#each kinds as k (k.id)}
+          <button
+            class="kind"
+            aria-pressed={kind === k.id}
+            title="{k.title} (Alt + ← →)"
+            aria-label={k.title}
+            onclick={() => setKind(k.id)}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d={k.icon} /></svg>
+          </button>
+        {/each}
+      </span>
     </div>
 
     {#if error}
@@ -471,6 +510,8 @@
       <div class="empty">
         {#if query}
           <p>Ничего не нашлось по «{query}»</p>
+        {:else if kind !== 'all'}
+          <p>Здесь нет записей этого типа</p>
         {:else if tab === 'pinned'}
           <p>Закрепите нужное сочетанием Ctrl+P, и оно не пропадёт из истории</p>
         {:else}
@@ -789,6 +830,40 @@
   .tabs button[aria-selected='true'] {
     color: var(--c-text);
     border-bottom-color: var(--c-accent);
+  }
+  /* Фильтр по типу — значками справа от вкладок, чтобы не съедать высоту. */
+  .kinds {
+    margin-left: auto;
+    display: flex;
+    gap: 2px;
+    align-self: center;
+  }
+  .tabs .kind {
+    width: 24px;
+    height: 22px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-s);
+    color: var(--c-muted);
+  }
+  .tabs .kind:hover {
+    background: var(--c-hover);
+    color: var(--c-text);
+  }
+  .tabs .kind[aria-pressed='true'] {
+    background: var(--c-sel);
+    color: var(--c-accent);
+  }
+  .kind svg {
+    width: 15px;
+    height: 15px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
   .list {
     list-style: none;

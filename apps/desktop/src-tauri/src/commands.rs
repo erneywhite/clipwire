@@ -314,15 +314,21 @@ pub fn history_list(
     state: State<'_, AppState>,
     query: String,
     pinned_only: bool,
+    kind: Option<clipwire_agent::history::Kind>,
     limit: usize,
 ) -> Vec<EntryDto> {
     let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
     let uploaded = uploaded_check(&state);
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-    h.list(&query, pinned_only, limit.min(500))
-        .into_iter()
-        .map(|e| to_dto(e, h.thumb(e.id), false, &files_dir, &uploaded))
-        .collect()
+    h.list_kind(
+        &query,
+        pinned_only,
+        kind.unwrap_or_default(),
+        limit.min(500),
+    )
+    .into_iter()
+    .map(|e| to_dto(e, h.thumb(e.id), false, &files_dir, &uploaded))
+    .collect()
 }
 
 #[tauri::command]
