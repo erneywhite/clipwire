@@ -3,6 +3,11 @@
 //! macOS: значок в строке меню — шаблон (чёрный с прозрачностью, цвет под тему
 //! даёт система), состояние — формой: обычный, приглушённый провод, перечёркнутый.
 //! Текстом состояние видно первым пунктом меню.
+//!
+//! Linux: те же формы, что на маке, но одним цветом под панель — белым на
+//! тёмной (GNOME, большинство оболочек), чёрным на светлой (светлая тема KDE).
+//! Значок показывается через AppIndicator (StatusNotifierItem); меню
+//! открывается любым кликом, двойного клика там нет.
 
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
@@ -50,7 +55,7 @@ impl Wire {
 
 /// Иконки трея, отрендеренные из docs/brand/clipwire-tray.svg (scripts/icons.mjs):
 /// панель задач (тёмная/светлая) × состояние × обычный/приглушённый кадр.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 macro_rules! tray_png {
     ($panel:literal, $state:literal) => {
         [
@@ -61,7 +66,7 @@ macro_rules! tray_png {
 }
 
 /// Шаблонный значок строки меню macOS для состояния.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn png(_light_panel: bool, wire: Wire, dim: bool) -> &'static [u8] {
     match mac_icon(wire, dim) {
         MacIcon::On => include_bytes!("../icons/tray/mac-on.png"),
@@ -70,7 +75,7 @@ fn png(_light_panel: bool, wire: Wire, dim: bool) -> &'static [u8] {
     }
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 enum MacIcon {
     On,
@@ -80,7 +85,7 @@ enum MacIcon {
 
 /// Состояние без цвета: нет связи — перечёркнутый, пауза и кадр пульсации —
 /// приглушённый провод.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(windows, allow(dead_code))]
 fn mac_icon(wire: Wire, dim: bool) -> MacIcon {
     match wire {
         Wire::Error => MacIcon::Off,
@@ -90,7 +95,7 @@ fn mac_icon(wire: Wire, dim: bool) -> MacIcon {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn png(light_panel: bool, wire: Wire, dim: bool) -> &'static [u8] {
     let set: [&[u8]; 2] = match (light_panel, wire) {
         (false, Wire::Online) => tray_png!("dark", "online"),
@@ -139,7 +144,28 @@ fn wire_for(st: &StatusDto, update: bool) -> (Wire, bool) {
     }
 }
 
-/// Светлая ли панель задач (Windows: SystemUsesLightTheme). Иначе — тёмная.
+/// Значок для трея. На Linux шаблон перекрашивается в цвет под панель.
+fn icon(light_panel: bool, wire: Wire, dim: bool) -> tauri::Result<Image<'static>> {
+    let img = Image::from_bytes(png(light_panel, wire, dim))?;
+    #[cfg(target_os = "linux")]
+    {
+        let v = if light_panel { 0 } else { 255 };
+        let mut rgba = img.rgba().to_vec();
+        for px in rgba.as_chunks_mut::<4>().0 {
+            px[0] = v;
+            px[1] = v;
+            px[2] = v;
+        }
+        Ok(Image::new_owned(rgba, img.width(), img.height()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(img)
+    }
+}
+
+/// Светлая ли панель задач (Windows: SystemUsesLightTheme; Linux: светлая
+/// схема KDE). Иначе — тёмная.
 fn light_panel() -> bool {
     #[cfg(windows)]
     {
@@ -160,10 +186,38 @@ fn light_panel() -> bool {
         };
         ok.is_ok() && v == 1
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        static LIGHT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LIGHT.get_or_init(kde_light_panel)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         false
     }
+}
+
+/// У KDE панель в цвет схемы: светлая, если схема не тёмная. В GNOME и
+/// большинстве других оболочек верхняя панель тёмная всегда.
+#[cfg(target_os = "linux")]
+fn kde_light_panel() -> bool {
+    let kde = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_uppercase()
+        .contains("KDE");
+    if !kde {
+        return false;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let text = std::fs::read_to_string(std::path::Path::new(&home).join(".config/kdeglobals"))
+        .unwrap_or_default();
+    let scheme = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ColorScheme="))
+        .unwrap_or("BreezeLight");
+    !scheme.to_lowercase().contains("dark")
 }
 
 /// Перерисовать иконку, если что-то поменялось (статус, кадр пульсации, тема панели).
@@ -180,10 +234,7 @@ fn render(app: &AppHandle) {
     }
     look.applied = Some(key);
     drop(look);
-    if let (Some(tray), Ok(img)) = (
-        app.tray_by_id(TRAY_ID),
-        Image::from_bytes(png(key.0, wire, dim)),
-    ) {
+    if let (Some(tray), Ok(img)) = (app.tray_by_id(TRAY_ID), icon(key.0, wire, dim)) {
         let _ = tray.set_icon(Some(img));
         #[cfg(target_os = "macos")]
         let _ = tray.set_icon_as_template(true);
@@ -246,15 +297,12 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         ],
     )?;
     TrayIconBuilder::with_id(TRAY_ID)
-        .icon(Image::from_bytes(png(
-            light_panel(),
-            Wire::Connecting,
-            false,
-        ))?)
+        .icon(icon(light_panel(), Wire::Connecting, false)?)
         .tooltip("Clipwire")
         .menu(&menu)
         // В строке меню macOS меню открывается обычным кликом; на Windows левый
-        // клик ничего не делает, двойной открывает настройки.
+        // клик ничего не делает, двойной открывает настройки. На Linux меню
+        // открывает любой клик (так устроен AppIndicator).
         .icon_as_template(cfg!(target_os = "macos"))
         .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, e| {

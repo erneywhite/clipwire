@@ -655,12 +655,15 @@
       {:else if section === 'privacy'}
         <h1>{t('Приватность')}</h1>
         <div class="card">
-          <Toggle
-            label={t('Скрывать окна при демонстрации экрана')}
-            hint={t('Окна Clipwire не попадут в запись экрана и трансляцию.')}
-            checked={s.hide_from_capture}
-            onchange={(v) => save({ hide_from_capture: v })}
-          />
+          <!-- На Linux окно не может попросить систему не показывать его в записи экрана. -->
+          {#if !isLinux}
+            <Toggle
+              label={t('Скрывать окна при демонстрации экрана')}
+              hint={t('Окна Clipwire не попадут в запись экрана и трансляцию.')}
+              checked={s.hide_from_capture}
+              onchange={(v) => save({ hide_from_capture: v })}
+            />
+          {/if}
           <Toggle
             label={t('Загружать карточки ссылок')}
             hint={t('По пробелу подгружается заголовок и картинка страницы. Похожие на одноразовые ссылки не загружаются никогда.')}

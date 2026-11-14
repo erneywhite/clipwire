@@ -33,7 +33,7 @@ Clipwire — бесплатный общий буфер обмена. Скопи
 вставки, которое открывается рядом с курсором мыши. Без сервера клиент работает как локальная
 история буфера на одном компьютере, сервер можно подключить позже.
 
-Есть клиенты для Windows и macOS (13 Ventura и новее, Apple Silicon и Intel). Linux в планах.
+Есть клиенты для Windows и macOS (13 Ventura и новее, Apple Silicon и Intel). Клиент для Linux (X11 и Wayland) в работе, см. [docs/linux.md](docs/linux.md).
 
 Нашли баг или есть идея? Пишите в [Issues](https://github.com/erneywhite/clipwire/issues).
 

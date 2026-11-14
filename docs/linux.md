@@ -142,13 +142,21 @@ sudo apt-get install -y build-essential curl git pkg-config libssl-dev \
 
 ### 4. Оболочка Tauri
 
-- Трей через AppIndicator. В чистом GNOME значков в трее нет: Ubuntu ставит расширение
-  AppIndicator по умолчанию, на других GNOME README называет расширение.
-- Монохромный значок под тему панели, как на маке (`icons/tray`).
-- Окна: прозрачность и `backdrop-filter` в WebKitGTK — только с запасным вариантом
-  (правило проекта). Заголовок — свой `TitleBar.svelte` с кнопками справа, как на Windows.
-- Скрытие окон при демонстрации экрана на Linux недоступно — не делать.
-- Автозапуск: `~/.config/autostart/clipwire.desktop` с `--background`.
+Сделано:
+
+- **Трей** через AppIndicator (StatusNotifierItem, `libayatana-appindicator3`). В чистом GNOME
+  значков в трее нет: Ubuntu ставит расширение AppIndicator по умолчанию, для остальных
+  README назовёт расширение (пункт 7). Меню открывается любым кликом, двойного клика нет —
+  «Настройки» есть в меню.
+- **Значок однотонный**, формы те же, что на маке (`mac-on/dim/off.png`), перекрашиваются при
+  загрузке: белый на тёмной панели (GNOME и большинство оболочек), чёрный на светлой схеме
+  KDE (`ColorScheme` в `kdeglobals` без «Dark»).
+- **Окна:** прозрачность и `backdrop-filter` не используются нигде, запасной вариант не
+  нужен. Заголовок — свой `TitleBar.svelte` с кнопками справа, как на Windows.
+- **Скрытие окон при демонстрации экрана** на Linux не работает — переключатель в
+  «Приватности» скрыт.
+- **Автозапуск** — плагин autostart: `~/.config/autostart/Clipwire.desktop` с `--background`,
+  у AppImage — путь образа (`$APPIMAGE`).
 
 ### 5. Секреты (`secret.rs`)
 
