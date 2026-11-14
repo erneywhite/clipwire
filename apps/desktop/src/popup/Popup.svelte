@@ -8,6 +8,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import EntryRow from '../lib/EntryRow.svelte'
   import AppTag from '../lib/AppTag.svelte'
+  import { t } from '../lib/i18n'
   import LinkCard from './LinkCard.svelte'
   import FilePreview from './FilePreview.svelte'
   import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -17,10 +18,10 @@
   // Фильтр по типу: 'all' — без фильтра. Повторный клик по выбранному снимает его.
   let kind = $state<KindFilter>('all')
   const kinds: { id: Exclude<KindFilter, 'all'>; title: string; icon: string }[] = [
-    { id: 'text', title: 'Текст', icon: 'M5 7h14M5 12h14M5 17h9' },
-    { id: 'link', title: 'Ссылки', icon: 'M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1' },
-    { id: 'image', title: 'Картинки', icon: 'M4 5h16v14H4zM4 16l5-5 4 4 2-2 5 5' },
-    { id: 'files', title: 'Файлы', icon: 'M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM14 3v5h5' },
+    { id: 'text', title: t('Текст'), icon: 'M5 7h14M5 12h14M5 17h9' },
+    { id: 'link', title: t('Ссылки'), icon: 'M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1' },
+    { id: 'image', title: t('Картинки'), icon: 'M4 5h16v14H4zM4 16l5-5 4 4 2-2 5 5' },
+    { id: 'files', title: t('Файлы'), icon: 'M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM14 3v5h5' },
   ]
   function setKind(k: KindFilter) {
     kind = kind === k ? 'all' : k
@@ -60,7 +61,7 @@
 
   /** Имя устройства, откуда пришла запись. */
   function deviceOf(e: Entry): string {
-    return e.local ? 'Это устройство' : e.device_name || 'Другое устройство'
+    return e.local ? t('Это устройство') : e.device_name || t('Другое устройство')
   }
 
   /**
@@ -194,7 +195,7 @@
     if (!only && needsDownload(entry)) {
       // shortcut: одно скачивание за раз, второе не встаёт в очередь; переделать, если будут жалобы.
       if (fetching) {
-        error = fetching === entry.id ? 'Файлы ещё скачиваются' : 'Сначала дождитесь, пока скачаются файлы другой записи'
+        error = fetching === entry.id ? t('Файлы ещё скачиваются') : t('Сначала дождитесь, пока скачаются файлы другой записи')
         return
       }
       const session = shown
@@ -478,21 +479,21 @@
         bind:this={input}
         bind:value={query}
         oninput={reload}
-        placeholder="Найти в буфере"
+        placeholder={t('Найти в буфере')}
         spellcheck="false"
-        aria-label="Поиск по истории"
+        aria-label={t('Поиск по истории')}
       />
     </label>
 
     <div class="tabs" role="tablist">
-      <button role="tab" aria-selected={tab === 'all'} onclick={() => { tab = 'all'; reload() }}>История</button>
-      <button role="tab" aria-selected={tab === 'pinned'} onclick={() => { tab = 'pinned'; reload() }}>Закреплённое</button>
-      <span class="kinds" role="group" aria-label="Тип записей">
+      <button role="tab" aria-selected={tab === 'all'} onclick={() => { tab = 'all'; reload() }}>{t('История')}</button>
+      <button role="tab" aria-selected={tab === 'pinned'} onclick={() => { tab = 'pinned'; reload() }}>{t('Закреплённое')}</button>
+      <span class="kinds" role="group" aria-label={t('Тип записей')}>
         {#each kinds as k (k.id)}
           <button
             class="kind"
             aria-pressed={kind === k.id}
-            title="{k.title} (Alt + ← →)"
+            title={t('{kind} (Alt + ← →)', { kind: k.title })}
             aria-label={k.title}
             onclick={() => setKind(k.id)}
           >
@@ -509,17 +510,17 @@
     {#if items.length === 0}
       <div class="empty">
         {#if query}
-          <p>Ничего не нашлось по «{query}»</p>
+          <p>{t('Ничего не нашлось по «{query}»', { query })}</p>
         {:else if kind !== 'all'}
-          <p>Здесь нет записей этого типа</p>
+          <p>{t('Здесь нет записей этого типа')}</p>
         {:else if tab === 'pinned'}
-          <p>Закрепите нужное сочетанием Ctrl+P, и оно не пропадёт из истории</p>
+          <p>{t('Закрепите нужное сочетанием Ctrl+P, и оно не пропадёт из истории')}</p>
         {:else}
-          <p>Здесь появится всё, что копируется на ваших устройствах</p>
+          <p>{t('Здесь появится всё, что копируется на ваших устройствах')}</p>
         {/if}
       </div>
     {:else}
-      <ul class="list" bind:this={listEl} role="listbox" aria-label="История буфера">
+      <ul class="list" bind:this={listEl} role="listbox" aria-label={t('История буфера')}>
         {#each items as item, i (item.id)}
           <EntryRow {item} {transfers} index={i} selected={i === sel} onselect={() => (sel = i)} onpaste={() => paste(item)} onpin={() => togglePin(item)} onremove={() => remove(item)} onmenu={(x, y) => openMenu(item, x, y)} />
         {/each}
@@ -527,35 +528,35 @@
     {/if}
 
     <footer class="hints">
-      <span><kbd>↵</kbd> вставить</span>
-      <span><kbd>␣</kbd> просмотр</span>
+      <span><kbd>↵</kbd> {t('вставить')}</span>
+      <span><kbd>␣</kbd> {t('просмотр')}</span>
       {#if editable(current)}
-        <span><kbd>Ctrl E</kbd> изменить</span>
+        <span><kbd>Ctrl E</kbd> {t('изменить')}</span>
       {:else}
-        <span><kbd>Ctrl P</kbd> закрепить</span>
+        <span><kbd>Ctrl P</kbd> {t('закрепить')}</span>
       {/if}
-      <span><kbd>Del</kbd> удалить</span>
+      <span><kbd>Del</kbd> {t('удалить')}</span>
     </footer>
   </section>
 
   {#if preview}
-    <section class="preview-pane" aria-label="Предпросмотр">
+    <section class="preview-pane" aria-label={t('Предпросмотр')}>
       {#if preview.entry.kind === 'image'}
         <div class="image-view">
           {#if preview.entry.image}
-            <img src={preview.entry.image} alt="Картинка {preview.entry.width}×{preview.entry.height}" draggable="false" />
+            <img src={preview.entry.image} alt={t('Картинка {w}×{h}', { w: preview.entry.width, h: preview.entry.height })} draggable="false" />
           {/if}
         </div>
         <div class="preview-meta">
           {deviceOf(preview.entry)}{#if preview.entry.source_app}&nbsp;· <AppTag app={preview.entry.source_app} />{/if} · {ago(preview.entry.seen_ms)} · {preview.entry.width}×{preview.entry.height} · {bytesLabel(preview.entry.bytes)}
         </div>
         <div class="actions">
-          <button class="primary" onclick={() => paste(preview?.entry)}>Вставить</button>
-          <button onclick={() => edit(preview?.entry)}>Изменить</button>
+          <button class="primary" onclick={() => paste(preview?.entry)}>{t('Вставить')}</button>
+          <button onclick={() => edit(preview?.entry)}>{t('Изменить')}</button>
           <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
-            {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
+            {preview.entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
-          <button class="danger" onclick={() => remove(preview?.entry)}>Удалить</button>
+          <button class="danger" onclick={() => remove(preview?.entry)}>{t('Удалить')}</button>
         </div>
       {:else if preview.entry.kind === 'files'}
         {@const entry = preview.entry}
@@ -578,14 +579,14 @@
                     type="checkbox"
                     checked={picked === null || picked.includes(i)}
                     onchange={() => togglePick(i, entry.files.length)}
-                    aria-label="Вставить «{f.name}»"
+                    aria-label={t('Вставить «{name}»', { name: f.name })}
                   />
                   <span>{f.name}</span>
                 </label>
                 <span class="fmeta">
-                  {f.is_dir ? (f.size > 0 ? `папка · ${bytesLabel(f.size)}` : 'папка') : bytesLabel(f.size)}{#if isGone(f)}
-                    · {f.is_dir ? 'папки' : 'файла'} нет на месте{:else if onlyThere(f)}
-                    · есть только на устройстве «{device}»{:else if fp}
+                  {f.is_dir ? (f.size > 0 ? t('папка · {size}', { size: bytesLabel(f.size) }) : t('папка')) : bytesLabel(f.size)}{#if isGone(f)}
+                    · {f.is_dir ? t('папки нет на месте') : t('файла нет на месте')}{:else if onlyThere(f)}
+                    · {t('есть только на устройстве «{device}»', { device })}{:else if fp}
                     · {progressLabel(fp)}{:else if canDownload(f)}
                     · {fetchLabel(f, device)}{/if}
                 </span>
@@ -599,47 +600,47 @@
         <div class="preview-meta">
           {entry.files.length === 1 ? `${entry.files[0].name} · ` : ''}{filesMeta(entry.files, entry.bytes, entry.width, entry.height)}{#if !single && progress}
             · {progressLabel(progress)}{:else if entry.image && onlyThere(entry.files[0])}
-            · есть только на устройстве «{device}»{/if}
+            · {t('есть только на устройстве «{device}»', { device })}{/if}
         </div>
         <div class="actions">
           <button class="primary" disabled={pasting || picked?.length === 0} onclick={() => pastePicked(entry)}>
             {#if pasting && fetching === entry.id}
-              Скачивается{progress && !progress.error ? ` ${progress.percent}%` : '…'}
+              {progress && !progress.error ? t('Скачивается {percent}%', { percent: progress.percent }) : t('Скачивается…')}
             {:else if picked}
-              Вставить выбранные ({picked.length})
+              {t('Вставить выбранные ({n})', { n: picked.length })}
             {:else}
-              Вставить
+              {t('Вставить')}
             {/if}
           </button>
           {#if editable(entry)}
-            <button onclick={() => edit(entry)}>Изменить</button>
+            <button onclick={() => edit(entry)}>{t('Изменить')}</button>
           {/if}
           {#if !single && entry.files.some(canDownload) && !pasting}
             <button disabled={fetching === entry.id} onclick={() => download(entry)}>
-              {fetching === entry.id ? 'Скачивается…' : 'Скачать'}
+              {fetching === entry.id ? t('Скачивается…') : t('Скачать')}
             </button>
           {/if}
           {#if isHere(entry.files[0])}
-            <button onclick={() => showInFolder(entry.files[0])}>Показать в папке</button>
+            <button onclick={() => showInFolder(entry.files[0])}>{t('Показать в папке')}</button>
           {/if}
           <button onclick={() => togglePin(entry).then(openPreview)}>
-            {entry.pinned ? 'Открепить' : 'Закрепить'}
+            {entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
-          <button class="danger" onclick={() => remove(entry)}>Удалить</button>
+          <button class="danger" onclick={() => remove(entry)}>{t('Удалить')}</button>
         </div>
       {:else}
       {#if preview.entry.html || isUrl(preview.entry.text)}
-        <div class="seg" role="tablist" aria-label="Вид">
+        <div class="seg" role="tablist" aria-label={t('Вид')}>
           <button role="tab" aria-selected={richView} onclick={() => (richView = true)}>
-            {isUrl(preview.entry.text) ? 'Карточка' : 'Форматирование'}
+            {isUrl(preview.entry.text) ? t('Карточка') : t('Форматирование')}
           </button>
-          <button role="tab" aria-selected={!richView} onclick={() => (richView = false)}>Текст</button>
+          <button role="tab" aria-selected={!richView} onclick={() => (richView = false)}>{t('Текст')}</button>
         </div>
       {/if}
       {#if isUrl(preview.entry.text) && richView}
         <LinkCard url={preview.entry.text.trim()} />
       {:else if preview.entry.html && richView}
-        <iframe class="rich-view" sandbox="" title="Текст с форматированием" srcdoc={richDoc(preview.entry.html)}></iframe>
+        <iframe class="rich-view" sandbox="" title={t('Текст с форматированием')} srcdoc={richDoc(preview.entry.html)}></iframe>
       {:else}
         <textarea
           bind:this={editor}
@@ -647,31 +648,31 @@
           class="editor"
           class:mono={looksLikeCode(draft)}
           spellcheck="false"
-          aria-label="Текст элемента, можно поправить перед вставкой"
+          aria-label={t('Текст элемента, можно поправить перед вставкой')}
         ></textarea>
       {/if}
       <div class="preview-meta">
         {#if edited}
-          изменено · Ctrl+Enter вставить · Ctrl+S сохранить
+          {t('изменено · Ctrl+Enter вставить · Ctrl+S сохранить')}
         {:else}
           {deviceOf(preview.entry)}{#if preview.entry.source_app}&nbsp;· <AppTag app={preview.entry.source_app} />{/if} · {ago(preview.entry.seen_ms)} · {sizeLabel(preview.entry.chars, preview.entry.lines)}{preview.entry.rich ? ` · ${preview.entry.rich}` : ''}
         {/if}
       </div>
       <div class="actions">
-        <button class="primary" onclick={() => paste(preview?.entry)}>Вставить</button>
+        <button class="primary" onclick={() => paste(preview?.entry)}>{t('Вставить')}</button>
         {#if edited}
-          <button onclick={saveDraft}>Сохранить в истории</button>
-          <button onclick={() => preview && (draft = preview.entry.text)}>Отменить правку</button>
+          <button onclick={saveDraft}>{t('Сохранить в истории')}</button>
+          <button onclick={() => preview && (draft = preview.entry.text)}>{t('Отменить правку')}</button>
         {:else}
           {#if isUrl(preview.entry.text)}
-            <button onclick={() => preview && openUrl(preview.entry.text.trim())}>Открыть в браузере</button>
+            <button onclick={() => preview && openUrl(preview.entry.text.trim())}>{t('Открыть в браузере')}</button>
           {:else if preview.entry.rich}
-            <button onclick={() => paste(preview?.entry, undefined, true)}>Без форматирования</button>
+            <button onclick={() => paste(preview?.entry, undefined, true)}>{t('Без форматирования')}</button>
           {/if}
           <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
-            {preview.entry.pinned ? 'Открепить' : 'Закрепить'}
+            {preview.entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
-          <button class="danger" onclick={() => remove(preview?.entry)}>Удалить</button>
+          <button class="danger" onclick={() => remove(preview?.entry)}>{t('Удалить')}</button>
         {/if}
       </div>
       {/if}
@@ -692,23 +693,23 @@
     }}
   ></div>
   <div class="menu" role="menu" tabindex="-1" bind:this={menuEl} style:left="{menu.x}px" style:top="{menu.y}px" onkeydown={menuKey}>
-    <button role="menuitem" onclick={() => act(() => paste(m))}>Вставить<kbd>Enter</kbd></button>
+    <button role="menuitem" onclick={() => act(() => paste(m))}>{t('Вставить')}<kbd>Enter</kbd></button>
     {#if m.kind === 'text' && m.rich}
-      <button role="menuitem" onclick={() => act(() => paste(m, undefined, true))}>Без форматирования<kbd>Shift Enter</kbd></button>
+      <button role="menuitem" onclick={() => act(() => paste(m, undefined, true))}>{t('Без форматирования')}<kbd>Shift Enter</kbd></button>
     {/if}
-    <button role="menuitem" onclick={() => act(openPreview)}>Просмотр<kbd>Пробел</kbd></button>
+    <button role="menuitem" onclick={() => act(openPreview)}>{t('Просмотр')}<kbd>{t('Пробел')}</kbd></button>
     {#if editable(m)}
-      <button role="menuitem" onclick={() => act(() => edit(m))}>Изменить<kbd>Ctrl E</kbd></button>
+      <button role="menuitem" onclick={() => act(() => edit(m))}>{t('Изменить')}<kbd>Ctrl E</kbd></button>
     {/if}
     {#if m.kind === 'text' && isUrl(m.text)}
-      <button role="menuitem" onclick={() => act(() => openUrl(m.text.trim()))}>Открыть в браузере</button>
+      <button role="menuitem" onclick={() => act(() => openUrl(m.text.trim()))}>{t('Открыть в браузере')}</button>
     {/if}
     {#if m.kind === 'files' && m.files[0]?.local_path}
-      <button role="menuitem" onclick={() => act(() => showInFolder(m.files[0]))}>Показать в папке</button>
+      <button role="menuitem" onclick={() => act(() => showInFolder(m.files[0]))}>{t('Показать в папке')}</button>
     {/if}
-    <button role="menuitem" onclick={() => act(() => togglePin(m))}>{m.pinned ? 'Открепить' : 'Закрепить'}<kbd>Ctrl P</kbd></button>
+    <button role="menuitem" onclick={() => act(() => togglePin(m))}>{m.pinned ? t('Открепить') : t('Закрепить')}<kbd>Ctrl P</kbd></button>
     <hr />
-    <button role="menuitem" class="danger" onclick={() => remove(m)}>Удалить<kbd>Del</kbd></button>
+    <button role="menuitem" class="danger" onclick={() => remove(m)}>{t('Удалить')}<kbd>Del</kbd></button>
   </div>
 {/if}
 

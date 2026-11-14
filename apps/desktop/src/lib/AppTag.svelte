@@ -2,11 +2,12 @@
   // Приложение, из которого скопировано: маленькая иконка и имя. Для строки
   // меты в окне вставки и в предпросмотре.
   import type { SourceApp } from './api'
+  import { t } from './i18n'
 
   let { app }: { app: SourceApp } = $props()
 </script>
 
-<span class="app" title="Скопировано в «{app.name}»">
+<span class="app" title={t('Скопировано в «{app}»', { app: app.name })}>
   {#if app.icon}<img src={app.icon} alt="" draggable="false" />{/if}<span class="name">{app.name}</span>
 </span>
 
