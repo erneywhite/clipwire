@@ -1,6 +1,8 @@
 # Собирает Docker-образ сервера и публикует его в GHCR:
 #   ghcr.io/erneywhite/clipwire-server:latest  — последний main
 #   ghcr.io/erneywhite/clipwire-server:X.Y.Z   — релизный тег vX.Y.Z
+# Раз в неделю образ собирается заново, чтобы обновления базового distroless
+# доходили до сервера и без новых коммитов.
 name: server-image
 
 on:
@@ -14,6 +16,9 @@ on:
       - "Cargo.lock"
       - "Dockerfile"
       - ".github/workflows/server-image.yml"
+  schedule:
+    # Понедельник, 03:17 UTC; расписание всегда идёт с main.
+    - cron: "17 3 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -44,6 +49,8 @@ jobs:
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
+          # Базовый образ берём свежий, а не из кэша сборщика.
+          pull: true
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

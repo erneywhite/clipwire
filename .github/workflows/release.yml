@@ -20,6 +20,9 @@ permissions:
 
 jobs:
   windows:
+    # Ручной запуск с ветки не должен публиковать релиз: нужен тег vX.Y.Z.
+    # macos и linux ждут это задание и без него тоже пропускаются.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
