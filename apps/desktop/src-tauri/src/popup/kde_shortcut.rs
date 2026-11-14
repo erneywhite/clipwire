@@ -109,9 +109,12 @@ async fn run(app: &AppHandle, accel: &str) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     tracing::info!("сочетание окна вставки зарегистрировано в KDE: {accel}");
+    tracing::debug!(path = %comp.path(), dest = ?comp.destination(), "жду нажатий");
     BOUND.store(true, Ordering::Relaxed);
     while let Some(msg) = pressed.next().await {
-        let Ok((_, action, _)) = msg.body().deserialize::<(String, String, i64)>() else {
+        let body = msg.body().deserialize::<(String, String, i64)>();
+        tracing::debug!(?body, "нажато сочетание KDE");
+        let Ok((_, action, _)) = body else {
             continue;
         };
         if action == ACTION {
@@ -119,6 +122,7 @@ async fn run(app: &AppHandle, accel: &str) -> Result<(), String> {
             let _ = app.run_on_main_thread(move || super::toggle(&app2));
         }
     }
+    tracing::debug!("поток сигналов KDE кончился");
     Err("служба сочетаний KDE закрыла соединение".into())
 }
 

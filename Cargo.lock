@@ -1052,7 +1052,6 @@ dependencies = [
  "futures-util",
  "gdkx11",
  "gtk",
- "libloading",
  "objc2",
  "objc2-app-kit",
  "objc2-core-graphics",

@@ -190,17 +190,19 @@ impl X {
     }
 }
 
-/// GNOME на Wayland: окна Clipwire лучше открывать через XWayland. Нативному
-/// Wayland-окну GNOME не даёт выбрать место (нет layer-shell), и окно вставки
-/// оказывалось посреди экрана; через XWayland оно встаёт под значок в трее.
-/// Буфер обмена и так идёт через XWayland, вставка — через портал (D-Bus).
+/// GNOME и KDE на Wayland: окна Clipwire лучше открывать через XWayland.
+/// Нативному Wayland-окну оболочка не даёт выбрать место, и окно вставки
+/// оказывалось посреди экрана; через XWayland оно встаёт у трея. (layer-shell
+/// в KDE пробовали: окно Tauri в нём не рисуется, а KDE кладёт слой поверх
+/// своей панели.) Буфер обмена — data-control или XWayland, вставка — портал,
+/// сочетание — D-Bus: от GTK-бэкенда это не зависит.
 /// `CLIPWIRE_NATIVE_WAYLAND=1` оставляет нативный Wayland.
 pub fn use_xwayland() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::env::var_os("DISPLAY").is_some()
         && std::env::var_os("GDK_BACKEND").is_none()
         && std::env::var_os("CLIPWIRE_NATIVE_WAYLAND").is_none()
-        && super::gnome_shortcut::applies()
+        && (super::gnome_shortcut::applies() || super::kde_shortcut::applies())
 }
 
 /// Окна Clipwire открыты через XWayland в Wayland-сессии.

@@ -150,14 +150,13 @@ sudo apt-get install -y build-essential curl git pkg-config libssl-dev \
   `CLIPWIRE_NATIVE_WAYLAND=1`), и окно вставки встаёт справа сверху главного монитора, под
   значком в трее (`Placement::TopRight`). Фокус берётся через `_NET_ACTIVE_WINDOW`, как на X11.
   Минус: при дробном масштабе (125 %, 150 %) окна XWayland в GNOME 46 чуть размыты. В остальных
-  Wayland-оболочках с layer-shell (KDE, Sway, Hyprland, labwc…) окно вставки — слой
-  (`popup/layer.rs`, `Placement::Layer`): `libgtk-layer-shell` подгружается через `dlopen`,
-  окно переводится в слой до первого показа (если GTK уже реализовал окно — сначала
-  `unrealize`), крепится к углу со стороны панели и справа (панель KDE — по `location` в
-  `plasma-org.kde.plasma.desktop-appletsrc`, у остальных — сверху), слой `OVERLAY`,
-  клавиатура монопольная (протокол v3 в KWin 5.27 другого не умеет: клик мимо окно не
-  закрывает, закрывают Esc и выбор). Нет библиотеки или протокола — по центру
-  (`Placement::Center`). В `.deb` библиотека в Recommends, в AppImage — внутри образа.
+  Так же сделано и в KDE Plasma: окна через XWayland, окно вставки встаёт в угол у панели со
+  стороны трея (`Placement::Tray`, `tray_corner`): панель — полоса, на которую рабочая область
+  (`_NET_WORKAREA`) меньше экрана; у верхней или нижней — справа, у боковой — внизу. В
+  остальных Wayland-оболочках — по центру (`Placement::Center`).
+  layer-shell пробовали (`zwlr_layer_shell_v1` через `libgtk-layer-shell`, `dlopen`): слой
+  создаётся и получает размер, но окно Tauri в нём не рисует ни кадра (GTK не прикрепляет буфер
+  после `configure`), а KDE кладёт слой поверх своей панели — отказались.
 - **`clipwire --popup`.** Второй запуск с этим ключом открывает окно вставки у уже запущенной
   копии (плагин single-instance, только в релизной сборке); первый запуск с ним — тоже.
   На Wayland глобальная клавиша программы работает только над окнами XWayland, поэтому в

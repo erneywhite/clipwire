@@ -10,16 +10,12 @@
       "deb": {
         "section": "utils",
         "recommends": [
-          "libgtk-layer-shell0",
           "pipewire-bin | pulseaudio-utils | alsa-utils"
         ],
         "desktopTemplate": "linux/clipwire.desktop"
       },
       "appimage": {
-        "bundleMediaFramework": false,
-        "files": {
-          "/usr/lib/libgtk-layer-shell.so.0": "/usr/lib/x86_64-linux-gnu/libgtk-layer-shell.so.0"
-        }
+        "bundleMediaFramework": false
       }
     }
   }

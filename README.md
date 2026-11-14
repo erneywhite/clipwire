@@ -94,8 +94,8 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
 3. **Tray icon in GNOME.** Ubuntu shows tray icons out of the box. On other GNOME distributions
    (Fedora, Debian) install the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/)
    extension, otherwise the icon is not shown (Clipwire still works: open it from the menu).
-4. **Wayland.** The paste window opens next to the tray: under it on GNOME, in the panel corner
-   on KDE Plasma, Sway and Hyprland. To have it paste by itself,
+4. **Wayland.** On GNOME and KDE Plasma the paste window opens next to the tray, elsewhere in the
+   middle of the screen. To have it paste by itself,
    turn on **Paste into the active window**; the system asks once for permission, see
    [Paste window](#paste-window). The shortcut is registered with the desktop by itself on GNOME,
    KDE Plasma and Hyprland; on Sway bind `clipwire --popup` to a key yourself.
@@ -119,12 +119,10 @@ Press Ctrl+Shift+V on Windows, Cmd+Shift+V on macOS or Ctrl+Alt+V on Linux (conf
 Ctrl+Shift+V is how terminals paste). The window opens next to the mouse cursor.
 
 On Linux in an Xorg session it works the same way; in terminals it pastes with Ctrl+Shift+V. On Wayland apps can't see the mouse cursor or
-press keys in other windows. On GNOME the window opens in the top right corner, under the tray icon
-(Clipwire runs its windows through XWayland there, so it can choose where they go; set
-`CLIPWIRE_NATIVE_WAYLAND=1` to keep native Wayland windows). On KDE Plasma, Sway, Hyprland and other
-desktops with layer-shell it opens in the corner next to the panel, on the tray side (this needs
-`libgtk-layer-shell0`, installed with the `.deb`); without layer-shell it opens in the middle of the
-screen. Enter only puts the entry on the clipboard; you paste it with Ctrl+V
+press keys in other windows. On GNOME and KDE Plasma the window opens in the corner next to the
+panel, on the tray side (Clipwire runs its windows through XWayland there, so it can choose where
+they go; set `CLIPWIRE_NATIVE_WAYLAND=1` to keep native Wayland windows). On other Wayland desktops
+it opens in the middle of the screen. Enter only puts the entry on the clipboard; you paste it with Ctrl+V
 yourself.
 
 **Pasting by itself on Wayland.** Turn on **Paste into the active window** under Paste. The
