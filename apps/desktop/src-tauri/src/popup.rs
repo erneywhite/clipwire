@@ -683,11 +683,22 @@ mod mac {
         }
         // Дождаться, пока программа на самом деле станет активной, иначе
         // Cmd+V уйдёт в никуда.
+        let mut focused = false;
         for _ in 0..25 {
             if clipwire_agent::clipboard::front_pid() == Some(pid) {
+                focused = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Фокус не вернулся: Cmd+V ушёл бы в чужое окно (в буфере может быть
+        // пароль). Оставляем вставку только в буфер.
+        if !focused {
+            tracing::warn!(
+                pid,
+                "прежняя программа не стала активной, вставка только в буфер"
+            );
+            return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         send_paste();
