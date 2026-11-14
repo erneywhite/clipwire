@@ -5,7 +5,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, type GroupDevice, type GroupRekeyed, type RekeyResult, type Status, type StorageKind } from '../lib/api'
   import { ago, plural } from '../lib/format'
-  import { CHECKING, confirmText, deviceTitle, seenLabel } from '../lib/devices'
+  import { CHECKING, checking as checkingText, confirmText, deviceTitle, seenLabel } from '../lib/devices'
 
   let { onRekeyed }: { onRekeyed?: (invite: string) => void } = $props()
 
@@ -62,7 +62,8 @@
       done(id ? await api.deviceRemove(id) : await api.groupRekey())
     } catch (e) {
       const msg = String(e)
-      if (msg.includes(CHECKING)) {
+      // Текст приходит из Rust на языке интерфейса; русский — на случай старых сообщений.
+      if (msg.includes(CHECKING) || msg.includes(checkingText())) {
         checking = true
         confirming = null
       } else {
@@ -157,7 +158,7 @@
       {t('Сменить ключ группы')}
     </button>
   {/if}
-  {#if checking}<p class="hint" role="status">{CHECKING}</p>{/if}
+  {#if checking}<p class="hint" role="status">{checkingText()}</p>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if result}
     <div class="done" role="status">

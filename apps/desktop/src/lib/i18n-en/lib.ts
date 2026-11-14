@@ -13,7 +13,7 @@ const en: Record<string, string> = {
   'папка': 'folder',
 
   // devices.ts
-  'Ответ сервера не пришёл, проверяю…': 'No response from the server, checking…',
+  'Ответ сервера не пришёл, проверяю…': 'No reply from the server, checking…',
   'Ключ группы сменило устройство «{n}»': 'The group key was changed by the device “{n}”',
   'Ключ группы сменён на другом устройстве': 'The group key was changed on another device',
   'Неизвестное устройство': 'Unknown device',
@@ -43,7 +43,6 @@ const en: Record<string, string> = {
   '12 часов': '12 hours',
   '1 день': '1 day',
   '3 дня': '3 days',
-  'Неделя': '1 week',
   '30 дней': '30 days',
   'Не удалять': 'Never delete',
   '{n} дн.': '{n} days',
@@ -74,7 +73,6 @@ const en: Record<string, string> = {
   'неизвестная ошибка': 'unknown error',
   'не отправлено: {error}': 'not sent: {error}',
   'не скачано: {error}': 'not downloaded: {error}',
-  'напрямую с устройства «{device}»': 'directly from the device “{device}”',
   'не скачан': 'not downloaded',
   'нет на месте, копия на сервере': 'missing, copy on the server',
 

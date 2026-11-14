@@ -1,7 +1,7 @@
 // Английский перевод: часть «popup». Ключ — русский текст из t('…').
 const en: Record<string, string> = {
   // AppTag
-  'Скопировано в «{app}»': 'Copied in “{app}”',
+  'Скопировано в «{app}»': 'Copied from “{app}”',
 
   // LinkCard
   'Загружаю карточку…': 'Loading card…',
@@ -51,7 +51,6 @@ const en: Record<string, string> = {
   'Файлы': 'Files',
   'Файлы ещё скачиваются': 'Files are still downloading',
   'Сначала дождитесь, пока скачаются файлы другой записи': 'Wait until the files of the other item finish downloading',
-  'Найти в буфере': 'Search the clipboard',
   'Поиск по истории': 'Search history',
   'История': 'History',
   'Закреплённое': 'Pinned',

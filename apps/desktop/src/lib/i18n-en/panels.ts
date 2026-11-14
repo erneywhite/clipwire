@@ -123,7 +123,6 @@ const en: Record<string, string> = {
   'В группе пока нет устройств.': 'There are no devices in the group yet.',
   'это устройство': 'this device',
   'нет карточки': 'no card',
-  'Удалить': 'Remove',
   'У неизвестных устройств старая версия Clipwire или карточка не открылась. При смене ключа новый ключ им передать нечем: обновите их и откройте на них Clipwire, тогда имя появится.':
     'Unknown devices run an old version of Clipwire or their card could not be opened. When the key is rotated there is no way to hand them the new one: update them and open Clipwire on them, and the name will appear.',
   'Удалить устройство и сменить ключ группы?': 'Remove the device and rotate the group key?',
