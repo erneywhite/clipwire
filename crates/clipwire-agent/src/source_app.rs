@@ -6,7 +6,10 @@
 //! кэшируется по пути exe на время работы программы: один и тот же редактор
 //! копирует сотни раз за день, а ресурсы exe не меняются.
 //!
-//! На других ОС пока только имя файла, без иконки.
+//! На macOS путь ведёт внутрь пакета `.app`: имя (как в Finder) и иконка
+//! берутся у пакета, для исключений есть ещё bundle id.
+//!
+//! На Linux пока только имя файла, без иконки.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -33,6 +36,24 @@ pub fn lookup(exe_path: &str) -> Option<SourceApp> {
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, app.clone());
     Some(app)
+}
+
+/// Имена, по которым программу можно внести в список «не синхронизировать»:
+/// имя exe, а на macOS ещё bundle id и имя пакета («KeePassXC»,
+/// «org.keepassxc.keepassxc»).
+#[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+pub fn ignore_keys(exe_path: &str) -> Vec<String> {
+    let mut keys: Vec<String> = file_name(exe_path).into_iter().collect();
+    #[cfg(target_os = "macos")]
+    {
+        keys.extend(platform::bundle_id(exe_path));
+        if let Some(app) = lookup(exe_path)
+            && !keys.contains(&app.name)
+        {
+            keys.push(app.name);
+        }
+    }
+    keys
 }
 
 /// Имя файла из пути: «C:\Program Files\App\App.exe» → «App.exe».
@@ -233,10 +254,84 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 mod platform {
-    // shortcut: на macOS и Linux пока только имя файла; имя и иконку из
-    // NSRunningApplication / .desktop-файла добавить вместе с клиентами (этап 4).
+    //! Программа на macOS — пакет `.app`: имя, bundle id и иконка берутся из
+    //! него по пути исполняемого файла, поэтому работают и для программ,
+    //! которые уже закрыты (история, список исключений).
+
+    use objc2::AnyThread;
+    use objc2::rc::autoreleasepool;
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSWorkspace};
+    use objc2_foundation::{
+        NSBundle, NSDictionary, NSFileManager, NSPoint, NSRect, NSSize, NSString,
+    };
+
+    const ICON: u32 = 32;
+
+    /// Путь пакета `.app`, внутри которого лежит исполняемый файл:
+    /// `/Applications/Safari.app/Contents/MacOS/Safari` → `/Applications/Safari.app`.
+    /// Ближайший снизу: у вложенных помощников свой пакет.
+    pub fn bundle_path(exe: &str) -> Option<&str> {
+        let end = exe.rfind(".app/")? + ".app".len();
+        Some(&exe[..end])
+    }
+
+    /// Понятное имя пакета (как в Finder, на языке системы) и иконка PNG.
+    pub fn read(path: &str) -> (Option<String>, Option<Vec<u8>>) {
+        let Some(bundle) = bundle_path(path) else {
+            return (None, None);
+        };
+        autoreleasepool(|_| {
+            let ns = NSString::from_str(bundle);
+            let name = NSFileManager::defaultManager()
+                .displayNameAtPath(&ns)
+                .to_string();
+            let name = name.strip_suffix(".app").unwrap_or(&name).to_string();
+            (Some(name).filter(|n| !n.trim().is_empty()), icon_png(&ns))
+        })
+    }
+
+    /// Идентификатор пакета (`com.agilebits.onepassword7`).
+    pub fn bundle_id(path: &str) -> Option<String> {
+        let bundle = bundle_path(path)?;
+        autoreleasepool(|_| {
+            NSBundle::bundleWithPath(&NSString::from_str(bundle))?
+                .bundleIdentifier()
+                .map(|s| s.to_string())
+        })
+    }
+
+    /// Иконка пакета 32×32 в PNG.
+    fn icon_png(bundle: &NSString) -> Option<Vec<u8>> {
+        let image = NSWorkspace::sharedWorkspace().iconForFile(bundle);
+        let mut rect = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(ICON as f64, ICON as f64),
+        );
+        // SAFETY: `rect` — живая переменная, контекст и подсказки не нужны.
+        let cg = unsafe { image.CGImageForProposedRect_context_hints(&mut rect, None, None) }?;
+        let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg);
+        // SAFETY: пустой словарь свойств.
+        let png = unsafe {
+            rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
+        }?
+        .to_vec();
+        // Система отдаёт ближайший подходящий размер (на Retina — 64×64).
+        let img = crate::image::decode_png(&png).ok()?;
+        let img = if img.dimensions() == (ICON, ICON) {
+            img
+        } else {
+            image::imageops::resize(&img, ICON, ICON, image::imageops::FilterType::Lanczos3)
+        };
+        crate::image::encode_png(ICON, ICON, img.as_raw()).ok()
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod platform {
+    // shortcut: на Linux пока только имя файла; имя и иконку из .desktop-файла
+    // добавить вместе с клиентом.
     pub fn read(_path: &str) -> (Option<String>, Option<Vec<u8>>) {
         (None, None)
     }
@@ -277,6 +372,39 @@ mod tests {
         assert_eq!(app.exe, "Моя Программа.exe");
         assert!(app.icon_png.is_empty());
         assert!(lookup("").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_bundle_name_icon_and_keys() {
+        assert_eq!(
+            platform::bundle_path("/Applications/Safari.app/Contents/MacOS/Safari"),
+            Some("/Applications/Safari.app")
+        );
+        assert_eq!(
+            platform::bundle_path("/Applications/X.app/Contents/Frameworks/H.app/Contents/MacOS/H"),
+            Some("/Applications/X.app/Contents/Frameworks/H.app")
+        );
+        assert_eq!(platform::bundle_path("/usr/bin/python3"), None);
+
+        let path = "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder";
+        let app = lookup(path).expect("сведения есть");
+        assert_eq!(app.exe, "Finder");
+        assert!(
+            !app.name.is_empty() && !app.name.ends_with(".app"),
+            "{}",
+            app.name
+        );
+        let img = crate::image::decode_png(&app.icon_png).expect("иконка есть");
+        assert_eq!(img.dimensions(), (32, 32));
+        assert!(img.pixels().any(|p| p.0[3] > 0), "иконка не пустая");
+        assert!(app.icon_png.len() < 16 * 1024, "иконка маленькая");
+
+        let keys = ignore_keys(path);
+        assert!(keys.contains(&"Finder".to_string()));
+        assert!(keys.contains(&"com.apple.finder".to_string()), "{keys:?}");
+        // Не пакет — только имя файла.
+        assert_eq!(ignore_keys("/usr/bin/python3"), vec!["python3".to_string()]);
     }
 
     #[cfg(windows)]

@@ -473,10 +473,11 @@ impl Service {
                         if paused.load(Ordering::Relaxed) {
                             return false;
                         }
-                        let exe = owner.and_then(crate::source_app::file_name);
-                        !exe.is_some_and(|exe| {
-                            is_ignored(&ignored.lock().unwrap_or_else(|e| e.into_inner()), &exe)
-                        })
+                        let keys = owner
+                            .map(crate::source_app::ignore_keys)
+                            .unwrap_or_default();
+                        let list = ignored.lock().unwrap_or_else(|e| e.into_inner());
+                        !keys.iter().any(|k| is_ignored(&list, k))
                     }),
                     on_late_virtual: late,
                 }
@@ -486,13 +487,17 @@ impl Service {
                     return;
                 }
                 // `owner` — полный путь exe программы-владельца буфера.
-                let exe = owner.as_deref().and_then(crate::source_app::file_name);
-                if let Some(exe) = &exe
-                    && is_ignored(&ignored_apps.lock().unwrap_or_else(|e| e.into_inner()), exe)
-                {
-                    tracing::debug!(%exe, "скопировано в игнорируемой программе, пропускаю");
+                // На macOS — ещё bundle id и имя пакета.
+                let keys = owner
+                    .as_deref()
+                    .map(crate::source_app::ignore_keys)
+                    .unwrap_or_default();
+                let list = ignored_apps.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(key) = keys.iter().find(|k| is_ignored(&list, k)) {
+                    tracing::debug!(%key, "скопировано в игнорируемой программе, пропускаю");
                     return;
                 }
+                drop(list);
                 if !guard.should_send(&content) {
                     return;
                 }
