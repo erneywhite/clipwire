@@ -291,6 +291,8 @@ export const api = {
   paste: (id: string, intoActive?: boolean, plain?: boolean, files?: number[]) =>
     invoke<void>('popup_paste', { id, intoActive, plain, files }),
   pasteText: (text: string, intoActive?: boolean) => invoke<void>('popup_paste_text', { text, intoActive }),
+  /** macOS: раздел «Универсальный доступ» в Системных настройках. */
+  openAccessibilitySettings: () => invoke<void>('open_accessibility_settings'),
   update: (id: string, text: string) => invoke<void>('history_update', { id, text }),
   preview: (open: boolean) => invoke<'left' | 'right'>('popup_preview', { open }),
   hidePopup: () => invoke<void>('popup_hide'),

@@ -43,6 +43,8 @@
   let richView = $state(true)
   const edited = $derived(preview !== null && draft !== preview.entry.text)
   let error = $state('')
+  // macOS: нет разрешения «Универсальный доступ», вставить сам не могу.
+  let needAccess = $state(false)
   let input: HTMLInputElement | undefined = $state()
   let listEl: HTMLUListElement | undefined = $state()
 
@@ -434,6 +436,7 @@
     const unlisten = [
       listen<Transfer>('clipwire://transfer', (e) => onTransfer(e.payload)),
       listen('clipwire://history-changed', () => load()),
+      listen('clipwire://need-accessibility', () => (needAccess = true)),
       listen<Settings>('clipwire://settings-changed', (e) => applySettings(e.payload)),
       // Живое превью размера из настроек: ширина списка меняется вместе с окном.
       listen('popup://opened', async () => {
@@ -449,6 +452,7 @@
         sel = 0
         preview = null
         error = ''
+        needAccess = false
         loadFailed = false
         await load()
         await tick()
@@ -505,6 +509,12 @@
 
     {#if error}
       <p class="error">{error}</p>
+    {/if}
+    {#if needAccess}
+      <div class="access" role="alert">
+        <p>{t('Скопировано в буфер — вставьте сами (Cmd+V). Чтобы Clipwire вставлял сразу, разрешите ему «Универсальный доступ» в Системных настройках.')}</p>
+        <button onclick={() => api.openAccessibilitySettings().catch((e) => (error = String(e)))}>{t('Открыть настройки')}</button>
+      </div>
     {/if}
 
     {#if items.length === 0}
@@ -892,6 +902,20 @@
     text-align: center;
     color: var(--c-muted);
     padding: var(--space-5);
+  }
+  .access {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+    margin: 0 var(--space-1) var(--space-2);
+    font-size: var(--text-s);
+  }
+  .access p {
+    margin: 0;
+    flex: 1;
+  }
+  .access button {
+    flex: none;
   }
   .error {
     color: var(--c-danger);

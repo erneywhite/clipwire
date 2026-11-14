@@ -311,7 +311,7 @@ pub use win::Watcher;
 #[cfg(target_os = "macos")]
 mod mac;
 #[cfg(target_os = "macos")]
-pub use mac::Watcher;
+pub use mac::{Watcher, front_pid};
 
 #[cfg(windows)]
 mod win {

@@ -285,7 +285,7 @@ unsafe extern "C" {
 }
 
 /// PID активной программы.
-fn front_pid() -> Option<i32> {
+pub fn front_pid() -> Option<i32> {
     let mut psn = ProcessSerialNumber::default();
     let mut pid = 0;
     // SAFETY: обе функции только пишут в переданные структуры.

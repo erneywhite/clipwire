@@ -354,6 +354,7 @@ pub fn run() {
             Some(vec!["--background"]),
         ))
         .invoke_handler(tauri::generate_handler![
+            popup::open_accessibility_settings,
             commands::get_status,
             commands::set_paused,
             commands::invite_code,
