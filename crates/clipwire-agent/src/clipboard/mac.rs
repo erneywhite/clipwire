@@ -120,6 +120,7 @@ impl Watcher {
                         // Программа-источник — та, что активна сейчас: буфер
                         // macOS не знает, кто в него писал.
                         let owner = frontmost_exe();
+                        tracing::debug!(?owner, "буфер сменился");
                         let seq = || pb.changeCount() as u32;
                         match super::read_consistent(seq, || read(&pb)) {
                             Some(Ok(Some(content))) => on_change(content, owner),
