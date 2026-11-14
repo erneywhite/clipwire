@@ -20,7 +20,9 @@
   <b>English</b> · <a href="README.ru.md">Русский</a>
 </p>
 
-<!-- screenshot: docs/screenshots/paste-window.png -->
+<p align="center">
+  <img src="docs/screenshots/preview.png" width="802" alt="Paste window with an image preview">
+</p>
 
 Clipwire is a free shared clipboard. Copy something on one computer, paste it on another.
 Text with formatting, images, files and folders travel through a server you run yourself,
@@ -53,6 +55,10 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
 - [License](#license)
 
 ## Getting started
+
+<p align="center">
+  <img src="docs/screenshots/settings-sync.png" width="560" alt="Sync settings: create a group or join one">
+</p>
 
 1. Download `Clipwire_*_x64-setup.exe` from [Releases](https://github.com/erneywhite/clipwire/releases)
    and run it. It installs for the current user and does not need administrator rights.
@@ -293,6 +299,10 @@ new number will not install.
 the button in About or from the tray menu. More in [docs/updates.md](docs/updates.md).
 
 ## Settings
+
+<p align="center">
+  <img src="docs/screenshots/settings-general.png" width="560" alt="General settings">
+</p>
 
 - Three themes (Graphite, Paper, Signal), each in light and dark, or follow the system.
 - Language: English, Русский or as in the system.

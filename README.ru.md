@@ -20,7 +20,9 @@
   <a href="README.md">English</a> · <b>Русский</b>
 </p>
 
-<!-- screenshot: docs/screenshots/paste-window.png -->
+<p align="center">
+  <img src="docs/screenshots/preview.png" width="802" alt="Окно вставки с предпросмотром картинки">
+</p>
 
 Clipwire — бесплатный общий буфер обмена. Скопировали на одном компьютере, вставили на другом.
 Текст с форматированием, картинки, файлы и папки идут через сервер, который вы разворачиваете
@@ -55,6 +57,10 @@ Clipwire — бесплатный общий буфер обмена. Скопи
 - [Лицензия](#лицензия)
 
 ## Начало работы
+
+<p align="center">
+  <img src="docs/screenshots/settings-sync.png" width="560" alt="Синхронизация: создать группу или подключиться">
+</p>
 
 1. Скачайте `Clipwire_*_x64-setup.exe` из [релизов](https://github.com/erneywhite/clipwire/releases)
    и запустите. Установщик ставит программу на текущего пользователя, права администратора не нужны.
@@ -300,6 +306,10 @@ Clipwire обновляется тихо. Раз в 6 часов он прове
 [docs/updates.md](docs/updates.md).
 
 ## Настройки
+
+<p align="center">
+  <img src="docs/screenshots/settings-general.png" width="560" alt="Основные настройки">
+</p>
 
 - Три темы оформления (Графит, Бумага, Сигнал), у каждой светлый и тёмный вариант, либо как в
   системе.
