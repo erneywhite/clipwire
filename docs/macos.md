@@ -258,6 +258,25 @@ H"f027…"`; у ad-hoc сборки — `cdhash H"d402…"`. `codesign --verify 
   `apps/desktop`.
 - Запуск приложения из исходников: `cd apps/desktop && npx tauri dev`. Настоящая сборка:
   `npx tauri build --target universal-apple-darwin`.
+- Проверки, где нужен «Универсальный доступ» (вставка в окно), — только на собранном
+  `.app`: у `npx tauri dev` из терминала разрешение спрашивается у терминала. Тестовая
+  сборка подписывается постоянным самоподписанным сертификатом, иначе после каждой
+  пересборки разрешение слетает (ad-hoc подпись — хэш кода):
+
+  ```
+  cd apps/desktop && npx tauri build --debug --bundles app   # ошибку про TAURI_SIGNING_PRIVATE_KEY в конце можно не смотреть: .app уже собран
+  scripts/macos-dev-sign.sh                                  # подписать target/debug/bundle/macos/Clipwire.app
+  open --env CLIPWIRE_HOME=/tmp/cw-test ../../target/debug/bundle/macos/Clipwire.app
+  ```
+
+  Скрипт при первом запуске создаёт сертификат «Clipwire Dev» в отдельной связке
+  `~/Library/Keychains/clipwire-dev.keychain-db` (пароль `clipwire-dev`, не секрет: там
+  только тестовый сертификат; в список поиска связок не добавляется). Потом каждая
+  подпись даёт одно и то же требование `identifier "io.github.erneywhite.clipwire" and
+  certificate root = H"a1ed…"`, и разрешение выдаётся один раз. Это не сертификат
+  выпусков: у выпусков свой (п. 7), при переходе с тестовой сборки на выпуск разрешение
+  выдаётся заново один раз. Удалить: `security delete-keychain
+  ~/Library/Keychains/clipwire-dev.keychain-db`.
 - Чтобы не трогать рабочие данные, для проверок — отдельная папка: `CLIPWIRE_HOME=/tmp/cw-test`.
 - Всё, что требует человека у экрана (нажать горячую клавишу, выдать разрешение, вставить
   в окно, посмотреть на значок), собирать в список «ручные проверки» с точными шагами и
