@@ -48,6 +48,8 @@ mod linux;
 #[cfg(target_os = "linux")]
 mod portal;
 #[cfg(target_os = "linux")]
+pub use linux::use_xwayland;
+#[cfg(target_os = "linux")]
 pub use portal::Portal;
 
 /// Может ли окно вставки само вставить в прежнее окно. Нет — на Wayland:
@@ -60,6 +62,36 @@ pub fn can_paste_into_active() -> bool {
     #[cfg(not(target_os = "linux"))]
     {
         true
+    }
+}
+
+/// Где открывается окно вставки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// У курсора мыши (Windows, macOS, Xorg).
+    Cursor,
+    /// Справа сверху, под значком в трее: GNOME на Wayland. Курсора там не
+    /// видно, а окна Clipwire идут через XWayland (см. `linux::use_xwayland`),
+    /// где место окна задаёт программа.
+    TopRight,
+    /// По центру: остальные Wayland-оболочки, место выбирает сама оболочка.
+    Center,
+}
+
+fn placement() -> Placement {
+    #[cfg(target_os = "linux")]
+    {
+        if linux::can_paste() {
+            Placement::Cursor
+        } else if linux::on_xwayland() {
+            Placement::TopRight
+        } else {
+            Placement::Center
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Placement::Cursor
     }
 }
 
@@ -148,14 +180,17 @@ pub fn show(app: &AppHandle) {
         )
     };
 
+    let place = placement();
     let cursor = app
         .cursor_position()
         .unwrap_or(PhysicalPosition::new(0.0, 0.0));
-    let monitor = app
-        .monitor_from_point(cursor.x, cursor.y)
-        .ok()
-        .flatten()
-        .or_else(|| app.primary_monitor().ok().flatten());
+    // Справа сверху — на главном мониторе: там верхняя панель со значком.
+    let monitor = if place == Placement::TopRight {
+        app.primary_monitor().ok().flatten()
+    } else {
+        app.monitor_from_point(cursor.x, cursor.y).ok().flatten()
+    }
+    .or_else(|| app.primary_monitor().ok().flatten());
     let Some(monitor) = monitor else {
         let _ = w.center();
         let _ = w.show();
@@ -169,14 +204,12 @@ pub fn show(app: &AppHandle) {
     let (ax, ay) = (area.position.x, area.position.y);
     let (aw, ah) = (area.size.width as i32, area.size.height as i32);
 
-    // На Wayland программа не знает, где курсор, и не двигает свои окна:
-    // окно по центру экрана (ставит его туда сама оболочка).
-    let at_cursor = can_paste_into_active();
-    // По умолчанию справа-снизу от курсора; если не влезает — по другую сторону.
-    let (cx, cy) = if at_cursor {
-        (cursor.x as i32, cursor.y as i32)
-    } else {
-        (ax + (aw - w_px) / 2 - gap, ay + (ah - h_px) / 2 - gap)
+    // У курсора — справа-снизу от него; если не влезает — по другую сторону.
+    // Справа сверху и по центру — та же формула от нужной точки.
+    let (cx, cy) = match place {
+        Placement::Cursor => (cursor.x as i32, cursor.y as i32),
+        Placement::TopRight => (ax + aw, ay),
+        Placement::Center => (ax + (aw - w_px) / 2 - gap, ay + (ah - h_px) / 2 - gap),
     };
     let mut x = if cx + gap + w_px <= ax + aw {
         cx + gap
@@ -201,10 +234,11 @@ pub fn show(app: &AppHandle) {
         area_w: aw as u32,
     });
     let _ = w.set_size(PhysicalSize::new(w_px as u32, h_px as u32));
-    if at_cursor {
-        let _ = w.set_position(PhysicalPosition::new(x, y));
-    } else {
+    if place == Placement::Center {
+        // Wayland: окно ставит оболочка, просьба лишь подсказка.
         let _ = w.center();
+    } else {
+        let _ = w.set_position(PhysicalPosition::new(x, y));
     }
     let protect = app
         .state::<AppState>()
@@ -216,7 +250,7 @@ pub fn show(app: &AppHandle) {
     let _ = w.show();
     let _ = w.set_focus();
     #[cfg(target_os = "linux")]
-    if at_cursor {
+    if place != Placement::Center {
         let win = w.clone();
         let _ = w.run_on_main_thread(move || {
             if let Some(xid) = linux::xid(&win) {

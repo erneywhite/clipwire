@@ -134,6 +134,14 @@ sudo apt-get install -y build-essential curl git pkg-config libssl-dev \
   (команда с `clipwire` и `--popup`), правится, а не дублируется. Проверено на живом профиле и
   тестом `gnome_live` в отдельном профиле dconf. Для KDE и других — портал GlobalShortcuts,
   пока не сделан: там сочетание назначается руками.
+- **Место окна на Wayland.** Где курсор, программе на Wayland не видно, а GNOME ещё и не даёт
+  нативному окну выбрать место (layer-shell в mutter нет). Поэтому в GNOME на Wayland Clipwire
+  выставляет себе `GDK_BACKEND=x11` до запуска GTK (`popup::linux::use_xwayland`, отключается
+  `CLIPWIRE_NATIVE_WAYLAND=1`), и окно вставки встаёт справа сверху главного монитора, под
+  значком в трее (`Placement::TopRight`). Фокус берётся через `_NET_ACTIVE_WINDOW`, как на X11.
+  Минус: при дробном масштабе (125 %, 150 %) окна XWayland в GNOME 46 чуть размыты. В остальных
+  Wayland-оболочках окно по центру (`Placement::Center`); для KDE/Sway/Hyprland можно сделать
+  layer-shell — позже.
 - **`clipwire --popup`.** Второй запуск с этим ключом открывает окно вставки у уже запущенной
   копии (плагин single-instance, только в релизной сборке); первый запуск с ним — тоже.
   На Wayland глобальная клавиша программы работает только над окнами XWayland, поэтому в

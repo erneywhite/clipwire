@@ -190,6 +190,25 @@ impl X {
     }
 }
 
+/// GNOME на Wayland: окна Clipwire лучше открывать через XWayland. Нативному
+/// Wayland-окну GNOME не даёт выбрать место (нет layer-shell), и окно вставки
+/// оказывалось посреди экрана; через XWayland оно встаёт под значок в трее.
+/// Буфер обмена и так идёт через XWayland, вставка — через портал (D-Bus).
+/// `CLIPWIRE_NATIVE_WAYLAND=1` оставляет нативный Wayland.
+pub fn use_xwayland() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var_os("DISPLAY").is_some()
+        && std::env::var_os("GDK_BACKEND").is_none()
+        && std::env::var_os("CLIPWIRE_NATIVE_WAYLAND").is_none()
+        && super::gnome_shortcut::applies()
+}
+
+/// Окна Clipwire открыты через XWayland в Wayland-сессии.
+pub fn on_xwayland() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var("GDK_BACKEND").is_ok_and(|b| b == "x11")
+}
+
 /// Сделать своё окно активным. Показ из фона (по `--popup`, из трея)
 /// менеджер окон может не пустить на передний план: защита от кражи фокуса.
 /// Показ асинхронный: просьба до того, как окно появилось на экране,

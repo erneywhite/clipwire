@@ -318,6 +318,13 @@ pub fn run() {
     if std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/")) {
         clipwire_agent::secret::enable_keychain();
     }
+    // GNOME на Wayland: окна через XWayland, чтобы окно вставки вставало под
+    // значок в трее (popup::linux::use_xwayland). До запуска GTK и любых потоков.
+    #[cfg(target_os = "linux")]
+    if popup::use_xwayland() {
+        // SAFETY: начало main, других потоков ещё нет.
+        unsafe { std::env::set_var("GDK_BACKEND", "x11") };
+    }
     // Linux: секреты под ключом из Secret Service (gnome-keyring, KWallet).
     // Подписи, как на маке, тут нет, поэтому и у `tauri dev` тоже.
     #[cfg(target_os = "linux")]
