@@ -10,6 +10,7 @@
 //! Протокол проверки и его ключ — `clipwire_core::p2p`, описание —
 //! `docs/files-transfer.md`, раздел «Прямая передача».
 
+use crate::i18n::tr;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -75,10 +76,10 @@ pub enum P2pError {
 impl std::fmt::Display for P2pError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Offline => "устройство не в сети",
-            Self::Denied => "устройство-источник не пустило: у него другой ключ группы",
-            Self::BadProof => "устройство-источник не подтвердило ключ группы",
-            Self::OwnDevice => "файла нет на месте, его переместили или удалили",
+            Self::Offline => tr("устройство не в сети"),
+            Self::Denied => tr("устройство-источник не пустило: у него другой ключ группы"),
+            Self::BadProof => tr("устройство-источник не подтвердило ключ группы"),
+            Self::OwnDevice => tr("файла нет на месте, его переместили или удалили"),
         })
     }
 }
@@ -222,7 +223,7 @@ pub async fn connect(
         anyhow::Ok(())
     })
     .await
-    .unwrap_or_else(|_| Err(anyhow!("устройство-источник не ответило на проверку")));
+    .unwrap_or_else(|_| Err(anyhow!(tr("устройство-источник не ответило на проверку"))));
     if let Err(e) = res {
         conn.close(1u32.into(), b"auth");
         return Err(e);

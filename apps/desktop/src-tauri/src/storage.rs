@@ -10,6 +10,7 @@
 //! значить перехват соединения, и после «Сбросить отпечаток» пароль или ключ
 //! вводятся заново.
 
+use clipwire_agent::i18n::{tr, trf};
 use std::sync::Mutex;
 
 use clipwire_agent::group_config::StorageController;
@@ -164,7 +165,7 @@ fn controller(app: &AppHandle) -> CmdResult<StorageController> {
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .and_then(|s| s.storage())
-        .ok_or_else(|| "Хранилище выбирается, когда устройство в группе".into())
+        .ok_or_else(|| tr("Хранилище выбирается, когда устройство в группе").into())
 }
 
 /// Форма из сохранённых настроек, без значений секретов.
@@ -259,7 +260,7 @@ fn from_form(form: &StorageForm, current: &StorageConfig) -> CmdResult<StorageCo
                     {
                         c.secret_key.clone()
                     }
-                    _ => return Err("Введите секретный ключ".into()),
+                    _ => return Err(tr("Введите секретный ключ").into()),
                 }
             };
             let region = f.region.trim();
@@ -280,7 +281,7 @@ fn from_form(form: &StorageForm, current: &StorageConfig) -> CmdResult<StorageCo
         "sftp" => {
             let f = &form.sftp;
             if f.port == 0 {
-                return Err("Порт — число от 1 до 65535".into());
+                return Err(tr("Порт — число от 1 до 65535").into());
             }
             let host = f.host.trim().to_string();
             let user = f.user.trim().to_string();
@@ -310,9 +311,9 @@ fn from_form(form: &StorageForm, current: &StorageConfig) -> CmdResult<StorageCo
                 } else if let Some(SftpAuth::Password(p)) = same {
                     p.clone()
                 } else if changed_key {
-                    return Err("Ключ сервера изменился: введите пароль заново".into());
+                    return Err(tr("Ключ сервера изменился: введите пароль заново").into());
                 } else {
-                    return Err("Введите пароль".into());
+                    return Err(tr("Введите пароль").into());
                 }),
                 "key" => {
                     let new_pass = (!f.passphrase.is_empty()).then(|| f.passphrase.clone());
@@ -331,12 +332,14 @@ fn from_form(form: &StorageForm, current: &StorageConfig) -> CmdResult<StorageCo
                             passphrase: new_pass.or_else(|| passphrase.clone()),
                         }
                     } else if changed_key {
-                        return Err("Ключ сервера изменился: вставьте закрытый ключ заново".into());
+                        return Err(
+                            tr("Ключ сервера изменился: вставьте закрытый ключ заново").into()
+                        );
                     } else {
-                        return Err("Вставьте закрытый ключ или выберите файл".into());
+                        return Err(tr("Вставьте закрытый ключ или выберите файл").into());
                     }
                 }
-                _ => return Err("Неизвестный способ входа".into()),
+                _ => return Err(tr("Неизвестный способ входа").into()),
             };
             Ok(StorageConfig::Sftp(SftpConfig {
                 host,
@@ -347,7 +350,7 @@ fn from_form(form: &StorageForm, current: &StorageConfig) -> CmdResult<StorageCo
                 host_key_sha256: f.host_key_sha256.trim().to_string(),
             }))
         }
-        other => Err(format!("Неизвестное хранилище «{other}»")),
+        other => Err(trf("Неизвестное хранилище «{other}»", &[("other", &other)])),
     }
 }
 

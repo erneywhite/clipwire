@@ -4,6 +4,7 @@
 //! (`devices::mark_excluded`), и человек выбирает, выйти или попробовать снова.
 
 use clipwire_agent::devices::{self, Controller, DeviceView, RekeyNotice};
+use clipwire_agent::i18n::{tr, trf};
 use clipwire_core::{DeviceId, GroupId, GroupKey};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -51,7 +52,7 @@ fn parse_device(id: &str) -> CmdResult<DeviceId> {
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
         .map(DeviceId)
-        .ok_or_else(|| "Неверный id устройства".into())
+        .ok_or_else(|| tr("Неверный id устройства").into())
 }
 
 fn controller(app: &AppHandle) -> CmdResult<Controller> {
@@ -61,7 +62,7 @@ fn controller(app: &AppHandle) -> CmdResult<Controller> {
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .and_then(|s| s.controller())
-        .ok_or_else(|| "Устройство не в группе".into())
+        .ok_or_else(|| tr("Устройство не в группе").into())
 }
 
 /// Что лежит в истории здесь и у группы на сервере (раздел «О программе»).
@@ -195,19 +196,25 @@ async fn switch_to(app: &AppHandle, old: GroupId, key: GroupKey) -> CmdResult<St
         Ok(true) => {}
         Ok(false) => {
             if on_disk().is_none() {
-                return Err("Ключ группы уже сменён".into());
+                return Err(tr("Ключ группы уже сменён").into());
             }
         }
         Err(e) => {
             if on_disk().is_none() {
-                return Err(format!("Ключ сменён, но не сохранился: {e:#}"));
+                return Err(trf(
+                    "Ключ сменён, но не сохранился: {e}",
+                    &[("e", &format!("{e:#}"))],
+                ));
             }
             tracing::warn!("новый ключ сохранён с ошибкой, перезапускаю всё равно: {e:#}");
         }
     }
-    crate::restart_service(app)
-        .await
-        .map_err(|e| format!("Ключ сменён, но синхронизация не перезапустилась: {e:#}"))?;
+    crate::restart_service(app).await.map_err(|e| {
+        trf(
+            "Ключ сменён, но синхронизация не перезапустилась: {e}",
+            &[("e", &format!("{e:#}"))],
+        )
+    })?;
     Ok(on_disk().map(|s| s.invite.encode()).unwrap_or_default())
 }
 
@@ -276,9 +283,12 @@ pub fn on_excluded(app: &AppHandle, old: GroupId) {
 #[tauri::command]
 pub async fn group_retry(app: AppHandle) -> CmdResult<()> {
     devices::clear_excluded(&app.state::<AppState>().paths).map_err(|e| format!("{e:#}"))?;
-    crate::restart_service(&app)
-        .await
-        .map_err(|e| format!("Синхронизация не запустилась: {e:#}"))?;
+    crate::restart_service(&app).await.map_err(|e| {
+        trf(
+            "Синхронизация не запустилась: {e}",
+            &[("e", &format!("{e:#}"))],
+        )
+    })?;
     Ok(())
 }
 

@@ -3,6 +3,7 @@
 //! `<title>`. Грузится только по пробелу, похожие на одноразовые ссылки не
 //! трогаем (переход по ним может сжечь код входа или сброса пароля).
 
+use clipwire_agent::i18n::{tr, trf};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Mutex, OnceLock};
@@ -41,7 +42,7 @@ pub struct LinkCache(Mutex<HashMap<String, LinkCard>>);
 pub async fn link_preview(app: AppHandle, url: String) -> LinkCard {
     let parsed = match Url::parse(url.trim()) {
         Ok(u) if matches!(u.scheme(), "http" | "https") => u,
-        _ => return failed(&url, "Это не веб-ссылка".into()),
+        _ => return failed(&url, tr("Это не веб-ссылка").into()),
     };
     let site = host_label(&parsed);
     let base = LinkCard {
@@ -185,7 +186,7 @@ enum Redirect {
 /// [`MAX_REDIRECTS`] редиректов, следующий — отказ.
 fn redirect_verdict(url: &Url, nth: usize) -> Redirect {
     if nth > MAX_REDIRECTS {
-        return Redirect::Refuse("слишком много редиректов".into());
+        return Redirect::Refuse(tr("слишком много редиректов").into());
     }
     if let Err(e) = check_target(url) {
         return Redirect::Refuse(e);
@@ -202,7 +203,7 @@ fn redirect_verdict(url: &Url, nth: usize) -> Redirect {
 /// [`PublicResolver`] при подключении.
 fn check_target(u: &Url) -> Result<(), String> {
     if !matches!(u.scheme(), "http" | "https") {
-        return Err("Это не веб-ссылка".into());
+        return Err(tr("Это не веб-ссылка").into());
     }
     // `Url` уже привёл адрес к обычному виду (`http://2130706433/` —
     // это 127.0.0.1), IPv6 в host_str — в квадратных скобках.
@@ -220,7 +221,7 @@ fn check_target(u: &Url) -> Result<(), String> {
     if ok {
         Ok(())
     } else {
-        Err("Ссылка ведёт на этот компьютер или в локальную сеть".into())
+        Err(tr("Ссылка ведёт на этот компьютер или в локальную сеть").into())
     }
 }
 
@@ -314,14 +315,14 @@ async fn public_addrs(
     host: &str,
 ) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
     if is_local_name(host) {
-        return Err("имя указывает на этот компьютер".into());
+        return Err(tr("имя указывает на этот компьютер").into());
     }
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 0))
         .await?
         .filter(|a| is_public_ip(a.ip()))
         .collect();
     if addrs.is_empty() {
-        return Err(format!("у {host} нет публичных адресов").into());
+        return Err(trf("у {host} нет публичных адресов", &[("host", &host)]).into());
     }
     Ok(addrs)
 }
@@ -346,11 +347,14 @@ async fn fetch(url: &Url) -> anyhow::Result<(Meta, Url)> {
         .send()
         .await?;
     let status = resp.status();
-    anyhow::ensure!(status.is_success(), "сайт ответил {status}");
+    anyhow::ensure!(
+        status.is_success(),
+        trf("сайт ответил {status}", &[("status", &status)])
+    );
     let ctype = header(&resp, "content-type");
     anyhow::ensure!(
         ctype.contains("html") || ctype.is_empty(),
-        "это не страница ({ctype})"
+        trf("это не страница ({ctype})", &[("ctype", &ctype)])
     );
     let final_url = resp.url().clone();
     let body = read_capped(resp, MAX_HTML).await?;
@@ -361,15 +365,23 @@ async fn fetch_image(url: &Url) -> anyhow::Result<String> {
     // Адрес картинки берётся со страницы: проверяем так же, как ссылку.
     check_target(url).map_err(anyhow::Error::msg)?;
     let resp = client().get(url.clone()).send().await?;
-    anyhow::ensure!(resp.status().is_success(), "картинка: {}", resp.status());
+    anyhow::ensure!(
+        resp.status().is_success(),
+        trf("картинка: {status}", &[("status", &resp.status())])
+    );
     // SVG не берём: в нём бывают скрипты, а растровая картинка есть почти всегда.
     let ctype = header(&resp, "content-type");
     let mime = ["image/png", "image/jpeg", "image/webp", "image/gif"]
         .into_iter()
         .find(|m| ctype.starts_with(m))
-        .ok_or_else(|| anyhow::anyhow!("картинка неподходящего типа {ctype}"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(trf(
+                "картинка неподходящего типа {ctype}",
+                &[("ctype", &ctype)]
+            ))
+        })?;
     let bytes = read_capped(resp, MAX_IMAGE + 1).await?;
-    anyhow::ensure!(bytes.len() <= MAX_IMAGE, "картинка больше 2 МБ");
+    anyhow::ensure!(bytes.len() <= MAX_IMAGE, tr("картинка больше 2 МБ"));
     Ok(format!(
         "data:{mime};base64,{}",
         data_encoding::BASE64.encode(&bytes)

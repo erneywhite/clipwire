@@ -25,6 +25,7 @@
 //! (`nsis_tauri_utils::RunAsUser`). На macOS и Linux `install` возвращает
 //! управление, перезапускаемся через `app.restart()`.
 
+use clipwire_agent::i18n::{tr, trf};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -328,9 +329,9 @@ fn announce(app: &AppHandle, dir: &Path) -> Startup {
             );
             notify(
                 app,
-                &format!(
-                    "Обновление до {} не установилось. Поставить его можно из меню в трее.",
-                    f.version
+                &trf(
+                    "Обновление до {version} не установилось. Поставить его можно из меню в трее.",
+                    &[("version", &f.version)],
                 ),
             );
             return startup;
@@ -341,7 +342,10 @@ fn announce(app: &AppHandle, dir: &Path) -> Startup {
     }
     let _ = std::fs::write(&announced_file, &current);
     tracing::info!("Clipwire обновлён до {current}");
-    notify(app, &format!("Clipwire обновлён до {current}"));
+    notify(
+        app,
+        &trf("Clipwire обновлён до {current}", &[("current", &current)]),
+    );
     Startup {
         after_auto: inst.auto,
         ..startup
@@ -604,7 +608,7 @@ async fn tick(app: &AppHandle) {
 async fn install_now(app: &AppHandle, ready: Ready, auto: bool) -> Result<(), String> {
     let state = app.state::<Updates>();
     if state.busy.swap(true, Ordering::AcqRel) {
-        return Err("Обновление уже устанавливается".into());
+        return Err(tr("Обновление уже устанавливается").into());
     }
     // Пауза живёт только в движке: запоминаем до остановки, чтобы вернуть
     // её и после перезапуска установщиком, и здесь, если он не запустился.
@@ -636,7 +640,7 @@ pub async fn install(app: AppHandle) -> Result<(), String> {
         Some(r) => r,
         None => {
             let Some(update) = check(&app).await? else {
-                return Err("Обновлений нет".into());
+                return Err(tr("Обновлений нет").into());
             };
             let bytes = update
                 .download(|_, _| {}, || {})

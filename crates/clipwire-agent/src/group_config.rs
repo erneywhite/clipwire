@@ -15,6 +15,7 @@
 //! секретов ([`StorageView`]), полные — только по явному запросу формы,
 //! сохранить и проверить подключение.
 
+use crate::i18n::{tr, trf};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -499,8 +500,6 @@ pub struct StorageController {
     pub(crate) storage: Arc<GroupStorage>,
 }
 
-const OFFLINE: &str = "Нет связи с сервером. Попробуйте, когда устройство будет в сети";
-
 impl StorageController {
     pub fn new(tx: mpsc::Sender<Control>, storage: Arc<GroupStorage>) -> Self {
         Self { tx, storage }
@@ -531,7 +530,7 @@ impl StorageController {
             && c.host_key_sha256.trim().is_empty()
         {
             return Err(
-                "Сначала проверьте подключение и подтвердите отпечаток ключа сервера".into(),
+                tr("Сначала проверьте подключение и подтвердите отпечаток ключа сервера").into(),
             );
         }
         let now = crate::history::now_ms().max(0) as u64;
@@ -540,9 +539,9 @@ impl StorageController {
             .storage
             .key
             .seal_config(&cfg)
-            .map_err(|e| format!("Настройки не сохранились: {e}"))?;
+            .map_err(|e| trf("Настройки не сохранились: {e}", &[("e", &e)]))?;
         if sealed.len() > MAX_CONFIG_BYTES {
-            return Err("Настройки слишком большие (длинный ключ SSH?)".into());
+            return Err(tr("Настройки слишком большие (длинный ключ SSH?)").into());
         }
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -552,8 +551,9 @@ impl StorageController {
                 reply,
             })
             .await
-            .map_err(|_| OFFLINE.to_string())?;
-        rx.await.map_err(|_| OFFLINE.to_string())??;
+            .map_err(|_| crate::devices::offline().to_string())?;
+        rx.await
+            .map_err(|_| crate::devices::offline().to_string())??;
         Ok(self.storage.view())
     }
 

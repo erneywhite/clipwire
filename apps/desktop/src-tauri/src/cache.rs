@@ -4,6 +4,7 @@
 //! записей истории и то, что качается сейчас) и запуск в фоне: удаление
 //! больших копий не должно задерживать окно.
 
+use clipwire_agent::i18n::trf;
 use std::collections::HashSet;
 
 use clipwire_core::BlobId;
@@ -88,7 +89,7 @@ pub async fn cache_clear(app: AppHandle) -> Result<CacheCleared, String> {
         }
     })
     .await
-    .map_err(|e| format!("Кэш не очистился: {e}"))?;
+    .map_err(|e| trf("Кэш не очистился: {e}", &[("e", &e)]))?;
     // Файлы записей больше не «здесь»: окно вставки перечитает список.
     let _ = app.emit("clipwire://history-changed", ());
     Ok(res)

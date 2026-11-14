@@ -1,6 +1,7 @@
 //! Настройки устройства (`settings.json` рядом с состоянием). Секретов здесь
 //! нет, поэтому файл открытый и его можно поправить руками.
 
+use crate::i18n::tr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -123,7 +124,7 @@ pub fn default_device_name() -> String {
     ["COMPUTERNAME", "HOSTNAME"]
         .iter()
         .find_map(|v| std::env::var(v).ok().filter(|s| !s.trim().is_empty()))
-        .unwrap_or_else(|| "Это устройство".into())
+        .unwrap_or_else(|| tr("Это устройство").into())
 }
 
 fn file(dir: &Path) -> PathBuf {

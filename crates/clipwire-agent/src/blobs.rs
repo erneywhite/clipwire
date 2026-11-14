@@ -7,6 +7,7 @@
 //! [`download_blob`] работают с одним файлом и годятся для сквозных тестов;
 //! [`Blobs`] держит очередь, кэш, outbox архивов папок и соединения для сервиса.
 
+use crate::i18n::{tr, trf};
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -617,11 +618,14 @@ impl UploadError {
 impl std::fmt::Display for UploadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Changed => f.write_str("файл изменился после копирования"),
-            Self::Missing => f.write_str("файла уже нет на месте"),
+            Self::Changed => f.write_str(tr("файл изменился после копирования")),
+            Self::Missing => f.write_str(tr("файла уже нет на месте")),
             Self::Rejected(e) => write!(f, "{e}"),
-            Self::Network(e) => write!(f, "нет связи с сервером: {e:#}"),
-            Self::External(e) => write!(f, "внешнее хранилище: {e}"),
+            Self::Network(e) => f.write_str(&trf(
+                "нет связи с сервером: {e}",
+                &[("e", &format!("{e:#}"))],
+            )),
+            Self::External(e) => f.write_str(&trf("внешнее хранилище: {e}", &[("e", e)])),
         }
     }
 }
@@ -745,7 +749,7 @@ where
                 "неожиданный ответ на Put: {other:?}"
             ))));
         }
-        None => return Err(net(anyhow!("сервер закрыл поток"))),
+        None => return Err(net(anyhow!(tr("сервер закрыл поток")))),
     };
     let count = chunk_count(job.size);
     if have > count {
@@ -779,7 +783,7 @@ where
         Some(other) => Err(UploadError::Rejected(BlobFail::Protocol(format!(
             "неожиданный ответ после загрузки: {other:?}"
         )))),
-        None => Err(net(anyhow!("сервер не подтвердил загрузку"))),
+        None => Err(net(anyhow!(tr("сервер не подтвердил загрузку")))),
     }
 }
 
@@ -822,11 +826,16 @@ async fn control(conn: &Connection, req: BlobRequest) -> Result<BlobReply, Uploa
         match read_msg::<_, BlobReply>(&mut recv).await.map_err(net)? {
             Some(BlobReply::Error(f)) => Err(server_fail(f)),
             Some(r) => Ok(r),
-            None => Err(net(anyhow!("сервер закрыл поток без ответа"))),
+            None => Err(net(anyhow!(tr("сервер закрыл поток без ответа")))),
         }
     })
     .await
-    .map_err(|_| net(anyhow!("сервер не ответил за {CONTROL_TIMEOUT:?}")))?
+    .map_err(|_| {
+        net(anyhow!(trf(
+            "сервер не ответил за {timeout}",
+            &[("timeout", &format!("{CONTROL_TIMEOUT:?}"))]
+        )))
+    })?
 }
 
 /// Завести файл на сервере до отправки элемента: проверяются лимиты и квоты,
@@ -949,19 +958,26 @@ impl PartWriter {
     /// Проверить и дописать часть. Ошибка расшифровки — файл испорчен или
     /// подменён, часть не пишется.
     pub async fn write_chunk(&mut self, key: &BlobKey, index: u64, sealed: &[u8]) -> Result<()> {
-        ensure!(!self.is_complete(), "лишняя часть файла {index}");
+        ensure!(
+            !self.is_complete(),
+            trf("лишняя часть файла {index}", &[("index", &index)])
+        );
         ensure!(
             index == self.next,
-            "часть {index} пришла не по порядку, ждали {}",
-            self.next
+            trf(
+                "часть {index} пришла не по порядку, ждали {next}",
+                &[("index", &index), ("next", &self.next)]
+            )
         );
         let plain = key
             .open(index, index + 1 == self.count, sealed)
             .map_err(|e| anyhow!("{e}"))?;
         ensure!(
             plain.len() == chunk_len(self.size, index),
-            "часть {index} не той длины: {} байт",
-            plain.len()
+            trf(
+                "часть {index} не той длины: {len} байт",
+                &[("index", &index), ("len", &plain.len())]
+            )
         );
         self.file.write_all(&plain).await?;
         // Сначала часть на диск, потом её номер: после сбоя ОС .part.ok не
@@ -975,13 +991,18 @@ impl PartWriter {
 
     /// Все части на месте: переименовать `.part` в настоящее имя.
     pub async fn finish(mut self) -> Result<PathBuf> {
-        ensure!(self.is_complete(), "файл скачан не до конца");
+        ensure!(self.is_complete(), tr("файл скачан не до конца"));
         self.file.flush().await?;
         self.file.sync_all().await?;
         drop(self.file);
         tokio::fs::rename(&self.part, &self.dest)
             .await
-            .with_context(|| format!("не переименовался {}", self.part.display()))?;
+            .with_context(|| {
+                trf(
+                    "не переименовался {path}",
+                    &[("path", &self.part.display())],
+                )
+            })?;
         let _ = tokio::fs::remove_file(&self.ok).await;
         Ok(self.dest)
     }
@@ -1052,7 +1073,7 @@ where
     }
     let mut w = PartWriter::open(dest, size)
         .await
-        .with_context(|| format!("не открылся {}", dest.display()))?;
+        .with_context(|| trf("не открылся {path}", &[("path", &dest.display())]))?;
     if w.is_complete() {
         return Ok(w.finish().await?);
     }
@@ -1069,16 +1090,25 @@ where
         match ready {
             Some(t) => tokio::time::timeout(t, read_msg::<_, BlobReply>(recv))
                 .await
-                .map_err(|_| GetError::NoReply(anyhow!("источник не ответил за {t:?}")))?,
+                .map_err(|_| {
+                    GetError::NoReply(anyhow!(trf(
+                        "источник не ответил за {timeout}",
+                        &[("timeout", &format!("{t:?}"))]
+                    )))
+                })?,
             None => read_msg::<_, BlobReply>(recv).await,
         }
         .map_err(|e| GetError::NoReply(e.into()))
     };
     match first.await? {
-        None => return Err(GetError::NoReply(anyhow!("сервер закрыл поток"))),
+        None => return Err(GetError::NoReply(anyhow!(tr("сервер закрыл поток")))),
         Some(BlobReply::GetReady { size: s, .. }) if s == size => {}
         Some(BlobReply::GetReady { size: s, .. }) => {
-            return Err(anyhow!("на сервере файл другого размера: {s} байт вместо {size}").into());
+            return Err(anyhow!(trf(
+                "на сервере файл другого размера: {s} байт вместо {size}",
+                &[("s", &s), ("size", &size)]
+            ))
+            .into());
         }
         // Отказ сервера уходит как есть (`BlobFail` внутри anyhow): по нему
         // вызывающий может отличить «файла нет» от прочих ошибок.
@@ -1100,7 +1130,7 @@ where
             Some(other) => {
                 return Err(anyhow!("неожиданное сообщение при скачивании: {other:?}").into());
             }
-            None => return Err(anyhow!("сервер оборвал передачу файла").into()),
+            None => return Err(anyhow!(tr("сервер оборвал передачу файла")).into()),
         }
     }
     let _ = send.shutdown().await;
@@ -1363,7 +1393,7 @@ impl Blobs {
             let scan = crate::folder::scan_dir(&src).map_err(|e| anyhow!("{e}"))?;
             ensure!(
                 scan.bytes == want_bytes && crate::folder::tar_size(&scan.entries)? == want_tar,
-                "папка изменилась после копирования"
+                tr("папка изменилась после копирования")
             );
             crate::folder::build_archive(&scan.entries, &out)
         })
@@ -1400,7 +1430,7 @@ impl Blobs {
             }
         })
         .await
-        .map_err(|_| anyhow!("сеть ещё не поднялась, попробуйте позже"))?;
+        .map_err(|_| anyhow!(tr("сеть ещё не поднялась, попробуйте позже")))?;
         if origin.0 == *ep.id().as_bytes() {
             return Err(crate::p2p::P2pError::OwnDevice.into());
         }
@@ -1491,10 +1521,12 @@ impl Blobs {
         res.map_err(GetError::into_inner)
             .map_err(|e| match e.downcast_ref::<BlobFail>() {
                 Some(BlobFail::NotFound) => {
-                    anyhow!("на устройстве-источнике этого файла уже нет в истории")
+                    anyhow!(tr("на устройстве-источнике этого файла уже нет в истории"))
                 }
                 Some(BlobFail::Cancelled) => {
-                    anyhow!("файл на устройстве-источнике изменился или пропал после копирования")
+                    anyhow!(tr(
+                        "файл на устройстве-источнике изменился или пропал после копирования"
+                    ))
                 }
                 _ => e,
             })
@@ -1682,9 +1714,12 @@ impl Blobs {
         origin: DeviceId,
         place: Option<BlobPlace>,
     ) -> Result<PathBuf> {
-        let blob = f
-            .blob
-            .ok_or_else(|| anyhow!("файл «{}» не передавался с устройства", f.name))?;
+        let blob = f.blob.ok_or_else(|| {
+            anyhow!(trf(
+                "файл «{name}» не передавался с устройства",
+                &[("name", &f.name)]
+            ))
+        })?;
         if let Some(p) = cached_file(&self.files_dir, f) {
             return Ok(p);
         }
@@ -1718,7 +1753,7 @@ impl Blobs {
                             .await
                     {
                         bail!(
-                            "настройки хранилища файлов группы ещё не пришли на это устройство, попробуйте вставить чуть позже"
+                            tr("настройки хранилища файлов группы ещё не пришли на это устройство, попробуйте вставить чуть позже")
                         );
                     }
                     (self.storage.external(), Waits::default())
@@ -1762,7 +1797,7 @@ impl Blobs {
                 let conn = self
                     .wait_conn(WAIT_CONN)
                     .await
-                    .ok_or_else(|| anyhow!("нет связи с сервером"))?;
+                    .ok_or_else(|| anyhow!(tr("нет связи с сервером")))?;
                 download_blob(&conn, &self.key, blob, size, &target, progress).await?
             };
             // Файл с другого устройства — как скачанный из интернета: метка
@@ -1781,7 +1816,7 @@ impl Blobs {
             .await?
         }
         .await
-        .with_context(|| format!("«{}» не скачался", f.name));
+        .with_context(|| trf("«{name}» не скачался", &[("name", &f.name)]));
         self.transfers.finish(
             blob,
             Direction::Down,
@@ -1855,8 +1890,9 @@ impl Blobs {
                                 };
                                 return (i, job, Ok(()));
                             }
-                            Err(e) => storage.warn(format!(
-                                "Внешнее хранилище недоступно ({e}), «{name}» отправлен через сервер Clipwire"
+                            Err(e) => storage.warn(trf(
+                                "Внешнее хранилище недоступно ({e}), «{name}» отправлен через сервер Clipwire",
+                                &[("e", &e), ("name", &name)],
                             )),
                         }
                     }
@@ -2146,8 +2182,9 @@ impl Blobs {
                         // файл уходит через сервер. Его папку во внешнем
                         // хранилище убираем, чтобы получатель не ждал там, а
                         // пошёл на сервер.
-                        self.storage.warn(format!(
-                            "Внешнее хранилище отказало ({e}), файл отправляется через сервер Clipwire"
+                        self.storage.warn(trf(
+                            "Внешнее хранилище отказало ({e}), файл отправляется через сервер Clipwire",
+                            &[("e", &e)],
                         ));
                         self.drop_external_in(store.as_ref(), job.blob).await;
                         upload_blob(conn, &self.key, job, progress).await
@@ -2190,7 +2227,10 @@ impl Blobs {
         }
         let res = res.map_err(|e| {
             if retry {
-                format!("{e}. Отправка продолжится после переподключения")
+                trf(
+                    "{e}. Отправка продолжится после переподключения",
+                    &[("e", &e)],
+                )
             } else {
                 e.to_string()
             }

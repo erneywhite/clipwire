@@ -1,6 +1,7 @@
 //! Окно редактора картинок: стрелки, рамки, текст и размытие поверх элемента
 //! истории. Рисует фронтенд на canvas, сюда приходит готовый PNG.
 
+use clipwire_agent::i18n::tr;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize};
 
 use crate::AppState;
@@ -14,7 +15,7 @@ const SHARE: f64 = 0.8;
 pub fn editor_open(app: AppHandle, id: String) -> Result<(), String> {
     let w = app
         .get_webview_window("editor")
-        .ok_or("Окно редактора не создано")?;
+        .ok_or(tr("Окно редактора не создано"))?;
     if let Some(p) = app.get_webview_window("popup") {
         let _ = p.hide();
     }
@@ -61,7 +62,7 @@ pub fn editor_open(app: AppHandle, id: String) -> Result<(), String> {
 pub async fn editor_save(app: AppHandle, png: String, paste: bool) -> Result<(), String> {
     let png = data_encoding::BASE64
         .decode(png.trim_start_matches("data:image/png;base64,").as_bytes())
-        .map_err(|_| "Картинка пришла повреждённой".to_string())?;
+        .map_err(|_| tr("Картинка пришла повреждённой").to_string())?;
     let img = clipwire_agent::image::decode_png(&png).map_err(|e| format!("{e:#}"))?;
     let content = clipwire_core::Content::Image {
         width: img.width(),
