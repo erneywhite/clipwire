@@ -33,7 +33,7 @@ The server is a single Docker container. The client keeps a searchable, encrypte
 a small paste window that opens next to the mouse cursor. Without a server the client still
 works as a local clipboard history on one computer, and you can connect a server later.
 
-Right now there is a client for Windows. The macOS client is in progress (the `macos` branch: the clipboard engine already works), Linux is planned.
+There are clients for Windows and macOS (13 Ventura or newer, Apple Silicon and Intel). Linux is planned.
 
 Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneywhite/clipwire/issues).
 
@@ -60,9 +60,26 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
   <img src="docs/screenshots/settings-sync.png" width="560" alt="Sync settings: create a group or join one">
 </p>
 
+**Windows.**
+
 1. Download `Clipwire_*_x64-setup.exe` from [Releases](https://github.com/erneywhite/clipwire/releases)
    and run it. It installs for the current user and does not need administrator rights.
 2. Start Clipwire. It lives in the tray; press Ctrl+Shift+V to open the paste window.
+
+**macOS.**
+
+1. Download `Clipwire_*_universal.dmg` from [Releases](https://github.com/erneywhite/clipwire/releases),
+   open it and drag Clipwire to Applications.
+2. The first launch. Clipwire is not notarized by Apple (that needs a paid developer account), so
+   macOS says it cannot check the app for malware. Open Clipwire once, close the warning, then go to
+   System Settings → Privacy & Security and click **Open Anyway** next to the line about Clipwire.
+   Or run once in Terminal: `xattr -dr com.apple.quarantine /Applications/Clipwire.app`.
+   This is needed only once: updates are installed by Clipwire itself.
+3. Clipwire lives in the menu bar (there is no Dock icon); press Cmd+Shift+V to open the paste window.
+4. To paste right into the window you were in, Clipwire needs the **Accessibility** permission. On the
+   first paste it explains how to give it and opens the right page of System Settings; until then the
+   chosen entry is just put on the clipboard. Updates keep the permission: every version is signed
+   with the same certificate.
 
 **Without a server.** History and the paste window work on a single computer. You can connect
 a server at any time: the last 50 entries of the local history go to the group, and the group's
@@ -78,7 +95,7 @@ The invitation code contains the group's encryption key. Share it only with your
 
 ## Paste window
 
-Press Ctrl+Shift+V (configurable). The window opens next to the mouse cursor.
+Press Ctrl+Shift+V on Windows or Cmd+Shift+V on macOS (configurable). The window opens next to the mouse cursor.
 
 | Keys | Action |
 |---|---|
@@ -178,7 +195,7 @@ One copy takes up to 500 files with a total size not above the upload threshold 
 threshold is 0). If it is bigger, or the source does not respond for 30 seconds, the copy is
 skipped. If something else was copied while an attachment was still being read, the attachment
 appears in the history but does not go to the clipboard or to other devices. Saved files are
-marked as downloaded from the internet, so Windows and Office warn before opening them. They stay
+marked as downloaded from the internet, so Windows and Office (on macOS, Gatekeeper) warn before opening them. They stay
 while a history entry refers to them. An image copied in Firefox or Thunderbird stays an image,
 even though the browser also puts a file on the clipboard.
 
@@ -200,7 +217,8 @@ turned off under Privacy.
 Each entry shows where it was copied from: a small icon and the program name ("Notepad",
 "Telegram"). The name comes from the exe's description and the 32×32 icon from the exe itself.
 Search also matches the program name. The name and icon travel with the entry, so the other
-devices of the group see the source too. Detection works on Windows.
+devices of the group see the source too. Detection works on Windows and macOS; on macOS a program
+can also be excluded by its bundle id (`org.keepassxc.keepassxc`).
 
 ## Image editor
 
@@ -269,11 +287,11 @@ Full description: [docs/storage.md](docs/storage.md).
 - Everything is encrypted end to end. The server sees only ciphertext; the key exists only on
   your devices.
 - The local history is stored in SQLite, and every entry is encrypted with a local key protected
-  by DPAPI.
+  by DPAPI on Windows and by a key in the Keychain on macOS. The group key is protected the same way.
 - Content that password managers mark as private is never synced. Programs can also be excluded
   from syncing (password managers are on the list by default).
-- Files downloaded from other devices are marked as coming from the internet, so Windows warns
-  before running them.
+- Files downloaded from other devices are marked as coming from the internet, so Windows (and
+  Gatekeeper on macOS) warns before running them.
 - An item copied on another device more than 10 minutes ago (for example one that arrived late)
   goes to the history only and does not touch the clipboard.
 - Link cards do not execute the page and do not load single-use links (see
@@ -308,7 +326,7 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
 - Language: English, Русский or as in the system.
 - Launch at login: the program starts minimized to the tray.
 - Copy sound: a short click when something new enters the history. Pasting from the history and
-  copying the same thing again are silent. Windows only.
+  copying the same thing again are silent. Windows and macOS.
 - History retention, from a day to forever (pinned entries are kept forever).
 - Device name, invitation code (**Show code**), leaving the group.
 - Paste window size (one slider with a live preview next to it) and the hotkey.
