@@ -825,13 +825,13 @@ fn record(history: &Mutex<History>, entry: Entry) -> bool {
     })
 }
 
-/// Сравнение без учёта регистра и расширения: «keepass», «KeePass.exe» — одно и то же.
+/// Сравнение без учёта регистра и расширения: «keepass», «KeePass.exe» — одно
+/// и то же; на macOS так же «Tabby» и «Tabby.app».
 pub fn is_ignored(list: &[String], exe: &str) -> bool {
     let norm = |s: &str| {
-        s.trim()
-            .trim_end_matches(".exe")
-            .trim_end_matches(".EXE")
-            .to_lowercase()
+        let s = s.trim().to_lowercase();
+        let s = s.strip_suffix(".exe").unwrap_or(&s);
+        s.strip_suffix(".app").unwrap_or(s).to_string()
     };
     let exe = norm(exe);
     list.iter().any(|x| norm(x) == exe)
@@ -1158,5 +1158,11 @@ mod tests {
         assert!(is_ignored(&list, "1Password.exe"));
         assert!(!is_ignored(&list, "KeePassXC.exe"));
         assert!(!is_ignored(&[], "notepad.exe"));
+        // macOS: пакет вписан с расширением, сравнивается с именем программы.
+        let mac = vec!["Tabby.app".to_string(), "com.apple.TextEdit".to_string()];
+        assert!(is_ignored(&mac, "Tabby"));
+        assert!(is_ignored(&mac, "tabby.APP"));
+        assert!(is_ignored(&mac, "com.apple.textedit"));
+        assert!(!is_ignored(&mac, "TextEdit"));
     }
 }
