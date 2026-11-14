@@ -307,6 +307,13 @@ pub fn show_settings(app: &AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // macOS: секреты на диске — под ключом из связки ключей, но только у
+    // приложения из пакета .app с постоянной подписью; `tauri dev` пишет
+    // открыто, иначе связка спрашивала бы разрешение на каждой пересборке.
+    #[cfg(target_os = "macos")]
+    if std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/")) {
+        clipwire_agent::secret::enable_keychain();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {

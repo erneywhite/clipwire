@@ -71,7 +71,7 @@ impl Paths {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).context("не читается state.bin"),
         };
-        let plain = crate::secret::unprotect(&raw)?;
+        let plain = crate::secret::unprotect_file(&self.state(), &raw)?;
         Ok(Some(
             postcard::from_bytes(&plain).context("state.bin повреждён")?,
         ))
