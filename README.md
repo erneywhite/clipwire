@@ -109,8 +109,9 @@ access apps use, and it is the only way Wayland lets an app press a key. Clipwir
 exactly one thing — pressing Ctrl+V right after you pick an entry. It does not see your screen,
 does not read what you type and does nothing in the background. While Clipwire is pasting, GNOME
 shows a remote-control icon in the top bar; it goes away a minute after the last paste. The
-permission is remembered; turn the switch off to revoke it (Clipwire forgets it as well). Terminals
-paste with Ctrl+Shift+V, so there the entry is only put on the clipboard. The app's own shortcut may not
+permission is remembered; turn the switch off to revoke it (Clipwire forgets it as well). On Wayland
+Clipwire can't tell which window is active, so it always presses Ctrl+V; terminals paste with
+Ctrl+Shift+V, so there press it yourself (the entry is already on the clipboard). The app's own shortcut may not
 reach other apps' windows there: assign a system shortcut (GNOME: Settings → Keyboard → Keyboard
 Shortcuts → Custom) to the command `clipwire --popup`.
 
