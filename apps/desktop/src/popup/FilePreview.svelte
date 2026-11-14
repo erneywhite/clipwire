@@ -10,6 +10,7 @@
   import { convertFileSrc } from '@tauri-apps/api/core'
   import { api, type FileInfo, type FilePreview } from '../lib/api'
   import { bytesLabel } from '../lib/format'
+  import { t } from '../lib/i18n'
   import { canDownload, entryProgress, isDirect, isHere, progressLabel, type TransferMap } from '../lib/transfer'
 
   let {
@@ -85,11 +86,11 @@
     <span class="name">{file.name}</span>
     {#if canDownload(file)}
       {#if isDirect(file)}
-        <span>{file.is_dir ? 'Папка · ' : ''}напрямую с устройства «{device}» · {bytesLabel(file.size)}</span>
+        <span>{file.is_dir ? t('Папка · напрямую с устройства «{device}» · {size}', { device, size: bytesLabel(file.size) }) : t('напрямую с устройства «{device}» · {size}', { device, size: bytesLabel(file.size) })}</span>
       {:else if file.remote}
-        <span>{file.is_dir ? 'Папка' : 'Файл'} на устройстве «{device}» · {bytesLabel(file.size)}</span>
+        <span>{file.is_dir ? t('Папка на устройстве «{device}» · {size}', { device, size: bytesLabel(file.size) }) : t('Файл на устройстве «{device}» · {size}', { device, size: bytesLabel(file.size) })}</span>
       {:else}
-        <span>Файла нет на месте, копия есть на сервере · {bytesLabel(file.size)}</span>
+        <span>{t('Файла нет на месте, копия есть на сервере · {size}', { size: bytesLabel(file.size) })}</span>
       {/if}
       {#if progress}
         <span class="bar" class:failed={!!progress.error} aria-hidden="true">
@@ -98,28 +99,28 @@
         <span class="state" class:failed={!!progress.error} role="status">{progressLabel(progress)}</span>
       {/if}
       <button class="get" disabled={downloading} onclick={() => ondownload?.()}>
-        {downloading ? 'Скачивается…' : progress?.error ? 'Скачать ещё раз' : 'Скачать'}
+        {downloading ? t('Скачивается…') : progress?.error ? t('Скачать ещё раз') : t('Скачать')}
       </button>
     {:else}
-      <span>{file.is_dir ? 'Папка' : bytesLabel(file.size)} · есть только на устройстве «{device}»</span>
+      <span>{file.is_dir ? t('Папка') : bytesLabel(file.size)} · {t('есть только на устройстве «{device}»', { device })}</span>
     {/if}
   </div>
 {:else if !here}
-  <div class="box muted">{file.is_dir ? 'Папки' : 'Файла'} нет на месте: {file.is_dir ? 'её' : 'его'} переместили или удалили.</div>
+  <div class="box muted">{file.is_dir ? t('Папки нет на месте: её переместили или удалили.') : t('Файла нет на месте: его переместили или удалили.')}</div>
 {:else if file.is_dir}
   <div class="box muted">
     <svg class="folder" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" /></svg>
     <span class="name">{file.name}</span>
-    <span>Папка{file.size > 0 ? ` · ${bytesLabel(file.size)}` : ''}</span>
+    <span>{t('Папка')}{file.size > 0 ? ` · ${bytesLabel(file.size)}` : ''}</span>
     <span class="path">{path}</span>
   </div>
 {:else if failed}
   <div class="box muted">{failed}</div>
 {:else if !info}
-  <div class="box muted">Открываю…</div>
+  <div class="box muted">{t('Открываю…')}</div>
 {:else if info.kind === 'text'}
   <pre class="box text">{info.text}{#if info.truncated}<span class="cut">
-… показано начало, весь файл — {bytesLabel(file.size)}</span>{/if}</pre>
+{t('… показано начало, весь файл — {size}', { size: bytesLabel(file.size) })}</span>{/if}</pre>
 {:else if info.kind === 'pdf'}
   <iframe class="box pdf" src={src} title={file.name}></iframe>
 {:else if info.kind === 'video' && !mediaError}
@@ -133,9 +134,9 @@
 {:else}
   <div class="box muted">
     {#if mediaError}
-      Этот формат встроенный плеер не воспроизводит. Откройте файл в своей программе через «Показать в папке».
+      {t('Этот формат встроенный плеер не воспроизводит. Откройте файл в своей программе через «Показать в папке».')}
     {:else}
-      Для этого типа файла предпросмотра нет.
+      {t('Для этого типа файла предпросмотра нет.')}
     {/if}
     <span class="path">{path}</span>
   </div>

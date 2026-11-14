@@ -3,6 +3,7 @@
   // чтобы превью выглядело ровно как настоящее окно.
   import type { Entry } from './api'
   import AppTag from './AppTag.svelte'
+  import { t } from './i18n'
   import { ago, bytesLabel, filesLabel, filesMeta, isUrl, looksLikeCode, sizeLabel } from './format'
   import { allUploaded, entryProgress, isDirect, isGone, progressLabel, type TransferMap } from './transfer'
 
@@ -46,7 +47,7 @@
   // Файл, которого нет здесь, но который есть на сервере, не «пропал»: его можно
   // скачать. Пропал только свой файл без копии на сервере.
   const gone = $derived(item.files.some(isGone))
-  const device = $derived(item.local ? 'Это устройство' : item.device_name || 'Другое устройство')
+  const device = $derived(item.local ? t('Это устройство') : item.device_name || t('Другое устройство'))
   // Мета после устройства и приложения-источника (его иконка — отдельным элементом).
   const meta = $derived(
     [
@@ -59,9 +60,9 @@
       ...(item.rich ? [item.rich] : []),
       ...(progress ? [progressLabel(progress)] : []),
       // По журналу загрузок (переживает перезапуск) и по событиям этого запуска.
-      ...(!progress && kind === 'files' && allUploaded(item.files, transfers) ? ['↑ на сервере'] : []),
+      ...(!progress && kind === 'files' && allUploaded(item.files, transfers) ? [t('↑ на сервере')] : []),
       // Файл больше порога ждёт на источнике: его скачают, только пока оно в сети.
-      ...(!progress && kind === 'files' && item.files.some(isDirect) ? [`напрямую с устройства «${device}»`] : []),
+      ...(!progress && kind === 'files' && item.files.some(isDirect) ? [t('напрямую с устройства «{device}»', { device })] : []),
     ].join(' · '),
   )
 </script>
@@ -114,12 +115,12 @@
         <img
           class="thumb"
           src={item.thumb}
-          alt="Картинка {item.width}×{item.height}"
+          alt={t('Картинка {w}×{h}', { w: item.width, h: item.height })}
           draggable="false"
           style:--ratio={item.width && item.height ? item.width / item.height : 16 / 9}
         />
       {:else}
-        <span class="thumb empty">Картинка</span>
+        <span class="thumb empty">{t('Картинка')}</span>
       {/if}
     {:else}
       <span class="text" class:mono={kind === 'code'}>{item.text}</span>
@@ -147,8 +148,8 @@
     {#if onremove}
       <button
         class="pin remove"
-        title="Удалить из истории (Delete)"
-        aria-label="Удалить из истории"
+        title={t('Удалить из истории (Delete)')}
+        aria-label={t('Удалить из истории')}
         onclick={(e) => {
           e.stopPropagation()
           onremove?.()
@@ -164,8 +165,8 @@
       <button
         class="pin"
         class:on={item.pinned}
-        title={item.pinned ? 'Открепить (Ctrl+P)' : 'Закрепить (Ctrl+P)'}
-        aria-label={item.pinned ? 'Открепить' : 'Закрепить'}
+        title={item.pinned ? t('Открепить (Ctrl+P)') : t('Закрепить (Ctrl+P)')}
+        aria-label={item.pinned ? t('Открепить') : t('Закрепить')}
         aria-pressed={item.pinned}
         onclick={(e) => {
           e.stopPropagation()

@@ -2,6 +2,7 @@
   // Карточка ссылки в предпросмотре: заголовок, описание и картинка из og-тегов.
   // Грузит Rust-часть (страница не исполняется), картинка приходит data URL.
   import { api, type LinkCard } from '../lib/api'
+  import { t } from '../lib/i18n'
 
   let { url }: { url: string } = $props()
 
@@ -27,7 +28,7 @@
   {#if !card}
     <div class="shot skeleton"></div>
     <p class="site">{host}</p>
-    <p class="muted">Загружаю карточку…</p>
+    <p class="muted">{t('Загружаю карточку…')}</p>
   {:else if card.status === 'ok'}
     {#if card.image}
       <img class="shot" src={card.image} alt="" draggable="false" />
@@ -39,12 +40,11 @@
     <p class="site">{card.site}</p>
     <p class="muted">
       {#if card.status === 'one_time'}
-        Похоже на одноразовую ссылку: вход, сброс пароля или подтверждение. Карточку не загружаю,
-        чтобы переход не сжёг её.
+        {t('Похоже на одноразовую ссылку: вход, сброс пароля или подтверждение. Карточку не загружаю, чтобы переход не сжёг её.')}
       {:else if card.status === 'off'}
-        Карточки ссылок выключены в настройках, в разделе «Приватность».
+        {t('Карточки ссылок выключены в настройках, в разделе «Приватность».')}
       {:else}
-        Карточка не загрузилась: {card.error}
+        {t('Карточка не загрузилась: {error}', { error: card.error ?? '' })}
       {/if}
     </p>
   {/if}
