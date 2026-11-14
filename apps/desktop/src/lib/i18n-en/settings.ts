@@ -158,7 +158,7 @@ const en: Record<string, string> = {
   "↵ вставить": "↵ paste",
   "␣ просмотр": "␣ preview",
   "Ctrl P закрепить": "Ctrl P pin",
-  "На Wayland программам не дают нажимать клавиши в чужих окнах: окно вставки кладёт элемент в буфер, вставьте его сами.": "On Wayland apps can't press keys in other windows: the paste window puts the item on the clipboard, and you paste it yourself.",
+  "На Wayland для этого система один раз спросит разрешение на управление клавиатурой. Clipwire только нажимает Ctrl+V после выбора элемента. Без разрешения элемент попадает в буфер, вставляете сами.": "On Wayland the system will ask once for permission to control the keyboard. Clipwire only presses Ctrl+V after you pick an item. Without it the item goes to the clipboard and you paste it yourself.",
   "На Wayland сочетание может не сработать в окнах других программ. Назначьте его в настройках системы («Клавиатура» → «Комбинации клавиш» → своя) на команду {cmd}.": "On Wayland the shortcut may not work in other apps' windows. Assign it in the system settings (Keyboard → Keyboard Shortcuts → Custom) to the command {cmd}.",
 }
 

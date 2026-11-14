@@ -43,6 +43,10 @@ struct Base {
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod portal;
+#[cfg(target_os = "linux")]
+pub use portal::Portal;
 
 /// Может ли окно вставки само вставить в прежнее окно. Нет — на Wayland:
 /// там элемент только кладётся в буфер.
@@ -452,6 +456,18 @@ pub async fn return_and_paste(app: &AppHandle, label: &str, paste: bool) {
             .prev_x11
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Wayland: через портал, если человек его включил.
+        let portal = paste
+            && !linux::can_paste()
+            && app
+                .state::<AppState>()
+                .settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .portal_paste;
+        if portal && let Err(e) = app.state::<Portal>().paste().await {
+            tracing::warn!("вставка через портал не удалась: {e}");
+        }
         if let (true, Some(prev)) = (paste && linux::can_paste(), prev) {
             // Если сочетание окна вставки совпадает с нажатием вставки (в
             // терминалах это Ctrl+Shift+V), захват отдал бы нажатие нам. На время

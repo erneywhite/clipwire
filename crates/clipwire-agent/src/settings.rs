@@ -86,6 +86,9 @@ pub struct Settings {
     pub delete_everywhere: bool,
     /// Язык интерфейса: `system`, `ru` или `en`.
     pub language: String,
+    /// Wayland: вставлять через портал удалённого управления (система один
+    /// раз спрашивает разрешение). Выключено — окно вставки только кладёт в буфер.
+    pub portal_paste: bool,
 }
 
 impl Default for Settings {
@@ -108,6 +111,7 @@ impl Default for Settings {
             auto_update: true,
             delete_everywhere: false,
             language: "system".into(),
+            portal_paste: false,
         }
     }
 }

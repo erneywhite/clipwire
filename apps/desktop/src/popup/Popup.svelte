@@ -47,7 +47,9 @@
   // macOS: нет разрешения «Универсальный доступ», вставить сам не могу.
   let needAccess = $state(false)
   // Wayland: окно не вставляет само, а только кладёт в буфер.
-  let canPaste = $state(true)
+  let canX11Paste = $state(true)
+  let portalPaste = $state(false)
+  const canPaste = $derived(canX11Paste || portalPaste)
   let input: HTMLInputElement | undefined = $state()
   let listEl: HTMLUListElement | undefined = $state()
 
@@ -432,6 +434,7 @@
   }
 
   function applySettings(s: Settings) {
+    portalPaste = s.portal_paste && s.paste_into_active
     applyTheme(s.theme, s.mode)
     // При открытом предпросмотре окно шире, а список сохраняет свою ширину.
     document.documentElement.style.setProperty('--popup-w', `${s.popup_width}px`)
@@ -439,7 +442,7 @@
 
   onMount(() => {
     api.settings().then(applySettings)
-    api.deviceInfo().then((i) => (canPaste = i.can_paste_into_active)).catch(() => {})
+    api.deviceInfo().then((i) => (canX11Paste = i.can_paste_into_active)).catch(() => {})
     load()
     const unlisten = [
       listen<Transfer>('clipwire://transfer', (e) => onTransfer(e.payload)),

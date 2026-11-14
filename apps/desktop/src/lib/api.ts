@@ -30,6 +30,8 @@ export interface Settings {
   delete_everywhere: boolean
   /** Язык интерфейса: как в системе, русский или английский. */
   language: 'system' | 'ru' | 'en'
+  /** Wayland: вставлять через портал удалённого управления. */
+  portal_paste: boolean
 }
 
 export interface DeviceInfo {

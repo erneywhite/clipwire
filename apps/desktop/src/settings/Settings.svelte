@@ -489,15 +489,22 @@
 
         <h2>{t('Вставка')}</h2>
         <div class="card">
-          <Toggle
-            label={t('Сразу вставлять в активное окно')}
-            hint={info && !info.can_paste_into_active
-              ? t('На Wayland программам не дают нажимать клавиши в чужих окнах: окно вставки кладёт элемент в буфер, вставьте его сами.')
-              : t('Двойной клик или Enter вставляет туда, где стоит курсор. Иначе элемент только попадает в буфер.')}
-            disabled={!!info && !info.can_paste_into_active}
-            checked={s.paste_into_active && info?.can_paste_into_active !== false}
-            onchange={(v) => save({ paste_into_active: v })}
-          />
+          {#if info && !info.can_paste_into_active}
+            <!-- Wayland: сам вставлять можно только с разрешения системы (портал). -->
+            <Toggle
+              label={t('Сразу вставлять в активное окно')}
+              hint={t('На Wayland для этого система один раз спросит разрешение на управление клавиатурой. Clipwire только нажимает Ctrl+V после выбора элемента. Без разрешения элемент попадает в буфер, вставляете сами.')}
+              checked={s.portal_paste && s.paste_into_active}
+              onchange={(v) => save(v ? { portal_paste: true, paste_into_active: true } : { portal_paste: false })}
+            />
+          {:else}
+            <Toggle
+              label={t('Сразу вставлять в активное окно')}
+              hint={t('Двойной клик или Enter вставляет туда, где стоит курсор. Иначе элемент только попадает в буфер.')}
+              checked={s.paste_into_active}
+              onchange={(v) => save({ paste_into_active: v })}
+            />
+          {/if}
         </div>
 
         <h2>{t('Хранить историю')}</h2>

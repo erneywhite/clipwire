@@ -418,6 +418,11 @@ pub fn run() {
             commands::update_ready,
         ])
         .setup(|app| {
+            #[cfg(target_os = "linux")]
+            {
+                let dir = app.state::<AppState>().paths.dir.clone();
+                app.manage(popup::Portal::new(&dir));
+            }
             // Утилита строки меню: без иконки в Dock и в Cmd+Tab. В собранном
             // пакете то же задаёт LSUIElement (Info.plist), здесь — для
             // `tauri dev` и чтобы не мелькала иконка при запуске.

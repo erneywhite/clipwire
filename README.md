@@ -100,7 +100,17 @@ Ctrl+Shift+V is how terminals paste). The window opens next to the mouse cursor.
 
 On Linux in an Xorg session it works the same way; in terminals it pastes with Ctrl+Shift+V. On Wayland apps can't see the mouse cursor or
 press keys in other windows, so the window opens in the middle of the screen and Enter only puts
-the entry on the clipboard; you paste it with Ctrl+V yourself. The app's own shortcut may not
+the entry on the clipboard; you paste it with Ctrl+V yourself.
+
+**Pasting by itself on Wayland.** Turn on **Paste into the active window** under Paste. The
+system then asks once for permission to *control the keyboard* (GNOME calls it "remote desktop" or
+"remote control"). It sounds scarier than it is: this is the standard desktop portal that remote
+access apps use, and it is the only way Wayland lets an app press a key. Clipwire uses it for
+exactly one thing — pressing Ctrl+V right after you pick an entry. It does not see your screen,
+does not read what you type and does nothing in the background. While Clipwire is pasting, GNOME
+shows a remote-control icon in the top bar; it goes away a minute after the last paste. The
+permission is remembered; turn the switch off to revoke it (Clipwire forgets it as well). Terminals
+paste with Ctrl+Shift+V, so there the entry is only put on the clipboard. The app's own shortcut may not
 reach other apps' windows there: assign a system shortcut (GNOME: Settings → Keyboard → Keyboard
 Shortcuts → Custom) to the command `clipwire --popup`.
 

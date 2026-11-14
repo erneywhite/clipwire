@@ -50,6 +50,8 @@ x11rb = { version = "0.13.2", features = ["xtest"] }
 # Те же версии, что у Tauri: номер X-окна, чтобы попросить для него фокус.
 gtk = "0.18"
 gdkx11 = "0.18"
+# Вставка на Wayland через портал удалённого управления (по разрешению человека).
+ashpd = { version = "0.14", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
