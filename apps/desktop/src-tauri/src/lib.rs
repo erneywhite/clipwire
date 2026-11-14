@@ -433,6 +433,7 @@ pub fn run() {
             {
                 let dir = app.state::<AppState>().paths.dir.clone();
                 app.manage(popup::Portal::new(&dir));
+                popup::setup_layer(app.handle());
             }
             // Утилита строки меню: без иконки в Dock и в Cmd+Tab. В собранном
             // пакете то же задаёт LSUIElement (Info.plist), здесь — для

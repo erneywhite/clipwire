@@ -124,6 +124,10 @@ pub static EN: &[(&str, &str)] = &[
     ),
     ("картинка больше 2 МБ", "the image is larger than 2 MB"),
     (
+        "Открыть окно вставки Clipwire",
+        "Open the Clipwire paste window",
+    ),
+    (
         "Система не дала разрешение. Окно вставки будет только класть элемент в буфер.",
         "The system didn't grant permission. The paste window will only put the item on the clipboard.",
     ),

@@ -132,16 +132,32 @@ sudo apt-get install -y build-essential curl git pkg-config libssl-dev \
   `org.gnome.settings-daemon.plugins.media-keys` → `custom-keybindings` (команда
   `<путь программы> --popup`, у AppImage — `$APPIMAGE`). Сочетание, заведённое руками
   (команда с `clipwire` и `--popup`), правится, а не дублируется. Проверено на живом профиле и
-  тестом `gnome_live` в отдельном профиле dconf. Для KDE и других — портал GlobalShortcuts,
-  пока не сделан: там сочетание назначается руками.
+  тестом `gnome_live` в отдельном профиле dconf.
+- **KDE Plasma:** сочетание регистрируется в службе сочетаний KDE (KGlobalAccel по D-Bus,
+  `popup/kde_shortcut.rs`): компонент «Clipwire», действие `popup`, флаги
+  `SetPresent | NoAutoloading`, нажатие приходит сигналом `globalShortcutPressed`. Работает в
+  Plasma 5 и 6 без диалогов. Портал глобальных сочетаний в Plasma 5.27 сломан: служба портала
+  1.18 не передаёт сочетания из `CreateSession`, а бэкенд KDE 5.27 ждёт их только там — ответ
+  `BindShortcuts` пустой (проверено скриптом). Если сочетание уже занято (например, своим на
+  `clipwire --popup`), KDE его не отдаёт — в логе предупреждение.
+- **Hyprland, GNOME 48+ и другие с порталом GlobalShortcuts** (`popup/global_shortcuts.rs`,
+  ashpd): `BindShortcuts` с предпочтительным сочетанием в записи XDG (`CTRL+ALT+v`), нажатия —
+  сигнал `Activated`. Проверить негде: в Ubuntu 24.04 нет ни Hyprland, ни Plasma 6.
+- **Sway** ничего из этого не умеет — сочетание в его конфиге (`bindsym … exec clipwire --popup`).
 - **Место окна на Wayland.** Где курсор, программе на Wayland не видно, а GNOME ещё и не даёт
   нативному окну выбрать место (layer-shell в mutter нет). Поэтому в GNOME на Wayland Clipwire
   выставляет себе `GDK_BACKEND=x11` до запуска GTK (`popup::linux::use_xwayland`, отключается
   `CLIPWIRE_NATIVE_WAYLAND=1`), и окно вставки встаёт справа сверху главного монитора, под
   значком в трее (`Placement::TopRight`). Фокус берётся через `_NET_ACTIVE_WINDOW`, как на X11.
   Минус: при дробном масштабе (125 %, 150 %) окна XWayland в GNOME 46 чуть размыты. В остальных
-  Wayland-оболочках окно по центру (`Placement::Center`); для KDE/Sway/Hyprland можно сделать
-  layer-shell — позже.
+  Wayland-оболочках с layer-shell (KDE, Sway, Hyprland, labwc…) окно вставки — слой
+  (`popup/layer.rs`, `Placement::Layer`): `libgtk-layer-shell` подгружается через `dlopen`,
+  окно переводится в слой до первого показа (если GTK уже реализовал окно — сначала
+  `unrealize`), крепится к углу со стороны панели и справа (панель KDE — по `location` в
+  `plasma-org.kde.plasma.desktop-appletsrc`, у остальных — сверху), слой `OVERLAY`,
+  клавиатура монопольная (протокол v3 в KWin 5.27 другого не умеет: клик мимо окно не
+  закрывает, закрывают Esc и выбор). Нет библиотеки или протокола — по центру
+  (`Placement::Center`). В `.deb` библиотека в Recommends, в AppImage — внутри образа.
 - **`clipwire --popup`.** Второй запуск с этим ключом открывает окно вставки у уже запущенной
   копии (плагин single-instance, только в релизной сборке); первый запуск с ним — тоже.
   На Wayland глобальная клавиша программы работает только над окнами XWayland, поэтому в

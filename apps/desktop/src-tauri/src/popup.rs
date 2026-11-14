@@ -42,13 +42,28 @@ struct Base {
 }
 
 #[cfg(target_os = "linux")]
+pub mod global_shortcuts;
+#[cfg(target_os = "linux")]
 pub mod gnome_shortcut;
+#[cfg(target_os = "linux")]
+pub mod kde_shortcut;
+#[cfg(target_os = "linux")]
+mod layer;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod portal;
 #[cfg(target_os = "linux")]
 pub use linux::use_xwayland;
+
+/// Linux: окно вставки — слой у панели, если оболочка умеет layer-shell.
+/// В главном потоке, до первого показа.
+#[cfg(target_os = "linux")]
+pub fn setup_layer(app: &AppHandle) {
+    if let Some(w) = window(app) {
+        layer::setup(&w, GAP as i32);
+    }
+}
 #[cfg(target_os = "linux")]
 pub use portal::Portal;
 
@@ -74,7 +89,10 @@ enum Placement {
     /// видно, а окна Clipwire идут через XWayland (см. `linux::use_xwayland`),
     /// где место окна задаёт программа.
     TopRight,
-    /// По центру: остальные Wayland-оболочки, место выбирает сама оболочка.
+    /// В углу со стороны панели (слой layer-shell): KDE, Sway, Hyprland…
+    /// Место задают края экрана, а не координаты (см. `layer`).
+    Layer,
+    /// По центру: Wayland без layer-shell, место выбирает сама оболочка.
     Center,
 }
 
@@ -85,6 +103,8 @@ fn placement() -> Placement {
             Placement::Cursor
         } else if linux::on_xwayland() {
             Placement::TopRight
+        } else if layer::active() {
+            Placement::Layer
         } else {
             Placement::Center
         }
@@ -113,6 +133,9 @@ pub fn register_hotkey(app: &AppHandle) -> Result<(), String> {
     {
         let accel = hotkey.clone();
         std::thread::spawn(move || gnome_shortcut::sync(&accel));
+        // KDE — через свою службу сочетаний, Hyprland и другие — через портал.
+        kde_shortcut::sync(app, &hotkey);
+        global_shortcuts::sync(app, &hotkey);
     }
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
@@ -185,7 +208,7 @@ pub fn show(app: &AppHandle) {
         .cursor_position()
         .unwrap_or(PhysicalPosition::new(0.0, 0.0));
     // Справа сверху — на главном мониторе: там верхняя панель со значком.
-    let monitor = if place == Placement::TopRight {
+    let monitor = if matches!(place, Placement::TopRight | Placement::Layer) {
         app.primary_monitor().ok().flatten()
     } else {
         app.monitor_from_point(cursor.x, cursor.y).ok().flatten()
@@ -208,7 +231,9 @@ pub fn show(app: &AppHandle) {
     // Справа сверху и по центру — та же формула от нужной точки.
     let (cx, cy) = match place {
         Placement::Cursor => (cursor.x as i32, cursor.y as i32),
-        Placement::TopRight => (ax + aw, ay),
+        // У слоя координаты не нужны, но расчёт тот же: предпросмотр
+        // раскрывается влево, от края экрана.
+        Placement::TopRight | Placement::Layer => (ax + aw, ay),
         Placement::Center => (ax + (aw - w_px) / 2 - gap, ay + (ah - h_px) / 2 - gap),
     };
     let mut x = if cx + gap + w_px <= ax + aw {
@@ -234,11 +259,16 @@ pub fn show(app: &AppHandle) {
         area_w: aw as u32,
     });
     let _ = w.set_size(PhysicalSize::new(w_px as u32, h_px as u32));
-    if place == Placement::Center {
+    match place {
         // Wayland: окно ставит оболочка, просьба лишь подсказка.
-        let _ = w.center();
-    } else {
-        let _ = w.set_position(PhysicalPosition::new(x, y));
+        Placement::Center => {
+            let _ = w.center();
+        }
+        // Слой держится за края экрана.
+        Placement::Layer => {}
+        Placement::Cursor | Placement::TopRight => {
+            let _ = w.set_position(PhysicalPosition::new(x, y));
+        }
     }
     let protect = app
         .state::<AppState>()
@@ -250,7 +280,7 @@ pub fn show(app: &AppHandle) {
     let _ = w.show();
     let _ = w.set_focus();
     #[cfg(target_os = "linux")]
-    if place != Placement::Center {
+    if matches!(place, Placement::Cursor | Placement::TopRight) {
         let win = w.clone();
         let _ = w.run_on_main_thread(move || {
             if let Some(xid) = linux::xid(&win) {

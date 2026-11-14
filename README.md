@@ -94,11 +94,11 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
 3. **Tray icon in GNOME.** Ubuntu shows tray icons out of the box. On other GNOME distributions
    (Fedora, Debian) install the [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/)
    extension, otherwise the icon is not shown (Clipwire still works: open it from the menu).
-4. **Wayland.** The paste window opens under the tray icon on GNOME and in the middle of the
-   screen elsewhere. To have it paste by itself,
+4. **Wayland.** The paste window opens next to the tray: under it on GNOME, in the panel corner
+   on KDE Plasma, Sway and Hyprland. To have it paste by itself,
    turn on **Paste into the active window**; the system asks once for permission, see
-   [Paste window](#paste-window). On GNOME the shortcut is added to the system shortcuts
-   automatically; on other Wayland desktops bind `clipwire --popup` to a key yourself.
+   [Paste window](#paste-window). The shortcut is registered with the desktop by itself on GNOME,
+   KDE Plasma and Hyprland; on Sway bind `clipwire --popup` to a key yourself.
 5. Keys are kept in the system password store (GNOME Keyring, KWallet).
 
 **Without a server.** History and the paste window work on a single computer. You can connect
@@ -121,8 +121,10 @@ Ctrl+Shift+V is how terminals paste). The window opens next to the mouse cursor.
 On Linux in an Xorg session it works the same way; in terminals it pastes with Ctrl+Shift+V. On Wayland apps can't see the mouse cursor or
 press keys in other windows. On GNOME the window opens in the top right corner, under the tray icon
 (Clipwire runs its windows through XWayland there, so it can choose where they go; set
-`CLIPWIRE_NATIVE_WAYLAND=1` to keep native Wayland windows). On other Wayland desktops it opens in
-the middle of the screen. Enter only puts the entry on the clipboard; you paste it with Ctrl+V
+`CLIPWIRE_NATIVE_WAYLAND=1` to keep native Wayland windows). On KDE Plasma, Sway, Hyprland and other
+desktops with layer-shell it opens in the corner next to the panel, on the tray side (this needs
+`libgtk-layer-shell0`, installed with the `.deb`); without layer-shell it opens in the middle of the
+screen. Enter only puts the entry on the clipboard; you paste it with Ctrl+V
 yourself.
 
 **Pasting by itself on Wayland.** Turn on **Paste into the active window** under Paste. The
@@ -135,10 +137,11 @@ shows a remote-control icon in the top bar; it goes away a minute after the last
 permission is remembered; turn the switch off to revoke it (Clipwire forgets it as well). On Wayland
 Clipwire can't tell which window is active, so it always presses Ctrl+V; terminals paste with
 Ctrl+Shift+V, so there press it yourself (the entry is already on the clipboard). An app's own shortcut doesn't reach
-other apps' windows there, so on GNOME Clipwire adds its shortcut to the system ones (Settings →
-Keyboard → Keyboard Shortcuts → Custom → Clipwire) and keeps it in sync with its settings. On other
-Wayland desktops (KDE Plasma, Sway, Hyprland…) assign a system shortcut to the command
-`clipwire --popup` yourself.
+other apps' windows there, so Clipwire registers it with the desktop and keeps it in sync with its
+settings: on GNOME among the custom keyboard shortcuts, on KDE Plasma in the KDE shortcut service
+(System Settings → Shortcuts → Clipwire), on Hyprland and other desktops with the global shortcuts
+portal (the desktop may ask to confirm once). On Sway, which has none of these, bind
+`clipwire --popup` to a key in its config.
 
 | Keys | Action |
 |---|---|

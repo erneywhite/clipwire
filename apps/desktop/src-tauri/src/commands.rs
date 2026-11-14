@@ -531,7 +531,9 @@ pub fn device_info(app: AppHandle) -> DeviceInfo {
         knows_source_app: clipwire_agent::clipboard::knows_source_app(),
         can_paste_into_active: crate::popup::can_paste_into_active(),
         #[cfg(target_os = "linux")]
-        system_shortcut: crate::popup::gnome_shortcut::applies(),
+        system_shortcut: crate::popup::gnome_shortcut::applies()
+            || crate::popup::kde_shortcut::bound()
+            || crate::popup::global_shortcuts::bound(),
         #[cfg(not(target_os = "linux"))]
         system_shortcut: false,
     }
