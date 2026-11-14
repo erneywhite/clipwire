@@ -5,6 +5,8 @@ use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Wry};
 
+use clipwire_agent::i18n::{tr, trf};
+
 use crate::{AppState, StatusDto, publish_status, show_settings};
 
 const TRAY_ID: &str = "main";
@@ -13,7 +15,11 @@ const TRAY_ID: &str = "main";
 pub struct TrayItems {
     status: MenuItem<Wry>,
     pause: CheckMenuItem<Wry>,
+    settings: MenuItem<Wry>,
     update: MenuItem<Wry>,
+    quit: MenuItem<Wry>,
+    /// Найденная версия обновления: текст пункта при смене языка.
+    update_version: std::sync::Mutex<Option<String>>,
 }
 
 /// Состояние провода на иконке: какой PNG брать.
@@ -164,13 +170,13 @@ pub fn spawn_animator(app: AppHandle) {
 
 fn describe(st: &StatusDto) -> String {
     match st {
-        StatusDto::Unconfigured => "Синхронизация не запустилась".into(),
-        StatusDto::Local => "Только это устройство".into(),
-        StatusDto::Connecting => "Подключение…".into(),
-        StatusDto::Online => "Синхронизация включена".into(),
-        StatusDto::Offline(e) => format!("Нет связи: {}", short(e)),
-        StatusDto::Paused => "На паузе".into(),
-        StatusDto::Excluded => "Сервер исключил устройство из группы".into(),
+        StatusDto::Unconfigured => tr("Синхронизация не запустилась").into(),
+        StatusDto::Local => tr("Только это устройство").into(),
+        StatusDto::Connecting => tr("Подключение…").into(),
+        StatusDto::Online => tr("Синхронизация включена").into(),
+        StatusDto::Offline(e) => trf("Нет связи: {reason}", &[("reason", &short(e))]),
+        StatusDto::Paused => tr("На паузе").into(),
+        StatusDto::Excluded => tr("Сервер исключил устройство из группы").into(),
     }
 }
 
@@ -183,12 +189,12 @@ fn short(s: &str) -> String {
 }
 
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
-    let status = MenuItem::with_id(app, "status", "Подключение…", false, None::<&str>)?;
-    let pause = CheckMenuItem::with_id(app, "pause", "Пауза", true, false, None::<&str>)?;
-    let settings = MenuItem::with_id(app, "settings", "Настройки", true, None::<&str>)?;
+    let status = MenuItem::with_id(app, "status", tr("Подключение…"), false, None::<&str>)?;
+    let pause = CheckMenuItem::with_id(app, "pause", tr("Пауза"), true, false, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", tr("Настройки"), true, None::<&str>)?;
     // Появляется (становится активным), когда фоновая проверка нашла обновление.
-    let update = MenuItem::with_id(app, "update", "Обновлений нет", false, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
+    let update = MenuItem::with_id(app, "update", tr("Обновлений нет"), false, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", tr("Выход"), true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
@@ -247,7 +253,10 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     app.manage(TrayItems {
         status,
         pause,
+        settings,
         update,
+        quit,
+        update_version: std::sync::Mutex::new(None),
     });
     Ok(())
 }
@@ -268,10 +277,35 @@ pub fn show_status(app: &AppHandle, st: &StatusDto) {
     render(app);
 }
 
+/// Язык сменили: переписать пункты меню и подсказку.
+pub fn retranslate(app: &AppHandle) {
+    if let Some(items) = app.try_state::<TrayItems>() {
+        let _ = items.pause.set_text(tr("Пауза"));
+        let _ = items.settings.set_text(tr("Настройки"));
+        let _ = items.quit.set_text(tr("Выход"));
+        let version = items
+            .update_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _ = items.update.set_text(match version {
+            Some(v) => trf("Обновить до {version}", &[("version", &v)]),
+            None => tr("Обновлений нет").into(),
+        });
+    }
+    publish_status(app);
+}
+
 pub fn show_update(app: &AppHandle, version: &str) {
     if let Some(items) = app.try_state::<TrayItems>() {
-        let _ = items.update.set_text(format!("Обновить до {version}"));
+        let _ = items
+            .update
+            .set_text(trf("Обновить до {version}", &[("version", &version)]));
         let _ = items.update.set_enabled(true);
+        *items
+            .update_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(version.to_string());
     }
     LOOK.lock().unwrap_or_else(|e| e.into_inner()).update = true;
     render(app);

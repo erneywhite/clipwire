@@ -196,6 +196,7 @@ fn load_state() -> anyhow::Result<AppState> {
         }
     });
     let settings = Settings::load(&paths.dir);
+    clipwire_agent::i18n::set_language(&settings.language);
     let history = History::open(&paths.dir)?;
     Ok(AppState {
         ignored_apps: Arc::new(Mutex::new(settings.ignored_apps.clone())),

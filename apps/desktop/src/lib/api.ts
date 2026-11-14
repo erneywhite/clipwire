@@ -28,6 +28,8 @@ export interface Settings {
   auto_update: boolean
   /** Удаление записи уходит на остальные устройства группы. */
   delete_everywhere: boolean
+  /** Язык интерфейса: как в системе, русский или английский. */
+  language: 'system' | 'ru' | 'en'
 }
 
 export interface DeviceInfo {

@@ -458,6 +458,16 @@
           />
         </div>
 
+        <h2>Язык</h2>
+        <div class="card pad">
+          <!-- Названия языков — на самих языках, их не переводим. -->
+          <div class="segmented" role="radiogroup" aria-label="Язык">
+            {#each [['system', 'Как в системе'], ['ru', 'Русский'], ['en', 'English']] as [id, title] (id)}
+              <button role="radio" aria-checked={s.language === id} class:on={s.language === id} onclick={() => save({ language: id as Settings['language'] })}>{title}</button>
+            {/each}
+          </div>
+        </div>
+
         <h2>Оформление</h2>
         <div class="card pad">
           <div class="themes">

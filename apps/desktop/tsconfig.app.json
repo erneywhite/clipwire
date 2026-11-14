@@ -6,6 +6,8 @@
     "module": "esnext",
     "types": ["svelte", "vite/client"],
     "allowArbitraryExtensions": true,
+    /* Модули из src/lib импортируют друг друга с «.ts»: так их запускают тесты в Node. */
+    "allowImportingTsExtensions": true,
     "noEmit": true,
     /**
      * Typecheck JS in `.svelte` and `.js` files by default.

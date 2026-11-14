@@ -9,6 +9,8 @@ pub mod devices;
 pub mod folder;
 pub mod group_config;
 pub mod history;
+pub mod i18n;
+pub mod i18n_en;
 pub mod image;
 pub mod loopguard;
 pub mod p2p;

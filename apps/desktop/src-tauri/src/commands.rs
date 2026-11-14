@@ -445,6 +445,10 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
         let _ = crate::popup::register_hotkey(&app);
         return Err(e);
     }
+    if old.language != settings.language {
+        clipwire_agent::i18n::set_language(&settings.language);
+        crate::tray::retranslate(&app);
+    }
     if old.hide_from_capture != settings.hide_from_capture {
         crate::apply_capture_protection(&app, settings.hide_from_capture);
     }

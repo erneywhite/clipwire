@@ -83,6 +83,8 @@ pub struct Settings {
     /// Удаление записи уходит на остальные устройства группы. Выключено —
     /// удаляется только здесь.
     pub delete_everywhere: bool,
+    /// Язык интерфейса: `system`, `ru` или `en`.
+    pub language: String,
 }
 
 impl Default for Settings {
@@ -109,6 +111,7 @@ impl Default for Settings {
             file_upload_limit_mb: 100,
             auto_update: true,
             delete_everywhere: false,
+            language: "system".into(),
         }
     }
 }

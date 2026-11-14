@@ -1,5 +1,8 @@
 import { mount } from 'svelte'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { listen } from '@tauri-apps/api/event'
+import { api, type Settings as AppSettings } from './lib/api'
+import { resolveLang, setLang } from './lib/i18n'
 import Settings from './settings/Settings.svelte'
 import Popup from './popup/Popup.svelte'
 import Preview from './settings/Preview.svelte'
@@ -33,6 +36,19 @@ document.addEventListener(
   },
   true,
 )
+
+// Язык выбирается до первого рисования: строки берутся при создании
+// компонентов. Сменили язык в настройках — окно перезагружается.
+let language: AppSettings['language'] = 'system'
+try {
+  language = (await api.settings()).language ?? 'system'
+} catch {
+  // Настройки не прочитались — окно всё равно должно открыться.
+}
+setLang(resolveLang(language, navigator.language))
+listen<AppSettings>('clipwire://settings-changed', (e) => {
+  if ((e.payload.language ?? 'system') !== language) location.reload()
+})
 
 // Одна сборка фронтенда на все окна: что рисовать, решает метка окна.
 const label = getCurrentWindow().label
