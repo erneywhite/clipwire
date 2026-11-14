@@ -1,6 +1,7 @@
 <script lang="ts">
   // Своя полоса заголовка вместо системной: знак, название, свернуть, развернуть,
   // закрыть. Перетаскивание и двойной клик (развернуть) — через data-tauri-drag-region.
+  import { t } from '../lib/i18n'
   import { invoke } from '@tauri-apps/api/core'
   import { getCurrentWindow } from '@tauri-apps/api/window'
 
@@ -31,17 +32,17 @@
     {title}
   </span>
   <div class="controls">
-    <button aria-label="Свернуть" onclick={() => win.minimize()}>
+    <button aria-label={t('Свернуть')} onclick={() => win.minimize()}>
       <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 5h8" /></svg>
     </button>
-    <button aria-label={maximized ? 'Восстановить' : 'Развернуть'} onclick={async () => (maximized = await invoke<boolean>('settings_toggle_maximize'))}>
+    <button aria-label={maximized ? t('Восстановить') : t('Развернуть')} onclick={async () => (maximized = await invoke<boolean>('settings_toggle_maximize'))}>
       {#if maximized}
         <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M3 1h6v6M1 3h6v6H1z" /></svg>
       {:else}
         <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 1h8v8H1z" /></svg>
       {/if}
     </button>
-    <button class="close" aria-label="Закрыть" onclick={() => win.close()}>
+    <button class="close" aria-label={t('Закрыть')} onclick={() => win.close()}>
       <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 1l8 8M9 1l-8 8" /></svg>
     </button>
   </div>
