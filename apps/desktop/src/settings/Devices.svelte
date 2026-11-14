@@ -133,7 +133,7 @@
     <div class="row device">
       <span class="dot" class:on={d.online}></span>
       <div class="who">
-        <span class="name" class:unknown={!d.known}>{deviceTitle(d)}{#if d.me}<span class="me"> · {t('это устройство')}</span>{/if}</span>
+        <span class="name" class:unknown={!d.known}>{deviceTitle(d)}{#if d.me}<span class="me">{' · '}{t('это устройство')}</span>{/if}</span>
         <span class="meta mono">{d.os ?? t('нет карточки')} · {d.fingerprint} · {seenLabel(d, fmt)}</span>
       </div>
       {#if !d.me}
