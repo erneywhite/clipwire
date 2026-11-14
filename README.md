@@ -412,6 +412,13 @@ cargo test --workspace
 cd apps/desktop && npm ci && npx tauri dev
 ```
 
+On macOS raise the open files limit first: the default is 256 per process, and the parallel
+network tests start dozens of iroh endpoints and fail with "Too many open files":
+
+```
+ulimit -n 10240 && cargo test --workspace
+```
+
 A release is built by GitHub Actions on a `vX.Y.Z` tag ([release.yml](.github/workflows/release.yml)):
 the installer, signed update files and `latest.json`. The version comes from the workspace
 `Cargo.toml`.

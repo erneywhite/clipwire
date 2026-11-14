@@ -182,6 +182,30 @@ async fn joined(dev: &Dev, info: &ServerInfo, relay: &str, key: &GroupKey) -> Re
     }
 }
 
+/// Новое соединение и обычный `Join` с повтором при «слишком много
+/// соединений» — та же гонка, что в [`joined`]: место прошлого соединения
+/// устройства сервер освобождает позже, чем клиент видит его конец.
+async fn joined_plain(
+    dev: &Dev,
+    info: &ServerInfo,
+    relay: &str,
+    key: &GroupKey,
+) -> Result<(Client, ServerMsg)> {
+    let started = std::time::Instant::now();
+    loop {
+        let mut c = Client::connect(dev, info, relay).await?;
+        match c.join_plain(key).await? {
+            ServerMsg::Error(e)
+                if e.contains("слишком много соединений") && started.elapsed() < T =>
+            {
+                c.conn.close(0u32.into(), b"retry");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            msg => return Ok((c, msg)),
+        }
+    }
+}
+
 async fn start_server() -> Result<(clipwire_server::Running, String, PathBuf)> {
     start_server_with(Guards::default()).await
 }
@@ -446,8 +470,8 @@ async fn rekey_moves_group_to_new_key() -> Result<()> {
     }
 
     // D включается позже и входит со старым ключом — получает свой пакет.
-    let mut cd = Client::connect(&d, &info, &relay).await?;
-    match cd.join_plain(&old).await? {
+    let (mut cd, msg) = joined_plain(&d, &info, &relay, &old).await?;
+    match msg {
         ServerMsg::Rekeyed { envelope } => {
             assert_eq!(open_rekey(&d.key, &old, &envelope)?.key, new)
         }
@@ -455,13 +479,13 @@ async fn rekey_moves_group_to_new_key() -> Result<()> {
     }
     cd.expect_closed().await?;
     // X со старым ключом — снова только «исключено», ни истории, ни входа.
-    let mut cx = Client::connect(&x, &info, &relay).await?;
-    assert_eq!(cx.join_plain(&old).await?, ServerMsg::Excluded);
+    let (mut cx, msg) = joined_plain(&x, &info, &relay, &old).await?;
+    assert_eq!(msg, ServerMsg::Excluded);
     cx.expect_closed().await?;
     // Сам R пакета для себя не клал: при повторном входе в старую группу
     // он тоже видит «исключено», и повторный Rekey отправить некуда.
-    let mut cr = Client::connect(&r, &info, &relay).await?;
-    assert_eq!(cr.join_plain(&old).await?, ServerMsg::Excluded);
+    let (_cr, msg) = joined_plain(&r, &info, &relay, &old).await?;
+    assert_eq!(msg, ServerMsg::Excluded);
     // Чужой секрет к старой группе по-прежнему отклоняется.
     let mut evil = Client::connect(&stranger, &info, &relay).await?;
     evil.send(&ClientMsg::Join {
@@ -472,8 +496,8 @@ async fn rekey_moves_group_to_new_key() -> Result<()> {
     assert!(matches!(evil.next().await?, ServerMsg::Error(_)));
 
     // Новым ключом в новую группу входят обычным Join; старой истории там нет.
-    let mut bn = Client::connect(&b, &info, &relay).await?;
-    assert_eq!(bn.join_plain(&new).await?, ServerMsg::Joined);
+    let (mut bn, msg) = joined_plain(&b, &info, &relay, &new).await?;
+    assert_eq!(msg, ServerMsg::Joined);
     assert_eq!(bn.next().await?, ServerMsg::HistoryEnd);
     let list = bn.devices().await?;
     assert_eq!(new.open_card(r.id(), &entry(&list, r.id()).card)?.name, "R");
