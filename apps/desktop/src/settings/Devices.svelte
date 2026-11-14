@@ -1,6 +1,7 @@
 <script lang="ts">
   // Устройства группы: список, удаление устройства и смена ключа группы.
   import { onMount } from 'svelte'
+  import { t } from '../lib/i18n'
   import { listen } from '@tauri-apps/api/event'
   import { api, type GroupDevice, type GroupRekeyed, type RekeyResult, type Status, type StorageKind } from '../lib/api'
   import { ago, plural } from '../lib/format'
@@ -108,69 +109,67 @@
   })
 </script>
 
-<h2>Устройства группы</h2>
+<h2>{t('Устройства группы')}</h2>
 <div class="card">
   {#if !loaded}
-    <p class="row hint">Загружаю список…</p>
+    <p class="row hint">{t('Загружаю список…')}</p>
   {:else if list.length === 0}
-    <p class="row hint">{error ? 'Список недоступен, пока нет связи с сервером.' : 'В группе пока нет устройств.'}</p>
+    <p class="row hint">{error ? t('Список недоступен, пока нет связи с сервером.') : t('В группе пока нет устройств.')}</p>
   {/if}
   {#each list as d (d.id)}
     <div class="row device">
       <span class="dot" class:on={d.online}></span>
       <div class="who">
-        <span class="name" class:unknown={!d.known}>{deviceTitle(d)}{#if d.me}<span class="me"> · это устройство</span>{/if}</span>
-        <span class="meta mono">{d.os ?? 'нет карточки'} · {d.fingerprint} · {seenLabel(d, fmt)}</span>
+        <span class="name" class:unknown={!d.known}>{deviceTitle(d)}{#if d.me}<span class="me"> · {t('это устройство')}</span>{/if}</span>
+        <span class="meta mono">{d.os ?? t('нет карточки')} · {d.fingerprint} · {seenLabel(d, fmt)}</span>
       </div>
       {#if !d.me}
-        <button class="danger" disabled={busy} onclick={() => askRemove(d.id)}>Удалить</button>
+        <button class="danger" disabled={busy} onclick={() => askRemove(d.id)}>{t('Удалить')}</button>
       {/if}
     </div>
   {/each}
 </div>
 {#if list.some((d) => !d.known && !d.me)}
   <p class="hint outside">
-    У неизвестных устройств старая версия Clipwire или карточка не открылась. При смене ключа новый ключ им передать
-    нечем: обновите их и откройте на них Clipwire, тогда имя появится.
+    {t('У неизвестных устройств старая версия Clipwire или карточка не открылась. При смене ключа новый ключ им передать нечем: обновите их и откройте на них Clipwire, тогда имя появится.')}
   </p>
 {/if}
 
 <div class="card pad">
   {#if confirming !== null}
     <div class="confirm">
-      <strong>{confirming ? 'Удалить устройство и сменить ключ группы?' : 'Сменить ключ группы?'}</strong>
+      <strong>{confirming ? t('Удалить устройство и сменить ключ группы?') : t('Сменить ключ группы?')}</strong>
       {#each explain as line (line)}
-        <p class="hint" class:warn={line.startsWith('Внимание')}>{line}</p>
+        <p class="hint" class:warn={line.startsWith('Внимание') || line.startsWith('Warning')}>{line}</p>
       {/each}
       <div class="buttons">
         <button class="danger" disabled={busy} onclick={run}>
-          {busy ? 'Меняю ключ…' : confirming ? 'Удалить устройство' : 'Сменить ключ'}
+          {busy ? t('Меняю ключ…') : confirming ? t('Удалить устройство') : t('Сменить ключ')}
         </button>
-        <button disabled={busy} onclick={() => (confirming = null)}>Отмена</button>
+        <button disabled={busy} onclick={() => (confirming = null)}>{t('Отмена')}</button>
       </div>
     </div>
   {:else}
     <p class="hint">
-      Новый ключ получат все устройства группы, а старый код приглашения перестанет работать. Пригодится, если код
-      приглашения попал не туда.
+      {t('Новый ключ получат все устройства группы, а старый код приглашения перестанет работать. Пригодится, если код приглашения попал не туда.')}
     </p>
     <button disabled={busy || !loaded || list.length === 0} onclick={() => ((confirming = ''), (result = null))}>
-      Сменить ключ группы
+      {t('Сменить ключ группы')}
     </button>
   {/if}
   {#if checking}<p class="hint" role="status">{CHECKING}</p>{/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if result}
     <div class="done" role="status">
-      <p>Ключ группы сменён. Новый код приглашения:</p>
+      <p>{t('Ключ группы сменён. Новый код приглашения:')}</p>
       <code class="code selectable">{result.invite}</code>
       <div class="buttons">
-        <button onclick={copyInvite}>{copied ? 'Скопировано' : 'Скопировать код'}</button>
-        <button onclick={() => (result = null)}>Скрыть</button>
+        <button onclick={copyInvite}>{copied ? t('Скопировано') : t('Скопировать код')}</button>
+        <button onclick={() => (result = null)}>{t('Скрыть')}</button>
       </div>
       {#if result.skipped.length > 0}
         <p class="hint warn">
-          Не получили новый ключ: {result.skipped.join(', ')}. Подключите их заново по этому коду.
+          {t('Не получили новый ключ: {names}. Подключите их заново по этому коду.', { names: result.skipped.join(', ') })}
         </p>
       {/if}
     </div>

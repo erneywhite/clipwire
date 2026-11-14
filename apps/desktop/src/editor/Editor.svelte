@@ -8,6 +8,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import { api, type Settings } from '../lib/api'
   import { applyTheme } from '../lib/theme'
+  import { t } from '../lib/i18n'
   import TitleBar from '../settings/TitleBar.svelte'
   import {
     COLORS,
@@ -33,15 +34,15 @@
   const win = getCurrentWindow()
 
   const TOOLS: { tool: Tool; key: string; label: string; icon: string }[] = [
-    { tool: 'select', key: 'V', label: 'Выбор и перемещение', icon: 'M6 3l12 9-5.5 1L10 19z' },
-    { tool: 'arrow', key: 'A', label: 'Стрелка', icon: 'M5 19L19 5M10 5h9v9' },
-    { tool: 'pen', key: 'P', label: 'Перо', icon: 'M4 20l4.5-1L19 8.5 15.5 5 5 15.5zM13.5 7l3.5 3.5' },
-    { tool: 'marker', key: 'M', label: 'Маркер', icon: 'M8 16l-3 4h7l1.5-2M8 16l8-11 4 3-8 10z' },
-    { tool: 'rect', key: 'R', label: 'Рамка', icon: 'M4 6h16v12H4z' },
-    { tool: 'ellipse', key: 'E', label: 'Эллипс', icon: 'M12 6c4.4 0 8 2.7 8 6s-3.6 6-8 6-8-2.7-8-6 3.6-6 8-6z' },
-    { tool: 'text', key: 'T', label: 'Текст', icon: 'M5 6h14M12 6v13M9 19h6' },
-    { tool: 'blur', key: 'B', label: 'Размыть', icon: 'M4 4h5v5H4zM15 4h5v5h-5zM9.5 9.5h5v5h-5zM4 15h5v5H4zM15 15h5v5h-5z' },
-    { tool: 'crop', key: 'C', label: 'Обрезать', icon: 'M7 3v14h14M3 7h14v14' },
+    { tool: 'select', key: 'V', label: t('Выбор и перемещение'), icon: 'M6 3l12 9-5.5 1L10 19z' },
+    { tool: 'arrow', key: 'A', label: t('Стрелка'), icon: 'M5 19L19 5M10 5h9v9' },
+    { tool: 'pen', key: 'P', label: t('Перо'), icon: 'M4 20l4.5-1L19 8.5 15.5 5 5 15.5zM13.5 7l3.5 3.5' },
+    { tool: 'marker', key: 'M', label: t('Маркер'), icon: 'M8 16l-3 4h7l1.5-2M8 16l8-11 4 3-8 10z' },
+    { tool: 'rect', key: 'R', label: t('Рамка'), icon: 'M4 6h16v12H4z' },
+    { tool: 'ellipse', key: 'E', label: t('Эллипс'), icon: 'M12 6c4.4 0 8 2.7 8 6s-3.6 6-8 6-8-2.7-8-6 3.6-6 8-6z' },
+    { tool: 'text', key: 'T', label: t('Текст'), icon: 'M5 6h14M12 6v13M9 19h6' },
+    { tool: 'blur', key: 'B', label: t('Размыть'), icon: 'M4 4h5v5H4zM15 4h5v5h-5zM9.5 9.5h5v5h-5zM4 15h5v5H4zM15 15h5v5h-5z' },
+    { tool: 'crop', key: 'C', label: t('Обрезать'), icon: 'M7 3v14h14M3 7h14v14' },
   ]
   const SIZES = ['S', 'M', 'L']
 
@@ -516,7 +517,7 @@
     busy = false
     try {
       const entry = await api.get(id)
-      if (!entry.image) throw new Error('У элемента нет картинки')
+      if (!entry.image) throw new Error(t('У элемента нет картинки'))
       const img = new Image()
       img.src = entry.image
       await img.decode()
@@ -650,19 +651,19 @@
 <svelte:window onkeydown={onKey} />
 
 <div class="editor">
-  <TitleBar title={W ? `Изменить картинку · ${W}×${H}` : 'Изменить картинку'} />
+  <TitleBar title={W ? t('Изменить картинку · {size}', { size: `${W}×${H}` }) : t('Изменить картинку')} />
 
-  <div class="toolbar" role="toolbar" aria-label="Инструменты">
-    {#each TOOLS as t (t.tool)}
+  <div class="toolbar" role="toolbar" aria-label={t('Инструменты')}>
+    {#each TOOLS as tl (tl.tool)}
       <button
         class="tool"
-        class:on={tool === t.tool}
-        title="{t.label} ({t.key})"
-        aria-label={t.label}
-        aria-pressed={tool === t.tool}
-        onclick={() => pickTool(t.tool)}
+        class:on={tool === tl.tool}
+        title="{tl.label} ({tl.key})"
+        aria-label={tl.label}
+        aria-pressed={tool === tl.tool}
+        onclick={() => pickTool(tl.tool)}
       >
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d={t.icon} /></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d={tl.icon} /></svg>
       </button>
     {/each}
     <span class="sep"></span>
@@ -671,25 +672,25 @@
         class="swatch"
         class:on={color === c}
         style:--swatch={c}
-        title="Цвет ({i + 1})"
-        aria-label="Цвет {i + 1}"
+        title={t('Цвет ({n})', { n: i + 1 })}
+        aria-label={t('Цвет {n}', { n: i + 1 })}
         aria-pressed={color === c}
         onclick={() => setColor(c)}
       ></button>
     {/each}
     <span class="sep"></span>
     {#each SIZES as s, i (s)}
-      <button class="size" class:on={size === i} title="Толщина ([ и ])" aria-pressed={size === i} onclick={() => setSize(i)}>{s}</button>
+      <button class="size" class:on={size === i} title={t('Толщина ([ и ])')} aria-pressed={size === i} onclick={() => setSize(i)}>{s}</button>
     {/each}
     <span class="grow"></span>
-    <button class="tool" title="Отменить (Ctrl+Z)" aria-label="Отменить" disabled={!undoStack.length} onclick={undo}>
+    <button class="tool" title={t('Отменить (Ctrl+Z)')} aria-label={t('Отменить')} disabled={!undoStack.length} onclick={undo}>
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 14L4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3" /></svg>
     </button>
-    <button class="tool" title="Повторить (Ctrl+Y)" aria-label="Повторить" disabled={!redoStack.length} onclick={redo}>
+    <button class="tool" title={t('Повторить (Ctrl+Y)')} aria-label={t('Повторить')} disabled={!redoStack.length} onclick={redo}>
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 14l5-5-5-5M20 9H10a6 6 0 0 0 0 12h3" /></svg>
     </button>
-    <button class="action" disabled={busy} onclick={() => save(false)}>Сохранить</button>
-    <button class="action primary" disabled={busy} onclick={() => save(true)}>Вставить</button>
+    <button class="action" disabled={busy} onclick={() => save(false)}>{t('Сохранить')}</button>
+    <button class="action primary" disabled={busy} onclick={() => save(true)}>{t('Вставить')}</button>
   </div>
 
   <div class="stage" bind:this={stage}>
@@ -709,7 +710,7 @@
         style={editorStyle}
         rows={Math.max(1, editing.value.split('\n').length)}
         spellcheck="false"
-        placeholder="Текст"
+        placeholder={t('Текст')}
         onblur={commitText}
       ></textarea>
     {/if}
@@ -719,11 +720,11 @@
     {#if error}
       <span class="error">{error}</span>
     {:else if escArmed}
-      <span class="warn">Изменения не сохранены. Esc ещё раз — закрыть без сохранения</span>
+      <span class="warn">{t('Изменения не сохранены. Esc ещё раз — закрыть без сохранения')}</span>
     {:else}
-      <span>V выбор</span><span>A стрелка</span><span>P перо</span><span>R рамка</span><span>T текст</span>
-      <span>B размыть</span><span>C обрезать</span><span>1–6 цвет</span><span>Ctrl Z отменить</span>
-      <span>Ctrl ↵ вставить</span><span>Esc закрыть</span>
+      <span>{t('V выбор')}</span><span>{t('A стрелка')}</span><span>{t('P перо')}</span><span>{t('R рамка')}</span><span>{t('T текст')}</span>
+      <span>{t('B размыть')}</span><span>{t('C обрезать')}</span><span>{t('1–6 цвет')}</span><span>{t('Ctrl Z отменить')}</span>
+      <span>{t('Ctrl ↵ вставить')}</span><span>{t('Esc закрыть')}</span>
     {/if}
   </footer>
 </div>

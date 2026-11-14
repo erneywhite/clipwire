@@ -1,6 +1,7 @@
 <script lang="ts">
   // Хранилище файлов группы: сервер Clipwire, S3-совместимое или SFTP.
   import { onMount } from 'svelte'
+  import { t } from '../lib/i18n'
   import { listen } from '@tauri-apps/api/event'
   import { api, type ProbeResult, type StorageForm, type StorageKind, type StorageState, type StorageWarning, type Status } from '../lib/api'
   import {
@@ -20,9 +21,9 @@
   } from '../lib/storage'
 
   const kinds: { id: StorageKind; title: string; hint: string }[] = [
-    { id: 'server', title: 'Сервер Clipwire', hint: 'Файлы лежат на сервере группы. Ничего настраивать не нужно.' },
-    { id: 's3', title: 'S3-совместимое', hint: 'AWS S3, MinIO, Backblaze B2, Cloudflare R2 и другие.' },
-    { id: 'sftp', title: 'SFTP', hint: 'Любой сервер с SSH: NAS, VPS, домашний компьютер.' },
+    { id: 'server', title: t('Сервер Clipwire'), hint: t('Файлы лежат на сервере группы. Ничего настраивать не нужно.') },
+    { id: 's3', title: t('S3-совместимое'), hint: t('AWS S3, MinIO, Backblaze B2, Cloudflare R2 и другие.') },
+    { id: 'sftp', title: 'SFTP', hint: t('Любой сервер с SSH: NAS, VPS, домашний компьютер.') },
   ]
 
   let stored = $state<StorageState | null>(null)
@@ -173,13 +174,13 @@
     input.value = ''
     if (!file || !form) return
     if (file.size > MAX_KEY_BYTES) {
-      error = 'Файл слишком большой для закрытого ключа'
+      error = t('Файл слишком большой для закрытого ключа')
       return
     }
     const text = await file.text()
     const problem = keyProblem(text)
     if (problem) {
-      error = `${file.name}: ${problem}`
+      error = t('{name}: {problem}', { name: file.name, problem })
       return
     }
     error = ''
@@ -207,12 +208,12 @@
   })
 </script>
 
-<h2>Хранилище файлов</h2>
+<h2>{t('Хранилище файлов')}</h2>
 <div class="card pad">
   {#if !form || !stored}
-    <p class="hint">{loadError || 'Загружаю настройки…'}</p>
+    <p class="hint">{loadError || t('Загружаю настройки…')}</p>
   {:else}
-    <div class="segmented" role="radiogroup" aria-label="Где хранить файлы">
+    <div class="segmented" role="radiogroup" aria-label={t('Где хранить файлы')}>
       {#each kinds as k (k.id)}
         <button role="radio" aria-checked={form.kind === k.id} class:on={form.kind === k.id} onclick={() => (form!.kind = k.id)}>{k.title}</button>
       {/each}
@@ -222,226 +223,220 @@
     {#if form.kind === 's3'}
       <div class="grid">
         <label class="field wide">
-          <span>Адрес API</span>
+          <span>{t('Адрес API')}</span>
           <input bind:value={form.s3.endpoint} placeholder="https://s3.eu-central-1.amazonaws.com" spellcheck="false" autocomplete="off" />
           {#if errors.endpoint && form.s3.endpoint}<span class="bad">{errors.endpoint}</span>{/if}
         </label>
         <label class="field">
-          <span>Регион</span>
+          <span>{t('Регион')}</span>
           <input bind:value={form.s3.region} placeholder="us-east-1" spellcheck="false" autocomplete="off" />
         </label>
         <label class="field">
-          <span>Бакет</span>
+          <span>{t('Бакет')}</span>
           <input bind:value={form.s3.bucket} placeholder="clipwire" spellcheck="false" autocomplete="off" />
           {#if errors.bucket && form.s3.bucket}<span class="bad">{errors.bucket}</span>{/if}
         </label>
         <label class="field wide">
-          <span>Папка в бакете (можно оставить пустой)</span>
+          <span>{t('Папка в бакете (можно оставить пустой)')}</span>
           <input bind:value={form.s3.prefix} placeholder="clipwire/files" spellcheck="false" autocomplete="off" />
         </label>
         <label class="field">
-          <span>Ключ доступа</span>
+          <span>{t('Ключ доступа')}</span>
           <input bind:value={form.s3.access_key} class="mono" spellcheck="false" autocomplete="off" />
         </label>
         <label class="field">
-          <span>Секретный ключ</span>
+          <span>{t('Секретный ключ')}</span>
           <span class="secret">
             <input
               type={showSecret ? 'text' : 'password'}
               bind:value={form.s3.secret_key}
               class="mono"
-              placeholder={keep ? 'Сохранён, оставьте пустым' : ''}
+              placeholder={keep ? t('Сохранён, оставьте пустым') : ''}
               spellcheck="false"
               autocomplete="off"
             />
-            <button type="button" class="eye" onclick={() => (showSecret = !showSecret)} aria-pressed={showSecret}>{showSecret ? 'Скрыть' : 'Показать'}</button>
+            <button type="button" class="eye" onclick={() => (showSecret = !showSecret)} aria-pressed={showSecret}>{showSecret ? t('Скрыть') : t('Показать')}</button>
           </span>
         </label>
       </div>
       <label class="check">
         <input type="checkbox" bind:checked={form.s3.path_style} />
         <span>
-          Адресация через путь
-          <span class="hint">Адрес вида <code>адрес/бакет/файл</code>. Нужна MinIO и большинству совместимых хранилищ; у AWS можно выключить.</span>
+          {t('Адресация через путь')}
+          <span class="hint">{t('Адрес вида')} <code>{t('адрес/бакет/файл')}</code>. {t('Нужна MinIO и большинству совместимых хранилищ; у AWS можно выключить.')}</span>
         </span>
       </label>
       {#if isHttp(form.s3.endpoint) && !errors.endpoint}
         <p class="hint warn">
-          Адрес без HTTPS: ключ доступа и подпись запросов идут открытым текстом. Подходит только для своей локальной
-          сети. Сами файлы всё равно зашифрованы ключом группы.
+          {t('Адрес без HTTPS: ключ доступа и подпись запросов идут открытым текстом. Подходит только для своей локальной сети. Сами файлы всё равно зашифрованы ключом группы.')}
         </p>
       {/if}
       <p class="hint">
-        Устройства сами удаляют старые файлы по сроку ниже. Надёжнее добавить ещё и правило жизненного цикла в
-        бакете (Lifecycle rule) на тот же срок: тогда файлы удалятся, даже если все устройства выключены.
+        {t('Устройства сами удаляют старые файлы по сроку ниже. Надёжнее добавить ещё и правило жизненного цикла в бакете (Lifecycle rule) на тот же срок: тогда файлы удалятся, даже если все устройства выключены.')}
       </p>
     {:else if form.kind === 'sftp'}
       <div class="grid">
         <label class="field wide">
-          <span>Сервер</span>
+          <span>{t('Сервер')}</span>
           <input bind:value={form.sftp.host} placeholder="nas.example.com" spellcheck="false" autocomplete="off" />
           {#if errors.host && form.sftp.host}<span class="bad">{errors.host}</span>{/if}
         </label>
         <label class="field">
-          <span>Порт</span>
+          <span>{t('Порт')}</span>
           <input class="num" type="number" min="1" max="65535" step="1" bind:value={form.sftp.port} />
           {#if errors.port}<span class="bad">{errors.port}</span>{/if}
         </label>
         <label class="field">
-          <span>Пользователь</span>
+          <span>{t('Пользователь')}</span>
           <input bind:value={form.sftp.user} spellcheck="false" autocomplete="off" />
         </label>
         <label class="field wide">
-          <span>Папка на сервере</span>
+          <span>{t('Папка на сервере')}</span>
           <input bind:value={form.sftp.path} placeholder="/volume1/clipwire" spellcheck="false" autocomplete="off" />
         </label>
       </div>
 
-      <div class="segmented small" role="radiogroup" aria-label="Способ входа">
-        {#each [['password', 'Пароль'], ['key', 'Закрытый ключ']] as [id, title] (id)}
+      <div class="segmented small" role="radiogroup" aria-label={t('Способ входа')}>
+        {#each [['password', t('Пароль')], ['key', t('Закрытый ключ')]] as [id, title] (id)}
           <button role="radio" aria-checked={form.sftp.auth === id} class:on={form.sftp.auth === id} onclick={() => (form!.sftp.auth = id as 'password' | 'key')}>{title}</button>
         {/each}
       </div>
       {#if form.sftp.auth === 'password'}
         <label class="field">
-          <span>Пароль</span>
+          <span>{t('Пароль')}</span>
           <span class="secret">
             <input
               type={showPassword ? 'text' : 'password'}
               bind:value={form.sftp.password}
-              placeholder={keep ? 'Сохранён, оставьте пустым' : ''}
+              placeholder={keep ? t('Сохранён, оставьте пустым') : ''}
               autocomplete="off"
             />
-            <button type="button" class="eye" onclick={() => (showPassword = !showPassword)} aria-pressed={showPassword}>{showPassword ? 'Скрыть' : 'Показать'}</button>
+            <button type="button" class="eye" onclick={() => (showPassword = !showPassword)} aria-pressed={showPassword}>{showPassword ? t('Скрыть') : t('Показать')}</button>
           </span>
           {#if errors.password && rekeyedHost}<span class="bad">{errors.password}</span>{/if}
         </label>
       {:else}
         <label class="field">
-          <span>Закрытый ключ OpenSSH</span>
+          <span>{t('Закрытый ключ OpenSSH')}</span>
           <textarea
             bind:value={form.sftp.private_key}
             rows="4"
-            placeholder={keep ? 'Сохранён, оставьте пустым, чтобы не менять' : '-----BEGIN OPENSSH PRIVATE KEY-----'}
+            placeholder={keep ? t('Сохранён, оставьте пустым, чтобы не менять') : '-----BEGIN OPENSSH PRIVATE KEY-----'}
             spellcheck="false"
             autocomplete="off"
           ></textarea>
           {#if errors.private_key && (form.sftp.private_key.trim() || rekeyedHost)}<span class="bad">{errors.private_key}</span>{/if}
         </label>
         <div class="buttons">
-          <button type="button" onclick={() => keyFile?.click()}>Выбрать файл ключа…</button>
+          <button type="button" onclick={() => keyFile?.click()}>{t('Выбрать файл ключа…')}</button>
           <input bind:this={keyFile} type="file" hidden onchange={pickKey} />
         </div>
         <label class="field">
-          <span>Пароль к ключу, если есть</span>
+          <span>{t('Пароль к ключу, если есть')}</span>
           <span class="secret">
             <input
               type={showPassphrase ? 'text' : 'password'}
               bind:value={form.sftp.passphrase}
-              placeholder={keep && stored.saved.sftp_passphrase ? 'Сохранён, оставьте пустым' : ''}
+              placeholder={keep && stored.saved.sftp_passphrase ? t('Сохранён, оставьте пустым') : ''}
               autocomplete="off"
             />
-            <button type="button" class="eye" onclick={() => (showPassphrase = !showPassphrase)} aria-pressed={showPassphrase}>{showPassphrase ? 'Скрыть' : 'Показать'}</button>
+            <button type="button" class="eye" onclick={() => (showPassphrase = !showPassphrase)} aria-pressed={showPassphrase}>{showPassphrase ? t('Скрыть') : t('Показать')}</button>
           </span>
         </label>
       {/if}
 
       <div class="hostkey">
-        <span class="label">Ключ сервера</span>
+        <span class="label">{t('Ключ сервера')}</span>
         {#if form.sftp.host_key_sha256}
           <code class="mono selectable">{form.sftp.host_key_sha256}</code>
-          <span class="hint">Подтверждён. Устройства группы подключаются только к серверу с этим ключом.</span>
+          <span class="hint">{t('Подтверждён. Устройства группы подключаются только к серверу с этим ключом.')}</span>
         {:else if offeredKey}
           <code class="mono selectable">{offeredKey}</code>
           <span class="hint">
-            Сверьте отпечаток с сервером: на нём выполните <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code>
-            или посмотрите в панели NAS. Не совпадает — не подтверждайте: между вами и сервером кто-то есть.
+            {t('Сверьте отпечаток с сервером: на нём выполните')} <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code>
+            {t('или посмотрите в панели NAS. Не совпадает — не подтверждайте: между вами и сервером кто-то есть.')}
           </span>
           <label class="check">
             <input type="checkbox" checked={false} onchange={(e) => e.currentTarget.checked && confirmKey()} />
-            <span>Отпечаток совпадает</span>
+            <span>{t('Отпечаток совпадает')}</span>
           </label>
         {:else}
-          <span class="hint">Ещё не подтверждён. Нажмите «Проверить подключение», чтобы увидеть отпечаток.</span>
+          <span class="hint">{t('Ещё не подтверждён. Нажмите «Проверить подключение», чтобы увидеть отпечаток.')}</span>
         {/if}
       </div>
     {/if}
 
     {#if form.kind !== 'server'}
       <label class="field">
-        <span>Сколько хранить файлы</span>
+        <span>{t('Сколько хранить файлы')}</span>
         <select bind:value={form.file_ttl_hours}>
           {#each ttlOptions(form.file_ttl_hours) as o (o.hours)}<option value={o.hours}>{o.title}</option>{/each}
         </select>
       </label>
       <p class="hint">
-        Настройки, включая ключи доступа, получат все устройства группы. Сервер Clipwire их не видит: они зашифрованы
-        ключом группы, как и сами файлы.
+        {t('Настройки, включая ключи доступа, получат все устройства группы. Сервер Clipwire их не видит: они зашифрованы ключом группы, как и сами файлы.')}
       </p>
     {/if}
 
     {#if stored.access_exposed && form.kind !== 'server'}
       <p class="hint warn" role="alert">
-        После смены ключа группы вне её осталось устройство, у которого есть эти доступы к хранилищу файлов: исключённое
-        или без карточки.
+        {t('После смены ключа группы вне её осталось устройство, у которого есть эти доступы к хранилищу файлов: исключённое или без карточки.')}
         {stored.form.kind === 'sftp'
-          ? 'Смените пароль или ключ SSH на сервере и сохраните новые здесь.'
-          : 'Смените ключ S3 у поставщика хранилища и сохраните новый здесь.'}
-        Пока доступы прежние, такое устройство может удалять и портить файлы группы в хранилище, хотя прочитать их не может.
+          ? t('Смените пароль или ключ SSH на сервере и сохраните новые здесь.')
+          : t('Смените ключ S3 у поставщика хранилища и сохраните новый здесь.')}
+        {t('Пока доступы прежние, такое устройство может удалять и портить файлы группы в хранилище, хотя прочитать их не может.')}
       </p>
     {/if}
     {#if stored.error && !dirty}
-      <p class="error" role="alert">Сохранённое хранилище не открывается: {stored.error}. Файлы пока идут через сервер Clipwire.</p>
+      <p class="error" role="alert">{t('Сохранённое хранилище не открывается: {error}. Файлы пока идут через сервер Clipwire.', { error: stored.error })}</p>
     {/if}
     {#if remoteChanged}
       <p class="hint warn" role="status">
-        Настройки хранилища изменили на другом устройстве.
-        <button class="link" onclick={load}>Показать новые</button> (ваши правки пропадут)
+        {t('Настройки хранилища изменили на другом устройстве.')}
+        <button class="link" onclick={load}>{t('Показать новые')}</button> {t('(ваши правки пропадут)')}
       </p>
     {/if}
 
     {#if probing}
-      <p class="hint" role="status">Проверяю подключение…</p>
+      <p class="hint" role="status">{t('Проверяю подключение…')}</p>
     {:else if probe && probeFresh}
       {#if probe.status === 'ok'}
-        <p class="ok" role="status">Подключение работает: запись, чтение и удаление прошли.</p>
+        <p class="ok" role="status">{t('Подключение работает: запись, чтение и удаление прошли.')}</p>
       {:else if probe.status === 'confirm_host_key'}
-        {#if !form.sftp.host_key_sha256}<p class="hint" role="status">Сервер ответил. Сверьте отпечаток его ключа выше.</p>{/if}
+        {#if !form.sftp.host_key_sha256}<p class="hint" role="status">{t('Сервер ответил. Сверьте отпечаток его ключа выше.')}</p>{/if}
       {:else if probe.status === 'host_key_mismatch'}
         <div class="error" role="alert">
-          <p>Сервер прислал другой ключ: <code class="selectable">{probe.got}</code>, а подтверждён <code class="selectable">{probe.expected}</code>.</p>
+          <p>{t('Сервер прислал другой ключ:')} <code class="selectable">{probe.got}</code>, {t('а подтверждён')} <code class="selectable">{probe.expected}</code>.</p>
           <p class="hint">
-            Смена ключа сервера может значить, что соединение перехватили. Если ключ правда меняли (переустановка,
-            новый сервер), сбросьте отпечаток и подтвердите новый, а потом введите пароль или ключ заново: сохранённый
-            серверу с другим ключом не отправляется. Если не меняли, ничего не трогайте.
+            {t('Смена ключа сервера может значить, что соединение перехватили. Если ключ правда меняли (переустановка, новый сервер), сбросьте отпечаток и подтвердите новый, а потом введите пароль или ключ заново: сохранённый серверу с другим ключом не отправляется. Если не меняли, ничего не трогайте.')}
           </p>
-          <button class="danger" onclick={resetKey}>Сбросить отпечаток</button>
+          <button class="danger" onclick={resetKey}>{t('Сбросить отпечаток')}</button>
         </div>
       {:else}
-        <p class="error" role="alert">Не подключилось: {probe.message}</p>
+        <p class="error" role="alert">{t('Не подключилось: {message}', { message: probe.message })}</p>
       {/if}
     {/if}
 
     {#if confirmUnchecked}
       <div class="confirm">
-        <span>Подключение не проверено. Если настройки неверны, файлы не дойдут через хранилище, и устройства будут слать их через сервер Clipwire. Сохранить всё равно?</span>
-        <button class="danger" disabled={saving} onclick={() => save(true)}>Сохранить без проверки</button>
-        <button onclick={() => (confirmUnchecked = false)}>Отмена</button>
+        <span>{t('Подключение не проверено. Если настройки неверны, файлы не дойдут через хранилище, и устройства будут слать их через сервер Clipwire. Сохранить всё равно?')}</span>
+        <button class="danger" disabled={saving} onclick={() => save(true)}>{t('Сохранить без проверки')}</button>
+        <button onclick={() => (confirmUnchecked = false)}>{t('Отмена')}</button>
       </div>
     {/if}
 
     <div class="buttons">
       {#if form.kind !== 'server'}
-        <button disabled={probing || !valid} onclick={runProbe}>{probing ? 'Проверяю…' : 'Проверить подключение'}</button>
+        <button disabled={probing || !valid} onclick={runProbe}>{probing ? t('Проверяю…') : t('Проверить подключение')}</button>
       {/if}
       <button class="primary" disabled={saving || probing || !dirty || !valid || needsKeyConfirm} onclick={() => save()}>
-        {saving ? 'Сохраняю…' : 'Сохранить'}
+        {saving ? t('Сохраняю…') : t('Сохранить')}
       </button>
-      {#if dirty}<button disabled={saving} onclick={revert}>Отменить правки</button>{/if}
-      {#if savedNote}<span class="ok" role="status">Сохранено</span>{/if}
+      {#if dirty}<button disabled={saving} onclick={revert}>{t('Отменить правки')}</button>{/if}
+      {#if savedNote}<span class="ok" role="status">{t('Сохранено')}</span>{/if}
     </div>
     {#if needsKeyConfirm && valid}
-      <p class="hint">Сохранить можно после того, как вы подтвердите отпечаток ключа сервера.</p>
+      <p class="hint">{t('Сохранить можно после того, как вы подтвердите отпечаток ключа сервера.')}</p>
     {/if}
     {#if error}<p class="error" role="alert">{error}</p>{/if}
 
@@ -449,9 +444,9 @@
       <div class="warning" role="status">
         <span>
           <span class="mono">{warningTime(warning.at_ms)}</span>
-          Хранилище группы не ответило, файл ушёл через сервер Clipwire: {warning.text}
+          {t('Хранилище группы не ответило, файл ушёл через сервер Clipwire: {text}', { text: warning.text })}
         </span>
-        <button onclick={() => (warning = null)}>Скрыть</button>
+        <button onclick={() => (warning = null)}>{t('Скрыть')}</button>
       </div>
     {/if}
   {/if}
