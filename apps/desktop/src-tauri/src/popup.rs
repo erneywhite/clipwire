@@ -203,6 +203,15 @@ pub fn show(app: &AppHandle) {
     let _ = w.set_content_protected(protect);
     let _ = w.show();
     let _ = w.set_focus();
+    #[cfg(target_os = "linux")]
+    if at_cursor {
+        let win = w.clone();
+        let _ = w.run_on_main_thread(move || {
+            if let Some(xid) = linux::xid(&win) {
+                std::thread::spawn(move || linux::raise(xid));
+            }
+        });
+    }
     tracing::debug!(x, y, w = w_px, h = h_px, "окно вставки показано");
     let _ = app.emit_to("popup", "popup://opened", ());
 }
@@ -443,10 +452,21 @@ pub async fn return_and_paste(app: &AppHandle, label: &str, paste: bool) {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let (true, Some(prev)) = (paste && linux::can_paste(), prev) {
+            // Если сочетание окна вставки совпадает с нажатием вставки (в
+            // терминалах это Ctrl+Shift+V), захват отдал бы нажатие нам. На время
+            // вставки сочетание снимается. Библиотека отправляет отмену захвата
+            // X-серверу только при следующем запросе с ответом — его даёт
+            // регистрация безобидного сочетания.
+            let gs = app.global_shortcut();
+            let _ = gs.unregister_all();
+            let _ = gs.register("Control+Alt+Shift+F24");
             match tokio::task::spawn_blocking(move || linux::focus_and_paste(prev)).await {
                 Ok(Err(e)) => tracing::warn!("вставка в прежнее окно не удалась: {e}"),
                 Err(e) => tracing::warn!("вставка в прежнее окно не удалась: {e}"),
                 Ok(Ok(())) => {}
+            }
+            if let Err(e) = register_hotkey(app) {
+                tracing::warn!("{e}");
             }
         }
     }

@@ -3,7 +3,7 @@
 
 import { t } from './i18n.ts'
 
-import { isMac } from './platform.ts'
+import { isLinux, isMac } from './platform.ts'
 
 /** Основная клавиша из KeyboardEvent.code; null — клавиша не годится для сочетания. */
 function mainKey(code: string): string | null {
@@ -48,7 +48,7 @@ export function label(accel: string): string {
         case 'Control':
           return isMac ? '⌃' : 'Ctrl'
         case 'Super':
-          return 'Win'
+          return isLinux ? 'Super' : 'Win'
         case 'Alt':
           return isMac ? '⌥' : 'Alt'
         case 'Shift':

@@ -99,7 +99,7 @@ impl Default for Settings {
             always_plain_text: false,
             popup_width: 380,
             popup_height: 520,
-            popup_hotkey: "CommandOrControl+Shift+V".into(),
+            popup_hotkey: default_hotkey().into(),
             sound_on_receive: true,
             link_previews: true,
             hide_from_capture: false,
@@ -109,6 +109,16 @@ impl Default for Settings {
             delete_everywhere: false,
             language: "system".into(),
         }
+    }
+}
+
+/// Сочетание окна вставки. На Linux Ctrl+Shift+V — вставка во всех
+/// терминалах: захватив его, программа сломала бы её.
+fn default_hotkey() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "CommandOrControl+Alt+V"
+    } else {
+        "CommandOrControl+Shift+V"
     }
 }
 

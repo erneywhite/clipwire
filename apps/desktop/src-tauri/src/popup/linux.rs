@@ -14,7 +14,7 @@ use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageEvent, ConnectionExt as _, CreateWindowAux, EventMask, KeyButMask,
-    PropMode, Window, WindowClass,
+    MapState, PropMode, Window, WindowClass,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -188,6 +188,42 @@ impl X {
         }
         self.conn.sync().ok()
     }
+}
+
+/// Сделать своё окно активным. Показ из фона (по `--popup`, из трея)
+/// менеджер окон может не пустить на передний план: защита от кражи фокуса.
+/// Показ асинхронный: просьба до того, как окно появилось на экране,
+/// пропадает, поэтому сначала ждём, пока оно станет видимым.
+pub fn raise(w: u32) {
+    let Some(x) = X::open() else { return };
+    // Первый показ дольше: окно и страница только создаются.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut asked: Option<Instant> = None;
+    while Instant::now() < deadline {
+        if x.active() == Some(w) {
+            return;
+        }
+        let viewable = x
+            .conn
+            .get_window_attributes(w)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|a| a.map_state == MapState::VIEWABLE);
+        // Просим снова, если первую просьбу не выполнили.
+        if viewable && asked.is_none_or(|t| t.elapsed() > Duration::from_millis(250)) {
+            x.activate(w);
+            asked = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Номер X-окна у окна Tauri. Вызывать в главном потоке GTK.
+pub fn xid(w: &tauri::WebviewWindow) -> Option<u32> {
+    use gtk::prelude::*;
+    let gdk = w.gtk_window().ok()?.window()?;
+    let x11 = gdk.downcast::<gdkx11::X11Window>().ok()?;
+    Some(x11.xid() as u32)
 }
 
 /// Окно, которое было активным до показа окна вставки.

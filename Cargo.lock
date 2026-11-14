@@ -1032,6 +1032,8 @@ dependencies = [
  "clipwire-agent",
  "clipwire-core",
  "data-encoding",
+ "gdkx11",
+ "gtk",
  "objc2",
  "objc2-app-kit",
  "objc2-core-graphics",
