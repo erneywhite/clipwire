@@ -4,19 +4,29 @@
 //! сообщений получает `WM_CLIPBOARDUPDATE` через `AddClipboardFormatListener`,
 //! без опроса. Поток не зависит от GUI-фреймворка приложения, поэтому один и
 //! тот же код работает и в Tauri, и в консольном агенте.
+//!
+//! macOS: опрос `changeCount` у `NSPasteboard`, см. [`mac`].
 
 use crate::i18n::tr;
 use anyhow::Result;
 
 /// Записать текст в буфер ОС.
+#[cfg(not(target_os = "macos"))]
 pub fn write_text(text: &str) -> Result<()> {
     use anyhow::Context;
     with_retry(|c| c.set_text(text)).context(tr("не удалось записать в буфер"))?;
     Ok(())
 }
 
+/// Записать текст в буфер ОС.
+#[cfg(target_os = "macos")]
+pub fn write_text(text: &str) -> Result<()> {
+    mac::write_text(text)
+}
+
 /// Записать картинку (PNG) в буфер ОС. `width` и `height` — размеры из
 /// элемента: PNG с другими настоящими размерами не пишем.
+#[cfg(not(target_os = "macos"))]
 pub fn write_image(png: &[u8], width: u32, height: u32) -> Result<()> {
     use anyhow::Context;
     let img = crate::image::decode_png_sized(png, width, height)?;
@@ -33,6 +43,14 @@ pub fn write_image(png: &[u8], width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
+/// Записать картинку (PNG) в буфер ОС. `width` и `height` — размеры из
+/// элемента: PNG с другими настоящими размерами не пишем.
+#[cfg(target_os = "macos")]
+pub fn write_image(png: &[u8], width: u32, height: u32) -> Result<()> {
+    crate::image::decode_png_sized(png, width, height)?;
+    mac::write_image(png)
+}
+
 /// Записать в буфер любое содержимое.
 pub fn write(content: &clipwire_core::Content) -> Result<()> {
     match content {
@@ -42,11 +60,17 @@ pub fn write(content: &clipwire_core::Content) -> Result<()> {
         clipwire_core::Content::Rich { text, html, rtf } => {
             win::write_rich(text, html.as_deref(), rtf.as_deref())
         }
-        // shortcut: на других ОС пока только текст, форматирование теряется. Этап macOS.
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        clipwire_core::Content::Rich { text, html, rtf } => {
+            mac::write_rich(text, html.as_deref(), rtf.as_deref())
+        }
+        // shortcut: на Linux пока только текст, форматирование теряется.
+        #[cfg(not(any(windows, target_os = "macos")))]
         clipwire_core::Content::Rich { text, .. } => write_text(text),
         #[cfg(windows)]
         clipwire_core::Content::Files(files) => win::write_files(files),
+        #[cfg(target_os = "macos")]
+        clipwire_core::Content::Files(files) => mac::write_files(files),
         #[allow(unreachable_patterns)]
         _ => anyhow::bail!(tr("этот тип пока не записывается в буфер")),
     }
@@ -110,7 +134,7 @@ const CONSISTENT_ATTEMPTS: usize = 3;
 /// Прочитать буфер согласованно: номер версии буфера (`seq`) до чтения и
 /// после должен совпасть, иначе части результата могут относиться к разному
 /// содержимому. До [`CONSISTENT_ATTEMPTS`] попыток, потом `None` — пропустить.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn read_consistent<T>(mut seq: impl FnMut() -> u32, mut read: impl FnMut() -> T) -> Option<T> {
     for _ in 0..CONSISTENT_ATTEMPTS {
         let before = seq();
@@ -247,7 +271,7 @@ pub struct WatchOptions {
 
 /// Описание локального файла или папки для элемента буфера: имя, размер,
 /// время изменения, у картинок — размеры в пикселях.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn local_file_ref(p: &std::path::Path) -> clipwire_core::FileRef {
     let meta = std::fs::metadata(p).ok();
     let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
@@ -283,6 +307,11 @@ pub(crate) fn local_file_ref(p: &std::path::Path) -> clipwire_core::FileRef {
 
 #[cfg(windows)]
 pub use win::Watcher;
+
+#[cfg(target_os = "macos")]
+mod mac;
+#[cfg(target_os = "macos")]
+pub use mac::Watcher;
 
 #[cfg(windows)]
 mod win {
@@ -855,10 +884,10 @@ mod win {
 }
 
 /// Заглушка для ОС без клиента (этап 4): слежения нет.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub struct Watcher;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl Watcher {
     pub fn start(
         _opts: WatchOptions,

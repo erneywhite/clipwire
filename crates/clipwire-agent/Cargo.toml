@@ -38,6 +38,11 @@ uuid = { version = "1.29.2", features = ["v7"] }
 clipboard-win = "5.4.3"
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_Security_Cryptography", "Win32_System_Ole", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
 
+[target."cfg(target_os = \"macos\")".dependencies]
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSDictionary", "NSString", "NSURL", "NSPathUtilities"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSImageRep", "NSBitmapImageRep", "NSWorkspace", "NSRunningApplication"] }
+
 [target."cfg(windows)".dev-dependencies]
 # Для тестов: реализация IDataObject через #[implement].
 windows-core = "0.62.2"

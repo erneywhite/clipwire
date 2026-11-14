@@ -33,7 +33,7 @@ The server is a single Docker container. The client keeps a searchable, encrypte
 a small paste window that opens next to the mouse cursor. Without a server the client still
 works as a local clipboard history on one computer, and you can connect a server later.
 
-Right now there is a client for Windows. Clients for macOS and Linux are planned.
+Right now there is a client for Windows. The macOS client is in progress (the `macos` branch: the clipboard engine already works), Linux is planned.
 
 Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneywhite/clipwire/issues).
 

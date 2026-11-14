@@ -283,6 +283,10 @@ pub static EN: &[(&str, &str)] = &[
         "файлы не записались в буфер: {e}",
         "could not write the files to the clipboard: {e}",
     ),
+    (
+        "файлы не записались в буфер",
+        "could not write the files to the clipboard",
+    ),
     ("буфер: {what}: {e}", "clipboard: {what}: {e}"),
     ("не открылся", "could not open"),
     ("текст", "text"),
