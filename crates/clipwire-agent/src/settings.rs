@@ -129,14 +129,42 @@ fn default_ignored_apps() -> Vec<String> {
     names.iter().map(|s| s.to_string()).collect()
 }
 
-/// Имя компьютера из окружения ОС.
-// shortcut: на macOS переменных COMPUTERNAME/HOSTNAME обычно нет, будет «Это устройство»;
-// взять имя через SCDynamicStore вместе с macOS-клиентом (этап 4).
+/// Имя компьютера: на macOS — как в «Общий доступ» («MacBook Pro Ивана»),
+/// иначе из окружения ОС.
 pub fn default_device_name() -> String {
+    #[cfg(target_os = "macos")]
+    if let Some(name) = mac_computer_name() {
+        return name;
+    }
     ["COMPUTERNAME", "HOSTNAME"]
         .iter()
         .find_map(|v| std::env::var(v).ok().filter(|s| !s.trim().is_empty()))
         .unwrap_or_else(|| tr("Это устройство").into())
+}
+
+/// `SCDynamicStoreCopyComputerName`: имя, которое человек видит и задаёт в
+/// системных настройках. Переменных COMPUTERNAME/HOSTNAME на маке нет.
+#[cfg(target_os = "macos")]
+fn mac_computer_name() -> Option<String> {
+    use objc2::rc::Retained;
+    use objc2_foundation::NSString;
+    #[link(name = "SystemConfiguration", kind = "framework")]
+    unsafe extern "C" {
+        fn SCDynamicStoreCopyComputerName(
+            store: *const std::ffi::c_void,
+            encoding: *mut u32,
+        ) -> *mut NSString;
+    }
+    // SAFETY: без хранилища (NULL) функция открывает своё; результат — новая
+    // ссылка CFString (Copy), бесплатно мостится в NSString и освобождается Retained.
+    let name = unsafe {
+        Retained::from_raw(SCDynamicStoreCopyComputerName(
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ))
+    }?;
+    let name = name.to_string();
+    (!name.trim().is_empty()).then_some(name)
 }
 
 fn file(dir: &Path) -> PathBuf {
@@ -168,6 +196,19 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_device_name_is_computer_name() {
+        let out = std::process::Command::new("scutil")
+            .args(["--get", "ComputerName"])
+            .output()
+            .unwrap();
+        let expected = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !expected.is_empty() {
+            assert_eq!(super::default_device_name(), expected);
+        }
+    }
+
     use super::*;
 
     #[test]
