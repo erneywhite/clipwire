@@ -2,6 +2,7 @@
 import type { GroupDevice, StorageKind } from './api'
 import type * as format from './format'
 import { t, tn, lang } from './i18n.ts'
+import { deviceName } from './platform.ts'
 
 /** Функции из `format.ts`. Передаются параметром, чтобы модуль запускался в
  *  Node для тестов без сборки (импорт без расширения Node не находит). */
@@ -23,7 +24,7 @@ export function rekeyedBy(name: string): string {
 
 /** Имя для показа: из карточки или «Неизвестное устройство». */
 export function deviceTitle(d: GroupDevice): string {
-  return d.name?.trim() || t('Неизвестное устройство')
+  return deviceName(d.name ?? '') || t('Неизвестное устройство')
 }
 
 /** «в сети», «был в сети: 5 мин», «не в сети». */

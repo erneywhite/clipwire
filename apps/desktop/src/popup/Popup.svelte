@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { isMac, keys } from '../lib/platform'
+  import { deviceName, isMac, keys } from '../lib/platform'
   import { onMount, tick } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
   import { api, type Entry, type FileInfo, type KindFilter, type Settings, type Transfer } from '../lib/api'
@@ -64,7 +64,7 @@
 
   /** Имя устройства, откуда пришла запись. */
   function deviceOf(e: Entry): string {
-    return e.local ? t('Это устройство') : e.device_name || t('Другое устройство')
+    return e.local ? t('Это устройство') : deviceName(e.device_name) || t('Другое устройство')
   }
 
   /**

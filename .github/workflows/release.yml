@@ -43,10 +43,12 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: Clipwire ${{ github.ref_name }}
           releaseBody: |
-            Windows — файл Clipwire_*_x64-setup.exe. macOS (13 и новее, Apple Silicon и Intel) — Clipwire_*_universal.dmg, первый запуск описан в README. Уже установленные копии обновятся сами.
+            Windows — файл Clipwire_*_windows_x64-setup.exe. macOS (13 и новее, Apple Silicon и Intel) — Clipwire_*_macos_universal.dmg, первый запуск описан в README. Уже установленные копии обновятся сами.
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+          # ОС в имени файла: в списке файлов выпуска сразу видно, что качать.
+          assetNamePattern: '[name]_[version]_windows_[arch][setup][ext]'
 
   # После Windows, а не параллельно: tauri-action дописывает свою платформу в
   # latest.json релиза, и два задания разом затёрли бы запись друг друга.
@@ -103,6 +105,7 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+          assetNamePattern: '[name]_[version]_macos_[arch][ext]'
 
       # Подпись должна быть сертификатом, а не ad-hoc: у ad-hoc требование —
       # хэш кода, и разрешения macOS слетали бы с каждым обновлением.

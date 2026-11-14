@@ -64,13 +64,13 @@ Clipwire — бесплатный общий буфер обмена. Скопи
 
 **Windows.**
 
-1. Скачайте `Clipwire_*_x64-setup.exe` из [релизов](https://github.com/erneywhite/clipwire/releases)
+1. Скачайте `Clipwire_*_windows_x64-setup.exe` из [релизов](https://github.com/erneywhite/clipwire/releases)
    и запустите. Установщик ставит программу на текущего пользователя, права администратора не нужны.
 2. Запустите Clipwire. Он живёт в трее, окно вставки открывается по Ctrl+Shift+V.
 
 **macOS.**
 
-1. Скачайте `Clipwire_*_universal.dmg` из [релизов](https://github.com/erneywhite/clipwire/releases),
+1. Скачайте `Clipwire_*_macos_universal.dmg` из [релизов](https://github.com/erneywhite/clipwire/releases),
    откройте и перетащите Clipwire в «Программы».
 2. Первый запуск. Clipwire не нотаризован Apple (для этого нужен платный аккаунт разработчика),
    поэтому macOS скажет, что не может проверить программу. Откройте Clipwire один раз, закройте

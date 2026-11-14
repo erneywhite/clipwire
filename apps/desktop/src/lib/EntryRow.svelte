@@ -4,6 +4,7 @@
   import type { Entry } from './api'
   import AppTag from './AppTag.svelte'
   import { t } from './i18n'
+  import { deviceName } from './platform'
   import { ago, bytesLabel, filesLabel, filesMeta, isUrl, looksLikeCode, sizeLabel } from './format'
   import { allUploaded, entryProgress, isDirect, isGone, progressLabel, type TransferMap } from './transfer'
 
@@ -47,7 +48,7 @@
   // Файл, которого нет здесь, но который есть на сервере, не «пропал»: его можно
   // скачать. Пропал только свой файл без копии на сервере.
   const gone = $derived(item.files.some(isGone))
-  const device = $derived(item.local ? t('Это устройство') : item.device_name || t('Другое устройство'))
+  const device = $derived(item.local ? t('Это устройство') : deviceName(item.device_name) || t('Другое устройство'))
   // Мета после устройства и приложения-источника (его иконка — отдельным элементом).
   const meta = $derived(
     [

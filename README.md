@@ -62,13 +62,13 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
 
 **Windows.**
 
-1. Download `Clipwire_*_x64-setup.exe` from [Releases](https://github.com/erneywhite/clipwire/releases)
+1. Download `Clipwire_*_windows_x64-setup.exe` from [Releases](https://github.com/erneywhite/clipwire/releases)
    and run it. It installs for the current user and does not need administrator rights.
 2. Start Clipwire. It lives in the tray; press Ctrl+Shift+V to open the paste window.
 
 **macOS.**
 
-1. Download `Clipwire_*_universal.dmg` from [Releases](https://github.com/erneywhite/clipwire/releases),
+1. Download `Clipwire_*_macos_universal.dmg` from [Releases](https://github.com/erneywhite/clipwire/releases),
    open it and drag Clipwire to Applications.
 2. The first launch. Clipwire is not notarized by Apple (that needs a paid developer account), so
    macOS says it cannot check the app for malware. Open Clipwire once, close the warning, then go to

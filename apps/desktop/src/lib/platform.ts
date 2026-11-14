@@ -17,3 +17,12 @@ export function keys(s: string, mac = isMac): string {
     .replace(/\bAlt ?\+ ?/g, '⌥')
     .replace(/\bShift ?\+ ?/g, '⇧')
 }
+
+/**
+ * Имя устройства для показа. Вне мака убирает символы из области частного
+ * использования Unicode: значок Apple (U+F8FF) в имени «MacBook Pro» есть
+ * только в шрифтах macOS, на Windows и Linux он рисуется пустым квадратиком.
+ */
+export function deviceName(name: string, mac = isMac): string {
+  return mac ? name.trim() : name.replace(/[-]/g, '').replace(/\s+/g, ' ').trim()
+}
