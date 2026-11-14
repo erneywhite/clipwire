@@ -250,18 +250,24 @@ pub fn mark_from_internet(path: &Path) {
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn mark_from_internet(_path: &Path) {}
 
-/// [`mark_from_internet`] для файла или для всех файлов внутри папки.
+/// [`mark_from_internet`] для файла или для всего внутри папки (на macOS и для
+/// самих каталогов).
 pub fn mark_tree_from_internet(path: &Path) {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return;
     };
     if meta.is_file() {
         mark_from_internet(path);
-    } else if meta.is_dir()
-        && let Ok(dir) = std::fs::read_dir(path)
-    {
-        for e in dir.flatten() {
-            mark_tree_from_internet(&e.path());
+    } else if meta.is_dir() {
+        // macOS: Gatekeeper проверяет карантин на самом бандле (`Отчёт.app` —
+        // это каталог), поэтому метка нужна и каталогам. В Windows поток
+        // `:Zone.Identifier` у каталога не нужен.
+        #[cfg(target_os = "macos")]
+        mark_from_internet(path);
+        if let Ok(dir) = std::fs::read_dir(path) {
+            for e in dir.flatten() {
+                mark_tree_from_internet(&e.path());
+            }
         }
     }
 }
