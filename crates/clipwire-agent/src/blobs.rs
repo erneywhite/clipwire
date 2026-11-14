@@ -203,8 +203,51 @@ pub fn mark_from_internet(path: &Path) {
     }
 }
 
-/// На других ОС такой метки нет.
-#[cfg(not(windows))]
+/// macOS: атрибут `com.apple.quarantine`, как у файлов из браузера:
+/// Gatekeeper спросит перед первым запуском программы или скрипта.
+/// Формат — `флаги;время (hex, секунды Unix);кто скачал;`.
+#[cfg(target_os = "macos")]
+pub fn mark_from_internet(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn setxattr(
+            path: *const std::ffi::c_char,
+            name: *const std::ffi::c_char,
+            value: *const std::ffi::c_void,
+            size: usize,
+            position: u32,
+            options: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let value = format!("0081;{secs:08x};Clipwire;");
+    // SAFETY: строки с нулём на конце и буфер значения живут до конца вызова.
+    let rc = unsafe {
+        setxattr(
+            cpath.as_ptr(),
+            c"com.apple.quarantine".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    if rc != 0 {
+        tracing::debug!(
+            "метка «из интернета» не поставилась на {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// На Linux такой метки нет.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn mark_from_internet(_path: &Path) {}
 
 /// [`mark_from_internet`] для файла или для всех файлов внутри папки.
@@ -2242,6 +2285,30 @@ impl Blobs {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_quarantine_mark() {
+        let dir = std::env::temp_dir().join(format!("clipwire-q-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join("в папке")).unwrap();
+        let (a, b) = (dir.join("файл.sh"), dir.join("в папке").join("b.txt"));
+        std::fs::write(&a, b"echo").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        mark_tree_from_internet(&dir);
+        for f in [&a, &b] {
+            let out = std::process::Command::new("xattr")
+                .args(["-p", "com.apple.quarantine"])
+                .arg(f)
+                .output()
+                .unwrap();
+            let v = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                v.starts_with("0081;") && v.trim_end().ends_with(";Clipwire;"),
+                "{v}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     use super::*;
     use clipwire_core::blob::OVERHEAD;
 

@@ -19,6 +19,9 @@ pub struct PopupState {
     /// Окно, которое было активным до показа, — туда вставляем.
     #[cfg(windows)]
     prev_window: Mutex<isize>,
+    /// PID программы, которая была активной до показа (macOS).
+    #[cfg(target_os = "macos")]
+    prev_pid: Mutex<Option<i32>>,
     /// Где окно стоит без предпросмотра (физические пиксели) и куда раскрыт предпросмотр.
     base: Mutex<Option<Base>>,
 }
@@ -90,6 +93,11 @@ pub fn show(app: &AppHandle) {
     #[cfg(windows)]
     {
         *state.prev_window.lock().unwrap_or_else(|e| e.into_inner()) = win::foreground();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        *state.prev_pid.lock().unwrap_or_else(|e| e.into_inner()) =
+            clipwire_agent::clipboard::front_pid();
     }
 
     let (lw, lh) = {
@@ -391,8 +399,158 @@ pub async fn return_and_paste(app: &AppHandle, label: &str, paste: bool) {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         win::send_paste();
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    mac::return_and_paste(app, label, paste).await;
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = paste;
+}
+
+/// Открыть раздел «Универсальный доступ» в Системных настройках.
+#[tauri::command]
+pub fn open_accessibility_settings(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .open_url(mac::ACCESSIBILITY_URL, None::<&str>)
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+    use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventTapLocation};
+    use objc2_foundation::{NSDictionary, NSNumber, NSString};
+    use tauri::{AppHandle, Emitter, Manager};
+
+    pub const ACCESSIBILITY_URL: &str =
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+    /// Что сделать после выбора элемента (он уже в буфере).
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Action {
+        /// Спрятать окно и вернуть прежнюю программу.
+        Return,
+        /// То же и нажать там Cmd+V.
+        ReturnAndPaste,
+        /// Нет разрешения «Универсальный доступ»: окно остаётся и объясняет,
+        /// как его дать. Элемент уже в буфере, вставить можно руками.
+        AskAccess,
+    }
+
+    /// `trusted` — есть разрешение на синтез нажатий. Объяснение показывает
+    /// только окно вставки; остальные окна (редактор) просто возвращают
+    /// прежнюю программу: вставить можно руками.
+    pub fn action(paste: bool, trusted: bool, label: &str) -> Action {
+        match (paste, trusted) {
+            (false, _) => Action::Return,
+            (true, true) => Action::ReturnAndPaste,
+            (true, false) if label == "popup" => Action::AskAccess,
+            (true, false) => Action::Return,
+        }
+    }
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AXIsProcessTrusted() -> u8;
+        fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> u8;
+    }
+
+    fn trusted() -> bool {
+        // SAFETY: функция без аргументов, только читает состояние.
+        unsafe { AXIsProcessTrusted() != 0 }
+    }
+
+    /// Попросить систему добавить программу в список «Универсального
+    /// доступа» и показать свой запрос (macOS показывает его один раз).
+    fn prompt_access() {
+        let dict = NSDictionary::from_slices(
+            &[&*NSString::from_str("AXTrustedCheckOptionPrompt")],
+            &[&*NSNumber::new_bool(true)],
+        );
+        // SAFETY: NSDictionary бесплатно мостится в CFDictionary и живёт до
+        // конца вызова.
+        unsafe { AXIsProcessTrustedWithOptions(objc2::rc::Retained::as_ptr(&dict).cast()) };
+    }
+
+    pub async fn return_and_paste(app: &AppHandle, label: &str, paste: bool) {
+        let prev = *app
+            .state::<super::PopupState>()
+            .prev_pid
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let act = action(paste, trusted(), label);
+        tracing::debug!(?act, ?prev, "вставка в прежнюю программу");
+        if act == Action::AskAccess {
+            prompt_access();
+            let _ = app.emit_to(label, "clipwire://need-accessibility", ());
+            return;
+        }
+        if let Some(w) = app.get_webview_window(label) {
+            let _ = w.hide();
+        }
+        let Some(pid) = prev.filter(|&p| p != std::process::id() as i32) else {
+            return;
+        };
+        if !activate(pid) {
+            tracing::warn!(
+                pid,
+                "прежняя программа не активировалась, вставка только в буфер"
+            );
+            return;
+        }
+        if act != Action::ReturnAndPaste {
+            return;
+        }
+        // Дождаться, пока программа на самом деле станет активной, иначе
+        // Cmd+V уйдёт в никуда.
+        for _ in 0..25 {
+            if clipwire_agent::clipboard::front_pid() == Some(pid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        send_paste();
+    }
+
+    fn activate(pid: i32) -> bool {
+        NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .is_some_and(|a| a.activateWithOptions(NSApplicationActivationOptions::empty()))
+    }
+
+    /// Нажать Cmd+V. shortcut: код клавиши V раскладки QWERTY (9); с русской
+    /// раскладкой Cmd+клавиша всё равно даёт латиницу, а на Dvorak вставка
+    /// не сработает.
+    fn send_paste() {
+        const KEY_V: u16 = 9;
+        for down in [true, false] {
+            let ev = CGEvent::new_keyboard_event(None, KEY_V, down);
+            CGEvent::set_flags(ev.as_deref(), CGEventFlags::MaskCommand);
+            CGEvent::post(CGEventTapLocation::HIDEventTap, ev.as_deref());
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn paste_needs_accessibility() {
+            assert_eq!(action(false, false, "popup"), Action::Return);
+            assert_eq!(action(false, true, "popup"), Action::Return);
+            assert_eq!(action(true, true, "popup"), Action::ReturnAndPaste);
+            assert_eq!(action(true, true, "editor"), Action::ReturnAndPaste);
+            assert_eq!(action(true, false, "popup"), Action::AskAccess);
+            assert_eq!(action(true, false, "editor"), Action::Return);
+        }
+    }
 }
 
 #[cfg(windows)]

@@ -46,7 +46,7 @@ fn file(dir: &Path) -> PathBuf {
 /// Настройки группы `key` с диска. Файл другой группы или битый — `None`.
 pub fn load_local(dir: &Path, key: &GroupKey) -> Option<GroupConfig> {
     let raw = std::fs::read(file(dir)).ok()?;
-    let sealed = crate::secret::unprotect(&raw)
+    let sealed = crate::secret::unprotect_file(&file(dir), &raw)
         .map_err(|e| tracing::warn!("{CONFIG_FILE} не расшифровался: {e:#}"))
         .ok()?;
     key.open_config(&sealed).ok()

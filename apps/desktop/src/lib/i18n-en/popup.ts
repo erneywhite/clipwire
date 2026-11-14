@@ -50,6 +50,9 @@ const en: Record<string, string> = {
   'Картинки': 'Images',
   'Файлы': 'Files',
   'Файлы ещё скачиваются': 'Files are still downloading',
+  'Открыть настройки': 'Open Settings',
+  'Скопировано в буфер — вставьте сами (Cmd+V). Чтобы Clipwire вставлял сразу, разрешите ему «Универсальный доступ» в Системных настройках.':
+    'Copied to the clipboard — paste it yourself (Cmd+V). To let Clipwire paste right away, allow it under Accessibility in System Settings.',
   'Сначала дождитесь, пока скачаются файлы другой записи': 'Wait until the files of the other item finish downloading',
   'Поиск по истории': 'Search history',
   'История': 'History',

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isMac, keys } from '../lib/platform'
   import { onMount, tick } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
   import { api, type Entry, type FileInfo, type KindFilter, type Settings, type Transfer } from '../lib/api'
@@ -43,6 +44,8 @@
   let richView = $state(true)
   const edited = $derived(preview !== null && draft !== preview.entry.text)
   let error = $state('')
+  // macOS: нет разрешения «Универсальный доступ», вставить сам не могу.
+  let needAccess = $state(false)
   let input: HTMLInputElement | undefined = $state()
   let listEl: HTMLUListElement | undefined = $state()
 
@@ -411,9 +414,13 @@
     } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyP') {
       e.preventDefault()
       togglePin(current)
-    } else if (e.key === 'Delete' && (e.shiftKey || query === '')) {
+    } else if (
+      (e.key === 'Delete' && (e.shiftKey || query === '')) ||
+      (isMac && e.metaKey && e.key === 'Backspace')
+    ) {
       // При пустом поиске Delete удаляет запись; с текстом в поиске он стирает
-      // символ, тогда удаление — Shift+Delete.
+      // символ, тогда удаление — Shift+Delete. На маке клавиша «delete» — это
+      // Backspace, удаление записи — ⌘⌫, как «в корзину» в Finder.
       e.preventDefault()
       remove(current)
     } else if ((e.ctrlKey || e.metaKey) && /^Digit[1-9]$/.test(e.code)) {
@@ -434,6 +441,7 @@
     const unlisten = [
       listen<Transfer>('clipwire://transfer', (e) => onTransfer(e.payload)),
       listen('clipwire://history-changed', () => load()),
+      listen('clipwire://need-accessibility', () => (needAccess = true)),
       listen<Settings>('clipwire://settings-changed', (e) => applySettings(e.payload)),
       // Живое превью размера из настроек: ширина списка меняется вместе с окном.
       listen('popup://opened', async () => {
@@ -449,6 +457,7 @@
         sel = 0
         preview = null
         error = ''
+        needAccess = false
         loadFailed = false
         await load()
         await tick()
@@ -506,6 +515,12 @@
     {#if error}
       <p class="error">{error}</p>
     {/if}
+    {#if needAccess}
+      <div class="access" role="alert">
+        <p>{t('Скопировано в буфер — вставьте сами (Cmd+V). Чтобы Clipwire вставлял сразу, разрешите ему «Универсальный доступ» в Системных настройках.')}</p>
+        <button onclick={() => api.openAccessibilitySettings().catch((e) => (error = String(e)))}>{t('Открыть настройки')}</button>
+      </div>
+    {/if}
 
     {#if items.length === 0}
       <div class="empty">
@@ -531,11 +546,11 @@
       <span><kbd>↵</kbd> {t('вставить')}</span>
       <span><kbd>␣</kbd> {t('просмотр')}</span>
       {#if editable(current)}
-        <span><kbd>Ctrl E</kbd> {t('изменить')}</span>
+        <span><kbd>{keys('Ctrl E')}</kbd> {t('изменить')}</span>
       {:else}
-        <span><kbd>Ctrl P</kbd> {t('закрепить')}</span>
+        <span><kbd>{keys('Ctrl P')}</kbd> {t('закрепить')}</span>
       {/if}
-      <span><kbd>Del</kbd> {t('удалить')}</span>
+      <span><kbd>{isMac ? '⌘⌫' : 'Del'}</kbd> {t('удалить')}</span>
     </footer>
   </section>
 
@@ -699,7 +714,7 @@
     {/if}
     <button role="menuitem" onclick={() => act(openPreview)}>{t('Просмотр')}<kbd>{t('Пробел')}</kbd></button>
     {#if editable(m)}
-      <button role="menuitem" onclick={() => act(() => edit(m))}>{t('Изменить')}<kbd>Ctrl E</kbd></button>
+      <button role="menuitem" onclick={() => act(() => edit(m))}>{t('Изменить')}<kbd>{keys('Ctrl E')}</kbd></button>
     {/if}
     {#if m.kind === 'text' && isUrl(m.text)}
       <button role="menuitem" onclick={() => act(() => openUrl(m.text.trim()))}>{t('Открыть в браузере')}</button>
@@ -707,7 +722,7 @@
     {#if m.kind === 'files' && m.files[0]?.local_path}
       <button role="menuitem" onclick={() => act(() => showInFolder(m.files[0]))}>{t('Показать в папке')}</button>
     {/if}
-    <button role="menuitem" onclick={() => act(() => togglePin(m))}>{m.pinned ? t('Открепить') : t('Закрепить')}<kbd>Ctrl P</kbd></button>
+    <button role="menuitem" onclick={() => act(() => togglePin(m))}>{m.pinned ? t('Открепить') : t('Закрепить')}<kbd>{keys('Ctrl P')}</kbd></button>
     <hr />
     <button role="menuitem" class="danger" onclick={() => remove(m)}>{t('Удалить')}<kbd>Del</kbd></button>
   </div>
@@ -892,6 +907,20 @@
     text-align: center;
     color: var(--c-muted);
     padding: var(--space-5);
+  }
+  .access {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+    margin: 0 var(--space-1) var(--space-2);
+    font-size: var(--text-s);
+  }
+  .access p {
+    margin: 0;
+    flex: 1;
+  }
+  .access button {
+    flex: none;
   }
   .error {
     color: var(--c-danger);

@@ -183,14 +183,15 @@ fn load_key(dir: &Path) -> Result<[u8; 32]> {
     let path = dir.join("history.key");
     match std::fs::read(&path) {
         Ok(raw) => {
-            let k = crate::secret::unprotect(&raw)?;
+            let k = crate::secret::unprotect_file(&path, &raw)?;
             k.try_into()
                 .map_err(|_| anyhow::anyhow!("history.key повреждён"))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir_all(dir)?;
             let k = crate::state::random_key()?;
-            std::fs::write(&path, crate::secret::protect(&k)?)
+            // Права 0600, как у остальных секретов.
+            crate::state::write_atomic(&path, &crate::secret::protect(&k)?)
                 .context("не записался history.key")?;
             Ok(k)
         }

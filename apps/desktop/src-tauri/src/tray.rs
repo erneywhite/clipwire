@@ -1,4 +1,8 @@
 //! Иконка в трее: цвет показывает состояние, меню — пауза, настройки, выход.
+//!
+//! macOS: значок в строке меню — шаблон (чёрный с прозрачностью, цвет под тему
+//! даёт система), состояние — формой: обычный, приглушённый провод, перечёркнутый.
+//! Текстом состояние видно первым пунктом меню.
 
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
@@ -46,6 +50,7 @@ impl Wire {
 
 /// Иконки трея, отрендеренные из docs/brand/clipwire-tray.svg (scripts/icons.mjs):
 /// панель задач (тёмная/светлая) × состояние × обычный/приглушённый кадр.
+#[cfg(not(target_os = "macos"))]
 macro_rules! tray_png {
     ($panel:literal, $state:literal) => {
         [
@@ -55,6 +60,37 @@ macro_rules! tray_png {
     };
 }
 
+/// Шаблонный значок строки меню macOS для состояния.
+#[cfg(target_os = "macos")]
+fn png(_light_panel: bool, wire: Wire, dim: bool) -> &'static [u8] {
+    match mac_icon(wire, dim) {
+        MacIcon::On => include_bytes!("../icons/tray/mac-on.png"),
+        MacIcon::Dim => include_bytes!("../icons/tray/mac-dim.png"),
+        MacIcon::Off => include_bytes!("../icons/tray/mac-off.png"),
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum MacIcon {
+    On,
+    Dim,
+    Off,
+}
+
+/// Состояние без цвета: нет связи — перечёркнутый, пауза и кадр пульсации —
+/// приглушённый провод.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mac_icon(wire: Wire, dim: bool) -> MacIcon {
+    match wire {
+        Wire::Error => MacIcon::Off,
+        Wire::Paused => MacIcon::Dim,
+        _ if dim => MacIcon::Dim,
+        _ => MacIcon::On,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn png(light_panel: bool, wire: Wire, dim: bool) -> &'static [u8] {
     let set: [&[u8]; 2] = match (light_panel, wire) {
         (false, Wire::Online) => tray_png!("dark", "online"),
@@ -149,6 +185,8 @@ fn render(app: &AppHandle) {
         Image::from_bytes(png(key.0, wire, dim)),
     ) {
         let _ = tray.set_icon(Some(img));
+        #[cfg(target_os = "macos")]
+        let _ = tray.set_icon_as_template(true);
     }
 }
 
@@ -215,7 +253,10 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         ))?)
         .tooltip("Clipwire")
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        // В строке меню macOS меню открывается обычным кликом; на Windows левый
+        // клик ничего не делает, двойной открывает настройки.
+        .icon_as_template(cfg!(target_os = "macos"))
+        .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, e| {
             crate::updates::touch(app);
             match e.id.as_ref() {
@@ -309,4 +350,20 @@ pub fn show_update(app: &AppHandle, version: &str) {
     }
     LOOK.lock().unwrap_or_else(|e| e.into_inner()).update = true;
     render(app);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mac_icon_by_state() {
+        assert_eq!(mac_icon(Wire::Online, false), MacIcon::On);
+        assert_eq!(mac_icon(Wire::Local, false), MacIcon::On);
+        assert_eq!(mac_icon(Wire::Connecting, false), MacIcon::On);
+        assert_eq!(mac_icon(Wire::Connecting, true), MacIcon::Dim);
+        assert_eq!(mac_icon(Wire::Paused, false), MacIcon::Dim);
+        assert_eq!(mac_icon(Wire::Error, false), MacIcon::Off);
+        assert_eq!(mac_icon(Wire::Error, true), MacIcon::Off);
+    }
 }

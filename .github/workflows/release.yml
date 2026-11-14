@@ -1,9 +1,13 @@
-# Релиз клиента: по тегу vX.Y.Z собирает установщик, подписывает файлы
-# обновления и публикует релиз с latest.json, который читает автообновление.
+# Релиз клиента: по тегу vX.Y.Z собирает установщики Windows и macOS,
+# подписывает файлы обновления и публикует релиз с latest.json, который читает
+# автообновление.
 #
 # Нужны секреты репозитория:
 #   TAURI_SIGNING_PRIVATE_KEY          — приватный ключ подписи обновлений
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD — пароль к нему
+#   APPLE_CERTIFICATE                  — base64 от .p12 сертификата «Clipwire Self-Signed»
+#   APPLE_CERTIFICATE_PASSWORD         — пароль .p12
+# Как сделать сертификат — docs/macos.md, п. 7. Нотаризации нет (APPLE_ID не нужен).
 name: release
 
 on:
@@ -38,7 +42,74 @@ jobs:
           projectPath: apps/desktop
           tagName: ${{ github.ref_name }}
           releaseName: Clipwire ${{ github.ref_name }}
-          releaseBody: Установщик для Windows — файл Clipwire_*_x64-setup.exe. Уже установленные копии обновятся сами.
+          releaseBody: |
+            Windows — файл Clipwire_*_x64-setup.exe. macOS (13 и новее, Apple Silicon и Intel) — Clipwire_*_universal.dmg, первый запуск описан в README. Уже установленные копии обновятся сами.
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+
+  # После Windows, а не параллельно: tauri-action дописывает свою платформу в
+  # latest.json релиза, и два задания разом затёрли бы запись друг друга.
+  macos:
+    needs: windows
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm ci
+        working-directory: apps/desktop
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      # Постоянный самоподписанный сертификат — во временную связку ключей:
+      # одна «личность» у всех версий, и macOS не сбрасывает «Универсальный
+      # доступ» после обновления (docs/macos.md). Сертификат не доверенный,
+      # но codesign им подписывает по имени.
+      - name: Сертификат подписи кода
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KC="$RUNNER_TEMP/clipwire-signing.keychain-db"
+          KC_PASS="$(uuidgen)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASS" "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          security find-identity -p codesigning "$KC"
+
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: Clipwire Self-Signed
+        with:
+          projectPath: apps/desktop
+          args: --target universal-apple-darwin
+          tagName: ${{ github.ref_name }}
+          releaseName: Clipwire ${{ github.ref_name }}
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+
+      # Подпись должна быть сертификатом, а не ad-hoc: у ad-hoc требование —
+      # хэш кода, и разрешения macOS слетали бы с каждым обновлением.
+      - name: Проверка подписи
+        run: |
+          APP=target/universal-apple-darwin/release/bundle/macos/Clipwire.app
+          codesign --verify --deep --strict "$APP"
+          REQ="$(codesign -dr - "$APP" 2>&1)"
+          echo "$REQ"
+          echo "$REQ" | grep -q 'certificate root = H"'

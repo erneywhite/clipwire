@@ -103,12 +103,7 @@ impl Default for Settings {
             sound_on_receive: true,
             link_previews: true,
             hide_from_capture: false,
-            ignored_apps: vec![
-                "KeePass.exe".into(),
-                "KeePassXC.exe".into(),
-                "1Password.exe".into(),
-                "Bitwarden.exe".into(),
-            ],
+            ignored_apps: default_ignored_apps(),
             file_upload_limit_mb: 100,
             auto_update: true,
             delete_everywhere: false,
@@ -117,14 +112,59 @@ impl Default for Settings {
     }
 }
 
-/// Имя компьютера из окружения ОС.
-// shortcut: на macOS переменных COMPUTERNAME/HOSTNAME обычно нет, будет «Это устройство»;
-// взять имя через SCDynamicStore вместе с macOS-клиентом (этап 4).
+/// Менеджеры паролей, которые не синхронизируются по умолчанию. Большинство и
+/// так помечает пароли приватными, список — запас на случай, если нет. Имена —
+/// как их видит `service::is_ignored` (без `.exe` / `.app`).
+fn default_ignored_apps() -> Vec<String> {
+    let names: &[&str] = if cfg!(target_os = "macos") {
+        &["KeePassXC", "1Password", "Bitwarden"]
+    } else {
+        &[
+            "KeePass.exe",
+            "KeePassXC.exe",
+            "1Password.exe",
+            "Bitwarden.exe",
+        ]
+    };
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+/// Имя компьютера: на macOS — как в «Общий доступ» («MacBook Pro Ивана»),
+/// иначе из окружения ОС.
 pub fn default_device_name() -> String {
+    #[cfg(target_os = "macos")]
+    if let Some(name) = mac_computer_name() {
+        return name;
+    }
     ["COMPUTERNAME", "HOSTNAME"]
         .iter()
         .find_map(|v| std::env::var(v).ok().filter(|s| !s.trim().is_empty()))
         .unwrap_or_else(|| tr("Это устройство").into())
+}
+
+/// `SCDynamicStoreCopyComputerName`: имя, которое человек видит и задаёт в
+/// системных настройках. Переменных COMPUTERNAME/HOSTNAME на маке нет.
+#[cfg(target_os = "macos")]
+fn mac_computer_name() -> Option<String> {
+    use objc2::rc::Retained;
+    use objc2_foundation::NSString;
+    #[link(name = "SystemConfiguration", kind = "framework")]
+    unsafe extern "C" {
+        fn SCDynamicStoreCopyComputerName(
+            store: *const std::ffi::c_void,
+            encoding: *mut u32,
+        ) -> *mut NSString;
+    }
+    // SAFETY: без хранилища (NULL) функция открывает своё; результат — новая
+    // ссылка CFString (Copy), бесплатно мостится в NSString и освобождается Retained.
+    let name = unsafe {
+        Retained::from_raw(SCDynamicStoreCopyComputerName(
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ))
+    }?;
+    let name = name.to_string();
+    (!name.trim().is_empty()).then_some(name)
 }
 
 fn file(dir: &Path) -> PathBuf {
@@ -156,6 +196,19 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_device_name_is_computer_name() {
+        let out = std::process::Command::new("scutil")
+            .args(["--get", "ComputerName"])
+            .output()
+            .unwrap();
+        let expected = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !expected.is_empty() {
+            assert_eq!(super::default_device_name(), expected);
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -473,10 +473,11 @@ impl Service {
                         if paused.load(Ordering::Relaxed) {
                             return false;
                         }
-                        let exe = owner.and_then(crate::source_app::file_name);
-                        !exe.is_some_and(|exe| {
-                            is_ignored(&ignored.lock().unwrap_or_else(|e| e.into_inner()), &exe)
-                        })
+                        let keys = owner
+                            .map(crate::source_app::ignore_keys)
+                            .unwrap_or_default();
+                        let list = ignored.lock().unwrap_or_else(|e| e.into_inner());
+                        !keys.iter().any(|k| is_ignored(&list, k))
                     }),
                     on_late_virtual: late,
                 }
@@ -486,13 +487,17 @@ impl Service {
                     return;
                 }
                 // `owner` — полный путь exe программы-владельца буфера.
-                let exe = owner.as_deref().and_then(crate::source_app::file_name);
-                if let Some(exe) = &exe
-                    && is_ignored(&ignored_apps.lock().unwrap_or_else(|e| e.into_inner()), exe)
-                {
-                    tracing::debug!(%exe, "скопировано в игнорируемой программе, пропускаю");
+                // На macOS — ещё bundle id и имя пакета.
+                let keys = owner
+                    .as_deref()
+                    .map(crate::source_app::ignore_keys)
+                    .unwrap_or_default();
+                let list = ignored_apps.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(key) = keys.iter().find(|k| is_ignored(&list, k)) {
+                    tracing::debug!(%key, "скопировано в игнорируемой программе, пропускаю");
                     return;
                 }
+                drop(list);
                 if !guard.should_send(&content) {
                     return;
                 }
@@ -820,13 +825,13 @@ fn record(history: &Mutex<History>, entry: Entry) -> bool {
     })
 }
 
-/// Сравнение без учёта регистра и расширения: «keepass», «KeePass.exe» — одно и то же.
+/// Сравнение без учёта регистра и расширения: «keepass», «KeePass.exe» — одно
+/// и то же; на macOS так же «Tabby» и «Tabby.app».
 pub fn is_ignored(list: &[String], exe: &str) -> bool {
     let norm = |s: &str| {
-        s.trim()
-            .trim_end_matches(".exe")
-            .trim_end_matches(".EXE")
-            .to_lowercase()
+        let s = s.trim().to_lowercase();
+        let s = s.strip_suffix(".exe").unwrap_or(&s);
+        s.strip_suffix(".app").unwrap_or(s).to_string()
     };
     let exe = norm(exe);
     list.iter().any(|x| norm(x) == exe)
@@ -1153,5 +1158,11 @@ mod tests {
         assert!(is_ignored(&list, "1Password.exe"));
         assert!(!is_ignored(&list, "KeePassXC.exe"));
         assert!(!is_ignored(&[], "notepad.exe"));
+        // macOS: пакет вписан с расширением, сравнивается с именем программы.
+        let mac = vec!["Tabby.app".to_string(), "com.apple.TextEdit".to_string()];
+        assert!(is_ignored(&mac, "Tabby"));
+        assert!(is_ignored(&mac, "tabby.APP"));
+        assert!(is_ignored(&mac, "com.apple.textedit"));
+        assert!(!is_ignored(&mac, "TextEdit"));
     }
 }

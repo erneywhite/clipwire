@@ -283,6 +283,27 @@ pub static EN: &[(&str, &str)] = &[
         "файлы не записались в буфер: {e}",
         "could not write the files to the clipboard: {e}",
     ),
+    (
+        "файлы не записались в буфер",
+        "could not write the files to the clipboard",
+    ),
+    (
+        "ключ Clipwire в связке ключей повреждён",
+        "the Clipwire key in the keychain is damaged",
+    ),
+    (
+        "ключ не записался в связку ключей",
+        "could not save the key to the keychain",
+    ),
+    (
+        "нет доступа к ключу Clipwire в связке ключей",
+        "no access to the Clipwire key in the keychain",
+    ),
+    ("файл с секретами повреждён", "the secrets file is damaged"),
+    (
+        "файл с секретами не расшифровался: ключ в связке ключей другой",
+        "could not decrypt the secrets file: the key in the keychain is different",
+    ),
     ("буфер: {what}: {e}", "clipboard: {what}: {e}"),
     ("не открылся", "could not open"),
     ("текст", "text"),

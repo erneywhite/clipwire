@@ -3,7 +3,7 @@
 
 import { t } from './i18n.ts'
 
-const isMac = /Mac/i.test(navigator.platform)
+import { isMac } from './platform.ts'
 
 /** Основная клавиша из KeyboardEvent.code; null — клавиша не годится для сочетания. */
 function mainKey(code: string): string | null {

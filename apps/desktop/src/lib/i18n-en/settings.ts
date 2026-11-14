@@ -36,6 +36,7 @@ const en: Record<string, string> = {
   "предпросмотр (при пустом поиске)": "preview (when search is empty)",
   "закрепить": "pin",
   "удалить из истории (при пустом поиске)": "delete from history (when search is empty)",
+  "удалить из истории": "delete from history",
   "удалить, когда в поиске есть текст": "delete when search has text",
   "Правый клик, клавиша меню": "Right-click, menu key",
   "действия с записью": "item actions",
