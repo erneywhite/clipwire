@@ -67,9 +67,14 @@ pub fn default_dir() -> PathBuf {
         .join("Library/Containers/com.wiheads.paste/Data/Library/Application Support/Paste")
 }
 
-/// Прочитать базу Paste. `images` — переносить ли картинки. Записи — от
-/// старых к новым.
-pub fn read(dir: &Path, images: bool) -> Result<(Vec<Imported>, Summary)> {
+/// Прочитать базу Paste. `images` — переносить ли картинки. Записи отдаются
+/// в `each` по одной, от старых к новым: с картинками архив Paste целиком в
+/// память не помещается.
+pub fn read(
+    dir: &Path,
+    images: bool,
+    mut each: impl FnMut(Imported) -> Result<()>,
+) -> Result<Summary> {
     let db_path = dir.join("db.sqlite");
     anyhow::ensure!(db_path.exists(), "нет базы Paste: {}", db_path.display());
     let db = rusqlite::Connection::open_with_flags(
@@ -110,7 +115,6 @@ pub fn read(dir: &Path, images: bool) -> Result<(Vec<Imported>, Summary)> {
         ))
     })?;
 
-    let mut out = Vec::new();
     let mut sum = Summary::default();
     for row in rows {
         let (raw, created, used, app, list) = row?;
@@ -155,14 +159,14 @@ pub fn read(dir: &Path, images: bool) -> Result<(Vec<Imported>, Summary)> {
         let secs = created.unwrap_or(0.0).max(used.unwrap_or(0.0)) + CORE_DATA_EPOCH;
         let pinned = list.is_some();
         sum.pinned += pinned as usize;
-        out.push(Imported {
+        each(Imported {
             content,
             seen_ms: (secs * 1000.0) as i64,
             app: app.and_then(|pk| apps.get(&pk).cloned()),
             pinned,
-        });
+        })?;
     }
-    Ok((out, sum))
+    Ok(sum)
 }
 
 /// Почему запись не переносится.
