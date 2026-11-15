@@ -1,0 +1,138 @@
+// Виртуальная прокрутка списка: в DOM только видимые строки и запас вокруг.
+// Строки разной высоты (текст, миниатюры до 132 px, файлы с полосой
+// прогресса), поэтому высоты меряются у отрисованных строк и запоминаются,
+// а у ещё не виденных оцениваются по среднему для такого же вида строк.
+// Здесь только расчёт, без DOM: его проверяет vlist.test.ts.
+
+/** Полуоткрытый отрезок индексов [start, end). */
+export interface Range {
+  start: number
+  end: number
+}
+
+/** Вид строки для оценки высоты: у строк с миниатюрой она заметно больше. */
+export type RowShape = 'row' | 'thumb'
+
+/** Оценки до первого замера: две строки текста с метой и строка с миниатюрой. */
+export const DEFAULT_HEIGHT: Record<RowShape, number> = { row: 56, thumb: 160 }
+
+/**
+ * Запомненные высоты строк по id записи. Пока строку не мерили, её высота —
+ * средняя по замеренным строкам того же вида, а до первого замера — DEFAULT_HEIGHT.
+ */
+export class HeightCache {
+  private known = new Map<string, { h: number; shape: RowShape }>()
+  private sum: Record<RowShape, number> = { row: 0, thumb: 0 }
+  private count: Record<RowShape, number> = { row: 0, thumb: 0 }
+
+  /** Высота строки: замер или оценка. */
+  get(id: string, shape: RowShape): number {
+    const k = this.known.get(id)
+    if (k) return k.h
+    return this.count[shape] ? this.sum[shape] / this.count[shape] : DEFAULT_HEIGHT[shape]
+  }
+
+  /** Есть ли замер у строки. */
+  has(id: string): boolean {
+    return this.known.has(id)
+  }
+
+  /** Записать замер. Возвращает, на сколько изменилась высота, которую отдавал get(). */
+  set(id: string, shape: RowShape, h: number): number {
+    const before = this.get(id, shape)
+    const old = this.known.get(id)
+    if (old) {
+      this.sum[old.shape] -= old.h
+      this.count[old.shape]--
+    }
+    this.known.set(id, { h, shape })
+    this.sum[shape] += h
+    this.count[shape]++
+    return h - before
+  }
+
+  /** Забыть строки, которых больше нет в списке: кэш не растёт вместе с историей. */
+  keepOnly(ids: Set<string>) {
+    for (const [id, k] of this.known) {
+      if (ids.has(id)) continue
+      this.known.delete(id)
+      this.sum[k.shape] -= k.h
+      this.count[k.shape]--
+    }
+  }
+
+  clear() {
+    this.known.clear()
+    this.sum = { row: 0, thumb: 0 }
+    this.count = { row: 0, thumb: 0 }
+  }
+
+  get size(): number {
+    return this.known.size
+  }
+}
+
+/** Верх каждой строки: offs[i] — начало строки i, offs[n] — высота всего списка. */
+export function offsets(n: number, heightAt: (i: number) => number): Float64Array {
+  const offs = new Float64Array(n + 1)
+  for (let i = 0; i < n; i++) offs[i + 1] = offs[i] + heightAt(i)
+  return offs
+}
+
+/** Строка, в которую попадает координата y. Для пустого списка — 0. */
+export function rowAt(offs: Float64Array, y: number): number {
+  const n = offs.length - 1
+  if (n <= 0) return 0
+  // Последняя строка, у которой верх не ниже y.
+  let lo = 0
+  let hi = n - 1
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (offs[mid] <= y) lo = mid
+    else hi = mid - 1
+  }
+  return lo
+}
+
+/** Какие строки держать в DOM: видимые и по `overscan` строк сверху и снизу. */
+export function visibleRange(offs: Float64Array, scrollTop: number, viewport: number, overscan: number): Range {
+  const n = offs.length - 1
+  if (n <= 0) return { start: 0, end: 0 }
+  const first = rowAt(offs, Math.max(0, scrollTop))
+  // Нижний край окна сам по себе не входит: строка, которая начинается ровно
+  // на нём, ещё не видна.
+  const last = rowAt(offs, Math.max(0, scrollTop + Math.max(viewport, 0) - 0.5))
+  return { start: Math.max(0, first - overscan), end: Math.min(n, last + 1 + overscan) }
+}
+
+/**
+ * Прокрутка, при которой строка i видна целиком, как scrollIntoView({block:'nearest'}):
+ * если она уже видна, прокрутка не меняется; выше окна — строка встаёт к верху,
+ * ниже — к низу. Строка выше окна прижимается к верху.
+ */
+export function scrollFor(offs: Float64Array, i: number, scrollTop: number, viewport: number): number {
+  const n = offs.length - 1
+  if (n <= 0 || i < 0 || i >= n) return scrollTop
+  const top = offs[i]
+  const bottom = offs[i + 1]
+  if (top < scrollTop) return top
+  if (bottom > scrollTop + viewport) return Math.min(top, bottom - viewport)
+  return scrollTop
+}
+
+/**
+ * Сколько записей перечитывать при изменении истории. Не всё подгруженное, а
+ * до видимого конца (или выбранной строки) с запасом, округлённым до целой
+ * страницы: после перечитывания до конца остаётся не меньше `ahead` записей,
+ * и следующая страница сразу не запрашивается. Не меньше `page` и не больше,
+ * чем было подгружено.
+ */
+export function reloadCount(loaded: number, needed: number, page: number, ahead: number): number {
+  const want = Math.ceil((needed + ahead) / page) * page
+  return Math.max(page, Math.min(loaded, want))
+}
+
+/** Сколько записей осталось до конца подгруженного: от выбранной и от нижней видимой. */
+export function rowsLeft(n: number, sel: number, lastVisible: number): number {
+  return Math.min(n - 1 - sel, n - 1 - lastVisible)
+}
