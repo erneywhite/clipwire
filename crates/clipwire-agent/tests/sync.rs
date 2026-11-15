@@ -7,6 +7,10 @@ use anyhow::{Context, Result};
 use clipwire_agent::state::{AgentState, random_key};
 use clipwire_agent::sync::{Engine, Event, Outgoing, Status};
 use clipwire_core::{Content, GroupKey, Invite, ItemId, ServerInfo, SourceApp};
+
+/// Ключ администратора тестового сервера: лежит в его каталоге данных до
+/// запуска, с ним движок создаёт группу (`JoinAsAdmin`).
+const TEST_ADMIN: clipwire_core::AdminKey = clipwire_core::AdminKey([42; 32]);
 use clipwire_server::Config;
 use tokio::sync::mpsc;
 
@@ -29,6 +33,8 @@ async fn start_server() -> Result<(clipwire_server::Running, ServerInfo)> {
         blob_total_quota: u64::MAX,
         blob_stall: Duration::from_secs(10),
     };
+    std::fs::create_dir_all(&config.data_dir)?;
+    std::fs::write(config.data_dir.join("admin.key"), TEST_ADMIN.0)?;
     let server = clipwire_server::start(&config).await?;
     tokio::time::timeout(T, server.endpoint().online()).await?;
     let port = server.relay_addr().context("нет relay")?.port();
@@ -54,7 +60,8 @@ impl Agent {
         };
         let (etx, events) = mpsc::unbounded_channel();
         let (local, lrx) = mpsc::channel(16);
-        let engine = Engine::new(state, "тест".into(), cursor, etx, Arc::new(|| {}));
+        let engine = Engine::new(state, "тест".into(), cursor, etx, Arc::new(|| {}))
+            .with_admin_key(Some(TEST_ADMIN));
         let task = tokio::spawn(engine.run(lrx));
         Ok(Self {
             local,

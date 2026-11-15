@@ -8,13 +8,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use clipwire_core::AdminKey;
 use clipwire_core::delete::DeleteNote;
 use clipwire_core::device::{DeviceCard, Rekey, open_rekey, rekey_public};
 use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{
-    ALPNS, ClientMsg, DeviceEntry, GroupStats, PinStats, ServerMsg, alpn_version, knows_deletes,
-    knows_pins, knows_server_info, knows_stats, version_older,
+    ALPNS, ClientMsg, DeviceEntry, GroupStats, PinStats, ServerMsg, alpn_version, knows_admin,
+    knows_deletes, knows_pins, knows_server_info, knows_stats, version_older,
 };
 use clipwire_core::{Content, DeviceId, Ext, ExtList, GroupId, GroupKey, Item, ItemId, SourceApp};
 use iroh::endpoint::{Connection, presets};
@@ -229,6 +230,10 @@ pub struct Engine {
     state: AgentState,
     device: DeviceId,
     device_name: String,
+    /// Ключ администратора сервера (из кода `cwserver2-…`). С ним вход идёт
+    /// `JoinAsAdmin`, и группа создаётся, если её нет. Без него сервер 0.5.0
+    /// создаёт только новую группу при смене ключа.
+    admin_key: Option<AdminKey>,
     cursor: Option<ItemId>,
     events: mpsc::UnboundedSender<Event>,
     notify: Notify,
@@ -356,6 +361,7 @@ impl Engine {
             listed_at: None,
             want_list: false,
             pending_rekey: None,
+            admin_key: None,
             config_check: None,
             config_off_until: None,
             want_config: false,
@@ -385,6 +391,13 @@ impl Engine {
     /// Принимать команды интерфейса (`devices::Controller`).
     pub fn with_control(mut self, control: mpsc::Receiver<Control>) -> Self {
         self.control = Some(control);
+        self
+    }
+
+    /// Входить с ключом администратора сервера (`JoinAsAdmin`): так
+    /// создаётся новая группа.
+    pub fn with_admin_key(mut self, key: Option<AdminKey>) -> Self {
+        self.admin_key = key;
         self
     }
 
@@ -699,7 +712,8 @@ impl Engine {
         let server_addr = addr.clone();
         let conn = connect(ep, addr.clone()).await?;
         let key = self.state.invite.group_key.clone();
-        let (conn, mut send, mut recv) = match join(&conn, &key, Some(&self.token())).await {
+        let admin = self.admin_key.as_ref();
+        let (conn, mut send, mut recv) = match join(&conn, &key, Some(&self.token()), admin).await {
             Ok((send, recv)) => (conn, send, recv),
             Err(JoinFail::Other(e)) => return Err(e),
             Err(JoinFail::Rotated(env)) => return Err(self.rotated(env)),
@@ -709,7 +723,7 @@ impl Engine {
                 // `Join` по новому соединению.
                 tracing::info!("вход с токеном не прошёл ({first}), пробую обычный вход");
                 let conn = connect(ep, addr).await?;
-                match join(&conn, &key, None).await {
+                match join(&conn, &key, None, None).await {
                     Ok((send, recv)) => (conn, send, recv),
                     Err(JoinFail::Rotated(env)) => return Err(self.rotated(env)),
                     // Если на первый вход сервер отказал внятно, его причина
@@ -1117,7 +1131,8 @@ impl Engine {
 
         // Новая группа: вход отдельным соединением и своя карточка в ней.
         let conn2 = connect(ep, addr).await?;
-        let (mut send2, mut recv2) = join(&conn2, &new_key, Some(&self.token()))
+        let admin = self.admin_key.as_ref();
+        let (mut send2, mut recv2) = join(&conn2, &new_key, Some(&self.token()), admin)
             .await
             .map_err(|e| anyhow!(trf("не удалось создать новую группу: {e}", &[("e", &e)])))?;
         let card = crate::devices::sealed_card(
@@ -1617,24 +1632,32 @@ impl std::fmt::Display for JoinFail {
     }
 }
 
-/// Открыть основной поток и войти в группу: с токеном (`JoinWithToken`) или
-/// без (`Join`, для старого сервера). Возвращает поток после `Joined`.
+/// Открыть основной поток и войти в группу: с ключом администратора
+/// (`JoinAsAdmin`, только серверу `clipwire/9`), с токеном (`JoinWithToken`)
+/// или без (`Join`, для старого сервера). Возвращает поток после `Joined`.
 async fn join(
     conn: &Connection,
     key: &clipwire_core::GroupKey,
     token: Option<&str>,
+    admin: Option<&AdminKey>,
 ) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), JoinFail> {
     let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|e| JoinFail::Closed(e.to_string()))?;
-    let msg = match token {
-        Some(t) => ClientMsg::JoinWithToken {
+    let admin = admin.filter(|_| knows_admin(conn.alpn()));
+    let msg = match (admin, token) {
+        (Some(a), _) => ClientMsg::JoinAsAdmin {
+            group_id: key.group_id(),
+            join_secret: key.join_secret(),
+            admin_key: a.clone(),
+        },
+        (None, Some(t)) => ClientMsg::JoinWithToken {
             group_id: key.group_id(),
             join_secret: key.join_secret(),
             token: t.to_string(),
         },
-        None => ClientMsg::Join {
+        (None, None) => ClientMsg::Join {
             group_id: key.group_id(),
             join_secret: key.join_secret(),
         },

@@ -26,6 +26,10 @@ use clipwire_core::proto::{
     ALPN, BlobChunk, BlobFail, BlobReply, BlobRequest, ClientMsg, ServerMsg, encode_frame,
 };
 use clipwire_core::{BlobId, Content, DeviceId, FileRef, GroupKey, Invite, ServerInfo};
+
+/// Ключ администратора тестового сервера: лежит в его каталоге данных до
+/// запуска, с ним движок создаёт группу (`JoinAsAdmin`).
+const TEST_ADMIN: clipwire_core::AdminKey = clipwire_core::AdminKey([42; 32]);
 use clipwire_server::{Config, Guards};
 use iroh::endpoint::{Connection, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
@@ -73,6 +77,8 @@ async fn start_server_guarded(
         blob_total_quota: u64::MAX,
         blob_stall,
     };
+    std::fs::create_dir_all(&config.data_dir)?;
+    std::fs::write(config.data_dir.join("admin.key"), TEST_ADMIN.0)?;
     let server = clipwire_server::start_with(&config, &guards).await?;
     tokio::time::timeout(T, server.endpoint().online()).await?;
     let port = server.relay_addr().context("нет relay")?.port();
@@ -105,11 +111,11 @@ impl Device {
         let (mut send, mut recv) = conn.open_bi().await?;
         write_msg(
             &mut send,
-            // Как настоящий агент: с токеном сервера, иначе новую группу не создать.
-            &ClientMsg::JoinWithToken {
+            // С ключом администратора: иначе новую группу не создать.
+            &ClientMsg::JoinAsAdmin {
                 group_id: key.group_id(),
                 join_secret: key.join_secret(),
-                token: info.relay_token.clone(),
+                admin_key: TEST_ADMIN,
             },
         )
         .await?;
@@ -518,8 +524,9 @@ impl Agent {
         let (b, transfers) = blobs(key, dir);
         let (etx, events) = mpsc::unbounded_channel();
         let (local, lrx) = mpsc::channel(16);
-        let engine =
-            Engine::new(state, "тест".into(), None, etx, Arc::new(|| {})).with_blobs(b.clone());
+        let engine = Engine::new(state, "тест".into(), None, etx, Arc::new(|| {}))
+            .with_admin_key(Some(TEST_ADMIN))
+            .with_blobs(b.clone());
         let device = engine.device();
         let task = tokio::spawn(engine.run(lrx));
         Ok(Self {

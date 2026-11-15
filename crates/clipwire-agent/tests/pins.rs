@@ -15,6 +15,10 @@ use clipwire_agent::state::{AgentState, random_key};
 use clipwire_agent::sync::{Engine, Event, Outgoing, Status};
 use clipwire_core::device::{DeviceCard, device_id};
 use clipwire_core::{BlobId, Content, DeviceId, GroupKey, Invite, Item, ServerInfo};
+
+/// Ключ администратора тестового сервера: лежит в его каталоге данных до
+/// запуска, с ним движок создаёт группу (`JoinAsAdmin`).
+const TEST_ADMIN: clipwire_core::AdminKey = clipwire_core::AdminKey([42; 32]);
 use clipwire_server::{Config, Guards};
 use tokio::sync::mpsc;
 
@@ -45,6 +49,8 @@ async fn start_server_at(
         blob_total_quota: u64::MAX,
         blob_stall: Duration::from_secs(10),
     };
+    std::fs::create_dir_all(&config.data_dir)?;
+    std::fs::write(config.data_dir.join("admin.key"), TEST_ADMIN.0)?;
     let server = clipwire_server::start_with(&config, &guards).await?;
     tokio::time::timeout(T, server.endpoint().online()).await?;
     let port = server.relay_addr().context("нет relay")?.port();
@@ -218,6 +224,7 @@ impl Dev {
         let (local, lrx) = mpsc::channel(16);
         let (ctx, crx) = mpsc::channel::<Control>(4);
         let engine = Engine::new(state, self.name.into(), None, etx, Arc::new(|| {}))
+            .with_admin_key(Some(TEST_ADMIN))
             .with_control(crx)
             .with_known_devices(self.known.clone())
             .with_pins(self.pins.clone(), self.mem.clone());
@@ -586,9 +593,10 @@ async fn pins_move_to_new_key() -> Result<()> {
     let key = GroupKey::generate()?;
     let mut a = Dev::new("A", &info, &key)?;
     let mut b = Dev::new("B", &info, &key)?;
+    // A входит первым и создаёт группу: ключ меняет только админ группы.
     a.start();
-    b.start();
     a.online().await?;
+    b.start();
     b.online().await?;
     a.devices_with_cards(2).await?;
     b.devices_with_cards(2).await?;
@@ -896,9 +904,10 @@ async fn offline_device_after_rekey_does_not_resurrect_pins() -> Result<()> {
     let key = GroupKey::generate()?;
     let mut a = Dev::new("A", &info, &key)?;
     let mut b = Dev::new("B", &info, &key)?;
+    // A входит первым и создаёт группу: ключ меняет только админ группы.
     a.start();
-    b.start();
     a.online().await?;
+    b.start();
     b.online().await?;
     a.devices_with_cards(2).await?;
     b.devices_with_cards(2).await?;
