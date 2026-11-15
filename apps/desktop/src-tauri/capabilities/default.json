@@ -21,7 +21,7 @@
     "core:window:allow-close",
     "core:window:allow-start-dragging",
     "core:event:default",
-    "updater:default",
+    "updater:allow-check",
     {
       "identifier": "opener:allow-open-url",
       "allow": [
@@ -33,7 +33,6 @@
         }
       ]
     },
-    "process:allow-restart",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled",
