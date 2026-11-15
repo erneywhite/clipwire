@@ -3,6 +3,7 @@
   // чтобы превью выглядело ровно как настоящее окно.
   import type { Entry } from './api'
   import AppTag from './AppTag.svelte'
+  import NoteEdit from './NoteEdit.svelte'
   import { t } from './i18n'
   import { deviceName } from './platform'
   import { ago, bytesLabel, filesLabel, filesMeta, isUrl, looksLikeCode, sizeLabel } from './format'
@@ -19,6 +20,9 @@
     onmenu,
     transfers = {},
     setsize,
+    noting = false,
+    onnotesave,
+    onnotecancel,
   }: {
     item: Entry
     index: number
@@ -35,11 +39,18 @@
     onpaste?: () => void
     /** Закрепить или открепить кликом по булавке. */
     onpin?: () => void
-    /** Удалить из истории кликом по корзине. */
-    onremove?: () => void
+    /** Удалить из истории кликом по корзине; рамка кнопки — чтобы выбор у закрепа открылся рядом. */
+    onremove?: (at: DOMRect) => void
     /** Правый клик: меню действий в этой точке окна. */
     onmenu?: (x: number, y: number) => void
+    /** Подпись правится прямо в строке, на месте заголовка. */
+    noting?: boolean
+    onnotesave?: (text: string) => void
+    onnotecancel?: () => void
   } = $props()
+
+  // Подпись видна только у закреплённых: у открепленной она остаётся в базе.
+  const note = $derived(item.pinned ? item.note : null)
 
   const kind = $derived(
     item.kind === 'image' || item.kind === 'files'
@@ -108,6 +119,12 @@
     {/if}
   </span>
   <span class="body">
+    <!-- Подпись — заголовок над обычным содержимым строки. Вставляется запись, не подпись. -->
+    {#if noting}
+      <NoteEdit value={note ?? ''} onsave={(text) => onnotesave?.(text)} oncancel={() => onnotecancel?.()} />
+    {:else if note}
+      <span class="note">{note}</span>
+    {/if}
     {#if kind === 'files'}
       {#if item.thumb}
         <img
@@ -166,7 +183,7 @@
         aria-label={t('Удалить из истории')}
         onclick={(e) => {
           e.stopPropagation()
-          onremove?.()
+          onremove?.((e.currentTarget as HTMLElement).getBoundingClientRect())
         }}
         ondblclick={(e) => e.stopPropagation()}
       >
@@ -236,6 +253,15 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
+  }
+  /* Акцент темы, смешанный с цветом текста: чистый акцент на светлых Графите
+   * и Сигнале не дотягивает до контраста 4,5:1, смесь дотягивает во всех темах. */
+  .note {
+    color: color-mix(in oklch, var(--c-accent) 75%, var(--c-text));
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .text {
     display: -webkit-box;

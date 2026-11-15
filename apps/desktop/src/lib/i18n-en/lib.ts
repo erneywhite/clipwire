@@ -96,6 +96,17 @@ const en: Record<string, string> = {
   'Сервер Clipwire': 'Clipwire server',
   '{where}: не подключается': '{where}: cannot connect',
   '{where}: были сбои, файлы шли через сервер': '{where}: had failures, files went through the server',
+  '{used} из {max}': '{used} of {max}',
+
+  // pins.ts, NoteEdit.svelte
+  'Снять закреп только здесь': 'Unpin on this device only',
+  'на других устройствах останется': 'stays pinned on other devices',
+  'Снять закреп везде': 'Unpin everywhere',
+  'запись останется в истории': 'the item stays in history',
+  'Удалить везде': 'Delete everywhere',
+  'со всех устройств группы': 'from every device in the group',
+  'Подпись: Enter — сохранить, Esc — отмена': 'Note: Enter to save, Esc to cancel',
+  'Подпись закреплённой записи': 'Note of the pinned item',
 
   // hotkey.ts
   'Пробел': 'Space',
