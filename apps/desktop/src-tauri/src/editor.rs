@@ -122,19 +122,24 @@ pub async fn editor_save(app: AppHandle, png: String, paste: bool) -> Result<(),
     // Редактор спрятан (на маке он остаётся на экране, если просит доступ к
     // универсальному доступу): закрыть окно насовсем вместе с картинкой. Не
     // сразу: страница этого окна ещё ждёт ответа на эту команду.
+    // Проверка и закрытие идут под замком `ensure_window`
+    // (`crate::destroy_window_if`), и счётчик читается уже под ним:
+    // `editor_open` увеличивает его до `ensure_window`, так что открытие,
+    // начатое раньше закрытия, его отменит, а начатое позже дождётся
+    // закрытия и создаст окно заново.
     let opens = OPENS.load(Ordering::SeqCst);
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(DESTROY_AFTER).await;
-        if let Some(w) = app.get_webview_window("editor")
-            && should_destroy(
-                opens,
-                OPENS.load(Ordering::SeqCst),
-                w.is_visible().unwrap_or(true),
-            )
-            && let Err(e) = w.destroy()
-        {
-            tracing::warn!("окно редактора не закрылось: {e}");
-        }
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            crate::destroy_window_if(&app, "editor", |w| {
+                should_destroy(
+                    opens,
+                    OPENS.load(Ordering::SeqCst),
+                    w.is_visible().unwrap_or(true),
+                )
+            });
+        })
+        .await;
     });
     Ok(())
 }

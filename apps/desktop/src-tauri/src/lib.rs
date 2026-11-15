@@ -372,6 +372,40 @@ pub fn apply_window_background(app: &AppHandle, hex: &str) {
 /// Последний цвет фона из темы, для окон, созданных после его выбора.
 static WINDOW_BACKGROUND: Mutex<Option<tauri::window::Color>> = Mutex::new(None);
 
+/// Замок над созданием и закрытием окон по требованию (`ensure_window`,
+/// `destroy_window_if`). Внутри — метки окон, которым уже сказали закрыться,
+/// но Tauri их ещё не убрал.
+static WINDOWS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Сколько `ensure_window` ждёт, пока закрываемое окно исчезнет.
+const DYING_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Закрыть окно насовсем, если `ok` согласен. Решение принимается под тем
+/// же замком, что и `ensure_window`: окно, которое как раз открывают снова,
+/// либо уже отдано открывающему (и `ok` это увидит), либо будет создано
+/// заново после закрытия. Звать не из главного потока: замок может ждать
+/// создания окна.
+pub fn destroy_window_if(
+    app: &AppHandle,
+    label: &str,
+    ok: impl FnOnce(&tauri::WebviewWindow) -> bool,
+) {
+    let mut dying = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(w) = app.get_webview_window(label) else {
+        return;
+    };
+    if !ok(&w) {
+        return;
+    }
+    match w.destroy() {
+        Ok(()) => {
+            if !dying.iter().any(|l| l == label) {
+                dying.push(label.to_string());
+            }
+        }
+        Err(e) => tracing::warn!("окно {label} не закрылось: {e}"),
+    }
+}
+
 /// Взять окно по метке или создать его по описанию из `tauri.conf.json`.
 /// Второе значение — окно только что создано (страница ещё грузится).
 ///
@@ -386,9 +420,18 @@ static WINDOW_BACKGROUND: Mutex<Option<tauri::window::Color>> = Mutex::new(None)
 /// же поток. Поэтому звать только из фонового потока или async-команды.
 pub fn ensure_window(app: &AppHandle, label: &str) -> Result<(tauri::WebviewWindow, bool), String> {
     // Два одновременных вызова не должны создавать окно дважды: вторая
-    // попытка с той же меткой упала бы.
-    static CREATING: Mutex<()> = Mutex::new(());
-    let _guard = CREATING.lock().unwrap_or_else(|e| e.into_inner());
+    // попытка с той же меткой упала бы. Тот же замок держит и
+    // `destroy_window_if`: окно, которое закрывают, не отдаётся как живое.
+    let mut dying = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = dying.iter().position(|l| l == label) {
+        // Tauri убирает окно из списка, только когда главный поток обработал
+        // закрытие; до тех пор `get_webview_window` отдаёт умирающее окно.
+        let deadline = std::time::Instant::now() + DYING_WAIT;
+        while app.get_webview_window(label).is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        dying.swap_remove(i);
+    }
     if let Some(w) = app.get_webview_window(label) {
         return Ok((w, false));
     }
