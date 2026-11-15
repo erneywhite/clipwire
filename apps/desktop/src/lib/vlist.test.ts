@@ -1,7 +1,7 @@
 // Проверка расчёта виртуальной прокрутки. Запуск: node src/lib/vlist.test.ts
 // (Node 23.6+ сам убирает типы), как transfer.test.ts.
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
-const { DEFAULT_HEIGHT, HeightCache, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange } = (await import(
+const { anchored, anchoredById, DEFAULT_HEIGHT, HeightCache, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange } = (await import(
   './vlist' + '.ts'
 )) as typeof import('./vlist')
 
@@ -87,6 +87,32 @@ function check(cond: boolean, msg: string) {
     const n = reloadCount(1e6, needed, 200, 50)
     check(n - needed >= 50 && n % 200 === 0, `после перечитывания запас не меньше ahead (needed=${needed}, n=${n})`)
   }
+}
+
+// Привязка прокрутки: верхняя видимая строка не уезжает.
+{
+  const before = offsets(10, () => 50)
+  const hs = [50, 120, 50, 50, 50, 50, 50, 50, 50, 50]
+  const after = offsets(10, (i) => hs[i])
+  check(anchored(before, after, 0) === 0, 'вверху прокрутка не меняется')
+  check(anchored(before, after, 60) === 60, 'строка 1 выросла, но она и есть верхняя: место внутри неё то же')
+  check(anchored(before, after, 210) === 280, 'строка выше окна выросла на 70 — прокрутка тоже')
+  const shrunk = offsets(10, (i) => (i < 3 ? 10 : 50))
+  check(anchored(before, shrunk, 175) === 55, 'строки выше сжались — прокрутка меньше')
+  check(anchored(before, offsets(11, () => 50), 210) === 210, 'другое число строк — не трогаем')
+}
+
+// Замена списка: верхняя видимая запись остаётся на месте.
+{
+  const ids = ['a', 'b', 'c', 'd', 'e']
+  const before = offsets(5, () => 50)
+  const withNew = ['n', ...ids]
+  const after = offsets(6, (i) => (i === 0 ? 80 : 50))
+  check(anchoredById(before, ids, after, withNew, 0) === 0, 'в самом верху новая запись видна, прокрутка не меняется')
+  check(anchoredById(before, ids, after, withNew, 120) === 200, 'сверху пришла запись в 80 px — прокрутка ниже на 80')
+  const gone = ['a', 'c', 'd', 'e']
+  check(anchoredById(before, ids, offsets(4, () => 50), gone, 160) === 110, 'выше удалили запись — прокрутка выше')
+  check(anchoredById(before, ids, offsets(2, () => 50), ['x', 'y'], 160) === 160, 'верхней записи больше нет — не трогаем')
 }
 
 check(rowsLeft(100, 10, 20) === 79, 'осталось — от нижней видимой')

@@ -121,6 +121,36 @@ export function scrollFor(offs: Float64Array, i: number, scrollTop: number, view
 }
 
 /**
+ * Прокрутка после смены высот: строка, которая была вверху окна, остаётся на
+ * том же месте, сколько бы ни выросли или сжались строки над ней.
+ */
+export function anchored(before: Float64Array, after: Float64Array, scrollTop: number): number {
+  if (before.length !== after.length || before.length < 2) return scrollTop
+  const i = rowAt(before, scrollTop)
+  return Math.max(0, after[i] + (scrollTop - before[i]))
+}
+
+/**
+ * Прокрутка после замены списка (сверху пришли новые записи, какие-то
+ * удалились): верхняя видимая запись остаётся на месте, если она есть и в
+ * новом списке. В самом верху прокрутка не трогается: новая запись должна
+ * появиться на виду.
+ */
+export function anchoredById(
+  before: Float64Array,
+  idsBefore: readonly string[],
+  after: Float64Array,
+  idsAfter: readonly string[],
+  scrollTop: number,
+): number {
+  if (scrollTop <= 0 || idsBefore.length === 0) return scrollTop
+  const i = rowAt(before, scrollTop)
+  const j = idsAfter.indexOf(idsBefore[i])
+  if (j < 0) return scrollTop
+  return Math.max(0, after[j] + (scrollTop - before[i]))
+}
+
+/**
  * Сколько записей перечитывать при изменении истории. Не всё подгруженное, а
  * до видимого конца (или выбранной строки) с запасом, округлённым до целой
  * страницы: после перечитывания до конца остаётся не меньше `ahead` записей,
