@@ -189,7 +189,9 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
                 if updates::is_activity(&e) {
                     updates::touch(&handle);
                 }
-                let _ = handle.emit("clipwire://history-changed", ());
+                // Через ту же склейку: серия копирований подряд или пачка
+                // пришедших записей перечитывает список один раз.
+                history_changed_soon(&handle);
             }
             UiEvent::Deleted(_) => {
                 // Скачанные копии удалённых записей больше не нужны.
