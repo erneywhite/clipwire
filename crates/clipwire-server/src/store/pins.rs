@@ -337,6 +337,7 @@ mod tests {
         PinId([n; 16])
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn put(
         s: &Store,
         g: &GroupId,
