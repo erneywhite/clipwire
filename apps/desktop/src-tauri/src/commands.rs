@@ -100,6 +100,8 @@ pub struct EntryDto {
     pub device_name: String,
     pub local: bool,
     pub pinned: bool,
+    /// Подпись закреплённой записи (до 80 символов), `None` — без подписи.
+    pub note: Option<String>,
     pub seen_ms: i64,
     /// Картинка: размеры в пикселях и вес PNG.
     pub width: u32,
@@ -245,6 +247,7 @@ fn row_dto(r: &Row, files_dir: &std::path::Path, uploaded: UploadedFn<'_>) -> En
         device_name: c.device_name.clone(),
         local: c.local,
         pinned: r.pinned,
+        note: r.note(),
         seen_ms: r.seen_ms,
         width: c.width,
         height: c.height,
@@ -359,6 +362,18 @@ pub fn history_get(state: State<'_, AppState>, id: String) -> CmdResult<EntryDto
         .ok_or_else(|| tr("Элемента уже нет в истории").into())
 }
 
+/// Закрепы группы текущего сервиса; `None` в локальном режиме.
+fn group_pins(state: &AppState) -> Option<std::sync::Arc<clipwire_agent::pins::Pins>> {
+    state
+        .service
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|s| s.pins())
+}
+
+/// Закрепить или открепить. В группе правка уходит на все устройства (без
+/// связи — после входа); открепление стирает подпись.
 #[tauri::command]
 pub fn history_pin(
     app: AppHandle,
@@ -367,12 +382,94 @@ pub fn history_pin(
     pinned: bool,
 ) -> CmdResult<()> {
     let id = parse_id(&id)?;
-    state
-        .history
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .set_pinned(id, pinned)
+    let pins = group_pins(&state);
+    let (hash, note) = {
+        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        h.set_pinned(id, pinned).map_err(err)?;
+        let row = h.row(id);
+        (
+            h.hash_of(id),
+            row.and_then(|r| r.note()).unwrap_or_default(),
+        )
+    };
+    if let (Some(pins), Some(hash)) = (pins, hash) {
+        if pinned {
+            pins.pin(hash, &note);
+        } else {
+            pins.unpin(hash);
+        }
+    }
+    let _ = app.emit("clipwire://history-changed", ());
+    Ok(())
+}
+
+/// Подпись закреплённой записи (пустая — убрать). Возвращает сохранённую
+/// подпись: без переводов строк и пробелов по краям, до 80 символов.
+#[tauri::command]
+pub fn history_note(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    note: String,
+) -> CmdResult<String> {
+    let id = parse_id(&id)?;
+    let pins = group_pins(&state);
+    let (saved, hash) = {
+        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = h.set_note(id, &note).map_err(err)?;
+        (saved, h.hash_of(id))
+    };
+    if let (Some(pins), Some(hash)) = (pins, hash) {
+        pins.set_note(hash, &saved);
+    }
+    let _ = app.emit("clipwire://history-changed", ());
+    Ok(saved)
+}
+
+/// Как убрать закреплённую запись (диалог Del на закрепе).
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PinnedDelete {
+    /// Снять закреп только на этом устройстве: на остальных он остаётся, и
+    /// следующая синхронизация не закрепит запись здесь снова.
+    Here,
+    /// Снять закреп на всех устройствах: запись остаётся обычной.
+    Everywhere,
+    /// Снять закреп везде и удалить запись на всех устройствах.
+    Delete,
+}
+
+#[tauri::command]
+pub fn history_delete_pinned(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    mode: PinnedDelete,
+) -> CmdResult<()> {
+    let id = parse_id(&id)?;
+    let pins = group_pins(&state);
+    let hash = {
+        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        let hash = h.hash_of(id);
+        match mode {
+            PinnedDelete::Here | PinnedDelete::Everywhere => h.set_pinned(id, false),
+            PinnedDelete::Delete => h.delete(id),
+        }
         .map_err(err)?;
+        hash
+    };
+    if let (Some(pins), Some(hash)) = (pins, hash) {
+        match mode {
+            PinnedDelete::Here => pins.unpin_here(hash),
+            PinnedDelete::Everywhere => pins.unpin(hash),
+            // Записка об удалении уходит, когда сервер примет снятие:
+            // закреплённое записка не удаляет.
+            PinnedDelete::Delete => pins.delete(hash),
+        }
+    }
+    if matches!(mode, PinnedDelete::Delete) {
+        crate::cache::prune_later(&app);
+    }
     let _ = app.emit("clipwire://history-changed", ());
     Ok(())
 }
@@ -575,12 +672,24 @@ pub fn history_update(
     text: String,
 ) -> CmdResult<()> {
     let id = parse_id(&id)?;
-    state
-        .history
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .update_text(id, text)
-        .map_err(err)?;
+    let pins = group_pins(&state);
+    // У правленой записи другой хэш: закреп переезжает на новый (старый
+    // снимается везде, новый ставится с той же подписью).
+    let moved = {
+        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        let before = h
+            .row(id)
+            .filter(|r| r.pinned)
+            .map(|r| (r.card.hash, r.note()));
+        h.update_text(id, text).map_err(err)?;
+        before.zip(h.hash_of(id))
+    };
+    if let (Some(pins), Some(((old, note), new))) = (pins, moved)
+        && old != new
+    {
+        pins.unpin(old);
+        pins.pin(new, &note.unwrap_or_default());
+    }
     let _ = app.emit("clipwire://history-changed", ());
     Ok(())
 }

@@ -75,6 +75,26 @@ export interface GroupStats {
   quota: number
 }
 
+/** Закрепы группы на сервере (`stats_overview`). */
+export interface PinStats {
+  /** Закреплённых записей (снятые не считаются). */
+  pins: number
+  /** Сколько места занимают все записи закрепов, включая снятые, байт. */
+  bytes: number
+  /** Пределы сервера: CLIPWIRE_PIN_MAX и CLIPWIRE_PIN_BYTES. */
+  max_pins: number
+  max_bytes: number
+}
+
+/** Как убрать закреплённую запись (`history_delete_pinned`). */
+export type PinnedDelete =
+  /** Снять закреп только здесь: на других устройствах он остаётся. */
+  | 'here'
+  /** Снять закреп везде: запись остаётся в истории как обычная. */
+  | 'everywhere'
+  /** Снять закреп везде и удалить запись на всех устройствах. */
+  | 'delete'
+
 /** Связь с сервером и его версия (`stats_overview`). */
 export interface Link {
   direct: boolean
@@ -93,6 +113,9 @@ export interface StatsOverview {
   /** null — устройство не в группе или сервер не ответил (см. server_error). */
   server: GroupStats | null
   server_error: string | null
+  /** Закрепы группы на сервере; null — не в группе или нет ответа (см. pins_error). */
+  pins: PinStats | null
+  pins_error: string | null
   /** Путь до сервера, null — нет связи. */
   link: Link | null
   /** Мс Unix, 0 — с запуска не было. */
@@ -117,6 +140,8 @@ export interface Entry {
   device_name: string
   local: boolean
   pinned: boolean
+  /** Подпись закреплённой записи (до 80 символов); null — без подписи. */
+  note: string | null
   seen_ms: number
   /** Картинка: размеры и вес PNG. */
   width: number
@@ -321,7 +346,12 @@ export const api = {
   list: (query: string, pinnedOnly: boolean, kind: KindFilter = 'all', limit = 200, offset = 0) =>
     invoke<Entry[]>('history_list', { query, pinnedOnly, kind, limit, offset }),
   get: (id: string) => invoke<Entry>('history_get', { id }),
+  /** В группе закреп уходит на все устройства; открепление стирает подпись. */
   pin: (id: string, pinned: boolean) => invoke<void>('history_pin', { id, pinned }),
+  /** Подпись закреплённой записи (пустая — убрать). Возвращает сохранённую: до 80 символов, без переводов строк. */
+  note: (id: string, note: string) => invoke<string>('history_note', { id, note }),
+  /** Del на закрепе. Отказ сервера по квоте приходит событием clipwire://pin-failed (строка). */
+  deletePinned: (id: string, mode: PinnedDelete) => invoke<void>('history_delete_pinned', { id, mode }),
   remove: (id: string) => invoke<void>('history_delete', { id }),
   clear: (keepPinned: boolean) => invoke<void>('history_clear', { keepPinned }),
   /** `files` — номера файлов записи, если вставить нужно только часть. */

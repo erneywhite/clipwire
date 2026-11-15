@@ -74,6 +74,10 @@ pub struct StatsDto {
     pub server: Option<clipwire_core::proto::GroupStats>,
     /// Почему цифр сервера нет: нет связи, старый сервер.
     pub server_error: Option<String>,
+    /// Закрепы группы на сервере; `None` — не спрашивали или нет ответа
+    /// (см. `pins_error`).
+    pub pins: Option<clipwire_core::proto::PinStats>,
+    pub pins_error: Option<String>,
     /// Путь до сервера, если есть связь.
     pub link: Option<LinkDto>,
     /// Последняя отправка и последнее получение с запуска, мс; 0 — не было.
@@ -106,16 +110,22 @@ pub async fn stats_overview(app: AppHandle) -> StatsDto {
         history_pinned,
         server: None,
         server_error: None,
+        pins: None,
+        pins_error: None,
         link: None,
         last_sent_ms: 0,
         last_received_ms: 0,
     };
     if let Ok(ctl) = controller(&app) {
         (dto.last_sent_ms, dto.last_received_ms) = ctl.last_sync();
-        let (stats, link) = tokio::join!(ctl.server_stats(), ctl.link());
+        let (stats, pins, link) = tokio::join!(ctl.server_stats(), ctl.pin_stats(), ctl.link());
         match stats {
             Ok(s) => dto.server = Some(s),
             Err(e) => dto.server_error = Some(e),
+        }
+        match pins {
+            Ok(p) => dto.pins = Some(p),
+            Err(e) => dto.pins_error = Some(e),
         }
         dto.link = link.ok().map(|l| {
             let client = clipwire_agent::sync::CLIENT_VERSION;

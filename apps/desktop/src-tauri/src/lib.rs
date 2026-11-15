@@ -220,6 +220,14 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
                 let _ = handle.emit("clipwire://group-config", &view);
             }
             UiEvent::StorageWarning(w) => storage::on_warning(&handle, w),
+            // Закрепы с других устройств: тоже склейкой, при входе их
+            // приходят сотни подряд.
+            UiEvent::PinsChanged => history_changed_soon(&handle),
+            // Сервер не принял закреп (квота, размер): текст для окна.
+            UiEvent::PinFailed(why) => {
+                tracing::warn!("{why}");
+                let _ = handle.emit("clipwire://pin-failed", &why);
+            }
             UiEvent::NewEntry => {
                 let on = handle
                     .state::<AppState>()
@@ -573,6 +581,8 @@ pub fn run() {
             commands::history_list,
             commands::history_get,
             commands::history_pin,
+            commands::history_note,
+            commands::history_delete_pinned,
             commands::history_delete,
             commands::history_clear,
             commands::get_settings,
