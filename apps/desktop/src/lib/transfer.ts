@@ -54,6 +54,25 @@ export function entryProgress(files: Pick<FileInfo, 'blob'>[], transfers: Transf
 }
 
 /**
+ * Можно ли убрать законченную передачу из карты. Нельзя, пока она сама идёт
+ * или пока идёт другой файл той же записи: entryProgress считает только файлы
+ * с передачей в карте, и без готового файла сумма уменьшится, процент и полоса
+ * поедут назад. `entries` — blob'ы файлов каждой записи, которая сейчас на
+ * виду (список и предпросмотр). Файл, которого нет ни в одной из них, никто
+ * не показывает: его можно убирать.
+ */
+export function canDrop(blob: string, transfers: TransferMap, entries: Iterable<readonly (string | null)[]>): boolean {
+  const x = transfers[blob]
+  if (!x) return false
+  if (x.state === 'active') return false
+  for (const blobs of entries) {
+    if (!blobs.includes(blob)) continue
+    if (blobs.some((b) => b !== null && b !== blob && transfers[b]?.state === 'active')) return false
+  }
+  return true
+}
+
+/**
  * Все файлы записи, которые отправлялись, уже на сервере. Полоса прогресса
  * видна только пока файл идёт, а это секунды: без этой пометки открывший окно
  * позже не узнает, ушёл ли файл. Сведения двух видов: события передач этого

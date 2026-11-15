@@ -6,7 +6,7 @@ import type { FileInfo, Transfer } from './api'
 
 // Node требует расширение в пути, а TypeScript без allowImportingTsExtensions его
 // не пропускает: путь собирается строкой, тип берётся отдельно.
-const { allUploaded, canDownload, entryProgress, fetchLabel, isDirect, isGone, onlyThere, percentOf, progressLabel } = (await import('./transfer' + '.ts')) as typeof import('./transfer')
+const { allUploaded, canDownload, canDrop, entryProgress, fetchLabel, isDirect, isGone, onlyThere, percentOf, progressLabel } = (await import('./transfer' + '.ts')) as typeof import('./transfer')
 
 function check(cond: boolean, msg: string) {
   if (!cond) throw new Error(`не прошло: ${msg}`)
@@ -128,6 +128,28 @@ check(entryProgress([{ blob: 'a' }], { a: t('a', { state: 'done', done: 100 }) }
     allUploaded([{ blob: 'b', uploaded: true }, { blob: 'c', uploaded: false }], { c: { ...up('done'), blob: 'c' } }),
     'один из журнала, второй из события — все на сервере',
   )
+}
+
+// Готовый файл не уходит из карты, пока идёт другой файл той же записи.
+{
+  const map = {
+    a: t('a', { state: 'done', done: 100, total: 100 }),
+    b: t('b', { done: 50, total: 400 }),
+    c: t('c', { state: 'failed', error: 'нет сети' }),
+    d: t('d', { state: 'done' }),
+  }
+  const entries = [['a', 'b', null], ['d']]
+  check(!canDrop('a', map, entries), 'сосед по записи ещё идёт — готовый файл остаётся')
+  check(!canDrop('b', map, entries), 'идущую передачу не убирают')
+  check(canDrop('d', map, entries), 'в своей записи всё закончилось — можно убрать')
+  check(canDrop('c', map, entries), 'файла нет ни в одной записи на виду — можно убрать')
+  check(!canDrop('x', map, entries), 'передачи нет — убирать нечего')
+  check(!canDrop('c', map, [['c', 'b']]), 'неудачный тоже ждёт соседа: иначе прогресс поедет назад')
+  // Прогресс записи с готовым файлом не меньше, чем без него.
+  const p = entryProgress([{ blob: 'a' }, { blob: 'b' }], map)!
+  check(p.percent === 30, `готовый файл в сумме: 150 из 500 — 30%, а не ${p.percent}`)
+  map.b = t('b', { state: 'done', done: 400, total: 400 })
+  check(canDrop('a', map, entries), 'запись докачалась — можно убирать')
 }
 
 console.log('transfer: все проверки прошли')

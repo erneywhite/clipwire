@@ -5,7 +5,7 @@
   import { api, type Entry, type FileInfo, type KindFilter, type Settings, type Transfer } from '../lib/api'
   import { applyTheme } from '../lib/theme'
   import { ago, bytesLabel, filesMeta, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
-  import { canDownload, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
+  import { canDownload, canDrop, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import EntryRow from '../lib/EntryRow.svelte'
   import { anchored, anchoredById, HeightCache, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange, type Range, type RowShape } from '../lib/vlist'
@@ -168,6 +168,13 @@
     dropTimers.delete(blob)
     const x = transfers[blob]
     if (!x || x.state === 'active') return
+    // Другой файл той же записи ещё идёт: без готового прогресс записи поедет
+    // назад. Ждём ещё, до конца всей записи.
+    const shownEntries = (preview ? [...items, preview.entry] : items).map((e) => e.files.map((f) => f.blob))
+    if (!canDrop(blob, transfers, shownEntries)) {
+      dropTimers.set(blob, setTimeout(() => dropTransfer(blob), DONE_KEEP_MS))
+      return
+    }
     // Пометку «↑ на сервере» строка берёт из события передачи, пока оно есть,
     // а потом из поля uploaded (журнал загрузок). У строк, прочитанных до
     // конца загрузки, поле ещё старое: выставляем его сами, иначе пометка
