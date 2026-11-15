@@ -642,6 +642,9 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
 pub async fn leave_group(app: AppHandle) -> CmdResult<()> {
     crate::stop_service(&app).await;
     let reset = app.state::<AppState>().paths.reset();
+    app.state::<AppState>()
+        .admin_stale
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     // Сервис запускаем в любом случае: даже если выход не удался, приложение
     // не должно остаться без синхронизации и окна вставки. Если ключ
     // удалился, дальше работаем локально, история остаётся.

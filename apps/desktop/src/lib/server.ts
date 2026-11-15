@@ -220,3 +220,19 @@ export function summaryRows(s: ServerSummary): [string, string][] {
     [t('Версия сервера'), s.version],
   ]
 }
+
+/**
+ * Нет связи из-за отказа по токену доступа: токен relay сменили, и старый код
+ * приглашения больше не пускает. Тогда в «Синхронизации» сразу открыто поле
+ * «Новый код приглашения». Тексты — от сервера (по-русски, не переводятся) и
+ * от агента (на языке интерфейса).
+ */
+export function tokenRefused(detail: string): boolean {
+  const d = detail.toLowerCase()
+  return [
+    'нужен новый код приглашения',
+    'неверный код сервера',
+    'relay отказал в доступе',
+    'the relay denied access',
+  ].some((p) => d.includes(p))
+}

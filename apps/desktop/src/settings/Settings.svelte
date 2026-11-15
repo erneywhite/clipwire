@@ -19,6 +19,7 @@
   import Devices from './Devices.svelte'
   import Storage from './Storage.svelte'
   import Server from './Server.svelte'
+  import { tokenRefused } from '../lib/server'
 
   type Section = 'general' | 'sync' | 'server' | 'privacy' | 'keys' | 'about'
   const allSections: { id: Section; title: string; icon: string }[] = [
@@ -89,14 +90,19 @@
   let adminInput = $state('')
   let adminBusy = $state(false)
   let adminError = $state('')
+  /** Сервер не принял ключ администратора (сменили): нужен новый код. */
+  let adminStale = $state(false)
   const showServer = $derived(adminKey && configured && status.kind !== 'excluded')
   const sections = $derived(allSections.filter((x) => x.id !== 'server' || showServer))
 
   async function loadAdmin() {
     try {
-      adminKey = (await api.adminState()).has_key
+      const a = await api.adminState()
+      adminKey = a.has_key
+      adminStale = a.stale
     } catch {
       adminKey = false
+      adminStale = false
     } finally {
       adminLoaded = true
     }
@@ -115,6 +121,32 @@
       adminError = String(e)
     } finally {
       adminBusy = false
+    }
+  }
+
+  // Новый код приглашения на месте: после смены токена relay группа и ключи
+  // те же, меняется только сервер. Поле открыто само, когда связи нет из-за
+  // отказа по токену, иначе — свёрнуто.
+  let reinviteInput = $state('')
+  let reinviteBusy = $state(false)
+  let reinviteError = $state('')
+  let reinviteOpen = $state(false)
+  const tokenProblem = $derived(status.kind === 'offline' && tokenRefused(status.detail))
+
+  async function reinvite() {
+    reinviteBusy = true
+    reinviteError = ''
+    try {
+      await api.syncUpdateInvite(reinviteInput.trim())
+      reinviteInput = ''
+      reinviteOpen = false
+      invite = ''
+      await refresh()
+      flash(t('Код приглашения обновлён, синхронизация перезапущена'))
+    } catch (e) {
+      reinviteError = String(e)
+    } finally {
+      reinviteBusy = false
     }
   }
 
@@ -503,6 +535,8 @@
       listen('clipwire://group-rekeyed', pullGroupNotices),
       listen('clipwire://group-rekey-failed', pullGroupNotices),
       listen('clipwire://group-excluded', pullGroupNotices),
+      // Ключ администратора устарел: раздел «Сервер» пропадает, здесь — подсказка.
+      listen('clipwire://admin-changed', () => loadAdmin()),
       listen('settings://close-blocked', () => {
         section = 'sync'
         confirmClose = true
@@ -704,6 +738,34 @@
             <div class="kv"><span>{t('Отпечаток устройства')}</span><span class="mono">{info?.device_id ?? '—'}</span></div>
           </div>
 
+          {#if adminStale}
+            <div class="card pad accent" role="status">
+              <h2 class="in-card">{t('Ключ администратора устарел')}</h2>
+              <p class="hint">
+                {t('Сервер не принял ключ администратора этого устройства: его сменили. Синхронизация работает без него, раздела «Сервер» пока нет. Введите новый код сервера администратора в карточке «Администратор сервера» ниже: его печатает сервер при запуске (лог контейнера) и команда')} <code>clipwire-server info</code>.
+              </p>
+            </div>
+          {/if}
+
+          {#if tokenProblem || reinviteOpen}
+            <div class="card pad" class:accent={tokenProblem}>
+              <h2 class="in-card">{t('Новый код приглашения')}</h2>
+              <p class="hint">
+                {tokenProblem
+                  ? t('Сервер не пускает это устройство со старым кодом: токен доступа сменили. Вставьте новый код приглашения в эту же группу, его можно взять на устройстве администратора. Группа, история и ключи останутся.')
+                  : t('Если токен доступа к серверу сменили, вставьте новый код приглашения в эту же группу. Группа, история и ключи останутся.')}
+              </p>
+              <textarea bind:value={reinviteInput} rows="3" placeholder="clipwire1-…" spellcheck="false" aria-label={t('Новый код приглашения')}></textarea>
+              <div class="buttons">
+                <button class="primary" disabled={reinviteBusy || !reinviteInput.trim()} onclick={reinvite}>{reinviteBusy ? t('Проверяю…') : t('Обновить код')}</button>
+                {#if !tokenProblem}<button onclick={() => ((reinviteOpen = false), (reinviteError = ''))}>{t('Скрыть')}</button>{/if}
+              </div>
+              {#if reinviteError}<p class="error" role="alert">{reinviteError}</p>{/if}
+            </div>
+          {:else}
+            <button class="link" onclick={() => (reinviteOpen = true)}>{t('Ввести новый код приглашения')}</button>
+          {/if}
+
           <h2>{t('Это устройство')}</h2>
           <div class="card pad">
             <label class="field">
@@ -766,6 +828,7 @@
             onRekeyed={() => ((invite = ''), (createdInvite = ''))}
             incoming={devicesIncoming}
             onIncomingTaken={() => (devicesIncoming = null)}
+            serverAdmin={adminKey}
           />
 
           <h2>{t('Администратор сервера')}</h2>

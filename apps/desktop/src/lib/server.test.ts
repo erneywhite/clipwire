@@ -3,7 +3,7 @@
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
 import type { ServerSetting } from './api'
 
-const { bytesText, collectChanges, draftsFor, groupSettings, hoursText, parseInput, pickUnit, rangeError, resetDraft, settingText, switchUnit, toInput } =
+const { bytesText, collectChanges, tokenRefused, draftsFor, groupSettings, hoursText, parseInput, pickUnit, rangeError, resetDraft, settingText, switchUnit, toInput } =
   (await import('./server' + '.ts')) as typeof import('./server')
 
 function check(cond: boolean, msg: string) {
@@ -80,5 +80,11 @@ check(collectChanges([item], { max_item_bytes: switchUnit(item, exact, 'MB') }).
 const groups = groupSettings([...list, setting({ key: 'future_x' })])
 check(groups[0].items[0].key === 'ttl_hours', 'история первой')
 check(groups.at(-1)!.items[0].key === 'future_x', 'незнакомое — в конце')
+
+// Отказ по токену доступа узнаётся и по тексту сервера, и по тексту агента.
+check(tokenRefused('сервер отказал: токен сервера сменён: нужен новый код приглашения'), 'смена токена')
+check(tokenRefused('сервер отказал: неверный код сервера'), 'неверный токен')
+check(tokenRefused('The relay denied access: bad token'), 'relay по-английски')
+check(!tokenRefused('таймаут подключения'), 'таймаут — не отказ по токену')
 
 console.log('server: всё прошло')

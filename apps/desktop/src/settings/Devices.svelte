@@ -5,18 +5,22 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, type DevicesIncoming, type GroupDevice, type RekeyResult, type Status, type StorageKind } from '../lib/api'
   import { ago, plural } from '../lib/format'
-  import { CHECKING, canManage, checking as checkingText, confirmText, deviceTitle, isAdmin, rolesText, seenLabel, type Roles } from '../lib/devices'
+  import { CHECKING, canClaimAdmin, canManage, checking as checkingText, confirmText, deviceTitle, isAdmin, rolesText, seenLabel, type Roles } from '../lib/devices'
 
   // `incoming` — итог смены ключа, пришедший событием (его забирает окно
   // настроек: раздел мог быть закрыт). Принятый сообщается `onIncomingTaken`.
+  // `serverAdmin` — у устройства есть ключ администратора сервера: оно может
+  // забрать роль админа группы, если прежний админ потерян.
   let {
     onRekeyed,
     incoming = null,
     onIncomingTaken,
+    serverAdmin = false,
   }: {
     onRekeyed?: (invite: string) => void
     incoming?: DevicesIncoming | null
     onIncomingTaken?: () => void
+    serverAdmin?: boolean
   } = $props()
 
   const fmt = { ago, plural }
@@ -42,6 +46,25 @@
   const manage = $derived(canManage(roles, list))
   const rolesNote = $derived(rolesText(roles, list))
   const meAdmin = $derived(list.some((d) => d.me && isAdmin(roles, d)))
+  const claimable = $derived(canClaimAdmin(roles, list, serverAdmin))
+  /** Подтверждение «Стать админом группы». */
+  let claiming = $state(false)
+  let claimBusy = $state(false)
+
+  /** Забрать роль админа группы себе (администратор сервера). */
+  async function claimAdmin() {
+    claimBusy = true
+    error = ''
+    try {
+      await api.groupAdminClaim()
+      claiming = false
+      await load()
+    } catch (e) {
+      error = String(e)
+    } finally {
+      claimBusy = false
+    }
+  }
 
   const explain = $derived(confirming === null ? [] : confirmText(list, confirming || null, fmt, storageKind))
 
@@ -203,6 +226,22 @@
 </div>
 {#if rolesNote}
   <p class="hint outside">{rolesNote}</p>
+{/if}
+{#if claimable}
+  <div class="card pad">
+    {#if claiming}
+      <div class="confirm" role="alertdialog">
+        <strong>{t('Стать админом группы?')}</strong>
+        <p class="hint">{t('Нынешний админ перестанет им быть: удалять устройства и менять ключ группы сможет только это устройство. Это нужно, если прежний админ потерян. Сервер разрешит это только с действующим ключом администратора сервера.')}</p>
+        <div class="buttons">
+          <button class="primary" disabled={claimBusy} onclick={claimAdmin}>{claimBusy ? t('Передаю…') : t('Стать админом')}</button>
+          <button disabled={claimBusy} onclick={() => (claiming = false)}>{t('Отмена')}</button>
+        </div>
+      </div>
+    {:else}
+      <button disabled={busy || handBusy} onclick={() => (claiming = true)}>{t('Стать админом группы (вы администратор сервера)')}</button>
+    {/if}
+  </div>
 {/if}
 {#if list.some((d) => !d.known && !d.me)}
   <p class="hint outside">

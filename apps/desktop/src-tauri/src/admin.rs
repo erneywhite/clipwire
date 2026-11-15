@@ -3,26 +3,57 @@
 //! в списке устройств. Запросы идут через движок (`clipwire_agent::admin`),
 //! ключ администратора лежит в `admin.bin`.
 
-use clipwire_agent::admin::{adopt_server_code, claim_code, fail_text};
+use std::sync::atomic::Ordering;
+
+use clipwire_agent::admin::{adopt_server_code, check_admin_code, claim_code, fail_text};
 use clipwire_agent::i18n::{tr, trf};
 use clipwire_core::admin::{SETTINGS, ServerSettings, ServerSummary, SettingUnit, check_setting};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
 use crate::AppState;
 use crate::devices::{controller, parse_device};
 
 type CmdResult<T> = Result<T, String>;
 
+/// Команды этого файла меняют сервер и роли в группе: их вызывает только
+/// окно настроек. Окно вставки и редактор показывают чужое содержимое
+/// (HTML из буфера, превью ссылок), и, если в них когда-нибудь найдётся
+/// способ выполнить скрипт, он не должен дотянуться до ключа
+/// администратора.
+fn only_settings(window: &WebviewWindow) -> CmdResult<()> {
+    if window.label() == "settings" {
+        Ok(())
+    } else {
+        tracing::warn!(
+            window = window.label(),
+            "команда администратора не из окна настроек"
+        );
+        Err(tr("Это доступно только в окне настроек").into())
+    }
+}
+
+/// Сервис сообщил, что ключ администратора устарел и забыт: отметить и
+/// сообщить окну настроек.
+pub fn on_admin_key_stale(app: &AppHandle) {
+    app.state::<AppState>()
+        .admin_stale
+        .store(true, Ordering::Relaxed);
+    let _ = app.emit("clipwire://admin-changed", ());
+}
+
 /// Есть ли у устройства ключ администратора сервера, к которому оно
-/// подключено. Без группы — нет.
+/// подключено. Без группы — нет. `stale` — ключ был, но сервер его не
+/// принял (сменили): нужен новый код сервера администратора.
 #[derive(Debug, Clone, Serialize)]
 pub struct AdminStateDto {
     pub has_key: bool,
+    pub stale: bool,
 }
 
 #[tauri::command]
-pub fn admin_state(app: AppHandle) -> AdminStateDto {
+pub fn admin_state(window: WebviewWindow, app: AppHandle) -> CmdResult<AdminStateDto> {
+    only_settings(&window)?;
     let state = app.state::<AppState>();
     let has_key = state
         .paths
@@ -31,13 +62,17 @@ pub fn admin_state(app: AppHandle) -> AdminStateDto {
         .flatten()
         .and_then(|s| state.paths.load_admin_key(s.invite.server.server_id))
         .is_some();
-    AdminStateDto { has_key }
+    Ok(AdminStateDto {
+        has_key,
+        stale: !has_key && state.admin_stale.load(Ordering::Relaxed),
+    })
 }
 
 /// «Я администратор сервера»: проверить код `cwserver2-…` на сервере (тот
 /// же сервер, ключ подходит) и сохранить ключ.
 #[tauri::command]
-pub async fn admin_claim(app: AppHandle, code: String) -> CmdResult<()> {
+pub async fn admin_claim(window: WebviewWindow, app: AppHandle, code: String) -> CmdResult<()> {
+    only_settings(&window)?;
     let state = app.state::<AppState>();
     let agent = state
         .paths
@@ -46,12 +81,15 @@ pub async fn admin_claim(app: AppHandle, code: String) -> CmdResult<()> {
         .ok_or_else(|| tr("Устройство не в группе").to_string())?;
     let info = claim_code(code.trim(), &agent)?;
     // Токен доступа в коде другой: его сменили, и со старым это устройство
-    // к серверу уже не подключится, проверить ключ не на чем. Сервер тот же
-    // (id совпал), поэтому новый код принимается как есть, и синхронизация
-    // перезапускается с ним.
+    // к серверу уже не подключится, проверить ключ через движок не на чем.
+    // Проверяем отдельным соединением по новому коду (relay и токен из него,
+    // `AdminAuth` с ключом из него) и только при успехе сохраняем: иначе
+    // опечатка или чужой код заменили бы рабочий сервер в состоянии.
     if info.server != agent.invite.server {
+        check_admin_code(&info).await?;
         adopt_server_code(&state.paths, code.trim())
             .map_err(|e| trf("Ключ не сохранился: {e}", &[("e", &format!("{e:#}"))]))?;
+        state.admin_stale.store(false, Ordering::Relaxed);
         crate::restart_service(&app)
             .await
             .map_err(|e| format!("{e:#}"))?;
@@ -63,13 +101,32 @@ pub async fn admin_claim(app: AppHandle, code: String) -> CmdResult<()> {
         .paths
         .save_admin_key(info.server.server_id, &info.admin_key)
         .map_err(|e| trf("Ключ не сохранился: {e}", &[("e", &format!("{e:#}"))]))?;
+    state.admin_stale.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Новый код приглашения в ту же группу, без выхода из неё: после смены
+/// токена relay ключ группы прежний, меняется только сервер. Код в другую
+/// группу не принимается. Синхронизация перезапускается с новым кодом.
+#[tauri::command]
+pub async fn sync_update_invite(
+    window: WebviewWindow,
+    app: AppHandle,
+    code: String,
+) -> CmdResult<()> {
+    only_settings(&window)?;
+    clipwire_agent::admin::adopt_invite(&app.state::<AppState>().paths, &code)?;
+    crate::restart_service(&app)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
     Ok(())
 }
 
 /// Забыть ключ администратора на этом устройстве. Движок перезапускается,
 /// чтобы соединение потеряло права администратора.
 #[tauri::command]
-pub async fn admin_forget(app: AppHandle) -> CmdResult<()> {
+pub async fn admin_forget(window: WebviewWindow, app: AppHandle) -> CmdResult<()> {
+    only_settings(&window)?;
     app.state::<AppState>()
         .paths
         .forget_admin_key()
@@ -130,7 +187,11 @@ fn settings_dto(s: &ServerSettings) -> Vec<SettingDto> {
 }
 
 #[tauri::command]
-pub async fn server_settings_get(app: AppHandle) -> CmdResult<Vec<SettingDto>> {
+pub async fn server_settings_get(
+    window: WebviewWindow,
+    app: AppHandle,
+) -> CmdResult<Vec<SettingDto>> {
+    only_settings(&window)?;
     let s = controller(&app)?.server_settings().await?;
     Ok(settings_dto(&s))
 }
@@ -154,12 +215,14 @@ fn check_changes(changes: &[SettingChange]) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn server_settings_set(
+    window: WebviewWindow,
     app: AppHandle,
     changes: Vec<SettingChange>,
 ) -> CmdResult<Vec<SettingDto>> {
     if changes.is_empty() {
-        return server_settings_get(app).await;
+        return server_settings_get(window, app).await;
     }
+    only_settings(&window)?;
     check_changes(&changes)?;
     let values = changes.into_iter().map(|c| (c.key, c.value)).collect();
     let s = controller(&app)?.set_server_settings(values).await?;
@@ -167,7 +230,8 @@ pub async fn server_settings_set(
 }
 
 #[tauri::command]
-pub async fn server_summary(app: AppHandle) -> CmdResult<ServerSummary> {
+pub async fn server_summary(window: WebviewWindow, app: AppHandle) -> CmdResult<ServerSummary> {
+    only_settings(&window)?;
     controller(&app)?.server_summary().await
 }
 
@@ -184,7 +248,11 @@ pub struct RelayRotatedDto {
 /// сохраняет новый код сервера сразу, до обрыва соединения, и
 /// переподключается с ним.
 #[tauri::command]
-pub async fn server_rotate_relay_token(app: AppHandle) -> CmdResult<RelayRotatedDto> {
+pub async fn server_rotate_relay_token(
+    window: WebviewWindow,
+    app: AppHandle,
+) -> CmdResult<RelayRotatedDto> {
+    only_settings(&window)?;
     let server_code = controller(&app)?.rotate_relay_token().await?;
     let paths = &app.state::<AppState>().paths;
     let state = adopt_server_code(paths, &server_code).map_err(|e| {
@@ -207,7 +275,8 @@ pub async fn server_rotate_relay_token(app: AppHandle) -> CmdResult<RelayRotated
 /// Сменить ключ администратора. Возвращает новый код сервера; ключ здесь
 /// сохраняется сразу, движок уже входит с ним.
 #[tauri::command]
-pub async fn server_rotate_admin_key(app: AppHandle) -> CmdResult<String> {
+pub async fn server_rotate_admin_key(window: WebviewWindow, app: AppHandle) -> CmdResult<String> {
+    only_settings(&window)?;
     let server_code = controller(&app)?.rotate_admin_key().await?;
     let paths = &app.state::<AppState>().paths;
     adopt_server_code(paths, &server_code).map_err(|e| {
@@ -230,7 +299,8 @@ pub struct GroupAdminDto {
 }
 
 #[tauri::command]
-pub async fn group_admin(app: AppHandle) -> CmdResult<GroupAdminDto> {
+pub async fn group_admin(window: WebviewWindow, app: AppHandle) -> CmdResult<GroupAdminDto> {
+    only_settings(&window)?;
     let ctl = controller(&app)?;
     let link = ctl.link().await?;
     // Админы групп появились в `clipwire/9`.
@@ -249,9 +319,22 @@ pub async fn group_admin(app: AppHandle) -> CmdResult<GroupAdminDto> {
 
 /// Передать роль админа группы другому устройству.
 #[tauri::command]
-pub async fn device_make_admin(app: AppHandle, device_id: String) -> CmdResult<()> {
+pub async fn device_make_admin(
+    window: WebviewWindow,
+    app: AppHandle,
+    device_id: String,
+) -> CmdResult<()> {
+    only_settings(&window)?;
     let id = parse_device(&device_id)?;
     controller(&app)?.transfer_group_admin(id).await
+}
+
+/// Стать админом группы самому: устройство администратора сервера чинит
+/// группу, чей админ потерян. Сервер проверяет права администратора.
+#[tauri::command]
+pub async fn group_admin_claim(window: WebviewWindow, app: AppHandle) -> CmdResult<()> {
+    only_settings(&window)?;
+    controller(&app)?.claim_group_admin().await
 }
 
 #[cfg(test)]

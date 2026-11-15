@@ -3,7 +3,7 @@
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
 import type { GroupDevice } from './api'
 
-const { canManage, confirmText, deviceTitle, exposedAccessText, isAdmin, leftOut, rekeyedBy, rolesText, seenLabel } = (await import('./devices' + '.ts')) as typeof import('./devices')
+const { canClaimAdmin, canManage, confirmText, deviceTitle, exposedAccessText, isAdmin, leftOut, rekeyedBy, rolesText, seenLabel } = (await import('./devices' + '.ts')) as typeof import('./devices')
 const fmt = (await import('./format' + '.ts')) as typeof import('./format')
 
 function check(cond: boolean, msg: string) {
@@ -68,5 +68,12 @@ check(isAdmin({ supported: true, admin: 'bbbb' }, work) && !isAdmin({ supported:
 check(rolesText({ supported: true, admin: 'bbbb' }, list).includes('«Рабочий»'), 'кто админ — по имени')
 check(rolesText({ supported: true, admin: null }, list).includes('кодом сервера администратора'), 'группа без админа')
 check(rolesText({ supported: false, admin: null }, list) === '', 'старый сервер — без пояснения')
+
+// Администратор сервера забирает роль, только если админ — другое устройство.
+check(canClaimAdmin({ supported: true, admin: 'bbbb' }, list, true), 'админ другой — можно забрать')
+check(!canClaimAdmin({ supported: true, admin: 'bbbb' }, list, false), 'без ключа администратора — нет')
+check(!canClaimAdmin({ supported: true, admin: 'aaaa' }, list, true), 'уже админ — нет')
+check(!canClaimAdmin({ supported: true, admin: null }, list, true), 'без админа роль приходит сама')
+check(!canClaimAdmin({ supported: false, admin: null }, list, true) && !canClaimAdmin(null, list, true), 'старый сервер или нет связи — нет')
 
 console.log('devices: всё прошло')

@@ -453,8 +453,12 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   /** Сохранить настройки хранилища: уйдут всем устройствам группы. */
   storageSave: (form: StorageForm) => invoke<StorageState>('storage_save', { form }),
   storageProbe: (form: StorageForm) => invoke<ProbeResult>('storage_probe', { form }),
-  /** Есть ли у устройства ключ администратора сервера. */
-  adminState: () => invoke<{ has_key: boolean }>('admin_state'),
+  /** Есть ли у устройства ключ администратора сервера; `stale` — ключ был, но сервер его не принял (сменили). */
+  adminState: () => invoke<{ has_key: boolean; stale: boolean }>('admin_state'),
+  /** Новый код приглашения в ту же группу (после смены токена relay): группа и ключи остаются. */
+  syncUpdateInvite: (code: string) => invoke<void>('sync_update_invite', { code }),
+  /** Стать админом группы самому (нужен ключ администратора сервера). */
+  groupAdminClaim: () => invoke<void>('group_admin_claim'),
   /** «Я администратор сервера»: проверить код cwserver2 на сервере и сохранить ключ. */
   adminClaim: (code: string) => invoke<void>('admin_claim', { code }),
   /** Забыть ключ администратора на этом устройстве. */

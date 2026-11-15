@@ -141,3 +141,15 @@ export function confirmText(list: GroupDevice[], removeId: string | null, _fmt: 
   out.push(t('История группы на сервере удалится, локальная история на устройствах останется. Код приглашения сменится, старый перестанет работать.'))
   return out
 }
+
+/**
+ * Показывать ли «Стать админом группы» администратору сервера: сервер знает
+ * роли, это устройство в списке и ещё не админ. Нужен, когда прежний админ
+ * потерян (сломан, продан): без админа ключ группы не сменить и устройства
+ * не удалить. Группа без админа получает его и так, при входе с ключом.
+ */
+export function canClaimAdmin(roles: Roles, list: GroupDevice[], serverAdmin: boolean): boolean {
+  if (!serverAdmin || !roles?.supported || !roles.admin) return false
+  const me = list.find((d) => d.me)
+  return !!me && !isAdmin(roles, me)
+}

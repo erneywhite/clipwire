@@ -263,6 +263,18 @@ const en: Record<string, string> = {
   "Я администратор сервера": "I am the server administrator",
   "админ": "admin",
   "ч": "h",
+  "Стать админом группы?": "Become the group admin?",
+  "Нынешний админ перестанет им быть: удалять устройства и менять ключ группы сможет только это устройство. Это нужно, если прежний админ потерян. Сервер разрешит это только с действующим ключом администратора сервера.": "The current admin stops being one: only this device will be able to remove devices and change the group key. Use this when the previous admin is lost. The server allows it only with a valid server administrator key.",
+  "Стать админом": "Become admin",
+  "Стать админом группы (вы администратор сервера)": "Become the group admin (you are the server administrator)",
+  "Код приглашения обновлён, синхронизация перезапущена": "Invite code updated, sync restarted",
+  "Ключ администратора устарел": "The administrator key is out of date",
+  "Сервер не принял ключ администратора этого устройства: его сменили. Синхронизация работает без него, раздела «Сервер» пока нет. Введите новый код сервера администратора в карточке «Администратор сервера» ниже: его печатает сервер при запуске (лог контейнера) и команда": "The server did not accept this device's administrator key: it was changed. Sync works without it, and the Server section is hidden for now. Enter the new server administrator code in the Server administrator card below: the server prints it on start (container log), and so does the command",
+  "Новый код приглашения": "New invite code",
+  "Сервер не пускает это устройство со старым кодом: токен доступа сменили. Вставьте новый код приглашения в эту же группу, его можно взять на устройстве администратора. Группа, история и ключи останутся.": "The server no longer lets this device in with the old code: the access token was changed. Paste a new invite code to the same group; you can get it on the administrator's device. The group, history and keys stay.",
+  "Если токен доступа к серверу сменили, вставьте новый код приглашения в эту же группу. Группа, история и ключи останутся.": "If the server access token was changed, paste a new invite code to the same group. The group, history and keys stay.",
+  "Обновить код": "Update code",
+  "Ввести новый код приглашения": "Enter a new invite code",
 }
 
 export default en
