@@ -28,16 +28,20 @@ fn busy(state: &AppState) -> HashSet<BlobId> {
 /// Удалить в фоне копии и забранные виртуальные файлы, на которые не
 /// ссылается ни одна запись истории.
 /// Зовётся после удаления записи, очистки истории, чистки по сроку и на старте.
+/// Сразу возвращается: и обход карточек истории, и удаление идут отдельным
+/// потоком (зовут и из обработчика событий сервиса).
 pub fn prune_later(app: &AppHandle) {
     let state = app.state::<AppState>();
     let busy = busy(&state);
-    let (keep, paths) = {
-        let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        (h.blobs(), h.file_paths())
-    };
     let dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
     let virtual_dir = clipwire_agent::clipboard::virtual_dir(&state.paths.dir);
+    let app = app.clone();
     std::thread::spawn(move || {
+        // Обход всех карточек: вторым соединением, без замка истории.
+        let (keep, paths) = {
+            let state = app.state::<AppState>();
+            clipwire_agent::history::read(&state.history, state.reader.as_ref(), |h| h.file_refs())
+        };
         let r = clipwire_agent::cache::prune(&dir, &keep, &busy);
         if r.removed > 0 {
             tracing::info!(removed = r.removed, "из кэша удалены ненужные копии");

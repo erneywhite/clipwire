@@ -30,6 +30,9 @@ pub struct AppState {
     pub paths: Paths,
     pub settings: Mutex<Settings>,
     pub history: Arc<Mutex<History>>,
+    /// Второе соединение с историей для долгих чтений (списки с поиском,
+    /// проверки файлов): без замка `history`.
+    pub reader: Option<clipwire_agent::history::HistoryReader>,
     /// Список игнорируемых программ, общий с сервисом: меняется без перезапуска.
     pub ignored_apps: Arc<Mutex<Vec<String>>>,
     /// Настройка `file_upload_limit_mb`, общая с сервисом.
@@ -267,6 +270,7 @@ fn load_state() -> anyhow::Result<AppState> {
         ignored_apps: Arc::new(Mutex::new(settings.ignored_apps.clone())),
         upload_limit_mb: Arc::new(settings.file_upload_limit_mb.into()),
         settings: Mutex::new(settings),
+        reader: history.reader(),
         history: Arc::new(Mutex::new(history)),
         service: Mutex::new(None),
         service_attempted: Default::default(),

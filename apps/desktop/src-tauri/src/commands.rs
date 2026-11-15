@@ -294,32 +294,41 @@ pub fn parse_id(id: &str) -> CmdResult<ItemId> {
 }
 
 #[tauri::command]
-pub fn history_list(
-    state: State<'_, AppState>,
+pub async fn history_list(
+    app: AppHandle,
     query: String,
     pinned_only: bool,
     kind: Option<clipwire_agent::history::Kind>,
     offset: Option<usize>,
     limit: usize,
 ) -> Vec<EntryDto> {
-    let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
-    let uploaded = uploaded_check(&state);
-    // Окно вставки берёт ленту страницами; одна страница не больше 1000.
-    // Под замком только чтение карточек; проверки файлов на диске — после.
-    let rows = state
-        .history
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .list_page(
-            &query,
-            pinned_only,
-            kind.unwrap_or_default(),
-            offset.unwrap_or(0),
-            limit.min(1000),
-        );
-    rows.iter()
-        .map(|r| row_dto(r, &files_dir, &uploaded))
-        .collect()
+    // Поиск редкого слова или вкладка с редким типом читают все карточки:
+    // отдельным потоком и вторым соединением, чтобы не ждали ни окно, ни
+    // запись новых копирований.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
+        let uploaded = uploaded_check(&state);
+        // Окно вставки берёт ленту страницами; одна страница не больше 1000.
+        // Проверки файлов на диске — после чтения карточек.
+        let rows = clipwire_agent::history::read(&state.history, state.reader.as_ref(), |h| {
+            h.list_page(
+                &query,
+                pinned_only,
+                kind.unwrap_or_default(),
+                offset.unwrap_or(0),
+                limit.min(1000),
+            )
+        });
+        rows.iter()
+            .map(|r| row_dto(r, &files_dir, &uploaded))
+            .collect()
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("список истории не прочитался: {e}");
+        Vec::new()
+    })
 }
 
 #[tauri::command]

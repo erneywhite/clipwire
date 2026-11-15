@@ -43,8 +43,8 @@ const NONE: FilePreview = FilePreview {
 };
 
 #[tauri::command]
-pub fn file_preview(app: AppHandle, path: String) -> Result<FilePreview, String> {
-    if !in_history(&app, &path) {
+pub async fn file_preview(app: AppHandle, path: String) -> Result<FilePreview, String> {
+    if !in_history(&app, &path).await {
         return Err(tr("Этого файла нет в истории").into());
     }
     let p = Path::new(&path);
@@ -73,12 +73,19 @@ pub fn file_preview(app: AppHandle, path: String) -> Result<FilePreview, String>
     Ok(read_text(p).unwrap_or(NONE))
 }
 
-fn in_history(app: &AppHandle, path: &str) -> bool {
-    let state = app.state::<AppState>();
-    let dir = files_dir(&state.paths.dir);
-    let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-    // Перебор карточек всех записей с файлами, без тел и без предела.
-    h.any_files(|local, files| files_have_path(local, files, &dir, Path::new(path)))
+/// Есть ли путь в истории. Перебор карточек всех записей с файлами, без тел
+/// и без предела: отдельным потоком и вторым соединением с историей.
+async fn in_history(app: &AppHandle, path: &str) -> bool {
+    let (app, path) = (app.clone(), path.to_string());
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let dir = files_dir(&state.paths.dir);
+        clipwire_agent::history::read(&state.history, state.reader.as_ref(), |h| {
+            h.any_files(|local, files| files_have_path(local, files, &dir, Path::new(&path)))
+        })
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Это путь файла записи на этом компьютере: исходный у своей записи, в кэше
@@ -350,9 +357,9 @@ pub async fn files_download(app: AppHandle, id: String) -> Result<(), String> {
 /// папка: открыть так файл значило бы запустить его. На macOS папка только
 /// показывается в Finder: бандл `.app` — тоже папка.
 #[tauri::command]
-pub fn folder_open(app: AppHandle, path: String) -> Result<(), String> {
+pub async fn folder_open(app: AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    if !in_history(&app, &path) {
+    if !in_history(&app, &path).await {
         return Err(tr("Этой папки нет в истории").into());
     }
     if !Path::new(&path).is_dir() {
