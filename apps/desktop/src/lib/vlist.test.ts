@@ -1,7 +1,7 @@
 // Проверка расчёта виртуальной прокрутки. Запуск: node src/lib/vlist.test.ts
 // (Node 23.6+ сам убирает типы), как transfer.test.ts.
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
-const { anchored, anchoredById, keptInDom, DEFAULT_HEIGHT, HeightCache, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange } = (await import(
+const { anchored, anchoredById, disjoint, keptInDom, DEFAULT_HEIGHT, HeightCache, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange } = (await import(
   './vlist' + '.ts'
 )) as typeof import('./vlist')
 
@@ -147,5 +147,13 @@ function check(cond: boolean, msg: string) {
 
 check(rowsLeft(100, 10, 20) === 79, 'осталось — от нижней видимой')
 check(rowsLeft(100, 95, 20) === 4, 'осталось — от выбранной, если она ниже')
+
+// Прыжок или шаг: остались ли в DOM прежние строки.
+check(!disjoint({ start: 0, end: 20 }, { start: 1, end: 21 }), 'шаг вниз на строку — отрезки пересекаются')
+check(!disjoint({ start: 10, end: 30 }, { start: 9, end: 29 }), 'шаг вверх на строку — отрезки пересекаются')
+check(disjoint({ start: 0, end: 12 }, { start: 139, end: 150 }), 'по кругу с первой на последнюю — прежних строк нет')
+check(disjoint({ start: 139, end: 150 }, { start: 0, end: 12 }), 'по кругу с последней на первую — прежних строк нет')
+check(disjoint({ start: 0, end: 10 }, { start: 10, end: 20 }), 'отрезки встык — общих строк нет')
+check(disjoint({ start: 0, end: 0 }, { start: 0, end: 10 }), 'из пустого списка — прыжок')
 
 console.log('vlist: всё прошло')

@@ -8,7 +8,7 @@
   import { canDownload, canDrop, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import EntryRow from '../lib/EntryRow.svelte'
-  import { anchored, anchoredById, HeightCache, keptInDom, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange, type Range, type RowShape } from '../lib/vlist'
+  import { anchored, anchoredById, disjoint, HeightCache, keptInDom, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange, type Range, type RowShape } from '../lib/vlist'
   import AppTag from '../lib/AppTag.svelte'
   import { t } from '../lib/i18n'
   import { debounce } from '../lib/debounce'
@@ -386,8 +386,7 @@
     if (listEl) scrollTop = listEl.scrollTop
     // Прыжок (перетащили ползунок, щёлкнули по полосе прокрутки): отрисованы только новые строки,
     // прежних в DOM не осталось.
-    const r = range
-    if (r.start >= prev.end || r.end <= prev.start) markJump(false)
+    if (disjoint(prev, range)) markJump(false)
     maybeMore()
   }
 
@@ -482,12 +481,17 @@
   async function scrollToSel() {
     // Выбранной строки может не быть в DOM: сначала прокрутка по расчёту,
     // потом, когда строка отрисована, точно по ней.
+    const prev = lastRange
     if (listEl) setScroll(scrollFor(offs, sel, listEl.scrollTop, listEl.clientHeight))
     await tick()
     revealSelected()
-    // Новые строки сейчас замерят, и поле сверху сдвинется: строку надо
-    // будет показать снова (onResize).
-    markJump(true)
+    // Прыжок (по кругу с первой записи на последнюю): в DOM только новые
+    // строки, их сейчас замерят, и поле сверху сдвинется. Поправка — по полю
+    // сверху, а строку надо будет показать снова (onResize). Обычный шаг
+    // стрелкой оставляет в DOM прежние строки, ему подходит привязка к строке
+    // вверху окна (anchored): с keptInDom незамеренная строка над окном сдвигала
+    // бы всё видимое на разницу с оценкой.
+    if (disjoint(prev, range)) markJump(true)
   }
 
   function move(d: number) {

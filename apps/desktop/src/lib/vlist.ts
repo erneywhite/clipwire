@@ -193,6 +193,15 @@ export function reloadCount(loaded: number, needed: number, page: number, ahead:
   return Math.max(page, Math.min(loaded, want))
 }
 
+/**
+ * Два отрезка строк не пересекаются: после перехода в DOM не осталось ни
+ * одной прежней строки (прыжок ползунком, переход по кругу с первой записи на
+ * последнюю). Пустой отрезок ни с чем не пересекается.
+ */
+export function disjoint(a: Range, b: Range): boolean {
+  return b.start >= a.end || b.end <= a.start
+}
+
 /** Сколько записей осталось до конца подгруженного: от выбранной и от нижней видимой. */
 export function rowsLeft(n: number, sel: number, lastVisible: number): number {
   return Math.min(n - 1 - sel, n - 1 - lastVisible)
