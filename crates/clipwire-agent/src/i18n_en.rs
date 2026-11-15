@@ -710,4 +710,29 @@ pub static EN: &[(&str, &str)] = &[
         "the written object cannot be read back",
     ),
     ("объект не удалился", "the object was not deleted"),
+    // Закрепы группы.
+    (
+        "Подписать можно только закреплённую запись",
+        "Only a pinned item can have a note",
+    ),
+    (
+        "На сервере уже {max} закрепов группы, больше нельзя: запись закреплена только здесь",
+        "The group already has {max} pins on the server, the limit: the item is pinned on this device only",
+    ),
+    (
+        "Закрепы группы заняли всё место на сервере ({mb} МБ): запись закреплена только здесь",
+        "The group's pins have used all their space on the server ({mb} MB): the item is pinned on this device only",
+    ),
+    (
+        "Запись больше предела сервера ({mb} МБ): закреплена только здесь",
+        "The item is larger than the server allows ({mb} MB): pinned on this device only",
+    ),
+    (
+        "Сервер не принял закреп: {e}",
+        "The server refused the pin: {e}",
+    ),
+    (
+        "Запись слишком большая для закрепа группы: закреплена только здесь",
+        "The item is too large for a group pin: pinned on this device only",
+    ),
 ];
