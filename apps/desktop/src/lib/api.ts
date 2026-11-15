@@ -335,8 +335,55 @@ export type ProbeResult =
   | { status: 'host_key_mismatch'; expected: string; got: string }
   | { status: 'error'; message: string }
 
-export const api = {
-  settings: () => invoke<Settings>('get_settings'),
+/** Настройка сервера для раздела «Сервер» (`server_settings_get`). */
+export interface ServerSetting {
+  key: string
+  unit: 'count' | 'bytes' | 'hours'
+  min: number
+  max: number
+  /** Действующее значение. */
+  value: number
+  /** Значение по умолчанию: из переменной окружения или встроенное. */
+  default: number
+  /** Задано из приложения (лежит в базе сервера): можно сбросить. */
+  stored: boolean
+  /** Переменная окружения со значением по умолчанию. */
+  env: string
+}
+
+/** Изменение настройки сервера: `value: null` — сбросить к значению по умолчанию. */
+export interface SettingChange {
+  key: string
+  value: number | null
+}
+
+/** Сводка сервера (`server_summary`). */
+export interface ServerSummary {
+  groups: number
+  devices: number
+  bytes_items: number
+  bytes_files: number
+  bytes_pins: number
+  version: string
+}
+
+/** Итог смены токена relay. */
+export interface RelayRotated {
+  /** Новый код сервера администратора. */
+  server_code: string
+  /** Новый код приглашения в эту группу. */
+  invite: string
+}
+
+/** Админ группы (`group_admin`). */
+export interface GroupAdmin {
+  /** Сервер знает админов групп (0.5.0 и новее). */
+  supported: boolean
+  /** Id админа (64 hex); null — у группы админа нет. */
+  admin: string | null
+}
+
+export const api = {  settings: () => invoke<Settings>('get_settings'),
   saveSettings: (settings: Settings) => invoke<void>('save_settings', { settings }),
   status: () => invoke<Status>('get_status'),
   setPaused: (paused: boolean) => invoke<void>('set_paused', { paused }),
@@ -406,4 +453,19 @@ export const api = {
   /** Сохранить настройки хранилища: уйдут всем устройствам группы. */
   storageSave: (form: StorageForm) => invoke<StorageState>('storage_save', { form }),
   storageProbe: (form: StorageForm) => invoke<ProbeResult>('storage_probe', { form }),
-}
+  /** Есть ли у устройства ключ администратора сервера. */
+  adminState: () => invoke<{ has_key: boolean }>('admin_state'),
+  /** «Я администратор сервера»: проверить код cwserver2 на сервере и сохранить ключ. */
+  adminClaim: (code: string) => invoke<void>('admin_claim', { code }),
+  /** Забыть ключ администратора на этом устройстве. */
+  adminForget: () => invoke<void>('admin_forget'),
+  serverSettings: () => invoke<ServerSetting[]>('server_settings_get'),
+  serverSettingsSet: (changes: SettingChange[]) => invoke<ServerSetting[]>('server_settings_set', { changes }),
+  serverSummary: () => invoke<ServerSummary>('server_summary'),
+  /** Сменить токен relay: все устройства отключатся и войдут по новому коду приглашения. */
+  serverRotateRelayToken: () => invoke<RelayRotated>('server_rotate_relay_token'),
+  /** Сменить ключ администратора: возвращает новый код сервера. */
+  serverRotateAdminKey: () => invoke<string>('server_rotate_admin_key'),
+  groupAdmin: () => invoke<GroupAdmin>('group_admin'),
+  /** Передать роль админа группы другому устройству. */
+  deviceMakeAdmin: (deviceId: string) => invoke<void>('device_make_admin', { deviceId }),}

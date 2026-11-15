@@ -45,6 +45,19 @@ pub async fn admin_claim(app: AppHandle, code: String) -> CmdResult<()> {
         .map_err(|e| format!("{e:#}"))?
         .ok_or_else(|| tr("Устройство не в группе").to_string())?;
     let info = claim_code(code.trim(), &agent)?;
+    // Токен доступа в коде другой: его сменили, и со старым это устройство
+    // к серверу уже не подключится, проверить ключ не на чем. Сервер тот же
+    // (id совпал), поэтому новый код принимается как есть, и синхронизация
+    // перезапускается с ним.
+    if info.server != agent.invite.server {
+        adopt_server_code(&state.paths, code.trim()).map_err(|e| {
+            trf("Ключ не сохранился: {e}", &[("e", &format!("{e:#}"))])
+        })?;
+        crate::restart_service(&app)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        return Ok(());
+    }
     // Сначала сервер: неверный или сменённый ключ сохранять незачем.
     controller(&app)?
         .admin_auth(info.admin_key.clone())

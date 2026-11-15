@@ -18,11 +18,13 @@
   import TitleBar from './TitleBar.svelte'
   import Devices from './Devices.svelte'
   import Storage from './Storage.svelte'
+  import Server from './Server.svelte'
 
-  type Section = 'general' | 'sync' | 'privacy' | 'keys' | 'about'
-  const sections: { id: Section; title: string; icon: string }[] = [
+  type Section = 'general' | 'sync' | 'server' | 'privacy' | 'keys' | 'about'
+  const allSections: { id: Section; title: string; icon: string }[] = [
     { id: 'general', title: t('Основные'), icon: 'M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0' },
     { id: 'sync', title: t('Синхронизация'), icon: 'M4 12a8 8 0 0 1 14-5.3M20 12a8 8 0 0 1-14 5.3M18 3v4h-4M6 21v-4h4' },
+    { id: 'server', title: t('Сервер'), icon: 'M4 4h16v7H4zM4 13h16v7H4zM8 7.5h0M8 16.5h0M12 7.5h5M12 16.5h5' },
     { id: 'privacy', title: t('Приватность'), icon: 'M6 11V8a6 6 0 0 1 12 0v3M5 11h14v10H5z' },
     { id: 'keys', title: t('Клавиши'), icon: 'M3 7h18v10H3zM7 11h0M11 11h0M15 11h0M8 14h8' },
     { id: 'about', title: t('О программе'), icon: 'M12 8h0M11 12h1v5h1M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z' },
@@ -80,6 +82,46 @@
   let updateReady = $state<string | null>(null)
 
   const configured = $derived(status.kind !== 'unconfigured' && status.kind !== 'local')
+
+  // Администратор сервера: раздел «Сервер» есть только у устройства с ключом.
+  let adminKey = $state(false)
+  let adminLoaded = $state(false)
+  let adminInput = $state('')
+  let adminBusy = $state(false)
+  let adminError = $state('')
+  const showServer = $derived(adminKey && configured && status.kind !== 'excluded')
+  const sections = $derived(allSections.filter((x) => x.id !== 'server' || showServer))
+
+  async function loadAdmin() {
+    try {
+      adminKey = (await api.adminState()).has_key
+    } catch {
+      adminKey = false
+    } finally {
+      adminLoaded = true
+    }
+  }
+
+  async function claimAdmin() {
+    adminBusy = true
+    adminError = ''
+    try {
+      await api.adminClaim(adminInput.trim())
+      adminInput = ''
+      await loadAdmin()
+      invite = ''
+      flash(t('Ключ администратора сохранён: появился раздел «Сервер»'))
+    } catch (e) {
+      adminError = String(e)
+    } finally {
+      adminBusy = false
+    }
+  }
+
+  // Раздел «Сервер» из прошлого открытия, а ключа уже нет — в «Синхронизацию».
+  $effect(() => {
+    if (section === 'server' && adminLoaded && !showServer && status.kind !== 'connecting') section = 'sync'
+  })
   let retrying = $state(false)
 
   async function retry() {
@@ -155,6 +197,7 @@
   async function refresh() {
     status = await api.status()
     info = await api.deviceInfo()
+    await loadAdmin()
   }
 
   async function createGroup() {
@@ -191,6 +234,7 @@
   async function leave() {
     await api.leaveGroup()
     confirmLeave = false
+    adminKey = false
     invite = ''
     createdInvite = ''
     await refresh()
@@ -471,7 +515,7 @@
       .then(() => api.settingsSectionGet())
       .catch(() => null)
       .then((prev) => {
-        if (prev && sections.some((x) => x.id === prev)) section = prev as Section
+        if (prev && allSections.some((x) => x.id === prev)) section = prev as Section
         sectionRestored = true
         refresh()
         pullGroupNotices()
@@ -631,8 +675,12 @@
           </p>
           <div class="card pad">
             <h2 class="in-card">{t('Это первое устройство')}</h2>
-            <p class="hint">{t('Код сервера печатает сервер Clipwire при запуске, строка начинается с')} <code>cwserver1-</code>.</p>
-            <textarea bind:value={serverCode} rows="3" placeholder="cwserver1-…" spellcheck="false"></textarea>
+            <p class="hint">
+              {t('Группу создаёт администратор сервера по коду сервера администратора, строка начинается с')} <code>cwserver2-</code>.
+              {t('Его печатает сервер Clipwire при запуске (лог контейнера в Docker-панели) и команда')} <code>clipwire-server info</code>.
+              {t('Это устройство станет админом группы и администратором сервера.')}
+            </p>
+            <textarea bind:value={serverCode} rows="3" placeholder="cwserver2-…" spellcheck="false"></textarea>
             <button class="primary" disabled={busy || !serverCode.trim()} onclick={createGroup}>{t('Создать группу')}</button>
           </div>
           <div class="card pad">
@@ -720,11 +768,27 @@
             onIncomingTaken={() => (devicesIncoming = null)}
           />
 
+          <h2>{t('Администратор сервера')}</h2>
+          <div class="card pad">
+            {#if adminKey}
+              <p class="hint">{t('У этого устройства есть ключ администратора сервера: в настройках есть раздел «Сервер» с пределами и сменой токена доступа.')}</p>
+              <button onclick={() => (section = 'server')}>{t('Открыть раздел «Сервер»')}</button>
+            {:else}
+              <p class="hint">
+                {t('Если сервер Clipwire ваш, введите код сервера администратора (начинается с')} <code>cwserver2-</code>{t('). Его печатает сервер при запуске (лог контейнера) и команда')} <code>clipwire-server info</code>.
+                {t('С ним появится раздел «Сервер», а группа без админа получит админом это устройство. Если токен доступа сменили, новый код сервера вернёт это устройство на связь.')}
+              </p>
+              <textarea bind:value={adminInput} rows="3" placeholder="cwserver2-…" spellcheck="false" aria-label={t('Код сервера администратора')}></textarea>
+              <button disabled={adminBusy || !adminInput.trim()} onclick={claimAdmin}>{adminBusy ? t('Проверяю…') : t('Я администратор сервера')}</button>
+              {#if adminError}<p class="error" role="alert">{adminError}</p>{/if}
+            {/if}
+          </div>
+
           <h2>{t('Отключить')}</h2>
           <div class="card pad">
             {#if confirmLeave}
               <div class="confirm">
-                <span>{t('Удалить ключи группы с этого устройства? Локальная история останется.')}</span>
+                <span>{adminKey ? t('Удалить ключи группы и ключ администратора сервера с этого устройства? Локальная история останется.') : t('Удалить ключи группы с этого устройства? Локальная история останется.')}</span>
                 <button class="danger" onclick={leave}>{t('Отключить')}</button>
                 <button onclick={() => (confirmLeave = false)}>{t('Отмена')}</button>
               </div>
@@ -733,6 +797,15 @@
             {/if}
           </div>
         {/if}
+      {:else if section === 'server' && showServer}
+        <h1>{t('Сервер')}</h1>
+        <Server
+          onForgotten={async () => {
+            await loadAdmin()
+            section = 'sync'
+          }}
+          onRelayRotated={() => ((invite = ''), (createdInvite = ''))}
+        />
       {:else if section === 'privacy'}
         <h1>{t('Приватность')}</h1>
         <div class="card">

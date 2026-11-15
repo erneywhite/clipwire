@@ -5,7 +5,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, type DevicesIncoming, type GroupDevice, type RekeyResult, type Status, type StorageKind } from '../lib/api'
   import { ago, plural } from '../lib/format'
-  import { CHECKING, checking as checkingText, confirmText, deviceTitle, seenLabel } from '../lib/devices'
+  import { CHECKING, canManage, checking as checkingText, confirmText, deviceTitle, isAdmin, rolesText, seenLabel, type Roles } from '../lib/devices'
 
   // `incoming` — итог смены ключа, пришедший событием (его забирает окно
   // настроек: раздел мог быть закрыт). Принятый сообщается `onIncomingTaken`.
@@ -33,6 +33,15 @@
   let checking = $state(false)
   /** Вид хранилища файлов группы: у внешнего доступы остаются у тех, кто окажется вне группы. */
   let storageKind = $state<StorageKind | null>(null)
+  /** Кто админ группы; null — не знаем (нет связи). */
+  let roles = $state<Roles>(null)
+  /** Кому передаём роль админа (подтверждение). */
+  let handing = $state<string | null>(null)
+  let handBusy = $state(false)
+
+  const manage = $derived(canManage(roles, list))
+  const rolesNote = $derived(rolesText(roles, list))
+  const meAdmin = $derived(list.some((d) => d.me && isAdmin(roles, d)))
 
   const explain = $derived(confirming === null ? [] : confirmText(list, confirming || null, fmt, storageKind))
 
@@ -59,6 +68,27 @@
       error = String(e)
     } finally {
       loaded = true
+    }
+    try {
+      roles = await api.groupAdmin()
+    } catch {
+      roles = null
+    }
+  }
+
+  /** Передать роль админа группы устройству handing. */
+  async function handOver() {
+    if (!handing) return
+    handBusy = true
+    error = ''
+    try {
+      await api.deviceMakeAdmin(handing)
+      handing = null
+      await load()
+    } catch (e) {
+      error = String(e)
+    } finally {
+      handBusy = false
     }
   }
 
@@ -149,15 +179,31 @@
     <div class="row device">
       <span class="dot" class:on={d.online}></span>
       <div class="who">
-        <span class="name" class:unknown={!d.known}>{deviceTitle(d)}{#if d.me}<span class="me">{' · '}{t('это устройство')}</span>{/if}</span>
+        <span class="name" class:unknown={!d.known}>{deviceTitle(d)}{#if d.me}<span class="me">{' · '}{t('это устройство')}</span>{/if}{#if isAdmin(roles, d)}<span class="badge">{t('админ')}</span>{/if}</span>
         <span class="meta mono">{d.os ?? t('нет карточки')} · {d.fingerprint} · {seenLabel(d, fmt)}</span>
       </div>
-      {#if !d.me}
+      {#if !d.me && meAdmin && d.known}
+        <button disabled={busy || handBusy} onclick={() => (handing = d.id)}>{t('Сделать админом')}</button>
+      {/if}
+      {#if !d.me && manage}
         <button class="danger" disabled={busy} onclick={() => askRemove(d.id)}>{t('Удалить')}</button>
       {/if}
     </div>
+    {#if handing === d.id}
+      <div class="row confirm" role="alertdialog">
+        <strong>{t('Сделать «{name}» админом группы?', { name: deviceTitle(d) })}</strong>
+        <p class="hint">{t('Это устройство перестанет быть админом: удалять устройства и менять ключ группы сможет только «{name}». Вернуть роль сможет только оно.', { name: deviceTitle(d) })}</p>
+        <div class="buttons">
+          <button class="primary" disabled={handBusy} onclick={handOver}>{handBusy ? t('Передаю…') : t('Сделать админом')}</button>
+          <button disabled={handBusy} onclick={() => (handing = null)}>{t('Отмена')}</button>
+        </div>
+      </div>
+    {/if}
   {/each}
 </div>
+{#if rolesNote}
+  <p class="hint outside">{rolesNote}</p>
+{/if}
 {#if list.some((d) => !d.known && !d.me)}
   <p class="hint outside">
     {t('У неизвестных устройств старая версия Clipwire или карточка не открылась. При смене ключа новый ключ им передать нечем: обновите их и откройте на них Clipwire, тогда имя появится.')}
@@ -182,7 +228,7 @@
     <p class="hint">
       {t('Новый ключ получат все устройства группы, а старый код приглашения перестанет работать. Пригодится, если код приглашения попал не туда.')}
     </p>
-    <button disabled={busy || !loaded || list.length === 0} onclick={() => ((confirming = ''), (result = null))}>
+    <button disabled={busy || !loaded || list.length === 0 || !manage} onclick={() => ((confirming = ''), (result = null))}>
       {t('Сменить ключ группы')}
     </button>
   {/if}
@@ -268,6 +314,19 @@
     color: var(--c-muted);
     font-style: normal;
   }
+  .badge {
+    display: inline-block;
+    margin-left: var(--space-2);
+    padding: 0 6px;
+    border: 1px solid var(--c-accent);
+    border-radius: var(--radius-s, 4px);
+    color: var(--c-accent);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs, 11px);
+    font-style: normal;
+    line-height: 1.6;
+    vertical-align: 1px;
+  }
   .meta {
     color: var(--c-muted);
     overflow-wrap: anywhere;
@@ -341,5 +400,14 @@
   button.danger {
     border-color: var(--c-danger);
     color: var(--c-danger);
+  }
+  button.primary {
+    background: var(--c-accent);
+    border-color: var(--c-accent);
+    color: var(--c-on-accent);
+  }
+  button.primary:hover:not(:disabled) {
+    background: var(--c-accent);
+    filter: brightness(1.08);
   }
 </style>
