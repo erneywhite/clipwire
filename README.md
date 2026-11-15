@@ -530,6 +530,10 @@ network tests start dozens of iroh endpoints and fail with "Too many open files"
 ulimit -n 10240 && cargo test --workspace
 ```
 
+How much memory and CPU the app uses while idle, and how to measure it (Windows and macOS
+commands that count Clipwire together with its WebView processes), is described in
+[docs/architecture.md](docs/architecture.md#память-и-процессор-в-простое) (in Russian).
+
 A release is built by GitHub Actions on a `vX.Y.Z` tag ([release.yml](.github/workflows/release.yml)):
 installers for Windows, macOS and Linux, signed update files and `latest.json`. The version comes
 from the workspace `Cargo.toml`. The signing keys live in the GitHub environment `release`, which

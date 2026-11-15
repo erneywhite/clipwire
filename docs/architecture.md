@@ -228,6 +228,83 @@ Item { id: uuid v7, origin: endpoint_id, created_at, kind: Text|Image|Files, pay
   идёт ровно к проверенному IP и DNS rebinding не проходит. Прокси для карточек не
   используется: через прокси имя резолвил бы он.
 
+## Память и процессор в простое
+
+Больше всего памяти в клиенте занимают WebView. На Windows это процессы
+`msedgewebview2.exe`: один браузерный, GPU, служебные и по процессу рендера на окно. На
+macOS это процессы `com.apple.WebKit.WebContent`. Поэтому окна живут так:
+
+- окно вставки создаётся на старте и при закрытии только прячется, чтобы горячая клавиша
+  открывала его сразу;
+- настройки, пример размера окна вставки и редактор картинок в `tauri.conf.json` помечены
+  `"create": false`. Их создаёт `ensure_window` (`apps/desktop/src-tauri/src/lib.rs`), когда
+  окно понадобилось, а при закрытии они закрываются насовсем вместе со своим WebView. Пример
+  размера закрывается вместе с настройками, редактор закрывается и после сохранения;
+- на Windows окно нельзя создавать из главного потока (WebView2 ждёт тот же поток и всё
+  встаёт), поэтому `show_settings`, `size_preview` и `editor_open` создают окна в фоновом
+  потоке.
+
+Остальное в простое:
+
+- значок в трее перерисовывается раз в 0,7 с только при пульсации (подключение, найдено
+  обновление). В остальное время такт спит до смены статуса, а тему панели задач Windows
+  перечитывает из реестра раз в 30 секунд;
+- карточек ссылок в памяти не больше 32: в карточке бывает картинка до 2 МБ;
+- скачанное обновление ждёт установки на диске (`update/pending.bin`) и читается только в
+  момент установки. Подпись проверяет `Update::install` над прочитанными байтами.
+
+### Как измерить
+
+Сравнивать стоит в одинаковых точках: через пару минут после запуска с `--background`, после
+одного показа окна вставки, после открытия и закрытия настроек и редактора, через 10 минут
+простоя. Каждую точку лучше снять три раза и взять медиану. Сумма рабочих наборов (WS)
+завышена: процессы WebView2 делят страницы памяти. Для сравнения версий честнее сумма
+private bytes.
+
+Windows (PowerShell 7): процесс Clipwire и всё его дерево, то есть `msedgewebview2.exe`
+браузера и рендеров.
+
+```powershell
+$all = Get-CimInstance Win32_Process
+$ids = [System.Collections.Generic.HashSet[uint32]]::new()
+$all | Where-Object Name -eq 'clipwire-desktop.exe' | ForEach-Object { [void]$ids.Add($_.ProcessId) }
+do {
+  $added = 0
+  foreach ($p in $all) { if ($ids.Contains($p.ParentProcessId) -and $ids.Add($p.ProcessId)) { $added++ } }
+} while ($added)
+$procs = Get-Process -Id ([uint32[]]$ids) -ErrorAction SilentlyContinue
+$procs | Sort-Object WorkingSet64 -Descending |
+  Format-Table Id, ProcessName,
+    @{ n = 'WS, MB'; e = { [math]::Round($_.WorkingSet64 / 1MB, 1) } },
+    @{ n = 'Private, MB'; e = { [math]::Round($_.PrivateMemorySize64 / 1MB, 1) } }
+'Total: {0} processes, WS {1:N1} MB, private {2:N1} MB' -f $procs.Count,
+  (($procs | Measure-Object WorkingSet64 -Sum).Sum / 1MB),
+  (($procs | Measure-Object PrivateMemorySize64 -Sum).Sum / 1MB)
+```
+
+Пробуждения процессора в простое видны в Process Explorer, в колонке «Context Switch
+Delta» у `clipwire-desktop.exe`.
+
+macOS: процессы WebContent запускает launchd, детьми приложения они не числятся. Их проще
+найти сравнением списка до запуска и после. Пока идёт замер, другие программы на WebKit
+(Safari, «Почта») лучше не открывать.
+
+```sh
+pgrep -f com.apple.WebKit > /tmp/wk.before
+open -a Clipwire --args --background; sleep 30
+APP=$(pgrep -f 'Clipwire.app/Contents/MacOS' | head -1)
+WK=$(pgrep -f com.apple.WebKit | grep -vxFf /tmp/wk.before)
+PIDS=$(echo $APP $WK | tr ' ' ',')
+ps -o pid=,rss=,comm= -p "$PIDS"
+ps -o rss= -p "$PIDS" | awk '{s+=$1} END {printf "RSS total: %.1f MB\n", s/1024}'
+for p in $APP $WK; do footprint -p $p | grep -i footprint; done   # как «Память» в Мониторе системы
+top -l 6 -s 5 -stats pid,command,cpu,mem,idlew $(printf -- '-pid %s ' $APP $WK)
+```
+
+Колонка `idlew` у `top` показывает пробуждения в простое. На маке буфер обмена опрашивается
+каждые 250 мс (уведомлений об изменении система не даёт), так что совсем без пробуждений
+приложение не бывает.
+
 ## Что сознательно отложено
 
 - P2P и файлы — этап 5.

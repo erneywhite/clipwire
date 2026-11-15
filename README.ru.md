@@ -542,6 +542,10 @@ cd apps/desktop && npm ci && npx tauri dev
 ulimit -n 10240 && cargo test --workspace
 ```
 
+Сколько памяти и процессора программа берёт в простое и как это измерить (команды для Windows
+и macOS, которые считают сам Clipwire вместе с его процессами WebView), описано в
+[docs/architecture.md](docs/architecture.md#память-и-процессор-в-простое).
+
 Релиз собирается в GitHub Actions по тегу `vX.Y.Z` ([release.yml](.github/workflows/release.yml)):
 установщики для Windows, macOS и Linux, подписанные файлы обновления и `latest.json`. Версия
 берётся из `Cargo.toml` рабочего пространства. Ключи подписи лежат в окружении GitHub `release`:
