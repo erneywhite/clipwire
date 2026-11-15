@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use clipwire_core::BlobId;
@@ -38,6 +39,48 @@ pub fn clear(files_dir: &Path, busy: &HashSet<BlobId>) -> Cleaned {
     remove_where(files_dir, |name, _| {
         BlobId::from_hex(name).is_some_and(|b| !busy.contains(&b))
     })
+}
+
+/// Одна фоновая работа вместо стопки одинаковых: просьбы, пришедшие, пока
+/// работа идёт, сливаются в один повтор после неё. Чистке кэша это нужно,
+/// потому что каждое удаление записи просит её заново, а каждый раз это
+/// обход всех карточек истории.
+#[derive(Default)]
+pub struct Rerun {
+    running: AtomicBool,
+    again: AtomicBool,
+}
+
+impl Rerun {
+    pub const fn new() -> Self {
+        Self {
+            running: AtomicBool::new(false),
+            again: AtomicBool::new(false),
+        }
+    }
+
+    /// Попросить работу. `true` — работа не идёт, звавший запускает её и
+    /// крутит `while rerun.next() { … }`; `false` — она уже идёт и
+    /// повторится сама.
+    pub fn request(&self) -> bool {
+        self.again.store(true, Ordering::SeqCst);
+        !self.running.swap(true, Ordering::SeqCst)
+    }
+
+    /// Делать ли ещё проход. `false` — просьб больше нет, работа закончена.
+    pub fn next(&self) -> bool {
+        loop {
+            if self.again.swap(false, Ordering::SeqCst) {
+                return true;
+            }
+            self.running.store(false, Ordering::SeqCst);
+            // Просьба между проверкой и сбросом видела «идёт» и не
+            // запустила работу: подхватываем её здесь.
+            if !self.again.load(Ordering::SeqCst) || self.running.swap(true, Ordering::SeqCst) {
+                return false;
+            }
+        }
+    }
 }
 
 /// Сколько живёт папка виртуальных файлов, на которую ещё никто не
@@ -134,6 +177,21 @@ pub fn size(files_dir: &Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rerun_merges_requests_made_while_running() {
+        let r = super::Rerun::new();
+        assert!(r.request(), "первая просьба запускает работу");
+        assert!(r.next());
+        // Пока идёт проход, просят дважды: будет один повтор.
+        assert!(!r.request());
+        assert!(!r.request());
+        assert!(r.next());
+        assert!(!r.next(), "просьб больше нет");
+        assert!(r.request(), "после конца работа запускается снова");
+        assert!(r.next());
+        assert!(!r.next());
+    }
+
     use super::*;
 
     fn put(dir: &Path, blob: BlobId, name: &str, bytes: usize) {

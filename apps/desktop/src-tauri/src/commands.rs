@@ -293,6 +293,9 @@ pub fn parse_id(id: &str) -> CmdResult<ItemId> {
         .map_err(|_| tr("Неверный id элемента").to_string())
 }
 
+/// Обходы ленты окна вставки: новый запрос останавливает устаревшие.
+static LIST_SCANS: clipwire_agent::history::Supersede = clipwire_agent::history::Supersede::new();
+
 #[tauri::command]
 pub async fn history_list(
     app: AppHandle,
@@ -304,7 +307,10 @@ pub async fn history_list(
 ) -> Vec<EntryDto> {
     // Поиск редкого слова или вкладка с редким типом читают все карточки:
     // отдельным потоком и вторым соединением, чтобы не ждали ни окно, ни
-    // запись новых копирований.
+    // запись новых копирований. Запрос с другим текстом или вкладкой
+    // останавливает старые обходы: окно их ответы всё равно отбрасывает.
+    let kind = kind.unwrap_or_default();
+    let ticket = LIST_SCANS.start(&format!("{query}\0{pinned_only}\0{kind:?}"));
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
@@ -312,14 +318,22 @@ pub async fn history_list(
         // Окно вставки берёт ленту страницами; одна страница не больше 1000.
         // Проверки файлов на диске — после чтения карточек.
         let rows = clipwire_agent::history::read(&state.history, state.reader.as_ref(), |h| {
-            h.list_page(
+            h.list_page_until(
                 &query,
                 pinned_only,
-                kind.unwrap_or_default(),
+                kind,
                 offset.unwrap_or(0),
                 limit.min(1000),
+                &|| LIST_SCANS.stale(ticket),
             )
         });
+        // shortcut: брошенный обход отдаёт пустую страницу, а не ошибку:
+        // окно отбрасывает ответы на старый запрос по своему номеру списка.
+        // Если история понадобится второму окну со своим запросом, ключ
+        // надо дополнить окном, иначе окна будут останавливать друг друга.
+        let Some(rows) = rows else {
+            return Vec::new();
+        };
         rows.iter()
             .map(|r| row_dto(r, &files_dir, &uploaded))
             .collect()
