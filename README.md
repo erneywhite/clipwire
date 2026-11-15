@@ -106,7 +106,8 @@ a server at any time: the last 50 entries of the local history go to the group, 
 history is merged into the local one. The clipboard itself is not touched.
 
 **Connecting a server.** Set up the server first (see [Self-hosted server](#self-hosted-server)); it
-prints a server code that looks like `cwserver1-…`.
+prints a server code that looks like `cwserver2-…`. That is the administrator's code: groups are
+created with it (see [Administrator code](#administrator-code)).
 
 1. On the first device open **Sync**, enter the server code and create a group.
 2. Clipwire shows an invitation code, `clipwire1-…`. Enter it on your other devices.
@@ -370,14 +371,21 @@ transfer. On it, syncing stops and Sync offers **Leave group** and **Try again**
 history are not wiped automatically, because the server can say "you were removed" without a key
 change, and what was already on the device stays there. A new key is accepted only if it was
 issued by a device that this computer has already seen in the list; after the change, settings
-say which device changed it. The removed device keeps the server token, so it can still create
-groups and take up file space. If the computer may have fallen into the wrong hands, change the
-token on the server (`CLIPWIRE_RELAY_TOKEN`) and hand out a new invitation code.
+say which device changed it. The removed device keeps the relay token from the invitation code:
+it can no longer create groups (that needs the administrator code since server 0.5.0), but it
+can still reach the relay. If the computer may have fallen into the wrong hands, the server
+administrator changes the relay token, and every device enters a new invitation code.
 
 **Changing the group key** does the same without removing anyone, which is useful if the
 invitation code ended up in the wrong place. The group's history on the server is erased, local
 history is untouched and the invitation code changes. Devices without a card do not receive the
 new key, and Clipwire warns about it before you confirm.
+
+**Group admin.** The device that created the group is its admin and is marked in the device
+list. Only the admin removes devices and changes the group key, and the role can be handed over
+to another device of the group. Groups created before server 0.5.0 have no admin: there any
+device can still change the key, and the first device that connects with the administrator
+code becomes the admin. After a key change the admin stays the same.
 
 Details of the protocol are in [docs/devices.md](docs/devices.md).
 
@@ -506,24 +514,54 @@ version number: `ghcr.io/erneywhite/clipwire-server:0.4.0`.
 4. Optionally hide the iroh-relay status page at the domain root: add a `location = /` with a
    redirect to the proxy config. An example is at the end of
    [deploy/nginx-clipwire.conf](deploy/nginx-clipwire.conf).
-5. Find the `server code: cwserver1-…` line in the container log (Clipwire's own log line is in
-   Russian: `код сервера: cwserver1-…`). The first device connects with it. `clipwire-server
-   info` prints the same.
+5. Find the server code line in the container log (Clipwire's own log line is in Russian:
+   `код сервера: cwserver2-…`). Your first device connects with it. `clipwire-server info`
+   prints the same.
 
 **Updating:** pull the new image and recreate the container. When the app is newer than the
 server, About shows it next to the server version and you get a notification once.
 
-**Checking from outside:** `cargo run -p clipwire-server --example probe -- cwserver1-…` connects
+**Checking from outside:** `cargo run -p clipwire-server --example probe -- cwserver2-…` connects
 two clients through the relay, sends an encrypted item between them and shows which path the
 packets took.
 
 **Building the image yourself:** run `docker compose up -d --build` in `deploy`
 ([deploy/docker-compose.yml](deploy/docker-compose.yml)).
 
-The server key, the relay token and the database live in the Docker volume `clipwire-data`. If
-you delete the key, the server's address changes and every device has to be connected again.
+The server key, the relay token, the administrator key and the database live in the Docker
+volume `clipwire-data`. If you delete the server key, the server's address changes and every
+device has to be connected again.
+
+### Administrator code
+
+The server has two secrets. The relay token lets devices reach the relay and is part of every
+invitation code. The administrator key (32 random bytes, `admin.key` in the data volume) is
+created on the first start of server 0.5.0 and is only in the server code `cwserver2-…`, never in
+an invitation code. Where to find the code:
+
+- the container log in the Docker panel, line `код сервера: cwserver2-…` (printed at every start
+  and after the administrator changes a secret from the app);
+- `clipwire-server info` in the container console, if your panel has one.
+
+With the administrator code a device can create groups and sees the **Server** section in
+settings: limits (the same as the variables below), a server summary, changing the relay token
+and changing the administrator key. Limits set there are stored in the server database and apply
+at once, without a restart; the environment variables become the defaults, and **Reset** returns
+a limit to its default.
+
+Changing the relay token disconnects every device, and old invitation codes stop working: hand
+out a new one. A token set with `CLIPWIRE_RELAY_TOKEN` can only be changed in the container
+settings. After changing the administrator key, the old server code stops working, enter the new
+one on your administrator device.
+
+An old server code `cwserver1-…` still connects, but it cannot create groups. Devices connected
+before the update keep working with their invitation codes; to get the Server section, enter the
+new server code once on your administrator device.
 
 ### Environment variables
+
+Variables marked with an asterisk are defaults: the server administrator can change them from the
+app without restarting the container.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -532,22 +570,22 @@ you delete the key, the server's address changes and every device has to be conn
 | `CLIPWIRE_RELAY_BIND` | `0.0.0.0:3340` | HTTP of the built-in relay |
 | `CLIPWIRE_QUIC_BIND` | `0.0.0.0:7843` | UDP for direct connections |
 | `CLIPWIRE_RELAY_TOKEN` | generated | relay access token, if you want your own (up to 256 characters) |
-| `CLIPWIRE_MAX_ITEM_BYTES` | `8388608` | limit for one encrypted item (8 MiB, enough for images) |
-| `CLIPWIRE_HISTORY_LEN` | `50` | how many latest items to keep per group |
-| `CLIPWIRE_TTL_HOURS` | `24` | how long to keep an item |
+| `CLIPWIRE_MAX_ITEM_BYTES`\* | `8388608` | limit for one encrypted item (8 MiB, enough for images) |
+| `CLIPWIRE_HISTORY_LEN`\* | `50` | how many latest items to keep per group |
+| `CLIPWIRE_TTL_HOURS`\* | `24` | how long to keep an item |
 | `CLIPWIRE_SELF_RELAY_URL` | `http://127.0.0.1:<relay port>` | how the server connects to its own relay |
-| `CLIPWIRE_MAX_FILE_BYTES` | `104857600` | limit for one file (100 MiB) |
-| `CLIPWIRE_BLOB_QUOTA` | `2147483648` | file space per group (2 GiB) |
-| `CLIPWIRE_BLOB_TOTAL_QUOTA` | `21474836480` | file space for the whole server (20 GiB) |
+| `CLIPWIRE_MAX_FILE_BYTES`\* | `104857600` | limit for one file (100 MiB) |
+| `CLIPWIRE_BLOB_QUOTA`\* | `2147483648` | file space per group (2 GiB) |
+| `CLIPWIRE_BLOB_TOTAL_QUOTA`\* | `21474836480` | file space for the whole server (20 GiB) |
 | `CLIPWIRE_BLOB_STALL_SECS` | `120` | how long to wait for the next part of a file before an upload counts as abandoned |
 | `CLIPWIRE_RESERVE_TTL_SECS` | `600` | after how long space reserved for a file is released if the upload never started |
-| `CLIPWIRE_MAX_RESERVES` | `512` | how many files one device may keep reserved without a single uploaded part |
-| `CLIPWIRE_MAX_GROUPS` | `100` | how many groups the server can hold (creating a group needs the server code; groups with no devices are deleted after 90 days) |
-| `CLIPWIRE_MAX_DEVICES` | `64` | how many devices one group can hold; a new device over the limit is refused, known devices still join |
-| `CLIPWIRE_HISTORY_TOTAL_BYTES` | `1073741824` | total limit of item history per server (1 GiB); the excess is evicted from the largest group |
-| `CLIPWIRE_MAX_DEVICE_CONNS` | `4` | simultaneous connections from one device |
-| `CLIPWIRE_PIN_MAX` | `5000` | how many pinned entries one group can keep on the server; a new pin over the limit is refused |
-| `CLIPWIRE_PIN_BYTES` | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries and the records of removed pins. Files of pinned entries count toward `CLIPWIRE_BLOB_QUOTA` |
+| `CLIPWIRE_MAX_RESERVES`\* | `512` | how many files one device may keep reserved without a single uploaded part |
+| `CLIPWIRE_MAX_GROUPS`\* | `100` | how many groups the server can hold (creating a group needs the administrator code; groups with no devices are deleted after 90 days) |
+| `CLIPWIRE_MAX_DEVICES`\* | `64` | how many devices one group can hold; a new device over the limit is refused, known devices still join |
+| `CLIPWIRE_HISTORY_TOTAL_BYTES`\* | `1073741824` | total limit of item history per server (1 GiB); the excess is evicted from the largest group |
+| `CLIPWIRE_MAX_DEVICE_CONNS`\* | `4` | simultaneous connections from one device |
+| `CLIPWIRE_PIN_MAX`\* | `5000` | how many pinned entries one group can keep on the server; a new pin over the limit is refused |
+| `CLIPWIRE_PIN_BYTES`\* | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries and the records of removed pins. Files of pinned entries count toward `CLIPWIRE_BLOB_QUOTA` |
 
 ### What the server stores
 
@@ -563,6 +601,7 @@ you delete the key, the server's address changes and every device has to be conn
   in with the old key gets "removed" and does not create the group again. Tombstones do not count
   toward `CLIPWIRE_MAX_GROUPS`.
 - Encrypted deletion notes.
+- Limits set from the app (table `settings`) and the admin of every group (a device ID).
 - Encrypted pins of the group (`clipwire/8`) with their notes and the pinned entries
   themselves, with no expiry: a pin lives until it is removed, and a removed pin stays as a
   record of a few hundred bytes without content. Files of pinned entries are not deleted after
