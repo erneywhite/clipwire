@@ -50,7 +50,7 @@ pub fn size_preview(app: AppHandle, width: f64, height: f64) {
         return;
     }
     tauri::async_runtime::spawn_blocking(move || {
-        let made = crate::ensure_window(&app, "preview", None);
+        let made = crate::ensure_window(&app, "preview");
         CREATING.store(false, Ordering::SeqCst);
         if let Err(e) = made {
             tracing::warn!("окно превью размера не создалось: {e}");

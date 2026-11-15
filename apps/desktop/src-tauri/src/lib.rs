@@ -384,11 +384,7 @@ static WINDOW_BACKGROUND: Mutex<Option<tauri::window::Color>> = Mutex::new(None)
 /// На Windows создание окна из главного потока (синхронная команда,
 /// обработчик событий окна, меню трея) зависает намертво: WebView2 ждёт тот
 /// же поток. Поэтому звать только из фонового потока или async-команды.
-pub fn ensure_window(
-    app: &AppHandle,
-    label: &str,
-    init_script: Option<String>,
-) -> Result<(tauri::WebviewWindow, bool), String> {
+pub fn ensure_window(app: &AppHandle, label: &str) -> Result<(tauri::WebviewWindow, bool), String> {
     // Два одновременных вызова не должны создавать окно дважды: вторая
     // попытка с той же меткой упала бы.
     static CREATING: Mutex<()> = Mutex::new(());
@@ -410,9 +406,6 @@ pub fn ensure_window(
     if let Some(color) = background {
         builder = builder.background_color(color);
     }
-    if let Some(script) = init_script {
-        builder = builder.initialization_script(script);
-    }
     let w = builder.build().map_err(|e| e.to_string())?;
     tracing::debug!("создано окно {label}");
     Ok((w, true))
@@ -432,7 +425,7 @@ fn hide_from_capture(app: &AppHandle) -> bool {
 pub fn show_settings(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let w = match ensure_window(&app, "settings", None) {
+        let w = match ensure_window(&app, "settings") {
             Ok((w, _)) => w,
             Err(e) => {
                 tracing::warn!("окно настроек не открылось: {e}");
@@ -552,6 +545,7 @@ pub fn run() {
             commands::history_update,
             editor::editor_open,
             editor::editor_save,
+            editor::editor_pending,
             link::link_preview,
             files::file_preview,
             files::files_download,

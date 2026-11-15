@@ -346,6 +346,8 @@ export const api = {
   /** Удалить скачанные копии, кроме тех, что качаются сейчас. */
   cacheClear: () => invoke<CacheCleared>('cache_clear'),
   editImage: (id: string) => invoke<void>('editor_open', { id }),
+  /** Какую картинку показывать редактору: последний запрошенный id. */
+  editorPending: () => invoke<string | null>('editor_pending'),
   linkPreview: (url: string) => invoke<LinkCard>('link_preview', { url }),
   filePreview: (path: string) => invoke<FilePreview>('file_preview', { path }),
   /** Скачать файлы записи с другого устройства без вставки. Прогресс идёт событиями. */
