@@ -6,6 +6,7 @@ mod blobs;
 pub mod config;
 mod devices;
 mod hub;
+mod pins;
 mod relay;
 mod session;
 mod store;

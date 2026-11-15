@@ -142,6 +142,13 @@ pub struct Guards {
     /// ключом. Потом от группы остаётся надгробие: строка без пакетов, по
     /// которой вход старым ключом получает `Excluded`, а не новую группу.
     pub rotated_keep: Duration,
+    /// Сколько закреплённых записей может быть у группы (снятые не
+    /// считаются). Сверх этого новый закреп получает отказ.
+    pub pin_max: u64,
+    /// Сколько места под закрепы на группу: зашифрованные состояния и
+    /// содержимое всех записей, включая снятые. Файлы закрепов считаются в
+    /// квоте файлов (`CLIPWIRE_BLOB_QUOTA`).
+    pub pin_bytes: u64,
 }
 
 /// Через сколько удаляется заброшенная группа: 90 дней.
@@ -161,6 +168,8 @@ impl Default for Guards {
             max_device_conns: 4,
             group_idle: GROUP_IDLE,
             rotated_keep: ROTATED_KEEP,
+            pin_max: 5000,
+            pin_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -185,6 +194,8 @@ impl Guards {
             max_device_conns,
             group_idle: d.group_idle,
             rotated_keep: d.rotated_keep,
+            pin_max: parse("CLIPWIRE_PIN_MAX", d.pin_max)?,
+            pin_bytes: parse("CLIPWIRE_PIN_BYTES", d.pin_bytes)?,
         })
     }
 }

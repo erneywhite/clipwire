@@ -27,6 +27,8 @@ struct Member {
     deletes_sub: Arc<AtomicBool>,
     /// Соединение по `clipwire/6`: знает `DevicesChanged`.
     devices_sub: Arc<AtomicBool>,
+    /// Соединение по `clipwire/8`: знает `Pinned`.
+    pins_sub: Arc<AtomicBool>,
 }
 
 type Groups = HashMap<GroupId, HashMap<u64, Member>>;
@@ -49,6 +51,7 @@ pub struct Registration<'a> {
     config_sub: Arc<AtomicBool>,
     deletes_sub: Arc<AtomicBool>,
     devices_sub: Arc<AtomicBool>,
+    pins_sub: Arc<AtomicBool>,
 }
 
 impl Registration<'_> {
@@ -65,6 +68,11 @@ impl Registration<'_> {
     /// Соединение знает `DevicesChanged` (`clipwire/6`).
     pub fn subscribe_devices(&self) {
         self.devices_sub.store(true, Ordering::Relaxed);
+    }
+
+    /// Соединение знает `Pinned` (`clipwire/8`).
+    pub fn subscribe_pins(&self) {
+        self.pins_sub.store(true, Ordering::Relaxed);
     }
 }
 
@@ -101,6 +109,7 @@ impl Hub {
         let config_sub = Arc::new(AtomicBool::new(false));
         let deletes_sub = Arc::new(AtomicBool::new(false));
         let devices_sub = Arc::new(AtomicBool::new(false));
+        let pins_sub = Arc::new(AtomicBool::new(false));
         self.lock().entry(group).or_default().insert(
             id,
             Member {
@@ -110,6 +119,7 @@ impl Hub {
                 config_sub: config_sub.clone(),
                 deletes_sub: deletes_sub.clone(),
                 devices_sub: devices_sub.clone(),
+                pins_sub: pins_sub.clone(),
             },
         );
         Registration {
@@ -120,6 +130,7 @@ impl Hub {
             config_sub,
             deletes_sub,
             devices_sub,
+            pins_sub,
         }
     }
 
@@ -172,6 +183,13 @@ impl Hub {
         self.send_to(group, except, msg, |m| {
             m.deletes_sub.load(Ordering::Relaxed)
         })
+    }
+
+    /// То же, но только соединениям по `clipwire/8`
+    /// ([`Registration::subscribe_pins`]). Полная очередь теряет сообщение:
+    /// устройство догонит его по `PinsSince` при следующем входе.
+    pub fn broadcast_pins(&self, group: &GroupId, except: u64, msg: &ServerMsg) -> usize {
+        self.send_to(group, except, msg, |m| m.pins_sub.load(Ordering::Relaxed))
     }
 
     /// Сообщить соединениям по `clipwire/6`, кроме `except`, что устройства
@@ -288,6 +306,26 @@ mod tests {
         assert_eq!(ra.try_recv().unwrap(), ServerMsg::DevicesChanged);
         assert!(rc.try_recv().is_err());
         assert_eq!(hub.devices_changed(&GroupId([9; 32]), 0), 0);
+    }
+
+    #[test]
+    fn pins_go_only_to_v8() {
+        let hub = Hub::default();
+        let g = GroupId([1; 32]);
+        let (ta, mut ra) = mpsc::channel(4);
+        let (tb, mut rb) = mpsc::channel(4);
+        let (tc, mut rc) = mpsc::channel(4);
+        let a = hub.register(g, DeviceId([1; 32]), ta);
+        let b = hub.register(g, DeviceId([2; 32]), tb);
+        let old = hub.register(g, DeviceId([3; 32]), tc);
+        a.subscribe_pins();
+        b.subscribe_pins();
+        old.subscribe_deletes();
+        let msg = ServerMsg::PinStats(Default::default());
+        assert_eq!(hub.broadcast_pins(&g, a.id, &msg), 1);
+        assert!(ra.try_recv().is_err());
+        assert_eq!(rb.try_recv().unwrap(), msg);
+        assert!(rc.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clipwire_core::delete::MAX_DELETE_BYTES;
 use clipwire_core::proto::io::{IoError, read_msg, read_msg_limited, write_msg};
 use clipwire_core::proto::{
-    ClientMsg, ServerMsg, knows_deletes, knows_devices_changed, knows_server_info,
+    ClientMsg, ServerMsg, knows_deletes, knows_devices_changed, knows_pins, knows_server_info,
 };
 use clipwire_core::storage::MAX_CONFIG_BYTES;
 use clipwire_core::{DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
@@ -54,6 +54,7 @@ pub struct Limits {
     pub max_device_conns: usize,
     pub group_idle: Duration,
     pub rotated_keep: Duration,
+    pub pin_quota: crate::store::PinQuota,
 }
 
 impl Limits {
@@ -74,6 +75,10 @@ impl Limits {
             max_device_conns: guards.max_device_conns,
             group_idle: guards.group_idle,
             rotated_keep: guards.rotated_keep,
+            pin_quota: crate::store::PinQuota {
+                max_pins: guards.pin_max,
+                max_bytes: guards.pin_bytes,
+            },
         }
     }
 }
@@ -297,6 +302,12 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
     }
     // Устройство вышло на связь: окна устройств остальных обновятся.
     shared.hub.devices_changed(&group, reg.id);
+    // Закрепы устройство забирает само (`PinsSince`), подписка — на правки
+    // с других устройств. Правка между подпиской и `PinsSince` придёт дважды,
+    // повтор устройство узнаёт по `rev`.
+    if knows_pins(conn.alpn()) {
+        reg.subscribe_pins();
+    }
     if knows_deletes(conn.alpn()) {
         reg.subscribe_deletes();
         for note in shared.store.deletes(&group, not_before)? {
@@ -366,6 +377,38 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                             let n = shared.hub.broadcast_deletes(&group, reg.id, &ServerMsg::Deleted(note));
                             tracing::info!(group = %short(&group), receivers = n, "удаление записей");
                         }
+                    }
+                    Some(ClientMsg::PinSet { pin_id, base_rev, pinned, state, content, blobs }) => {
+                        let w = crate::store::PinWrite {
+                            pin_id,
+                            base_rev,
+                            pinned,
+                            state: &state,
+                            content: content.as_deref(),
+                            blobs: &blobs,
+                        };
+                        if let Some(reply) = crate::pins::set(shared, &group, reg.id, &w)? {
+                            write_msg(&mut send, &reply).await?;
+                        }
+                    }
+                    Some(ClientMsg::PinsSince { rev }) => {
+                        let (records, more) = shared.store.pins_since(&group, rev)?;
+                        write_msg(&mut send, &ServerMsg::Pins { records, more }).await?;
+                    }
+                    Some(ClientMsg::PinContent { pin_id }) => {
+                        let content = shared.store.pin_content(&group, &pin_id)?;
+                        write_msg(&mut send, &ServerMsg::PinContentIs { pin_id, content }).await?;
+                    }
+                    Some(ClientMsg::GetPinStats) => {
+                        let (pins, bytes) = shared.store.pin_stats(&group)?;
+                        let q = shared.limits.pin_quota;
+                        let stats = clipwire_core::proto::PinStats {
+                            pins,
+                            bytes,
+                            max_pins: q.max_pins,
+                            max_bytes: q.max_bytes,
+                        };
+                        write_msg(&mut send, &ServerMsg::PinStats(stats)).await?;
                     }
                     Some(ClientMsg::GetStats) => {
                         let mut stats = shared.store.group_stats(&group, shared.not_before_ms())?;
