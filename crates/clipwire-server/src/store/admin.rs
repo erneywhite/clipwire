@@ -9,7 +9,16 @@
 //! - `groups.pending_by`, `pending_ms` — группа создана для смены ключа
 //!   (вход с токеном relay без ключа администратора), а `Rekey` ещё не
 //!   пришёл. У устройства такая группа одна; брошенная удаляется через
-//!   [`PENDING_KEEP`].
+//!   [`PENDING_KEEP`]. В такой группе можно только то, что нужно для смены
+//!   ключа (карточка, настройки и закрепы группы), без элементов и файлов
+//!   (`session.rs`), и принять её новой группой в `Rekey` может только
+//!   создавшее её устройство.
+//! - `groups.rotated_by` — кто сменил ключ: не больше [`MAX_REKEYS_PER_DAY`]
+//!   смен ключа с одного устройства за сутки.
+//! - `groups.idle_ms` — заброшенная группа (`purge_idle_groups`): данных
+//!   нет, осталась строка с `join_digest`. Вход верным секретом создаёт её
+//!   заново без ключа администратора, как до 0.5.0; в пределе групп она не
+//!   считается.
 
 use std::time::Duration;
 
@@ -25,6 +34,19 @@ use super::Store;
 /// Через сколько удаляется новая группа для смены ключа, если `Rekey` так и
 /// не пришёл: агент шлёт его сразу после входа в новую группу.
 pub const PENDING_KEEP: Duration = Duration::from_secs(3600);
+
+/// Сколько раз одно устройство может сменить ключ за сутки. Настоящему
+/// человеку хватает с запасом (смена ключа — это удаление устройства или
+/// подозрение на утечку), а цепочка «новая группа → `Rekey` → снова» больше
+/// не плодит строк в базе без предела.
+pub const MAX_REKEYS_PER_DAY: i64 = 10;
+
+/// Условие «группа считается в пределе `max_groups`»: не надгробие, ключ не
+/// сменён, не заброшена. У групп со сменённым ключом данных уже нет (их
+/// удаляет `Rekey`), остаются пакеты нового ключа до надгробия через 30 дней:
+/// если бы они занимали место, цепочка смен ключа забила бы предел групп.
+pub(super) const COUNTED_GROUP: &str =
+    "tombstone_ms IS NULL AND rotated_ms IS NULL AND idle_ms IS NULL";
 
 /// Служебный ключ: когда токен relay сменили из клиента (мс). После этого
 /// вход без токена (`Join`) не принимается, иначе старый код приглашения
@@ -64,7 +86,40 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    // Столбцы после первых сборок 0.5.0: каждый проверяется отдельно.
+    for (col, ty) in [("rotated_by", "BLOB"), ("idle_ms", "INTEGER")] {
+        let has: bool = conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('groups') WHERE name = '{col}'"
+            ))?
+            .exists([])?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE groups ADD COLUMN {col} {ty};"))?;
+        }
+    }
     Ok(())
+}
+
+/// Сколько групп считается в пределе `max_groups` ([`COUNTED_GROUP`]).
+pub(super) fn counted_groups(conn: &Connection) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM groups WHERE {COUNTED_GROUP}"),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n.max(0) as u64)
+}
+
+/// Незавершённая ли это группа смены ключа.
+pub(super) fn is_pending(conn: &Connection, group: &GroupId) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM groups WHERE group_id = ?1 AND pending_by IS NOT NULL",
+            params![&group.0[..]],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// Может ли устройство сменить ключ хоть одной живой группы, в которой
@@ -74,7 +129,7 @@ pub(super) fn may_rekey_any(conn: &Connection, device: &DeviceId) -> Result<bool
         .query_row(
             "SELECT 1 FROM devices AS d JOIN groups AS g ON g.group_id = d.group_id
              WHERE d.device_id = ?1 AND g.rotated_ms IS NULL AND g.tombstone_ms IS NULL
-               AND g.pending_by IS NULL
+               AND g.pending_by IS NULL AND g.idle_ms IS NULL
                AND (g.admin_device IS NULL OR g.admin_device = ?1)
              LIMIT 1",
             params![&device.0[..]],
@@ -84,13 +139,32 @@ pub(super) fn may_rekey_any(conn: &Connection, device: &DeviceId) -> Result<bool
         .is_some())
 }
 
-/// Удалить незавершённые группы смены ключа этого устройства (кроме тех, где
-/// уже лежат файлы: их строки должна убрать чистка вместе с диском).
+/// Удалить незавершённые группы смены ключа этого устройства, всегда и со
+/// всем содержимым (каскадом). Файлов в них нет: загрузка в незавершённую
+/// группу не принимается (`BlobBegin::Pending`).
 pub(super) fn drop_pending_of(conn: &Connection, device: &DeviceId) -> Result<usize> {
     Ok(conn.execute(
-        "DELETE FROM groups AS g WHERE g.pending_by = ?1
-           AND NOT EXISTS (SELECT 1 FROM blobs AS b WHERE b.group_id = g.group_id)",
+        "DELETE FROM groups WHERE pending_by = ?1",
         params![&device.0[..]],
+    )?)
+}
+
+/// Сколько незавершённых групп смены ключа у устройства.
+pub(super) fn pending_count(conn: &Connection, device: &DeviceId) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM groups WHERE pending_by = ?1",
+        params![&device.0[..]],
+        |r| r.get(0),
+    )?;
+    Ok(n.max(0) as u64)
+}
+
+/// Сколько раз устройство меняло ключ с `since_ms`.
+pub(super) fn rekeys_since(conn: &Connection, device: &DeviceId, since_ms: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM groups WHERE rotated_by = ?1 AND rotated_ms >= ?2",
+        params![&device.0[..], since_ms],
+        |r| r.get(0),
     )?)
 }
 
@@ -139,14 +213,15 @@ pub(super) fn admin_of(conn: &Connection, group: &GroupId) -> Result<Option<Devi
 }
 
 /// После смены ключа: админ новой группы — админ старой (если у старой он
-/// был), пометка «для смены ключа» снимается.
+/// был), пометка «для смены ключа» снимается. Уже заданного админа новой
+/// группы это не перезаписывает (у незавершённой группы его и нет).
 pub(super) fn inherit_admin(
     conn: &Connection,
     new: &GroupId,
     old_admin: Option<&DeviceId>,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE groups SET admin_device = COALESCE(?2, admin_device),
+        "UPDATE groups SET admin_device = COALESCE(admin_device, ?2),
              pending_by = NULL, pending_ms = NULL
          WHERE group_id = ?1",
         params![&new.0[..], old_admin.map(|d| d.0.to_vec())],
@@ -221,10 +296,29 @@ impl Store {
         Ok(self.conn().execute(
             "UPDATE groups SET admin_device = ?2
              WHERE group_id = ?1 AND admin_device IS NULL AND rotated_ms IS NULL
-               AND tombstone_ms IS NULL
+               AND tombstone_ms IS NULL AND pending_by IS NULL AND idle_ms IS NULL
                AND EXISTS (SELECT 1 FROM devices WHERE group_id = ?1 AND device_id = ?2)",
             params![&group.0[..], &device.0[..]],
         )? > 0)
+    }
+
+    /// Сделать `device` админом группы и при живом админе (`ClaimGroupAdmin`
+    /// администратора сервера: прежний админ потерян). Права администратора
+    /// проверяет вызывающий. `true` — `device` теперь админ; `false` — он не
+    /// в группе, или ключ группы сменён, или это незавершённая группа.
+    pub fn take_group_admin(&self, group: &GroupId, device: &DeviceId) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE groups SET admin_device = ?2
+             WHERE group_id = ?1 AND rotated_ms IS NULL AND tombstone_ms IS NULL
+               AND pending_by IS NULL AND idle_ms IS NULL
+               AND EXISTS (SELECT 1 FROM devices WHERE group_id = ?1 AND device_id = ?2)",
+            params![&group.0[..], &device.0[..]],
+        )? > 0)
+    }
+
+    /// Незавершённая ли это группа смены ключа (`Rekey` ещё не пришёл).
+    pub fn is_pending(&self, group: &GroupId) -> Result<bool> {
+        is_pending(&self.conn(), group)
     }
 
     /// Передать роль админа группы от `from` к `to`.
@@ -257,10 +351,10 @@ impl Store {
             let v: i64 = conn.query_row(sql, [], |r| r.get(0))?;
             Ok(v.max(0) as u64)
         };
-        let groups = one("SELECT COUNT(*) FROM groups WHERE tombstone_ms IS NULL")?;
+        let groups = counted_groups(&conn)?;
         let devices = one("SELECT COUNT(DISTINCT d.device_id) FROM devices AS d
              JOIN groups AS g ON g.group_id = d.group_id
-             WHERE g.rotated_ms IS NULL AND g.tombstone_ms IS NULL")?;
+             WHERE g.rotated_ms IS NULL AND g.tombstone_ms IS NULL AND g.idle_ms IS NULL")?;
         let bytes_items = one("SELECT COALESCE(SUM(length(ciphertext)), 0) FROM items")?;
         let bytes_pins = one("SELECT COALESCE(SUM(length(state) + content_len), 0) FROM pins")?;
         // Та же формула sealed_size, что у квоты файлов (`blob_begin`).
@@ -280,12 +374,11 @@ impl Store {
     }
 
     /// Удалить новые группы смены ключа, созданные раньше `before_ms` и так и
-    /// не получившие `Rekey`. Группы с файлами не трогаются (их уберёт чистка
-    /// заброшенных групп вместе с диском). Возвращает число удалённых.
+    /// не получившие `Rekey`, со всем содержимым. Файлов в них не бывает:
+    /// загрузка туда не принимается. Возвращает число удалённых.
     pub fn purge_pending(&self, before_ms: i64) -> Result<usize> {
         Ok(self.conn().execute(
-            "DELETE FROM groups AS g WHERE g.pending_by IS NOT NULL AND g.pending_ms < ?1
-               AND NOT EXISTS (SELECT 1 FROM blobs AS b WHERE b.group_id = g.group_id)",
+            "DELETE FROM groups WHERE pending_by IS NOT NULL AND pending_ms < ?1",
             params![before_ms],
         )?)
     }
@@ -381,6 +474,94 @@ mod tests {
             !s.claim_group_admin(&legacy.group_id(), &DeviceId([4; 32]))
                 .unwrap()
         );
+    }
+
+    /// Ревью безопасности, находка 2: в незавершённую группу нельзя
+    /// загружать файлы, а удаляется она всегда, что бы в ней ни лежало.
+    #[test]
+    fn pending_group_takes_no_files_and_is_always_dropped() {
+        let s = Store::in_memory().unwrap();
+        let (k, n1, n2) = (GroupKey([1; 32]), GroupKey([2; 32]), GroupKey([3; 32]));
+        let dev = DeviceId([1; 32]);
+        join(&s, &k, 1, Create::Admin);
+        assert_eq!(join(&s, &n1, 1, Create::ForRekey), JoinOutcome::Created);
+        assert!(s.is_pending(&n1.group_id()).unwrap());
+        assert!(!s.is_pending(&k.group_id()).unwrap());
+        let begin = |g: &GroupKey| {
+            s.blob_begin(
+                &g.group_id(),
+                &clipwire_core::BlobId([7; 16]),
+                &dev,
+                10,
+                10,
+                0,
+                u64::MAX,
+                u64::MAX,
+                usize::MAX,
+            )
+            .unwrap()
+        };
+        assert_eq!(begin(&n1), crate::store::BlobBegin::Pending);
+        // Строка файла, оставшаяся от старой сборки, не спасает группу от
+        // удаления (раньше группы с файлами пропускались).
+        s.conn()
+            .execute(
+                "INSERT INTO blobs (group_id, blob_id, size, have, created_ms, last_touch_ms)
+                 VALUES (?1, x'01', 1, 1, 10, 10)",
+                params![&n1.group_id().0[..]],
+            )
+            .unwrap();
+        assert_eq!(join(&s, &n2, 1, Create::ForRekey), JoinOutcome::Created);
+        assert_eq!(join(&s, &n1, 1, Create::No), JoinOutcome::NoGroup);
+        let blobs: i64 = s
+            .conn()
+            .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blobs, 0);
+        // И по сроку — тоже со всем содержимым.
+        s.conn()
+            .execute(
+                "INSERT INTO blobs (group_id, blob_id, size, have, created_ms, last_touch_ms)
+                 VALUES (?1, x'01', 1, 1, 10, 10)",
+                params![&n2.group_id().0[..]],
+            )
+            .unwrap();
+        assert_eq!(s.purge_pending(11).unwrap(), 1);
+        assert!(!s.is_pending(&n2.group_id()).unwrap());
+        // После смены ключа группа обычная: файлы принимаются.
+        let n3 = GroupKey([4; 32]);
+        assert_eq!(join(&s, &n3, 1, Create::ForRekey), JoinOutcome::Created);
+        let limits = crate::store::RekeyLimits { max_envelope: 512 };
+        assert!(matches!(
+            s.rekey(&k.group_id(), &dev, &n3.group_id(), &[], 20, &limits)
+                .unwrap(),
+            crate::store::RekeyOutcome::Done { .. }
+        ));
+        assert!(!s.is_pending(&n3.group_id()).unwrap());
+        assert_eq!(s.group_admin(&n3.group_id()).unwrap(), Some(dev));
+        assert_eq!(begin(&n3), crate::store::BlobBegin::Created);
+    }
+
+    /// Ревью безопасности, находка 4: администратор сервера забирает роль
+    /// админа группы и при живом админе, но только в своей группе.
+    #[test]
+    fn server_admin_takes_group_admin() {
+        let s = Store::in_memory().unwrap();
+        let k = GroupKey([1; 32]);
+        let g = k.group_id();
+        let (a, b, x) = (DeviceId([1; 32]), DeviceId([2; 32]), DeviceId([3; 32]));
+        join(&s, &k, 1, Create::Admin);
+        join(&s, &k, 2, Create::No);
+        assert_eq!(s.group_admin(&g).unwrap(), Some(a));
+        assert!(s.take_group_admin(&g, &b).unwrap());
+        assert_eq!(s.group_admin(&g).unwrap(), Some(b));
+        // Не из группы — нет.
+        assert!(!s.take_group_admin(&g, &x).unwrap());
+        assert_eq!(s.group_admin(&g).unwrap(), Some(b));
+        // Незавершённой группе смены ключа — нет.
+        let n = GroupKey([2; 32]);
+        join(&s, &n, 2, Create::ForRekey);
+        assert!(!s.take_group_admin(&n.group_id(), &b).unwrap());
     }
 
     #[test]

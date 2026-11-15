@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
-use clipwire_core::admin::{AdminFail, AdminKey, SETTINGS, ServerSettings, check_setting};
+use clipwire_core::admin::{
+    AdminFail, AdminKey, SETTINGS, SecretCode, ServerSettings, check_setting,
+};
 use clipwire_core::proto::{ClientMsg, ServerMsg};
 use clipwire_core::{AdminServerInfo, ServerInfo};
 use tokio::sync::watch;
@@ -213,7 +215,7 @@ impl AdminSession {
         }
     }
 
-    fn authorized(&self, shared: &Shared) -> bool {
+    pub fn authorized(&self, shared: &Shared) -> bool {
         self.generation == Some(shared.admin.generation())
     }
 }
@@ -278,12 +280,17 @@ pub fn handle(
             ServerMsg::ServerSummary(s)
         }
         ClientMsg::RotateRelayToken => match shared.admin.rotate_relay_token()? {
+            // Новый код в лог не пишется: его получает клиент в ответе, а
+            // лог контейнера часто видят больше людей, чем нужно. При
+            // запуске код печатается (`main.rs`): без SSH это единственный
+            // способ его узнать.
             Ok(server_code) => {
                 shared.store.mark_relay_rotated(now_ms())?;
                 tracing::info!("токен relay сменён из клиента, все соединения закрываются");
-                tracing::info!("код сервера: {server_code}");
                 return Ok(Some(AdminReply::SendAndCloseAll(
-                    ServerMsg::RelayTokenRotated { server_code },
+                    ServerMsg::RelayTokenRotated {
+                        server_code: SecretCode(server_code),
+                    },
                 )));
             }
             Err(f) => return fail(f),
@@ -291,8 +298,9 @@ pub fn handle(
         ClientMsg::RotateAdminKey => {
             let server_code = shared.admin.rotate_admin_key()?;
             tracing::info!("ключ администратора сменён из клиента");
-            tracing::info!("код сервера: {server_code}");
-            ServerMsg::AdminKeyRotated { server_code }
+            ServerMsg::AdminKeyRotated {
+                server_code: SecretCode(server_code),
+            }
         }
         _ => unreachable!("проверено выше"),
     };

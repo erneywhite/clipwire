@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::admin::{AdminFail, AdminKey, ServerSettings, ServerSummary};
+use crate::admin::{AdminFail, AdminKey, SecretCode, ServerSettings, ServerSummary};
 use crate::blob::BlobId;
 use crate::crypto::{GroupId, JoinSecret, SealedItem};
 use crate::item::DeviceId;
@@ -220,7 +220,9 @@ pub enum ClientMsg {
     /// так создаётся новая группа (кроме новой группы при смене ключа, см.
     /// `Rekey`); создатель становится админом группы. В существующую группу
     /// без админа входящий так становится её админом. Соединение сразу
-    /// считается прошедшим `AdminAuth`.
+    /// считается прошедшим `AdminAuth`. Неверный ключ — ответ
+    /// `AdminFailed(BadKey)` вместо `Joined`, и сервер закрывает поток: клиент
+    /// понимает, что ключ устарел, и входит снова с `JoinWithToken`.
     JoinAsAdmin {
         group_id: GroupId,
         join_secret: JoinSecret,
@@ -257,6 +259,12 @@ pub enum ClientMsg {
     TransferGroupAdmin { device: DeviceId },
     /// Кто админ группы — ответ `GroupAdmin`. Только по [`ALPN_9`].
     GetGroupAdmin,
+    /// Забрать роль админа группы себе, даже если админ у группы есть
+    /// (прежний админ потерян: устройство сломано или пропало). Только по
+    /// [`ALPN_9`], только после `AdminAuth` (или `JoinAsAdmin`) и только
+    /// устройству группы. Ответ — `GroupAdmin`, остальным — `DevicesChanged`;
+    /// без прав — `AdminFailed(NotAuthorized)`.
+    ClaimGroupAdmin,
 }
 
 /// Закреп на сервере (в `Pins`, `Pinned`, `PinRejected`).
@@ -414,9 +422,9 @@ pub enum ServerMsg {
     ServerSummary(ServerSummary),
     /// Токен relay сменён: новый код сервера `cwserver2-…`. Следом сервер
     /// закрывает соединение.
-    RelayTokenRotated { server_code: String },
+    RelayTokenRotated { server_code: SecretCode },
     /// Ключ администратора сменён: новый код сервера `cwserver2-…`.
-    AdminKeyRotated { server_code: String },
+    AdminKeyRotated { server_code: SecretCode },
     /// Админ группы (ответ на `GetGroupAdmin` и `TransferGroupAdmin`).
     /// `None` — у группы админа нет (создана до 0.5.0, и никто ещё не входил
     /// в неё с ключом администратора сервера).
@@ -699,6 +707,10 @@ mod tests {
         assert_eq!(
             tag(postcard::to_stdvec(&ClientMsg::GetGroupAdmin).unwrap()),
             23
+        );
+        assert_eq!(
+            tag(postcard::to_stdvec(&ClientMsg::ClaimGroupAdmin).unwrap()),
+            24
         );
         assert_eq!(tag(postcard::to_stdvec(&ServerMsg::AdminOk).unwrap()), 21);
         let fail = ServerMsg::AdminFailed(AdminFail::BadKey);

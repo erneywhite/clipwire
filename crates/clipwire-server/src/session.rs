@@ -313,7 +313,10 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         }
         Credential::Admin(key) if admin.auth(shared, key) => Create::Admin,
         Credential::Admin(_) => {
-            refuse(&mut send, "неверный ключ администратора сервера").await;
+            // Типизированный отказ, а не текст: клиент узнаёт устаревший
+            // ключ администратора и входит снова с токеном (`JoinWithToken`).
+            crate::devices::close_with(&mut send, Some(&ServerMsg::AdminFailed(AdminFail::BadKey)))
+                .await;
             bail!("неверный ключ администратора");
         }
     };
@@ -416,11 +419,27 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         group,
         device,
     ));
+    let mut pending = PendingGroup(shared.store.is_pending(&group)?);
 
     loop {
         tokio::select! {
             msg = read_msg::<_, ClientMsg>(&mut recv) => {
-                match msg? {
+                let msg = msg?;
+                // В незавершённой группе смены ключа — только то, что нужно
+                // для смены ключа: карточка, настройки и закрепы группы (их
+                // агент перешифровывает новым ключом до `Rekey`), списки.
+                // Элементы и записки об удалении — нет: иначе такая группа
+                // была бы хранилищем вне предела групп. Файлы отсекает
+                // `BlobBegin::Pending`.
+                if matches!(
+                    msg,
+                    Some(ClientMsg::Push(_) | ClientMsg::Backfill(_) | ClientMsg::Delete(_))
+                ) && pending.check(shared, &group)?
+                {
+                    refuse(&mut send, PENDING_REFUSED).await;
+                    bail!("элемент в незавершённую группу смены ключа");
+                }
+                match msg {
                     None => return Ok(()),
                     Some(ClientMsg::Push(item)) => accept(shared, &group, device, reg.id, item, false)?,
                     Some(ClientMsg::Backfill(item)) => accept(shared, &group, device, reg.id, item, true)?,
@@ -461,6 +480,21 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         need_admin_alpn(conn)?;
                         let admin = shared.store.group_admin(&group)?;
                         write_msg(&mut send, &ServerMsg::GroupAdmin { admin }).await?;
+                    }
+                    Some(ClientMsg::ClaimGroupAdmin) => {
+                        need_admin_alpn(conn)?;
+                        // Администратор сервера чинит группу, чей админ
+                        // потерян: роль забирается и при живом админе.
+                        let reply = if !admin.authorized(shared) {
+                            ServerMsg::AdminFailed(AdminFail::NotAuthorized)
+                        } else if shared.store.take_group_admin(&group, &device)? {
+                            tracing::info!(group = %short(&group), "администратор сервера стал админом группы");
+                            shared.hub.devices_changed(&group, reg.id);
+                            ServerMsg::GroupAdmin { admin: Some(device) }
+                        } else {
+                            ServerMsg::AdminFailed(AdminFail::NoSuchDevice)
+                        };
+                        write_msg(&mut send, &reply).await?;
                     }
                     Some(
                         msg @ (ClientMsg::GetServerSettings
@@ -598,6 +632,24 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                 write_msg(&mut send, &out).await?;
             }
         }
+    }
+}
+
+/// Отказ на элемент в незавершённой группе смены ключа.
+const PENDING_REFUSED: &str =
+    "смена ключа группы ещё не завершена: элементы в новую группу не принимаются";
+
+/// Незавершённая ли группа соединения. Пока да, на каждый запрос, которому
+/// это важно, перепроверяется в базе: `Rekey` с другого соединения снимает
+/// пометку. Снятая обратно не появляется, и база больше не спрашивается.
+struct PendingGroup(bool);
+
+impl PendingGroup {
+    fn check(&mut self, shared: &Shared, group: &GroupId) -> Result<bool> {
+        if self.0 {
+            self.0 = shared.store.is_pending(group)?;
+        }
+        Ok(self.0)
     }
 }
 

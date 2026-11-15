@@ -103,12 +103,17 @@ impl Client {
     /// Войти с ключом администратора (группа создастся, если её нет) и
     /// дочитать историю. Возвращает её длину.
     async fn join(&mut self, key: &GroupKey) -> Result<usize> {
-        self.send(&ClientMsg::JoinAsAdmin {
+        self.join_msg(ClientMsg::JoinAsAdmin {
             group_id: key.group_id(),
             join_secret: key.join_secret(),
             admin_key: ADMIN,
         })
-        .await?;
+        .await
+    }
+
+    /// Войти первым сообщением `msg` и дочитать историю.
+    async fn join_msg(&mut self, msg: ClientMsg) -> Result<usize> {
+        self.send(&msg).await?;
         match self.next().await? {
             ServerMsg::Joined => {}
             other => anyhow::bail!("ждали Joined, пришло {other:?}"),
@@ -168,13 +173,39 @@ impl Client {
 }
 
 async fn joined(dev: &Dev, info: &ServerInfo, relay: &str, key: &GroupKey) -> Result<Client> {
+    let msg = ClientMsg::JoinAsAdmin {
+        group_id: key.group_id(),
+        join_secret: key.join_secret(),
+        admin_key: ADMIN,
+    };
+    joined_msg(dev, info, relay, msg).await
+}
+
+/// Новая группа для смены ключа: `JoinWithToken` без ключа администратора,
+/// как это делает агент. Принять новой группой в `Rekey` сервер может только
+/// такую.
+async fn joined_for_rekey(
+    dev: &Dev,
+    info: &ServerInfo,
+    relay: &str,
+    key: &GroupKey,
+) -> Result<Client> {
+    let msg = ClientMsg::JoinWithToken {
+        group_id: key.group_id(),
+        join_secret: key.join_secret(),
+        token: "test-token".into(),
+    };
+    joined_msg(dev, info, relay, msg).await
+}
+
+async fn joined_msg(dev: &Dev, info: &ServerInfo, relay: &str, msg: ClientMsg) -> Result<Client> {
     // Сервер освобождает место соединения, когда его сессия закончилась, а
     // клиент узнаёт об отказе раньше. Новое соединение сразу после отказа может
     // упереться в предел соединений устройства: подождать и повторить.
     let started = std::time::Instant::now();
     loop {
         let mut c = Client::connect(dev, info, relay).await?;
-        match c.join(key).await {
+        match c.join_msg(msg.clone()).await {
             Ok(_) => return Ok(c),
             Err(e)
                 if e.to_string().contains("слишком много соединений") && started.elapsed() < T =>
@@ -391,7 +422,7 @@ async fn rekey_moves_group_to_new_key() -> Result<()> {
     assert!(file.exists());
 
     // R создаёт новую группу и входит в неё (второе соединение того же устройства).
-    let mut rn = joined(&r, &info, &relay, &new).await?;
+    let mut rn = joined_for_rekey(&r, &info, &relay, &new).await?;
     rn.publish(&new, &r, "R").await?;
 
     // Пакеты для всех, кроме X и себя, по ключам из проверенных карточек.
@@ -542,7 +573,7 @@ async fn rotated_group_becomes_tombstone() -> Result<()> {
         cd.publish(&old, &d, "Домашний").await?;
         cd.conn.close(0u32.into(), b"bye");
     }
-    let mut rn = joined(&r, &info, &relay, &new).await?;
+    let mut rn = joined_for_rekey(&r, &info, &relay, &new).await?;
     rn.publish(&new, &r, "R").await?;
     let envelope = seal_rekey(&new, &old, &r.key, d.id(), &rekey_public(&d.key))?;
     cr.send(&ClientMsg::Rekey {

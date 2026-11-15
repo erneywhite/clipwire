@@ -354,7 +354,9 @@ async fn rotate_relay_token_cuts_old_codes() -> Result<()> {
     p.join_with(&plain(&key)).await?;
 
     let new = match a.ask(&ClientMsg::RotateRelayToken).await? {
-        ServerMsg::RelayTokenRotated { server_code } => AdminServerInfo::decode(&server_code)?,
+        ServerMsg::RelayTokenRotated { server_code } => {
+            AdminServerInfo::decode(server_code.as_str())?
+        }
         other => anyhow::bail!("ждали RelayTokenRotated, пришло {other:?}"),
     };
     assert_ne!(new.server.relay_token, old_token);
@@ -425,7 +427,9 @@ async fn rotate_admin_key() -> Result<()> {
         ServerMsg::AdminOk
     );
     let new = match a.ask(&ClientMsg::RotateAdminKey).await? {
-        ServerMsg::AdminKeyRotated { server_code } => AdminServerInfo::decode(&server_code)?,
+        ServerMsg::AdminKeyRotated { server_code } => {
+            AdminServerInfo::decode(server_code.as_str())?
+        }
         other => anyhow::bail!("ждали AdminKeyRotated, пришло {other:?}"),
     };
     assert_ne!(new.admin_key, ADMIN);
@@ -453,9 +457,13 @@ async fn rotate_admin_key() -> Result<()> {
     );
     // Группу старым ключом не создать, новым — можно.
     let key = GroupKey::generate()?;
+    // Отказ типизированный: клиент по нему понимает, что ключ устарел, и
+    // входит снова с токеном.
     let mut c = Client::connect(&s, "test-token").await?;
-    let e = c.refused(&as_admin(&key, &ADMIN)).await?;
-    assert!(e.contains("ключ администратора"), "{e}");
+    assert_eq!(
+        c.ask(&as_admin(&key, &ADMIN)).await?,
+        ServerMsg::AdminFailed(AdminFail::BadKey)
+    );
     let mut c = Client::connect(&s, "test-token").await?;
     c.join_with(&as_admin(&key, &new.admin_key)).await?;
     s.running.shutdown().await
@@ -547,12 +555,16 @@ async fn group_admin_rights_and_transfer() -> Result<()> {
         envelopes: vec![],
     })
     .await?;
-    // Успех — поток закрывается без сообщений.
-    let end = tokio::time::timeout(T, read_msg::<_, ServerMsg>(&mut b.recv)).await??;
-    assert!(
-        matches!(end, None | Some(ServerMsg::DevicesChanged)),
-        "{end:?}"
-    );
+    // Успех — поток закрывается без сообщений (кроме DevicesChanged, они
+    // приходят когда угодно). Ждём закрытия: до него смена ключа могла ещё
+    // не записаться.
+    loop {
+        match tokio::time::timeout(T, read_msg::<_, ServerMsg>(&mut b.recv)).await?? {
+            None => break,
+            Some(ServerMsg::DevicesChanged) => {}
+            Some(other) => anyhow::bail!("ждали закрытия, пришло {other:?}"),
+        }
+    }
     // Админ новой группы — админ старой.
     assert_eq!(bn.group_admin().await?, Some(b.device()));
     s.running.shutdown().await
@@ -596,5 +608,116 @@ async fn legacy_group_gets_admin() -> Result<()> {
     let mut c = Client::connect(&s, "test-token").await?;
     c.join_with(&as_admin(&k2, &ADMIN)).await?;
     assert_eq!(c.group_admin().await?, Some(c.device()));
+    s.running.shutdown().await
+}
+
+/// Ревью безопасности, находка 1: админ своей группы G1 шлёт `Rekey` в
+/// существующую чужую группу G2, где он рядовой участник. Раньше админом G2
+/// становился он; теперь отказ, и админ G2 не меняется.
+#[tokio::test(flavor = "multi_thread")]
+async fn rekey_into_existing_foreign_group_is_refused() -> Result<()> {
+    let s = start(Some("test-token"), Guards::default()).await?;
+    let (g1, g2) = (GroupKey::generate()?, GroupKey::generate()?);
+    // B создаёт G2 и в ней админ; A создаёт G1 и входит в G2 рядовым.
+    let mut b = Client::connect(&s, "test-token").await?;
+    b.join_with(&as_admin(&g2, &ADMIN)).await?;
+    let mut a = Client::connect(&s, "test-token").await?;
+    a.join_with(&as_admin(&g1, &ADMIN)).await?;
+    let mut a2 = Client::connect_on(a.ep.clone(), &s).await?;
+    a2.join_with(&with_token(&g2, "test-token")).await?;
+    assert_eq!(a2.group_admin().await?, Some(b.device()));
+
+    let e = match a
+        .ask(&ClientMsg::Rekey {
+            new_group: g2.group_id(),
+            envelopes: vec![],
+        })
+        .await?
+    {
+        ServerMsg::Error(e) => e,
+        other => anyhow::bail!("ждали Error, пришло {other:?}"),
+    };
+    assert!(e.contains("создана этим устройством"), "{e}");
+    assert_eq!(b.group_admin().await?, Some(b.device()));
+    // G1 не сменила ключ: A входит в неё как обычно.
+    let mut a3 = Client::connect_on(a.ep.clone(), &s).await?;
+    a3.join_with(&with_token(&g1, "test-token")).await?;
+    s.running.shutdown().await
+}
+
+/// Ревью безопасности, находка 2: в незавершённой группе смены ключа
+/// элементы не принимаются (раньше туда можно было грузить что угодно, и
+/// чистка таких групп с файлами не удаляла).
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_group_refuses_items() -> Result<()> {
+    let s = start(Some("test-token"), Guards::default()).await?;
+    let (g, new) = (GroupKey::generate()?, GroupKey::generate()?);
+    let mut a = Client::connect(&s, "test-token").await?;
+    a.join_with(&as_admin(&g, &ADMIN)).await?;
+    let mut an = Client::connect_on(a.ep.clone(), &s).await?;
+    an.join_with(&with_token(&new, "test-token")).await?;
+    // Карточка и список устройств — можно (это нужно для смены ключа).
+    an.send(&ClientMsg::PublishCard(vec![1, 2, 3])).await?;
+    assert!(matches!(
+        an.ask(&ClientMsg::ListDevices).await?,
+        ServerMsg::Devices(_)
+    ));
+    let item = new.seal(&clipwire_core::Item::new(
+        an.device(),
+        clipwire_core::Content::Text("в обход предела".into()),
+    ))?;
+    let e = match an.ask(&ClientMsg::Push(item)).await? {
+        ServerMsg::Error(e) => e,
+        other => anyhow::bail!("ждали Error, пришло {other:?}"),
+    };
+    assert!(e.contains("не завершена"), "{e}");
+    s.running.shutdown().await
+}
+
+/// Ревью безопасности, находка 4: группа с потерянным админом. Администратор
+/// сервера из этой группы забирает роль и при живом админе, но только явным
+/// `ClaimGroupAdmin` и только с правами администратора.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_admin_claims_group_admin() -> Result<()> {
+    let s = start(Some("test-token"), Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Client::connect(&s, "test-token").await?;
+    a.join_with(&as_admin(&key, &ADMIN)).await?;
+    let mut b = Client::connect(&s, "test-token").await?;
+    b.join_with(&with_token(&key, "test-token")).await?;
+
+    // Без прав администратора — отказ.
+    assert_eq!(
+        b.ask(&ClientMsg::ClaimGroupAdmin).await?,
+        ServerMsg::AdminFailed(AdminFail::NotAuthorized)
+    );
+    // AdminAuth сам по себе админа не меняет: он у группы есть.
+    assert_eq!(
+        b.ask(&ClientMsg::AdminAuth { key: ADMIN }).await?,
+        ServerMsg::AdminOk
+    );
+    assert_eq!(b.group_admin().await?, Some(a.device()));
+    // Явный запрос — роль у B, A узнаёт из DevicesChanged.
+    assert_eq!(
+        b.ask(&ClientMsg::ClaimGroupAdmin).await?,
+        ServerMsg::GroupAdmin {
+            admin: Some(b.device())
+        }
+    );
+    let changed = tokio::time::timeout(T, read_msg::<_, ServerMsg>(&mut a.recv))
+        .await??
+        .context("закрыт")?;
+    assert_eq!(changed, ServerMsg::DevicesChanged);
+    assert_eq!(a.group_admin().await?, Some(b.device()));
+    // Соединению только для администрирования (без группы) — нельзя.
+    let mut adm = Client::connect(&s, "test-token").await?;
+    assert_eq!(
+        adm.ask(&ClientMsg::AdminAuth { key: ADMIN }).await?,
+        ServerMsg::AdminOk
+    );
+    assert!(matches!(
+        adm.ask(&ClientMsg::ClaimGroupAdmin).await?,
+        ServerMsg::Error(_)
+    ));
     s.running.shutdown().await
 }

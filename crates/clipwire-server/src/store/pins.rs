@@ -698,8 +698,8 @@ mod tests {
         assert!(s.idle_groups(1_000_000).unwrap().is_empty());
         put(&s, &g, pin(1), 1, false, None, &[], Q);
         assert_eq!(s.idle_groups(1_000_000).unwrap(), vec![g]);
-        assert!(s.delete_idle_group(&g, 1_000_000).unwrap());
-        // Каскад удалил и записи закрепов.
+        assert!(s.bury_idle_group(&g, 1_000_000, 1_000_000).unwrap());
+        // Записи закрепов удалены вместе с остальными данными группы.
         let n: i64 = s
             .conn()
             .query_row("SELECT COUNT(*) FROM pins", [], |r| r.get(0))
@@ -714,7 +714,7 @@ mod tests {
         let (g, g2) = (GroupId([7; 32]), GroupId([8; 32]));
         let d = DeviceId([2; 32]);
         s.join(&g, &JoinSecret([1; 32]), &d, 0, true, 10).unwrap();
-        s.join(&g2, &JoinSecret([3; 32]), &d, 0, true, 10).unwrap();
+        s.join_rekey(&g2, &JoinSecret([3; 32]), &d, 0).unwrap();
         let b = BlobId([1; 16]);
         put(&s, &g, pin(1), 0, true, Some(b"c"), &[b], Q);
         put(&s, &g2, pin(1), 0, true, Some(b"d"), &[b], Q);

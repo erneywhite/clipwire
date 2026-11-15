@@ -37,6 +37,26 @@ impl AdminKey {
     }
 }
 
+/// Код сервера `cwserver2-…` в ответах `RelayTokenRotated` и
+/// `AdminKeyRotated`. В нём ключ администратора и токен relay, поэтому в
+/// отладочном выводе (логи, `{:?}` сообщений) он не печатается. В кадре —
+/// обычная строка.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretCode(pub String);
+
+impl std::fmt::Debug for SecretCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretCode(..)")
+    }
+}
+
+impl SecretCode {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// В чём измеряется настройка: клиенту — как показывать поле.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingUnit {
@@ -203,7 +223,8 @@ pub struct ServerSettings {
 /// Сводка сервера (ответ на `GetServerSummary`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ServerSummary {
-    /// Групп на сервере (без надгробий сменённых групп).
+    /// Групп, которые считаются в пределе `max_groups`: без надгробий и
+    /// групп со сменённым ключом.
     pub groups: u64,
     /// Разных устройств во всех этих группах.
     pub devices: u64,
@@ -259,6 +280,17 @@ mod tests {
         b.0[31] = 2;
         assert!(!a.matches(&b));
         assert_eq!(format!("{a:?}"), "AdminKey(..)");
+    }
+
+    #[test]
+    fn secret_code_is_hidden_in_debug_but_plain_on_wire() {
+        let c = SecretCode("cwserver2-секрет".into());
+        assert_eq!(format!("{c:?}"), "SecretCode(..)");
+        // В кадре — та же строка, что и без обёртки.
+        assert_eq!(
+            postcard::to_stdvec(&c).unwrap(),
+            postcard::to_stdvec(&"cwserver2-секрет".to_string()).unwrap()
+        );
     }
 
     #[test]

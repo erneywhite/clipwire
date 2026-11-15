@@ -192,15 +192,32 @@ impl Identity {
 
 /// Записать секрет с правами 0600. Через временный файл и переименование:
 /// при смене токена или ключа из клиента обрыв посередине не оставит
-/// полузаписанный файл, с которым сервер не запустится.
+/// полузаписанный файл, с которым сервер не запустится. Временный файл
+/// создаётся сразу с 0600 (а не меняет права после записи): иначе между
+/// записью и chmod секрет лежал бы с правами по umask. Остаток прошлой
+/// попытки удаляется: права при открытии ставятся только новому файлу.
 pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data).with_context(|| format!("не записался {}", tmp.display()))?;
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("не удалился {}", tmp.display())),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
+    let mut f = opts
+        .open(&tmp)
+        .with_context(|| format!("не создался {}", tmp.display()))?;
+    f.write_all(data)
+        .and_then(|()| f.sync_all())
+        .with_context(|| format!("не записался {}", tmp.display()))?;
+    drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("не записался {}", path.display()))?;
     Ok(())
 }
@@ -361,5 +378,25 @@ mod tests {
         assert!(Identity::load_or_create(&dir2, None).is_err());
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    #[test]
+    fn private_file_is_replaced_whole_and_owner_only() {
+        let dir = tmp("private");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.key");
+        // Остаток прошлой оборванной записи не мешает.
+        std::fs::write(path.with_extension("tmp"), b"old tmp").unwrap();
+        write_private(&path, b"first").unwrap();
+        write_private(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert!(!path.with_extension("tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

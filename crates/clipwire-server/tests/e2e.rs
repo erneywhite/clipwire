@@ -926,8 +926,11 @@ async fn new_group_needs_admin_key() -> Result<()> {
     if let ClientMsg::JoinAsAdmin { admin_key, .. } = &mut bad {
         admin_key.0[0] ^= 1;
     }
-    let e = join_error(&mut c, &bad).await?;
-    assert!(e.contains("ключ администратора"), "{e}");
+    write_msg(&mut c.send, &bad).await?;
+    assert_eq!(
+        c.next().await?,
+        ServerMsg::AdminFailed(clipwire_core::admin::AdminFail::BadKey)
+    );
 
     // С ключом администратора создаётся; дальше пускает и обычный Join, и
     // вход с токеном relay, как у старых клиентов (/3–/8).

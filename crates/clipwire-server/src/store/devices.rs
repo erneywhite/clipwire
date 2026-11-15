@@ -186,22 +186,46 @@ impl Store {
                 "сменить ключ группы и удалить устройство может только админ группы",
             ));
         }
-        let new: Option<Option<i64>> = tx
+        if super::admin::is_pending(&tx, group)? {
+            return Ok(Refused("смена ключа этой группы ещё не завершена"));
+        }
+        let day_ago = now_ms - 24 * 60 * 60 * 1000;
+        if super::admin::rekeys_since(&tx, sender, day_ago)? >= super::admin::MAX_REKEYS_PER_DAY {
+            return Ok(Refused(
+                "слишком много смен ключа с этого устройства за сутки, попробуйте позже",
+            ));
+        }
+        let new: Option<(Option<i64>, Option<Vec<u8>>)> = tx
             .query_row(
-                "SELECT rotated_ms FROM groups WHERE group_id = ?1",
+                "SELECT rotated_ms, pending_by FROM groups WHERE group_id = ?1",
                 params![&new_group.0[..]],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        match new {
+        let pending_by = match new {
             None => return Ok(Refused("новой группы нет на сервере")),
-            Some(Some(_)) => return Ok(Refused("ключ новой группы тоже сменён")),
-            Some(None) => {}
+            Some((Some(_), _)) => return Ok(Refused("ключ новой группы тоже сменён")),
+            Some((None, p)) => p,
+        };
+        // Новой группой годится только та, что отправитель сам только что
+        // создал под смену ключа (`Create::ForRekey`) и где он один. Иначе
+        // участник одной группы перевёл бы её устройства в другую
+        // существующую группу и унаследовал бы там админа (`inherit_admin`).
+        if pending_by.as_deref() != Some(&sender.0[..]) {
+            return Ok(Refused(
+                "новая группа должна быть создана этим устройством для смены ключа",
+            ));
         }
-        // Новую группу создаёт и входит в неё сам инициатор: так нельзя
-        // перевести участников в чужую группу, в которой отправителя нет.
         if !is_member(&tx, new_group, sender)? {
             return Ok(Refused("отправитель не вошёл в новую группу"));
+        }
+        let new_members: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM devices WHERE group_id = ?1",
+            params![&new_group.0[..]],
+            |r| r.get(0),
+        )?;
+        if new_members != 1 {
+            return Ok(Refused("в новой группе уже есть другие устройства"));
         }
         let members: i64 = tx.query_row(
             "SELECT COUNT(*) FROM devices WHERE group_id = ?1",
@@ -218,8 +242,8 @@ impl Store {
         }
 
         tx.execute(
-            "UPDATE groups SET rotated_to = ?2, rotated_ms = ?3 WHERE group_id = ?1",
-            params![&group.0[..], &new_group.0[..], now_ms],
+            "UPDATE groups SET rotated_to = ?2, rotated_ms = ?3, rotated_by = ?4 WHERE group_id = ?1",
+            params![&group.0[..], &new_group.0[..], now_ms, &sender.0[..]],
         )?;
         super::admin::inherit_admin(&tx, new_group, old_admin.as_ref())?;
         for (device, envelope) in envelopes {
@@ -257,8 +281,9 @@ impl Store {
     /// удалить пакеты, карточки, устройства (и элементы с файлами, если вдруг
     /// остались), а строку группы оставить с отметкой `tombstone_ms = now_ms`.
     /// Вход в надгробие верным секретом получает `Excluded`
-    /// ([`rotation_in`]: пакета нет), заново группа не создаётся. Надгробия не
-    /// считаются в пределе групп. Возвращает, сколько групп стало надгробиями.
+    /// ([`rotation_in`]: пакета нет), заново группа не создаётся. В пределе
+    /// групп не считаются ни надгробия, ни группы со сменённым ключом до них
+    /// (`admin::COUNTED_GROUP`). Возвращает, сколько групп стало надгробиями.
     pub fn purge_rotated(&self, before_ms: i64, now_ms: i64) -> Result<usize> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -271,17 +296,7 @@ impl Store {
                 .collect::<rusqlite::Result<_>>()?
         };
         for g in &groups {
-            for table in [
-                "rekeys",
-                "cards",
-                "devices",
-                "items",
-                "blobs",
-                "group_config",
-                "deletes",
-                "pins",
-                "pin_blobs",
-            ] {
+            for table in super::GROUP_TABLES {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE group_id = ?1"),
                     params![g],
@@ -354,6 +369,23 @@ mod tests {
         .unwrap()
     }
 
+    /// Вход в новую группу для смены ключа (`JoinWithToken` без ключа
+    /// администратора).
+    fn join_rekey(s: &Store, key: &GroupKey, dev: u8) -> JoinOutcome {
+        s.join_limited(
+            &key.group_id(),
+            &key.join_secret(),
+            &DeviceId([dev; 32]),
+            10,
+            crate::store::Create::ForRekey,
+            crate::store::JoinLimits {
+                max_groups: usize::MAX,
+                max_devices: usize::MAX,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn cards_are_stored_per_device_and_listed() {
         let s = Store::in_memory().unwrap();
@@ -417,7 +449,7 @@ mod tests {
         let refused = |o: RekeyOutcome| matches!(o, RekeyOutcome::Refused(_));
         // Новой группы ещё нет.
         assert!(refused(s.rekey(&g, &r, &g2, &env, 50, &LIMITS).unwrap()));
-        join(&s, &new, 1);
+        assert_eq!(join_rekey(&s, &new, 1), JoinOutcome::Created);
         // Та же группа, длинный пакет, дубль, чужое устройство, слишком много пакетов.
         assert!(refused(s.rekey(&g, &r, &g, &env, 50, &LIMITS).unwrap()));
         let long = vec![(d, vec![0u8; 513])];
@@ -481,7 +513,7 @@ mod tests {
         assert_eq!(s.rotation(&g2, &d).unwrap(), None);
         // Надгробие не заброшенная группа и не удаляется никогда.
         assert!(s.idle_groups(i64::MAX).unwrap().iter().all(|x| *x != g));
-        assert!(!s.delete_idle_group(&g, i64::MAX).unwrap());
+        assert!(!s.bury_idle_group(&g, i64::MAX, 0).unwrap());
         assert_eq!(
             s.join(&g, &new.join_secret(), &d, 80, true, usize::MAX)
                 .unwrap(),
@@ -490,27 +522,153 @@ mod tests {
     }
 
     #[test]
-    fn tombstones_do_not_count_toward_max_groups() {
+    fn rotated_groups_do_not_count_toward_max_groups() {
         let s = Store::in_memory().unwrap();
-        let (old, new, third) = (GroupKey([1; 32]), GroupKey([2; 32]), GroupKey([3; 32]));
+        let keys: Vec<GroupKey> = (1..=4).map(|n| GroupKey([n; 32])).collect();
         let r = DeviceId([1; 32]);
-        let join_max = |k: &GroupKey| {
-            s.join(&k.group_id(), &k.join_secret(), &r, 10, true, 2)
-                .unwrap()
+        let join_max = |k: &GroupKey, create: crate::store::Create| {
+            s.join_limited(
+                &k.group_id(),
+                &k.join_secret(),
+                &r,
+                10,
+                create,
+                crate::store::JoinLimits {
+                    max_groups: 2,
+                    max_devices: usize::MAX,
+                },
+            )
+            .unwrap()
         };
-        assert_eq!(join_max(&old), JoinOutcome::Created);
-        assert_eq!(join_max(&new), JoinOutcome::Created);
+        use crate::store::Create::{Admin, ForRekey};
+        assert_eq!(join_max(&keys[0], Admin), JoinOutcome::Created);
+        assert_eq!(join_max(&keys[1], ForRekey), JoinOutcome::Created);
         assert!(matches!(
-            s.rekey(&old.group_id(), &r, &new.group_id(), &[], 50, &LIMITS)
-                .unwrap(),
+            s.rekey(
+                &keys[0].group_id(),
+                &r,
+                &keys[1].group_id(),
+                &[],
+                50,
+                &LIMITS
+            )
+            .unwrap(),
             RekeyOutcome::Done { .. }
         ));
-        // До срока сменённая группа ещё занимает место.
-        assert_eq!(join_max(&third), JoinOutcome::TooManyGroups);
+        // Сменённая группа места не занимает уже до надгробия: цепочка смен
+        // ключа не забивает предел групп.
+        assert_eq!(join_max(&keys[2], Admin), JoinOutcome::Created);
+        assert_eq!(join_max(&keys[3], Admin), JoinOutcome::TooManyGroups);
         assert_eq!(s.purge_rotated(51, 60).unwrap(), 1);
-        assert_eq!(join_max(&third), JoinOutcome::Created);
+        assert_eq!(join_max(&keys[3], Admin), JoinOutcome::TooManyGroups);
         // А вход старым ключом с правом создавать группу её не воскрешает.
-        assert_eq!(join_max(&old), JoinOutcome::Rotated(Rotation::Excluded));
+        assert_eq!(
+            join_max(&keys[0], Admin),
+            JoinOutcome::Rotated(Rotation::Excluded)
+        );
+    }
+
+    /// Ревью безопасности, находка 1: админ своей группы шлёт `Rekey` в
+    /// существующую чужую группу, где он рядовой участник, и становился там
+    /// админом.
+    #[test]
+    fn rekey_into_existing_foreign_group_is_refused() {
+        let s = Store::in_memory().unwrap();
+        let (mine, theirs, free) = (GroupKey([1; 32]), GroupKey([2; 32]), GroupKey([3; 32]));
+        let (me, owner) = (DeviceId([1; 32]), DeviceId([2; 32]));
+        let refused = |o: RekeyOutcome| matches!(o, RekeyOutcome::Refused(_));
+        // Я — админ своей группы и рядовой участник чужой.
+        join(&s, &mine, 1);
+        join(&s, &theirs, 2);
+        join(&s, &theirs, 1);
+        assert_eq!(s.group_admin(&theirs.group_id()).unwrap(), Some(owner));
+        assert!(refused(
+            s.rekey(&mine.group_id(), &me, &theirs.group_id(), &[], 50, &LIMITS)
+                .unwrap()
+        ));
+        assert_eq!(s.group_admin(&theirs.group_id()).unwrap(), Some(owner));
+        assert_eq!(s.rotation(&mine.group_id(), &me).unwrap(), None);
+
+        // Чужая группа без админа (до 0.5.0), где я один, — тоже не годится:
+        // её создал не я под смену ключа.
+        join(&s, &free, 1);
+        s.conn()
+            .execute(
+                "UPDATE groups SET admin_device = NULL WHERE group_id = ?1",
+                params![&free.group_id().0[..]],
+            )
+            .unwrap();
+        assert!(refused(
+            s.rekey(&mine.group_id(), &me, &free.group_id(), &[], 50, &LIMITS)
+                .unwrap()
+        ));
+        assert_eq!(s.group_admin(&free.group_id()).unwrap(), None);
+
+        // Незавершённая группа другого устройства — тоже нет.
+        let other_new = GroupKey([4; 32]);
+        assert_eq!(join_rekey(&s, &other_new, 2), JoinOutcome::Created);
+        join(&s, &other_new, 1);
+        assert!(refused(
+            s.rekey(
+                &mine.group_id(),
+                &me,
+                &other_new.group_id(),
+                &[],
+                50,
+                &LIMITS
+            )
+            .unwrap()
+        ));
+        // Своя незавершённая, но туда уже вошёл кто-то ещё, — нет.
+        let crowded = GroupKey([5; 32]);
+        assert_eq!(join_rekey(&s, &crowded, 1), JoinOutcome::Created);
+        join(&s, &crowded, 2);
+        assert!(refused(
+            s.rekey(&mine.group_id(), &me, &crowded.group_id(), &[], 50, &LIMITS)
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn rekeys_per_device_are_limited_per_day() {
+        let s = Store::in_memory().unwrap();
+        let me = DeviceId([1; 32]);
+        let key = |n: u8| GroupKey([n; 32]);
+        join(&s, &key(0), 1);
+        let max = crate::store::admin::MAX_REKEYS_PER_DAY as u8;
+        for n in 0..max {
+            assert_eq!(join_rekey(&s, &key(n + 1), 1), JoinOutcome::Created);
+            assert!(matches!(
+                s.rekey(
+                    &key(n).group_id(),
+                    &me,
+                    &key(n + 1).group_id(),
+                    &[],
+                    1_000 + n as i64,
+                    &LIMITS
+                )
+                .unwrap(),
+                RekeyOutcome::Done { .. }
+            ));
+        }
+        assert_eq!(join_rekey(&s, &key(max + 1), 1), JoinOutcome::Created);
+        let next = |now: i64| {
+            s.rekey(
+                &key(max).group_id(),
+                &me,
+                &key(max + 1).group_id(),
+                &[],
+                now,
+                &LIMITS,
+            )
+            .unwrap()
+        };
+        assert!(matches!(next(2_000), RekeyOutcome::Refused(_)));
+        // Через сутки после первой — снова можно.
+        assert!(matches!(
+            next(1_000 + 24 * 60 * 60 * 1000 + 1),
+            RekeyOutcome::Done { .. }
+        ));
     }
 
     #[test]
@@ -520,7 +678,7 @@ mod tests {
         let (g, g2) = (old.group_id(), new.group_id());
         let r = DeviceId([1; 32]);
         join(&s, &old, 1);
-        join(&s, &new, 1);
+        join_rekey(&s, &new, 1);
         assert!(matches!(
             s.rekey(&g, &r, &g2, &[], 50, &LIMITS).unwrap(),
             RekeyOutcome::Done { .. }

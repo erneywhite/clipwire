@@ -282,6 +282,11 @@ async fn begin(
         BlobBegin::Rotated => {
             return Err(BlobFail::Protocol("ключ группы сменён".into()).into());
         }
+        // В незавершённую группу смены ключа файлы не грузят: иначе она
+        // стала бы бесплатным хранилищем вне предела групп.
+        BlobBegin::Pending => {
+            return Err(BlobFail::Protocol("смена ключа группы ещё не завершена".into()).into());
+        }
     };
     let now = Progress {
         have,
@@ -361,17 +366,20 @@ pub async fn purge_stale_reserves(shared: &Shared) -> anyhow::Result<usize> {
 }
 
 /// Чистка заброшенных групп: ни одно устройство не входило за `group_idle`,
-/// нет ни элементов, ни файлов, и сейчас никто не подключён. Устройства
-/// группы удаляются вместе с ней. Так освобождаются места под
-/// `CLIPWIRE_MAX_GROUPS`. Возвращает, сколько групп удалено.
+/// нет ни элементов, ни файлов, и сейчас никто не подключён. Устройства и
+/// остальные данные группы удаляются, от неё остаётся строка с секретом
+/// (`Store::bury_idle_group`): верный секрет создаст её заново. Так
+/// освобождаются места под `CLIPWIRE_MAX_GROUPS`. Возвращает, сколько групп
+/// очищено.
 pub fn purge_idle_groups(shared: &Shared) -> anyhow::Result<usize> {
-    let seen_before = now_ms() - shared.limits().group_idle.as_millis() as i64;
+    let now = now_ms();
+    let seen_before = now - shared.limits().group_idle.as_millis() as i64;
     let mut removed = 0;
     for group in shared.store.idle_groups(seen_before)? {
         if shared.hub.is_online(&group) {
             continue;
         }
-        if shared.store.delete_idle_group(&group, seen_before)? {
+        if shared.store.bury_idle_group(&group, seen_before, now)? {
             removed += 1;
         }
     }
