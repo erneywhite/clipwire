@@ -273,10 +273,34 @@ const THEME_POLL: Option<Duration> = if cfg!(windows) {
 /// Будит такт: начался или кончился статус с пульсацией.
 static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
-/// Когда такту проснуться в следующий раз: `None` — только по [`WAKE`].
-/// Пульсирует — через кадр; иначе — к следующей проверке темы, если она нужна.
-fn next_tick(pulsing: bool, theme_poll: Option<Duration>) -> Option<Duration> {
-    if pulsing { Some(PULSE) } else { theme_poll }
+/// Шаг пульсации в момент `now`: менять ли кадр и когда следующий.
+///
+/// Кадр меняется по сроку, а не по таймеру сна: такт будят и смены статуса
+/// (в переподключении они идут каждые полсекунды), и с таймером, который
+/// каждый раз заводится заново, значок замер бы. Только началась пульсация —
+/// кадр через [`PULSE`]; срок прошёл — меняем и ставим следующий (после
+/// долгого сна — от `now`, без серии кадров подряд); не пульсирует — срока нет.
+fn pulse_step(pulsing: bool, next_frame: Option<Instant>, now: Instant) -> (bool, Option<Instant>) {
+    if !pulsing {
+        return (false, None);
+    }
+    match next_frame {
+        None => (false, Some(now + PULSE)),
+        Some(at) if now >= at => {
+            let next = at + PULSE;
+            (true, Some(if next > now { next } else { now + PULSE }))
+        }
+        Some(at) => (false, Some(at)),
+    }
+}
+
+/// Когда такту проснуться: ближайший из сроков кадра и проверки темы.
+/// `None` — только по [`WAKE`].
+fn next_wake(next_frame: Option<Instant>, theme_due: Option<Instant>) -> Option<Instant> {
+    match (next_frame, theme_due) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Пульсирует ли сейчас значок.
@@ -292,31 +316,30 @@ fn pulsing() -> bool {
 /// полтора раза в секунду всю жизнь программы.
 pub fn spawn_animator(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let mut theme_at = Instant::now();
+        let mut next_frame: Option<Instant> = None;
+        let mut theme_due = THEME_POLL.map(|p| Instant::now() + p);
         loop {
-            let pulse = pulsing();
-            let woken = match next_tick(pulse, THEME_POLL) {
-                Some(wait) => tokio::select! {
-                    _ = tokio::time::sleep(wait) => false,
-                    _ = WAKE.notified() => true,
-                },
-                None => {
-                    WAKE.notified().await;
-                    true
-                }
-            };
-            if let Some(poll) = THEME_POLL
-                && theme_at.elapsed() >= poll
-            {
-                refresh_light_panel();
-                theme_at = Instant::now();
-            }
-            // Кадр меняется только по таймеру: смена статуса рисует сама.
-            if pulse && !woken {
+            let now = Instant::now();
+            let (flip, frame) = pulse_step(pulsing(), next_frame, now);
+            next_frame = frame;
+            if flip {
                 let mut look = LOOK.lock().unwrap_or_else(|e| e.into_inner());
                 look.phase = !look.phase;
             }
+            if let Some(due) = theme_due
+                && now >= due
+            {
+                refresh_light_panel();
+                theme_due = THEME_POLL.map(|p| now + p);
+            }
             render(&app);
+            match next_wake(next_frame, theme_due) {
+                Some(at) => tokio::select! {
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {}
+                    _ = WAKE.notified() => {}
+                },
+                None => WAKE.notified().await,
+            }
         }
     });
 }
@@ -473,13 +496,14 @@ mod tests {
 
     #[test]
     fn ticker_runs_only_while_pulsing() {
-        let poll = Some(Duration::from_secs(30));
-        // Пульсация — каждый кадр, тема не мешает.
-        assert_eq!(next_tick(true, poll), Some(PULSE));
-        assert_eq!(next_tick(true, None), Some(PULSE));
+        let t0 = Instant::now();
+        let theme = Some(t0 + Duration::from_secs(30));
+        // Пульсация — ближайший кадр, тема не мешает.
+        assert_eq!(next_wake(Some(t0 + PULSE), theme), Some(t0 + PULSE));
+        assert_eq!(next_wake(Some(t0 + PULSE), None), Some(t0 + PULSE));
         // Спокойный значок: Windows проверяет тему редко, остальные спят.
-        assert_eq!(next_tick(false, poll), poll);
-        assert_eq!(next_tick(false, None), None);
+        assert_eq!(next_wake(None, theme), theme);
+        assert_eq!(next_wake(None, None), None);
         // Пульсируют только подключение и найденное обновление.
         assert!(wire_for(&StatusDto::Connecting, false).1);
         assert!(wire_for(&StatusDto::Online, true).1);
@@ -488,6 +512,38 @@ mod tests {
         assert!(!wire_for(&StatusDto::Local, false).1);
         assert!(!wire_for(&StatusDto::Paused, true).1);
         assert!(!wire_for(&StatusDto::Offline("x".into()), true).1);
+    }
+
+    /// Частые пробуждения (статус каждые полсекунды) не останавливают
+    /// пульсацию: кадр меняется по сроку.
+    #[test]
+    fn pulse_survives_frequent_wakes() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // Началась пульсация: кадр не меняется сразу, срок — через кадр.
+        assert_eq!(pulse_step(true, None, t0), (false, Some(ms(700))));
+        // Будят каждые 500 мс: в 500 рано, в 1000 срок прошёл — кадр меняется.
+        let mut frame = Some(ms(700));
+        let mut flips = 0;
+        for n in (500..=3000).step_by(500) {
+            let (flip, next) = pulse_step(true, frame, ms(n));
+            flips += flip as u32;
+            frame = next;
+        }
+        // За три секунды — четыре смены кадра (700, 1400, 2100, 2800 по срокам).
+        assert_eq!(flips, 4);
+        // Ровно в срок — смена, следующий срок от прошлого, а не от «сейчас».
+        assert_eq!(
+            pulse_step(true, Some(ms(700)), ms(700)),
+            (true, Some(ms(1400)))
+        );
+        // Проспали долго: одна смена, следующий срок от «сейчас».
+        assert_eq!(
+            pulse_step(true, Some(ms(700)), ms(5000)),
+            (true, Some(ms(5700)))
+        );
+        // Пульсация кончилась — срока нет.
+        assert_eq!(pulse_step(false, Some(ms(700)), ms(5000)), (false, None));
     }
 
     #[test]
