@@ -938,7 +938,7 @@ impl History {
     }
 
     #[cfg(test)]
-    fn in_memory() -> Self {
+    pub(crate) fn in_memory() -> Self {
         Self::init(Connection::open_in_memory().unwrap(), [7; 32], None).unwrap()
     }
 
@@ -1981,14 +1981,15 @@ impl History {
     /// Закреп с другого устройства (или из импорта): запись с этим простым
     /// хэшем (`Content::hash`) закрепить или открепить и поставить подпись.
     /// Если такой записи нет, а закреп живой, запись добавляется из `entry`
-    /// (содержимое закрепа) на своё место по времени. Снятый закреп без
+    /// (содержимое закрепа) на своё место по времени, с миниатюрой `thumb`
+    /// ([`make_thumb`]; её считают до замка истории). Снятый закреп без
     /// записи ничего не добавляет. Возвращает, изменилась ли история.
     pub fn apply_pin(
         &mut self,
         hash: &[u8; 32],
         pinned: bool,
         note: &str,
-        entry: Option<Entry>,
+        entry: Option<(Entry, Option<Vec<u8>>)>,
     ) -> Result<bool> {
         let note = if pinned {
             clean_note(note)
@@ -2015,14 +2016,13 @@ impl History {
                 None => false,
             },
             None => match entry {
-                Some(mut e) if pinned => {
+                Some((mut e, thumb)) if pinned => {
                     anyhow::ensure!(
                         e.content.hash() == *hash,
                         "содержимое закрепа не совпадает с его хэшем"
                     );
                     e.pinned = true;
                     e.set_note(&note);
-                    let thumb = make_thumb(&e);
                     if self.live_exists(e.id)? {
                         // Тот же id у другой записи (правленой): свой id.
                         e.id = ItemId::new();
@@ -3680,8 +3680,14 @@ mod tests {
         assert!(!h.apply_pin(&other.hash(), true, "x", None).unwrap());
         // Содержимое не того хэша не принимается.
         assert!(h.apply_pin(&hash, false, "", None).unwrap());
-        assert!(h.apply_pin(&[9; 32], true, "x", Some(e.clone())).is_err());
-        assert!(h.apply_pin(&other.hash(), true, "чужая", Some(e)).unwrap());
+        assert!(
+            h.apply_pin(&[9; 32], true, "x", Some((e.clone(), None)))
+                .is_err()
+        );
+        assert!(
+            h.apply_pin(&other.hash(), true, "чужая", Some((e, None)))
+                .unwrap()
+        );
         assert_eq!(texts(h.list("", false, 10)), ["есть здесь", "с другого"]);
         let added = h.id_by_hash(&other.hash()).unwrap();
         assert!(h.row(added).unwrap().pinned);

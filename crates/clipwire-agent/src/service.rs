@@ -405,6 +405,11 @@ impl Service {
                     device,
                 };
                 let engine = engine.with_pins(book.clone(), Arc::new(source));
+                if let Some(b) = &blobs {
+                    // Файлы закрепов по книге — сразу, до первой чистки
+                    // внешнего хранилища: связи с сервером может и не быть.
+                    b.storage().set_kept(book.kept_blobs());
+                }
                 pins = Some(book);
                 if let Some(b) = &blobs {
                     storage = Some(crate::group_config::StorageController::new(
@@ -448,12 +453,13 @@ impl Service {
 
         // События движка.
         {
-            let (paused, status, guard, on_event, history) = (
+            let (paused, status, guard, on_event, history, pins_for_events) = (
                 paused.clone(),
                 status.clone(),
                 guard.clone(),
                 on_event.clone(),
                 history.clone(),
+                pins.clone(),
             );
             rt.spawn(async move {
                 while let Some(ev) = event_rx.recv().await {
@@ -567,15 +573,10 @@ impl Service {
                             }
                         }
                         Event::Pin(p) => {
-                            let entry = p.item.map(entry_of_pin);
                             let res = tokio::task::spawn_blocking({
                                 let history = history.clone();
-                                move || {
-                                    history
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .apply_pin(&p.hash, p.pinned, &p.note, entry)
-                                }
+                                let book = pins_for_events.clone();
+                                move || apply_pin_event(&history, book.as_deref(), p)
                             })
                             .await;
                             match res {
@@ -791,6 +792,28 @@ impl Service {
         });
         transfers || crate::activity::busy()
     }
+}
+
+/// Закреп группы — в историю (событие движка `Event::Pin`). Миниатюра
+/// новой записи считается до замка истории. Если своя правка этого хэша
+/// встала в очередь, пока событие шло, её закреп главнее: команды ставят
+/// правку в очередь до записи в историю, а проверка идёт под замком
+/// истории, поэтому только что поставленный закреп не снимется пришедшим
+/// раньше снятием. Возвращает, изменилась ли история.
+fn apply_pin_event(
+    history: &Mutex<History>,
+    pins: Option<&Pins>,
+    p: crate::pins::PinApply,
+) -> Result<bool> {
+    let entry = p.item.map(entry_of_pin).map(|e| {
+        let thumb = make_thumb(&e);
+        (e, thumb)
+    });
+    let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
+    if pins.is_some_and(|b| b.pending(&p.hash)) {
+        return Ok(false);
+    }
+    h.apply_pin(&p.hash, p.pinned, &p.note, entry)
 }
 
 /// Сведения элемента без подписи: подпись не ходит внутри элементов.
@@ -1018,6 +1041,39 @@ mod tests {
     use super::*;
     use crate::blobs::UploadJob;
     use clipwire_core::FileRef;
+
+    /// Снятие с сервера, пришедшее, пока здесь закрепляли заново (правка
+    /// уже в очереди книги), свежий закреп не снимает; без своей правки —
+    /// применяется.
+    #[test]
+    fn pin_event_yields_to_own_pending_edit() {
+        let history = Mutex::new(History::in_memory());
+        let content = Content::Text("закрепили только что".into());
+        let hash = content.hash();
+        let id = {
+            let mut h = history.lock().unwrap();
+            let e = local_entry(DeviceId([1; 32]), "ПК", content);
+            let id = e.id;
+            h.add(e).unwrap();
+            id
+        };
+        let pins = Pins::in_memory(clipwire_core::GroupId([1; 32]));
+        // Как `history_pin`: сначала очередь, потом история.
+        pins.pin(hash, "");
+        history.lock().unwrap().set_pinned(id, true).unwrap();
+        let unpin = crate::pins::PinApply {
+            hash,
+            pinned: false,
+            note: String::new(),
+            item: None,
+        };
+        assert!(!apply_pin_event(&history, Some(&pins), unpin.clone()).unwrap());
+        assert!(history.lock().unwrap().row(id).unwrap().pinned);
+        // Правка ушла — снятие применяется.
+        pins.update(|b| b.outbox.clear());
+        assert!(apply_pin_event(&history, Some(&pins), unpin).unwrap());
+        assert!(!history.lock().unwrap().row(id).unwrap().pinned);
+    }
 
     fn file(path: &str, size: u64, is_dir: bool) -> FileRef {
         FileRef {
