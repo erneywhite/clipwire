@@ -131,10 +131,7 @@ pub fn claim_code(code: &str, state: &AgentState) -> Result<AdminServerInfo, Str
         }
     };
     if a.server.server_id != state.invite.server.server_id {
-        return Err(tr(
-            "Это код другого сервера: устройство подключено не к нему.",
-        )
-        .into());
+        return Err(tr("Это код другого сервера: устройство подключено не к нему.").into());
     }
     Ok(a)
 }
@@ -413,7 +410,10 @@ mod tests {
         let a = creation_code(&admin_code(1, "t", 7)).unwrap();
         assert_eq!(a.admin_key, AdminKey([7; 32]));
         let old = creation_code(&server(1, "t").encode()).unwrap_err();
-        assert!(old.contains("cwserver2-") && old.contains("clipwire-server info"), "{old}");
+        assert!(
+            old.contains("cwserver2-") && old.contains("clipwire-server info"),
+            "{old}"
+        );
         let bad = creation_code("cwserver2-!!!").unwrap_err();
         assert!(bad.contains("не разобрался"), "{bad}");
         // Код приглашения — не код сервера.
@@ -465,7 +465,10 @@ mod tests {
             min: 1,
             max: 1000,
         });
-        assert!(range.contains("max_devices") && range.contains("1000"), "{range}");
+        assert!(
+            range.contains("max_devices") && range.contains("1000"),
+            "{range}"
+        );
         assert_eq!(
             fail_text(&AdminFail::Unavailable("причина".into())),
             "причина"

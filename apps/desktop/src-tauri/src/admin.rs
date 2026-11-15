@@ -50,18 +50,15 @@ pub async fn admin_claim(app: AppHandle, code: String) -> CmdResult<()> {
     // (id совпал), поэтому новый код принимается как есть, и синхронизация
     // перезапускается с ним.
     if info.server != agent.invite.server {
-        adopt_server_code(&state.paths, code.trim()).map_err(|e| {
-            trf("Ключ не сохранился: {e}", &[("e", &format!("{e:#}"))])
-        })?;
+        adopt_server_code(&state.paths, code.trim())
+            .map_err(|e| trf("Ключ не сохранился: {e}", &[("e", &format!("{e:#}"))]))?;
         crate::restart_service(&app)
             .await
             .map_err(|e| format!("{e:#}"))?;
         return Ok(());
     }
     // Сначала сервер: неверный или сменённый ключ сохранять незачем.
-    controller(&app)?
-        .admin_auth(info.admin_key.clone())
-        .await?;
+    controller(&app)?.admin_auth(info.admin_key.clone()).await?;
     state
         .paths
         .save_admin_key(info.server.server_id, &info.admin_key)
@@ -112,9 +109,8 @@ fn unit_name(u: SettingUnit) -> &'static str {
 /// Настройки в порядке `SETTINGS`. Настройки, которых сервер не прислал
 /// (сервер старее клиента), не показываются.
 fn settings_dto(s: &ServerSettings) -> Vec<SettingDto> {
-    let get = |list: &[(String, u64)], key: &str| {
-        list.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
-    };
+    let get =
+        |list: &[(String, u64)], key: &str| list.iter().find(|(k, _)| k == key).map(|(_, v)| *v);
     SETTINGS
         .iter()
         .filter_map(|spec| {

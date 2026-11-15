@@ -788,10 +788,7 @@ pub static EN: &[(&str, &str)] = &[
         "Значение {key} должно быть от {min} до {max}",
         "{key} must be between {min} and {max}",
     ),
-    (
-        "Ключ не сохранился: {e}",
-        "The key was not saved: {e}",
-    ),
+    ("Ключ не сохранился: {e}", "The key was not saved: {e}"),
     (
         "Токен сменён, но новый код сервера не сохранился: {e}. Запишите код: {code}",
         "The token was changed, but the new server code was not saved: {e}. Write down the code: {code}",

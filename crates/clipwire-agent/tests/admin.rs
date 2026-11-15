@@ -116,7 +116,10 @@ async fn admin_key_creates_group_and_plain_token_does_not() -> Result<()> {
     let key = GroupKey::generate()?;
     let mut a = Agent::spawn(&info, &key, Some(ADMIN))?;
     a.status().await?.expect("с ключом группа создаётся");
-    assert_eq!(a.ctl.group_admin().await.map_err(anyhow::Error::msg)?, Some(a.ctl.device()));
+    assert_eq!(
+        a.ctl.group_admin().await.map_err(anyhow::Error::msg)?,
+        Some(a.ctl.device())
+    );
 
     // Настройки сервера: прочитать, поменять, сбросить.
     let s = a.ctl.server_settings().await.map_err(anyhow::Error::msg)?;
@@ -186,8 +189,14 @@ async fn member_claims_admin_and_group_admin_moves() -> Result<()> {
         .await
         .unwrap_err();
     assert!(err.contains("админ группы"), "{err}");
-    a.ctl.transfer_group_admin(b.ctl.device()).await.map_err(anyhow::Error::msg)?;
-    assert_eq!(a.ctl.group_admin().await.map_err(anyhow::Error::msg)?, Some(b.ctl.device()));
+    a.ctl
+        .transfer_group_admin(b.ctl.device())
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        a.ctl.group_admin().await.map_err(anyhow::Error::msg)?,
+        Some(b.ctl.device())
+    );
 
     drop(a);
     drop(b);
@@ -203,7 +212,11 @@ async fn relay_token_rotation_gives_new_code() -> Result<()> {
     let mut a = Agent::spawn(&info, &key, Some(ADMIN))?;
     a.status().await?.expect("на связи");
 
-    let code = a.ctl.rotate_relay_token().await.map_err(anyhow::Error::msg)?;
+    let code = a
+        .ctl
+        .rotate_relay_token()
+        .await
+        .map_err(anyhow::Error::msg)?;
     let new = AdminServerInfo::decode(&code)?;
     assert_ne!(new.server.relay_token, info.relay_token);
 
