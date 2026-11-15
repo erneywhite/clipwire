@@ -284,7 +284,9 @@
 
   /** Следующая страница ленты, если она есть и ещё не грузится. */
   async function loadMore() {
-    if (exhausted || loadingMore || !items.length) return
+    // Пока новый список (другой запрос, вкладка или фильтр) не пришёл, на экране
+    // старый: смещение по его длине дало бы дыру в новой ленте.
+    if (exhausted || loadingMore || listing.busy || !items.length) return
     loadingMore = true
     const g = gen
     try {
