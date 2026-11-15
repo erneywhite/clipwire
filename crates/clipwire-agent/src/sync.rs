@@ -958,6 +958,12 @@ impl Engine {
 
     /// Сообщение сервера посреди сессии. Ошибка заканчивает сессию.
     fn handle_msg(&mut self, key: &GroupKey, msg: ServerMsg) -> Result<()> {
+        // Закрепы разбираются асинхронно, в `pin_send` (там же, где их
+        // ответы уходят серверу).
+        if pin_engine::is_pin_msg(&msg) {
+            self.ps.inbox.push_back(msg);
+            return Ok(());
+        }
         match msg {
             ServerMsg::Deliver(sealed) => {
                 if sealed.origin != self.device && !self.known.contains_key(&sealed.origin) {
@@ -982,17 +988,21 @@ impl Engine {
                 // До первых страниц закрепов записки ждут: удаление
                 // закреплённого везде приходит снятием закрепа и запиской,
                 // и снятие должно успеть раньше (закреплённое записка не
-                // удаляет).
-                Ok(note) if self.pins_on() && !self.ps.ready => self.ps.deferred.push(note),
+                // удаляет). Так же ждут, пока в очереди лежат неразобранные
+                // закрепы: снятие могло прийти раньше записки.
+                Ok(note) if self.pins_on() && (!self.ps.ready || !self.ps.inbox.is_empty()) => {
+                    self.ps.deferred.push(note)
+                }
                 Ok(note) => self.emit(Event::Deleted(note)),
                 Err(e) => tracing::warn!("записка об удалении не открылась: {e}"),
             },
-            ServerMsg::Pins { records, more } => self.pin_page(key, records, more),
-            ServerMsg::Pinned(rec) => self.pin_broadcast(key, rec),
-            ServerMsg::PinAccepted { pin_id, rev } => self.pin_accepted(pin_id, rev),
-            ServerMsg::PinRejected { pin_id, current } => self.pin_rejected(key, pin_id, current),
-            ServerMsg::PinContentIs { pin_id, content } => self.pin_content(key, pin_id, content),
-            ServerMsg::PinFailed { pin_id, reason } => self.pin_failed(pin_id, reason),
+            ServerMsg::Pins { .. }
+            | ServerMsg::Pinned(_)
+            | ServerMsg::PinAccepted { .. }
+            | ServerMsg::PinRejected { .. }
+            | ServerMsg::PinContentIs { .. }
+            // Ушли в очередь выше (`is_pin_msg`).
+            | ServerMsg::PinFailed { .. } => {}
             ServerMsg::PinStats(stats) => match self.pin_stats_waiters.pop_front() {
                 Some(reply) => {
                     let _ = reply.send(Ok(stats));
@@ -1137,6 +1147,8 @@ impl Engine {
         // Ответ на список значит, что карточка (и настройки, и закрепы) уже
         // записаны.
         write_msg(&mut send2, &ClientMsg::ListDevices).await?;
+        // Закрепы, которые новая группа не приняла (квота сервера).
+        let mut pin_fails: Vec<clipwire_core::proto::PinFail> = Vec::new();
         loop {
             match tokio::time::timeout(CONNECT_TIMEOUT, read_msg::<_, ServerMsg>(&mut recv2))
                 .await
@@ -1144,9 +1156,26 @@ impl Engine {
             {
                 Some(ServerMsg::Devices(_)) => break,
                 Some(ServerMsg::Error(e)) => bail!(trf("новая группа: {e}", &[("e", &e)])),
+                Some(ServerMsg::PinFailed { reason, .. }) => pin_fails.push(reason),
+                // Новые id в новой группе: отказ по rev значит, что запись
+                // там уже есть (повтор), — не ошибка.
+                Some(ServerMsg::PinRejected { .. }) => {}
                 Some(_) => {}
                 None => bail!(tr("сервер закрыл соединение с новой группой")),
             }
+        }
+        if let Some(first) = pin_fails.first() {
+            tracing::warn!(
+                n = pin_fails.len(),
+                "новая группа не приняла закрепы: {first}"
+            );
+            self.emit(Event::PinFailed(trf(
+                "После смены ключа сервер не принял закрепов: {n}. {why}",
+                &[
+                    ("n", &pin_fails.len()),
+                    ("why", &pin_engine::fail_text(first)),
+                ],
+            )));
         }
 
         let envelopes =

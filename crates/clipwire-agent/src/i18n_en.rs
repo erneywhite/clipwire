@@ -735,4 +735,8 @@ pub static EN: &[(&str, &str)] = &[
         "Запись слишком большая для закрепа группы: закреплена только здесь",
         "The item is too large for a group pin: pinned on this device only",
     ),
+    (
+        "После смены ключа сервер не принял закрепов: {n}. {why}",
+        "After the key change the server refused {n} pins. {why}",
+    ),
 ];
