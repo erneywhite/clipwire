@@ -30,6 +30,37 @@ use crate::state::AgentState;
 /// обычно сотни килобайт — пара мегабайт.
 pub const MAX_ITEM_BYTES: usize = 7 * 1024 * 1024 + 512 * 1024;
 
+/// Сколько элементов истории принимается за один вход. Сервер по умолчанию
+/// хранит 50 на группу (`CLIPWIRE_HISTORY_LEN`); запас с большим
+/// превышением. Больше — сервер врёт или сломан, вход прекращается.
+const MAX_JOIN_HISTORY_ITEMS: usize = 1000;
+/// Сколько байт шифротекста истории принимается за один вход. Элементы
+/// копятся в памяти до `HistoryEnd`, так что предел держит память клиента.
+const MAX_JOIN_HISTORY_BYTES: usize = 256 * 1024 * 1024;
+
+/// Счётчик истории, пришедшей при входе: пределы по числу и размеру.
+#[derive(Default)]
+struct HistoryBudget {
+    items: usize,
+    bytes: usize,
+}
+
+impl HistoryBudget {
+    /// Учесть ещё один элемент; ошибка, если предел превышен.
+    fn admit(&mut self, item: &clipwire_core::SealedItem) -> Result<()> {
+        self.admit_size(item.ciphertext.len())
+    }
+
+    fn admit_size(&mut self, len: usize) -> Result<()> {
+        self.items += 1;
+        self.bytes = self.bytes.saturating_add(len);
+        if self.items > MAX_JOIN_HISTORY_ITEMS || self.bytes > MAX_JOIN_HISTORY_BYTES {
+            bail!(tr("сервер прислал слишком много истории"));
+        }
+        Ok(())
+    }
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Сколько попыток подряд отправить элемент с файлами, чей резерв не доходит
@@ -638,12 +669,16 @@ impl Engine {
         // История идёт по элементу; таймаут на каждый, а не на всю: с
         // картинками она может качаться дольше CONNECT_TIMEOUT.
         let mut history = Vec::new();
+        let mut budget = HistoryBudget::default();
         loop {
             match tokio::time::timeout(CONNECT_TIMEOUT, read_msg(&mut recv))
                 .await
                 .context(tr("сервер не дослал историю"))??
             {
-                Some(ServerMsg::History { item, backfill }) => history.push((item, backfill)),
+                Some(ServerMsg::History { item, backfill }) => {
+                    budget.admit(&item)?;
+                    history.push((item, backfill));
+                }
                 Some(ServerMsg::HistoryEnd) => break,
                 Some(ServerMsg::Error(e)) => bail!(trf("сервер: {e}", &[("e", &e)])),
                 Some(other) => bail!("неожиданное сообщение в истории: {other:?}"),
@@ -1523,6 +1558,21 @@ fn relay_hint(ep: &Endpoint) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn join_history_budget_stops_runaway_server() {
+        use super::*;
+        let mut b = HistoryBudget::default();
+        for _ in 0..MAX_JOIN_HISTORY_ITEMS {
+            b.admit_size(10).unwrap();
+        }
+        assert!(b.admit_size(10).is_err(), "лишний элемент по числу");
+        let mut b = HistoryBudget::default();
+        b.admit_size(MAX_JOIN_HISTORY_BYTES).unwrap();
+        assert!(b.admit_size(1).is_err(), "лишний байт по размеру");
+        let mut b = HistoryBudget::default();
+        assert!(b.admit_size(usize::MAX).is_err(), "переполнение суммы");
+    }
+
     use super::*;
     use clipwire_core::{GroupKey, Invite, SealedItem, ServerInfo};
 
