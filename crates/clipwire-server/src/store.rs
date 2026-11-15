@@ -46,6 +46,13 @@ pub enum BlobBegin {
     Rotated,
 }
 
+/// Пределы входа: сколько групп на сервере и устройств в группе.
+#[derive(Debug, Clone, Copy)]
+pub struct JoinLimits {
+    pub max_groups: usize,
+    pub max_devices: usize,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum JoinOutcome {
     /// Группы не было, создана с этим секретом.
@@ -202,9 +209,12 @@ impl Store {
         device: &DeviceId,
         now_ms: i64,
         may_create: bool,
-        max_groups: usize,
-        max_devices: usize,
+        limits: JoinLimits,
     ) -> Result<JoinOutcome> {
+        let JoinLimits {
+            max_groups,
+            max_devices,
+        } = limits;
         let digest = secret.digest();
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -272,15 +282,11 @@ impl Store {
         may_create: bool,
         max_groups: usize,
     ) -> Result<JoinOutcome> {
-        self.join_limited(
-            group,
-            secret,
-            device,
-            now_ms,
-            may_create,
+        let limits = JoinLimits {
             max_groups,
-            usize::MAX,
-        )
+            max_devices: usize::MAX,
+        };
+        self.join_limited(group, secret, device, now_ms, may_create, limits)
     }
 
     /// Сохраняет элемент и обрезает историю группы до `keep` последних.
@@ -1082,8 +1088,10 @@ mod tests {
                 &DeviceId([n; 32]),
                 0,
                 true,
-                10,
-                2,
+                JoinLimits {
+                    max_groups: 10,
+                    max_devices: 2,
+                },
             )
             .unwrap()
         };

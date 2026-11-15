@@ -239,8 +239,10 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         &device,
         now_ms(),
         may_create,
-        shared.limits.max_groups,
-        shared.limits.max_devices,
+        crate::store::JoinLimits {
+            max_groups: shared.limits.max_groups,
+            max_devices: shared.limits.max_devices,
+        },
     )?;
     let reason = match &outcome {
         JoinOutcome::Rotated(r) => {
