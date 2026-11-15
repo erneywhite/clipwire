@@ -7,7 +7,7 @@ clipwire-server — сервер Clipwire
 
 Команды:
   run    запустить сервер (по умолчанию)
-  info   напечатать код сервера для первого устройства
+  info   напечатать код сервера (cwserver2-…) для устройства администратора
 
 Настройки задаются переменными окружения, см. README.";
 
@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         "info" => {
             let config = Config::from_env()?;
             let id = Identity::load_or_create(&config.data_dir, config.relay_token.as_deref())?;
-            println!("{}", id.server_info(&config.public_url).encode());
+            println!("{}", id.admin_info(&config.public_url).encode());
             Ok(())
         }
         "-h" | "--help" | "help" => {
@@ -50,7 +50,7 @@ async fn run() -> Result<()> {
         public = %config.public_url,
         "сервер запущен"
     );
-    tracing::info!("код сервера: {}", running.info.encode());
+    tracing::info!("код сервера: {}", running.server_code());
     stop_signal().await?;
     tracing::info!("остановка");
     // Не даём корректной остановке тянуться дольше, чем Docker ждёт до SIGKILL.

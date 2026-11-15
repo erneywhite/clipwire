@@ -68,6 +68,10 @@ pub enum UiEvent {
     /// Сервер не принял закреп (квота, размер): текст для человека. Запись
     /// закреплена только на этом устройстве.
     PinFailed(String),
+    /// Ключ администратора сервера устарел (его сменили): сервис уже забыл
+    /// его на диске, синхронизация идёт без него. Интерфейс просит ввести
+    /// новый код сервера администратора.
+    AdminKeyStale,
 }
 
 pub type UiCallback = Arc<dyn Fn(UiEvent) + Send + Sync>;
@@ -381,6 +385,9 @@ impl Service {
             Some(state) => {
                 let (ctl_tx, ctl_rx) = mpsc::channel(8);
                 let group_key = state.invite.group_key.clone();
+                // Ключ администратора сервера, если он есть у устройства: с ним
+                // движок создаёт группу и входит с правами администратора.
+                let admin_key = paths.load_admin_key(state.invite.server.server_id);
                 let local_history = if backfill {
                     local_backfill(&history.lock().unwrap_or_else(|e| e.into_inner()))
                 } else {
@@ -393,6 +400,7 @@ impl Service {
                     event_tx,
                     Arc::new(|| {}),
                 )
+                .with_admin_key(admin_key)
                 .with_backfill(local_history)
                 .with_known_devices(crate::devices::load_known(&paths, group_key.group_id()))
                 .with_blobs(blobs.clone().expect("в группе передача файлов есть"))
@@ -587,6 +595,14 @@ impl Service {
                             }
                         }
                         Event::PinFailed(why) => on_event(UiEvent::PinFailed(why)),
+                        // Ключ уже не подходит серверу: на диске он только
+                        // заставлял бы каждый запуск сначала пробовать его.
+                        Event::AdminKeyStale => {
+                            if let Err(e) = paths.forget_admin_key() {
+                                tracing::warn!("устаревший ключ администратора не удалился: {e:#}");
+                            }
+                            on_event(UiEvent::AdminKeyStale);
+                        }
                         Event::KnownDevices(cards) => {
                             if let Some(g) = group
                                 && let Err(e) = crate::devices::save_known(&paths, g, &cards)

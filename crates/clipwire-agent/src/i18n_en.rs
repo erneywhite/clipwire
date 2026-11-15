@@ -739,4 +739,84 @@ pub static EN: &[(&str, &str)] = &[
         "После смены ключа сервер не принял закрепов: {n}. {why}",
         "After the key change the server refused {n} pins. {why}",
     ),
+    // Администратор сервера и админ группы.
+    (
+        "Его печатает сервер при запуске (лог контейнера) и команда clipwire-server info, строка начинается с cwserver2-.",
+        "The server prints it on startup (container log) and via clipwire-server info; it starts with cwserver2-.",
+    ),
+    (
+        "С кодом cwserver1- группу не создать: эта версия Clipwire создаёт группы только на сервере 0.5.0 или новее и только с его кодом администратора cwserver2-. Если сервер старее, обновите его образ, и он напечатает новый код.",
+        "A cwserver1- code cannot create a group: this version of Clipwire creates groups only on server 0.5.0 or newer and only with its administrator code cwserver2-. If the server is older, update its image, and it will print the new code.",
+    ),
+    ("Код не сохранился: {e}", "The code was not saved: {e}"),
+    (
+        "Код приглашения не разобрался ({e}). Он начинается с clipwire1-.",
+        "Could not read the invite code ({e}). It starts with clipwire1-.",
+    ),
+    ("сервер не ответил", "the server did not reply"),
+    (
+        "сервер не принял ключ администратора",
+        "the server did not accept the administrator key",
+    ),
+    (
+        "Это доступно только в окне настроек",
+        "This is available only in the settings window",
+    ),
+    (
+        "Это приглашение в другую группу. Чтобы перейти в неё, выйдите из этой группы и войдите по коду.",
+        "This invite is for another group. To move to it, leave this group and join with the code.",
+    ),
+    (
+        "Это приглашение на другой сервер. Чтобы перейти на него, выйдите из группы и войдите по коду.",
+        "This invite is for another server. To move to it, leave the group and join with the code.",
+    ),
+    (
+        "В коде cwserver1- нет ключа администратора.",
+        "A cwserver1- code has no administrator key.",
+    ),
+    (
+        "Это код другого сервера: устройство подключено не к нему.",
+        "This code is for a different server: this device is not connected to it.",
+    ),
+    (
+        "Ключ администратора не подошёл: его сменили, или это код другого сервера. Введите текущий код сервера администратора.",
+        "The administrator key did not match: it was changed, or the code is for another server. Enter the current server admin code.",
+    ),
+    (
+        "Сервер не дал прав администратора: у этого устройства нет действующего ключа администратора (его могли сменить). Введите текущий код сервера администратора.",
+        "The server did not grant administrator rights: this device has no valid administrator key (it may have been changed). Enter the current server admin code.",
+    ),
+    (
+        "Это может только админ группы",
+        "Only the group admin can do this",
+    ),
+    (
+        "Сервер не поддерживает администрирование: обновите сервер Clipwire до 0.5.0",
+        "The server does not support administration: update the Clipwire server to 0.5.0",
+    ),
+    (
+        "Сервер ответил не то, что ожидалось",
+        "The server sent an unexpected reply",
+    ),
+    (
+        "Код сервера не разобрался ({e}). Код сервера начинается с cwserver2-.",
+        "Could not read the server code ({e}). A server code starts with cwserver2-.",
+    ),
+    (
+        "Сервер не знает настройку {key}: обновите сервер Clipwire",
+        "The server does not know the setting {key}: update the Clipwire server",
+    ),
+    (
+        "Значение {key} должно быть от {min} до {max}",
+        "{key} must be between {min} and {max}",
+    ),
+    ("Ключ не сохранился: {e}", "The key was not saved: {e}"),
+    (
+        "Токен сменён, но новый код сервера не сохранился: {e}. Запишите код: {code}",
+        "The token was changed, but the new server code was not saved: {e}. Write down the code: {code}",
+    ),
+    (
+        "Ключ сменён, но не сохранился на этом устройстве: {e}. Запишите код: {code}",
+        "The key was changed, but it was not saved on this device: {e}. Write down the code: {code}",
+    ),
 ];

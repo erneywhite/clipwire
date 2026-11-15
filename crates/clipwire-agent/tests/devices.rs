@@ -14,7 +14,11 @@ use tokio::sync::mpsc;
 
 const T: Duration = Duration::from_secs(20);
 
-async fn start_server() -> Result<(clipwire_server::Running, ServerInfo)> {
+/// Сервер и группа на нём, созданная как до 0.5.0: без админа. Движки здесь
+/// входят без ключа администратора (`JoinWithToken`, как старые клиенты), и
+/// сменить ключ может любой участник, а новую группу для смены ключа сервер
+/// создаёт по членству в старой.
+async fn start_server() -> Result<(clipwire_server::Running, ServerInfo, GroupKey)> {
     let config = Config {
         data_dir: std::env::temp_dir()
             .join(format!("clipwire-devices-test-{}", uuid::Uuid::now_v7())),
@@ -36,7 +40,13 @@ async fn start_server() -> Result<(clipwire_server::Running, ServerInfo)> {
     let port = server.relay_addr().context("нет relay")?.port();
     let mut info = server.info.clone();
     info.relay_url = format!("http://localhost:{port}");
-    Ok((server, info))
+    let key = GroupKey::generate()?;
+    let db = rusqlite::Connection::open(config.data_dir.join("clipwire.db"))?;
+    db.execute(
+        "INSERT INTO groups (group_id, join_digest, created_ms) VALUES (?1, ?2, 0)",
+        rusqlite::params![&key.group_id().0[..], &key.join_secret().digest()[..]],
+    )?;
+    Ok((server, info, key))
 }
 
 /// Устройство: постоянный ключ устройства, движок пересоздаётся с новым
@@ -211,8 +221,7 @@ impl Agent {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cards_are_listed_with_names_and_online() -> Result<()> {
-    let (server, info) = start_server().await?;
-    let key = GroupKey::generate()?;
+    let (server, info, key) = start_server().await?;
     let mut a = Agent::new("Ноутбук", &info, &key)?;
     let mut b = Agent::new("Рабочий", &info, &key)?;
     a.online().await?;
@@ -242,8 +251,7 @@ async fn cards_are_listed_with_names_and_online() -> Result<()> {
 /// от A, C исключено и больше ничего не получает.
 #[tokio::test(flavor = "multi_thread")]
 async fn removing_device_moves_others_to_new_key() -> Result<()> {
-    let (server, info) = start_server().await?;
-    let key = GroupKey::generate()?;
+    let (server, info, key) = start_server().await?;
     let mut a = Agent::new("A", &info, &key)?;
     let mut b = Agent::new("B", &info, &key)?;
     let mut c = Agent::new("C", &info, &key)?;
@@ -306,8 +314,7 @@ async fn removing_device_moves_others_to_new_key() -> Result<()> {
 /// получает свой пакет.
 #[tokio::test(flavor = "multi_thread")]
 async fn offline_device_gets_its_key_later() -> Result<()> {
-    let (server, info) = start_server().await?;
-    let key = GroupKey::generate()?;
+    let (server, info, key) = start_server().await?;
     let mut a = Agent::new("A", &info, &key)?;
     let mut b = Agent::new("B", &info, &key)?;
     let mut c = Agent::new("C", &info, &key)?;
@@ -361,8 +368,7 @@ async fn offline_device_gets_its_key_later() -> Result<()> {
 /// Смена ключа без удаления: все остаются в группе.
 #[tokio::test(flavor = "multi_thread")]
 async fn rekey_without_removal_keeps_everyone() -> Result<()> {
-    let (server, info) = start_server().await?;
-    let key = GroupKey::generate()?;
+    let (server, info, key) = start_server().await?;
     let mut a = Agent::new("A", &info, &key)?;
     let mut b = Agent::new("B", &info, &key)?;
     let mut c = Agent::new("C", &info, &key)?;
@@ -395,8 +401,7 @@ async fn rekey_without_removal_keeps_everyone() -> Result<()> {
 /// сменил ключ.
 #[tokio::test(flavor = "multi_thread")]
 async fn rekey_by_unknown_device_counts_as_exclusion() -> Result<()> {
-    let (server, info) = start_server().await?;
-    let key = GroupKey::generate()?;
+    let (server, info, key) = start_server().await?;
     let mut a = Agent::new("A", &info, &key)?;
     let mut b = Agent::new("B", &info, &key)?;
     a.online().await?;
@@ -421,8 +426,7 @@ async fn rekey_by_unknown_device_counts_as_exclusion() -> Result<()> {
 /// и после входа, если удалили, пока оно было не в сети.
 #[tokio::test]
 async fn delete_reaches_other_devices() -> Result<()> {
-    let (server, info) = start_server().await?;
-    let key = GroupKey::generate()?;
+    let (server, info, key) = start_server().await?;
     let mut a = Agent::new("A", &info, &key)?;
     let mut b = Agent::new("B", &info, &key)?;
     a.online().await?;

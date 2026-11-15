@@ -46,7 +46,7 @@ fn to_dto(v: &DeviceView, me: DeviceId) -> DeviceDto {
     }
 }
 
-fn parse_device(id: &str) -> CmdResult<DeviceId> {
+pub(crate) fn parse_device(id: &str) -> CmdResult<DeviceId> {
     data_encoding::HEXLOWER
         .decode(id.trim().as_bytes())
         .ok()
@@ -55,7 +55,7 @@ fn parse_device(id: &str) -> CmdResult<DeviceId> {
         .ok_or_else(|| tr("Неверный id устройства").into())
 }
 
-fn controller(app: &AppHandle) -> CmdResult<Controller> {
+pub(crate) fn controller(app: &AppHandle) -> CmdResult<Controller> {
     app.state::<AppState>()
         .service
         .lock()

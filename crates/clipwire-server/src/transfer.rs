@@ -228,7 +228,7 @@ async fn serve_stream(
 /// уже известного файла. Размер сверяем до замка, иначе ответ ждал бы, пока
 /// закончит другой загрузчик этого файла.
 fn precheck(shared: &Shared, group: &GroupId, blob: &BlobId, size: u64) -> Result<Arc<Live>, Fail> {
-    let limits = &shared.limits;
+    let limits = shared.limits();
     if size > limits.max_file_bytes {
         return Err(BlobFail::TooLarge {
             max: limits.max_file_bytes,
@@ -256,7 +256,7 @@ async fn begin(
     size: u64,
     live: &Live,
 ) -> Result<(u64, bool), Fail> {
-    let (limits, group) = (&shared.limits, at.group);
+    let (limits, group) = (shared.limits(), at.group);
     let begin = shared.store.blob_begin(
         group,
         blob,
@@ -281,6 +281,11 @@ async fn begin(
         // Соединение со старой группой вот-вот закроется (`docs/devices.md`).
         BlobBegin::Rotated => {
             return Err(BlobFail::Protocol("ключ группы сменён".into()).into());
+        }
+        // В незавершённую группу смены ключа файлы не грузят: иначе она
+        // стала бы бесплатным хранилищем вне предела групп.
+        BlobBegin::Pending => {
+            return Err(BlobFail::Protocol("смена ключа группы ещё не завершена".into()).into());
         }
     };
     let now = Progress {
@@ -344,7 +349,7 @@ async fn abort(
 /// не старый; тогда его не трогаем. Ждущие `Get` получают `Cancelled`.
 /// Возвращает, сколько резервов удалено.
 pub async fn purge_stale_reserves(shared: &Shared) -> anyhow::Result<usize> {
-    let older_than = now_ms() - shared.limits.reserve_ttl.as_millis() as i64;
+    let older_than = now_ms() - shared.limits().reserve_ttl.as_millis() as i64;
     let stale = shared.store.stale_reserves(older_than)?;
     let mut removed = 0;
     for (group, blob) in &stale {
@@ -361,17 +366,20 @@ pub async fn purge_stale_reserves(shared: &Shared) -> anyhow::Result<usize> {
 }
 
 /// Чистка заброшенных групп: ни одно устройство не входило за `group_idle`,
-/// нет ни элементов, ни файлов, и сейчас никто не подключён. Устройства
-/// группы удаляются вместе с ней. Так освобождаются места под
-/// `CLIPWIRE_MAX_GROUPS`. Возвращает, сколько групп удалено.
+/// нет ни элементов, ни файлов, и сейчас никто не подключён. Устройства и
+/// остальные данные группы удаляются, от неё остаётся строка с секретом
+/// (`Store::bury_idle_group`): верный секрет создаст её заново. Так
+/// освобождаются места под `CLIPWIRE_MAX_GROUPS`. Возвращает, сколько групп
+/// очищено.
 pub fn purge_idle_groups(shared: &Shared) -> anyhow::Result<usize> {
-    let seen_before = now_ms() - shared.limits.group_idle.as_millis() as i64;
+    let now = now_ms();
+    let seen_before = now - shared.limits().group_idle.as_millis() as i64;
     let mut removed = 0;
     for group in shared.store.idle_groups(seen_before)? {
         if shared.hub.is_online(&group) {
             continue;
         }
-        if shared.store.delete_idle_group(&group, seen_before)? {
+        if shared.store.bury_idle_group(&group, seen_before, now)? {
             removed += 1;
         }
     }
@@ -415,7 +423,7 @@ async fn put(
     let count = chunk_count(size);
     loop {
         let next = read_msg_limited::<_, BlobChunk>(recv, MAX_CHUNK_FRAME);
-        let msg = tokio::time::timeout(shared.limits.blob_stall, next)
+        let msg = tokio::time::timeout(shared.limits().blob_stall, next)
             .await
             .map_err(|_| BlobFail::Stalled)??;
         let Some(chunk) = msg else {
@@ -524,7 +532,7 @@ async fn get(
             index += 1;
             continue;
         }
-        match tokio::time::timeout(shared.limits.blob_stall, rx.changed()).await {
+        match tokio::time::timeout(shared.limits().blob_stall, rx.changed()).await {
             Ok(Ok(())) => {
                 let p = *rx.borrow_and_update();
                 if p.cancelled {

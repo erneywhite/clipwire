@@ -1,5 +1,5 @@
 // Подписи и тексты подтверждений для раздела «Устройства группы».
-import type { GroupDevice, StorageKind } from './api'
+import type { GroupAdmin, GroupDevice, StorageKind } from './api'
 import type * as format from './format'
 import { t, tn, lang } from './i18n.ts'
 import { deviceName } from './platform.ts'
@@ -63,8 +63,38 @@ export function exposedAccessText(kind: StorageKind | null, removing = true, los
 /** Что остаётся у исключённого устройства на сервере и как это закрыть. */
 export function serverTokenText(): string {
   return t(
-    'Токен сервера у исключённого устройства остаётся: с ним оно может создавать группы и занимать место под файлы. Если устройство могло попасть в чужие руки, поменяйте токен на сервере (переменная CLIPWIRE_RELAY_TOKEN) и раздайте новый код приглашения.',
+    'Токен доступа к серверу у исключённого устройства остаётся: с ним оно достучится до relay, но в группу не войдёт и новую группу не создаст. Если устройство могло попасть в чужие руки, смените токен доступа в разделе «Сервер» (нужен код сервера администратора) и раздайте новый код приглашения.',
   )
+}
+
+/** Админ группы по ответу `group_admin`; `null` — не знаем (нет связи). */
+export type Roles = GroupAdmin | null
+
+/** Может ли это устройство удалять устройства и менять ключ группы. Сервер
+ *  старше 0.5.0 и группа без админа разрешают это всем; не знаем — не
+ *  запрещаем, сервер всё равно проверит сам. */
+export function canManage(roles: Roles, list: GroupDevice[]): boolean {
+  if (!roles || !roles.supported || roles.admin === null) return true
+  return list.some((d) => d.me && d.id === roles.admin)
+}
+
+/** Это устройство — админ группы. */
+export function isAdmin(roles: Roles, d: GroupDevice): boolean {
+  return !!roles?.supported && roles.admin === d.id
+}
+
+/** Пояснение под списком: кто админ и что это значит для этого устройства. */
+export function rolesText(roles: Roles, list: GroupDevice[]): string {
+  if (!roles || !roles.supported) return ''
+  if (roles.admin === null) {
+    return t('У группы пока нет админа, поэтому ключ группы может сменить любое устройство. Админом станет первое устройство, которое подключится с кодом сервера администратора.')
+  }
+  const admin = list.find((d) => d.id === roles.admin)
+  if (admin?.me) {
+    return t('Это устройство — админ группы: только оно удаляет устройства и меняет ключ группы. Роль можно передать другому устройству.')
+  }
+  const name = admin ? deviceTitle(admin) : roles.admin.slice(0, 10)
+  return t('Удалять устройства и менять ключ группы может только админ группы — «{name}». Передать роль другому устройству может только он.', { name })
 }
 
 /**
@@ -110,4 +140,16 @@ export function confirmText(list: GroupDevice[], removeId: string | null, _fmt: 
   }
   out.push(t('История группы на сервере удалится, локальная история на устройствах останется. Код приглашения сменится, старый перестанет работать.'))
   return out
+}
+
+/**
+ * Показывать ли «Стать админом группы» администратору сервера: сервер знает
+ * роли, это устройство в списке и ещё не админ. Нужен, когда прежний админ
+ * потерян (сломан, продан): без админа ключ группы не сменить и устройства
+ * не удалить. Группа без админа получает его и так, при входе с ключом.
+ */
+export function canClaimAdmin(roles: Roles, list: GroupDevice[], serverAdmin: boolean): boolean {
+  if (!serverAdmin || !roles?.supported || !roles.admin) return false
+  const me = list.find((d) => d.me)
+  return !!me && !isAdmin(roles, me)
 }

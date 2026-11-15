@@ -13,12 +13,16 @@ use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{
     ALPN, BlobChunk, BlobFail, BlobReply, BlobRequest, ClientMsg, ServerMsg,
 };
-use clipwire_core::{BlobId, Content, DeviceId, GroupKey, Item, SealedItem, ServerInfo};
+use clipwire_core::{AdminKey, BlobId, Content, DeviceId, GroupKey, Item, SealedItem, ServerInfo};
 use clipwire_server::{Config, Guards};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
 
 const T: Duration = Duration::from_secs(20);
+
+/// Ключ администратора тестового сервера: тест кладёт его в каталог данных
+/// до запуска (`admin.key`), и сервер берёт его вместо случайного.
+const ADMIN: AdminKey = AdminKey([42; 32]);
 
 struct Client {
     _ep: Endpoint,
@@ -52,15 +56,10 @@ impl Client {
         })
     }
 
-    /// Войти с токеном сервера (группа создастся, если её нет) и дочитать
-    /// историю группы.
+    /// Войти с ключом администратора (группа создастся, если её нет) и
+    /// дочитать историю группы.
     async fn join(&mut self, key: &GroupKey) -> Result<Vec<(SealedItem, bool)>> {
-        self.join_msg(&ClientMsg::JoinWithToken {
-            group_id: key.group_id(),
-            join_secret: key.join_secret(),
-            token: "test-token".into(),
-        })
-        .await
+        self.join_msg(&join_as_admin(key)).await
     }
 
     /// Войти обычным `Join`, без токена: только в существующую группу.
@@ -143,6 +142,8 @@ async fn start_server_guarded(
         blob_stall: Duration::from_secs(10),
     };
     tune(&mut config);
+    std::fs::create_dir_all(&config.data_dir)?;
+    std::fs::write(config.data_dir.join("admin.key"), ADMIN.0)?;
     let server = clipwire_server::start_with(&config, &guards).await?;
     tokio::time::timeout(T, server.endpoint().online())
         .await
@@ -877,6 +878,14 @@ async fn join_error(c: &mut Client, msg: &ClientMsg) -> Result<String> {
     }
 }
 
+fn join_as_admin(key: &GroupKey) -> ClientMsg {
+    ClientMsg::JoinAsAdmin {
+        group_id: key.group_id(),
+        join_secret: key.join_secret(),
+        admin_key: ADMIN,
+    }
+}
+
 fn join_with_token(key: &GroupKey, token: &str) -> ClientMsg {
     ClientMsg::JoinWithToken {
         group_id: key.group_id(),
@@ -886,7 +895,7 @@ fn join_with_token(key: &GroupKey, token: &str) -> ClientMsg {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn new_group_needs_server_token() -> Result<()> {
+async fn new_group_needs_admin_key() -> Result<()> {
     let (server, relay) = start_server().await?;
     let info = server.info.clone();
     let key = GroupKey::generate()?;
@@ -905,11 +914,36 @@ async fn new_group_needs_server_token() -> Result<()> {
     let e = join_error(&mut c, &join_with_token(&key, "wrong-token")).await?;
     assert!(e.contains("код сервера"), "{e}");
 
-    // С верным токеном создаётся, дальше пускает и обычный Join.
+    // С верным токеном relay, но без ключа администратора — тоже нет: так
+    // входят старые клиенты и устройства с кодом приглашения.
+    let mut c = Client::connect(&info, &relay, "test-token").await?;
+    let e = join_error(&mut c, &join_with_token(&key, "test-token")).await?;
+    assert!(e.contains("кодом сервера администратора"), "{e}");
+
+    // С неверным ключом администратора — отказ.
+    let mut c = Client::connect(&info, &relay, "test-token").await?;
+    let mut bad = join_as_admin(&key);
+    if let ClientMsg::JoinAsAdmin { admin_key, .. } = &mut bad {
+        admin_key.0[0] ^= 1;
+    }
+    write_msg(&mut c.send, &bad).await?;
+    assert_eq!(
+        c.next().await?,
+        ServerMsg::AdminFailed(clipwire_core::admin::AdminFail::BadKey)
+    );
+
+    // С ключом администратора создаётся; дальше пускает и обычный Join, и
+    // вход с токеном relay, как у старых клиентов (/3–/8).
     let mut a = Client::connect(&info, &relay, "test-token").await?;
     assert!(a.join(&key).await?.is_empty());
     let mut b = Client::connect(&info, &relay, "test-token").await?;
     assert!(b.join_plain(&key).await?.is_empty());
+    let mut old = Client::connect(&info, &relay, "test-token").await?;
+    assert!(
+        old.join_msg(&join_with_token(&key, "test-token"))
+            .await?
+            .is_empty()
+    );
     let sent = a.push_text(&key, "привет").await?;
     match b.next().await? {
         ServerMsg::Deliver(s) => assert_eq!(key.open(&s)?, sent),
@@ -942,7 +976,7 @@ async fn max_groups_limits_new_groups() -> Result<()> {
     joined(&server.info, &relay, &keys[0]).await?;
     joined(&server.info, &relay, &keys[1]).await?;
     let mut c = Client::connect(&server.info, &relay, "test-token").await?;
-    let e = join_error(&mut c, &join_with_token(&keys[2], "test-token")).await?;
+    let e = join_error(&mut c, &join_as_admin(&keys[2])).await?;
     assert!(e.contains("предельное число групп"), "{e}");
     // В существующие группы входить можно.
     joined(&server.info, &relay, &keys[0]).await?;
@@ -1151,7 +1185,7 @@ async fn idle_groups_free_their_slots() -> Result<()> {
     let a = joined(&server.info, &relay, &old).await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
     let mut c = Client::connect(&server.info, &relay, "test-token").await?;
-    let e = join_error(&mut c, &join_with_token(&new, "test-token")).await?;
+    let e = join_error(&mut c, &join_as_admin(&new)).await?;
     assert!(e.contains("предельное число групп"), "{e}");
     // Отключилось — после срока группа без элементов и файлов удаляется.
     // Эндпоинт закрываем явно: так закрытие соединения точно уходит серверу.

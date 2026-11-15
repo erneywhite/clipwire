@@ -15,10 +15,12 @@ use clipwire_core::{BlobId, DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+mod admin;
 mod config;
 mod deletes;
 mod devices;
 mod pins;
+pub use admin::{Create, PENDING_KEEP};
 pub use devices::{RekeyLimits, RekeyOutcome, Rotation};
 use pins::KEPT_BY_PIN;
 pub use pins::{PinOutcome, PinQuota, PinWrite};
@@ -47,6 +49,9 @@ pub enum BlobBegin {
     TooManyReserves,
     /// Ключ группы сменён: файлы в неё больше не принимаются.
     Rotated,
+    /// Незавершённая группа смены ключа: файлы в неё не принимаются, пока
+    /// не пришёл `Rekey`.
+    Pending,
 }
 
 /// Пределы входа: сколько групп на сервере и устройств в группе.
@@ -64,7 +69,8 @@ pub enum JoinOutcome {
     Joined,
     /// Группа есть, но секрет другой.
     Denied,
-    /// Группы нет, а создавать её этому входу нельзя (вход без токена сервера).
+    /// Группы нет, а создавать её этому входу нельзя: нет ключа
+    /// администратора сервера и это не новая группа для смены ключа.
     NoGroup,
     /// Группы нет, и на сервере уже предельное число групп.
     TooManyGroups,
@@ -77,13 +83,27 @@ pub enum JoinOutcome {
 }
 
 /// Условие «группа `g` заброшена» для [`Store::idle_groups`] и
-/// [`Store::delete_idle_group`]: `?1` — время, с которого никто не входил.
+/// [`Store::bury_idle_group`]: `?1` — время, с которого никто не входил.
 const IDLE_GROUP: &str = "NOT EXISTS (SELECT 1 FROM devices AS d
                              WHERE d.group_id = g.group_id AND d.last_seen_ms >= ?1)
      AND NOT EXISTS (SELECT 1 FROM items AS i WHERE i.group_id = g.group_id)
      AND NOT EXISTS (SELECT 1 FROM blobs AS b WHERE b.group_id = g.group_id)
      AND NOT EXISTS (SELECT 1 FROM pins AS p WHERE p.group_id = g.group_id AND p.pinned = 1)
-     AND g.rotated_ms IS NULL";
+     AND g.rotated_ms IS NULL AND g.idle_ms IS NULL AND g.pending_by IS NULL";
+
+/// Таблицы с данными группы, которые чистятся, когда от группы остаётся
+/// только строка (надгробие, заброшенная группа).
+const GROUP_TABLES: [&str; 9] = [
+    "rekeys",
+    "cards",
+    "devices",
+    "items",
+    "blobs",
+    "group_config",
+    "deletes",
+    "pins",
+    "pin_blobs",
+];
 
 /// У какой группы удалить самый старый элемент, когда история всех групп
 /// вместе не влезает в общий предел. `usage` — объём истории и число
@@ -184,6 +204,7 @@ impl Store {
             conn.execute_batch("ALTER TABLE blobs ADD COLUMN origin BLOB;")?;
         }
         devices::migrate(&conn)?;
+        admin::migrate(&conn)?;
         config::migrate(&conn)?;
         deletes::migrate(&conn)?;
         pins::migrate(&conn)?;
@@ -198,8 +219,8 @@ impl Store {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Вход устройства в группу. Новая группа создаётся, только если
-    /// `may_create` (вход с токеном сервера) и групп меньше `max_groups`.
+    /// Вход устройства в группу. Новая группа создаётся, только если это
+    /// разрешает `create` ([`Create`]) и групп меньше `max_groups`.
     /// Проверка числа групп и вставка идут в одной транзакции, поэтому два
     /// одновременных входа предел не проскочат.
     ///
@@ -213,7 +234,7 @@ impl Store {
         secret: &JoinSecret,
         device: &DeviceId,
         now_ms: i64,
-        may_create: bool,
+        create: Create,
         limits: JoinLimits,
     ) -> Result<JoinOutcome> {
         let JoinLimits {
@@ -223,32 +244,57 @@ impl Store {
         let digest = secret.digest();
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let existing: Option<Vec<u8>> = tx
+        let existing: Option<(Vec<u8>, bool)> = tx
             .query_row(
-                "SELECT join_digest FROM groups WHERE group_id = ?1",
+                "SELECT join_digest, idle_ms IS NOT NULL FROM groups WHERE group_id = ?1",
                 params![&group.0[..]],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
         let outcome = match existing {
-            None if !may_create => return Ok(JoinOutcome::NoGroup),
+            None if create == Create::No => return Ok(JoinOutcome::NoGroup),
+            None if create == Create::ForRekey && !admin::may_rekey_any(&tx, device)? => {
+                return Ok(JoinOutcome::NoGroup);
+            }
             None => {
-                // Надгробия сменённых групп (`store/devices.rs`) места не занимают.
-                let groups: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM groups WHERE tombstone_ms IS NULL",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if groups as u64 >= max_groups as u64 {
+                if create == Create::ForRekey {
+                    // Одна незавершённая новая группа на устройство: прошлая
+                    // (смена ключа не дошла до `Rekey`) больше не нужна и
+                    // удаляется целиком.
+                    admin::drop_pending_of(&tx, device)?;
+                    if admin::pending_count(&tx, device)? > 0 {
+                        return Ok(JoinOutcome::TooManyGroups);
+                    }
+                }
+                // Надгробия и группы со сменённым ключом (`store/devices.rs`),
+                // заброшенные группы места не занимают.
+                if admin::counted_groups(&tx)? >= max_groups as u64 {
                     return Ok(JoinOutcome::TooManyGroups);
                 }
                 tx.execute(
                     "INSERT INTO groups (group_id, join_digest, created_ms) VALUES (?1, ?2, ?3)",
                     params![&group.0[..], &digest[..], now_ms],
                 )?;
+                admin::mark_created(&tx, group, device, create, now_ms)?;
                 JoinOutcome::Created
             }
-            Some(d) if constant_time_eq(&d, &digest) => {
+            // Заброшенная группа (`bury_idle_group`): верный секрет создаёт её
+            // заново, как до 0.5.0 создавал первый вход с токеном. Ключ
+            // администратора не нужен: группу когда-то создали законно, а
+            // секрет знают только её устройства. Админа у неё нет, как у
+            // группы до 0.5.0.
+            Some((d, true)) if constant_time_eq(&d, &digest) => {
+                if admin::counted_groups(&tx)? >= max_groups as u64 {
+                    return Ok(JoinOutcome::TooManyGroups);
+                }
+                tx.execute(
+                    "UPDATE groups SET idle_ms = NULL, admin_device = NULL, created_ms = ?2
+                     WHERE group_id = ?1",
+                    params![&group.0[..], now_ms],
+                )?;
+                JoinOutcome::Created
+            }
+            Some((d, _)) if constant_time_eq(&d, &digest) => {
                 // Секрет проверен — теперь можно сказать, что ключ сменён.
                 if let Some(r) = devices::rotation_in(&tx, group, device)? {
                     return Ok(JoinOutcome::Rotated(r));
@@ -291,7 +337,29 @@ impl Store {
             max_groups,
             max_devices: usize::MAX,
         };
-        self.join_limited(group, secret, device, now_ms, may_create, limits)
+        let create = if may_create {
+            Create::Admin
+        } else {
+            Create::No
+        };
+        self.join_limited(group, secret, device, now_ms, create, limits)
+    }
+
+    /// Вход в новую группу для смены ключа (`Create::ForRekey`) без
+    /// пределов: для тестов хранилища.
+    #[cfg(test)]
+    pub fn join_rekey(
+        &self,
+        group: &GroupId,
+        secret: &JoinSecret,
+        device: &DeviceId,
+        now_ms: i64,
+    ) -> Result<JoinOutcome> {
+        let limits = JoinLimits {
+            max_groups: usize::MAX,
+            max_devices: usize::MAX,
+        };
+        self.join_limited(group, secret, device, now_ms, Create::ForRekey, limits)
     }
 
     /// Сохраняет элемент и обрезает историю группы до `keep` последних.
@@ -485,6 +553,9 @@ impl Store {
         if is_rotated(&tx, group)? {
             return Ok(BlobBegin::Rotated);
         }
+        if admin::is_pending(&tx, group)? {
+            return Ok(BlobBegin::Pending);
+        }
         // Третье — истёк ли файл: файлы живых закрепов не истекают.
         let existing: Option<(i64, i64, bool)> = tx
             .query_row(
@@ -677,8 +748,8 @@ impl Store {
     }
 
     /// Заброшенные группы: ни одно устройство не входило с `seen_before_ms`,
-    /// и нет ни элементов, ни файлов. Кандидаты на удаление
-    /// ([`Store::delete_idle_group`]).
+    /// и нет ни элементов, ни файлов. Кандидаты на чистку
+    /// ([`Store::bury_idle_group`]).
     pub fn idle_groups(&self, seen_before_ms: i64) -> Result<Vec<GroupId>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
@@ -694,14 +765,43 @@ impl Store {
         Ok(out)
     }
 
-    /// Удалить группу (и её устройства, каскадом), если она всё ещё
-    /// заброшена: между поиском и удалением в неё могли войти. `true`, если
-    /// удалена.
-    pub fn delete_idle_group(&self, group: &GroupId, seen_before_ms: i64) -> Result<bool> {
-        Ok(self.conn().execute(
-            &format!("DELETE FROM groups AS g WHERE g.group_id = ?2 AND {IDLE_GROUP}"),
-            params![seen_before_ms, &group.0[..]],
-        )? > 0)
+    /// Очистить заброшенную группу, если она всё ещё заброшена: между
+    /// поиском и чисткой в неё могли войти. Устройства, карточки, настройки и
+    /// снятые закрепы удаляются, а строка с `join_digest` остаётся с
+    /// пометкой `idle_ms = now_ms`: верный секрет создаст группу заново без
+    /// ключа администратора (`join_limited`), в пределе групп она не
+    /// считается. `true`, если очищена.
+    pub fn bury_idle_group(
+        &self,
+        group: &GroupId,
+        seen_before_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let idle = tx
+            .query_row(
+                &format!("SELECT 1 FROM groups AS g WHERE g.group_id = ?2 AND {IDLE_GROUP}"),
+                params![seen_before_ms, &group.0[..]],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !idle {
+            return Ok(false);
+        }
+        for table in GROUP_TABLES {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE group_id = ?1"),
+                params![&group.0[..]],
+            )?;
+        }
+        tx.execute(
+            "UPDATE groups SET idle_ms = ?2, admin_device = NULL WHERE group_id = ?1",
+            params![&group.0[..], now_ms],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Зарегистрировано ли устройство хоть в одной группе.
@@ -1104,7 +1204,7 @@ mod tests {
                 &k.join_secret(),
                 &DeviceId([n; 32]),
                 0,
-                true,
+                Create::Admin,
                 JoinLimits {
                     max_groups: 10,
                     max_devices: 2,
@@ -1342,9 +1442,17 @@ mod tests {
         assert_eq!(s.idle_groups(500).unwrap(), vec![key(1).group_id()]);
         // Пока искали, в группу вошли: её не трогаем.
         join(1, 3, 600);
-        assert!(!s.delete_idle_group(&key(1).group_id(), 500).unwrap());
-        assert!(s.delete_idle_group(&key(1).group_id(), 700).unwrap());
-        // Устройства ушли вместе с группой.
+        assert!(!s.bury_idle_group(&key(1).group_id(), 500, 650).unwrap());
+        assert!(s.bury_idle_group(&key(1).group_id(), 700, 750).unwrap());
+        // Повторно не находится и не трогается.
+        assert!(
+            s.idle_groups(i64::MAX)
+                .unwrap()
+                .iter()
+                .all(|g| *g != key(1).group_id())
+        );
+        assert!(!s.bury_idle_group(&key(1).group_id(), 700, 760).unwrap());
+        // Устройства ушли вместе с данными группы.
         assert!(!s.is_known_device(&DeviceId([3; 32])).unwrap());
         // Место освободилось: предел групп считается по оставшимся.
         assert_eq!(
@@ -1359,5 +1467,62 @@ mod tests {
             .unwrap(),
             JoinOutcome::Created
         );
+    }
+
+    /// Ревью безопасности, находка 5а: заброшенная группа раньше удалялась и
+    /// пересоздавалась первым входом с токеном. Теперь создать группу можно
+    /// только с ключом администратора, поэтому от заброшенной остаётся
+    /// строка с секретом, и верный секрет создаёт её заново без ключа.
+    #[test]
+    fn idle_group_is_recreated_by_its_secret() {
+        let s = Store::in_memory().unwrap();
+        let (k, other) = (GroupKey([1; 32]), GroupKey([2; 32]));
+        let g = k.group_id();
+        let (a, b) = (DeviceId([1; 32]), DeviceId([2; 32]));
+        let join = |dev: &DeviceId, secret: &JoinSecret, create: Create, max: usize| {
+            s.join_limited(
+                &g,
+                secret,
+                dev,
+                1000,
+                create,
+                JoinLimits {
+                    max_groups: max,
+                    max_devices: usize::MAX,
+                },
+            )
+            .unwrap()
+        };
+        s.join(&g, &k.join_secret(), &a, 100, true, usize::MAX)
+            .unwrap();
+        assert_eq!(s.group_admin(&g).unwrap(), Some(a));
+        assert!(s.bury_idle_group(&g, 500, 600).unwrap());
+        // В пределе групп не считается.
+        assert_eq!(
+            s.join(&other.group_id(), &other.join_secret(), &a, 700, true, 1)
+                .unwrap(),
+            JoinOutcome::Created
+        );
+        // Чужой секрет — отказ; верный, но сервер полон — отказ.
+        assert_eq!(
+            join(&b, &other.join_secret(), Create::No, 10),
+            JoinOutcome::Denied
+        );
+        assert_eq!(
+            join(&b, &k.join_secret(), Create::No, 1),
+            JoinOutcome::TooManyGroups
+        );
+        // Верный секрет, обычный вход без ключа администратора — группа снова
+        // есть, админа у неё нет (как у группы до 0.5.0).
+        assert_eq!(
+            join(&b, &k.join_secret(), Create::No, 10),
+            JoinOutcome::Created
+        );
+        assert_eq!(s.group_admin(&g).unwrap(), None);
+        assert_eq!(
+            join(&a, &k.join_secret(), Create::No, 10),
+            JoinOutcome::Joined
+        );
+        assert!(s.claim_group_admin(&g, &a).unwrap());
     }
 }

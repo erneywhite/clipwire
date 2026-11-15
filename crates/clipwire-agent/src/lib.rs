@@ -2,6 +2,7 @@
 //! Используется приложением (Tauri) и консольным `clipwire-agent`.
 
 pub mod activity;
+pub mod admin;
 pub mod blobs;
 pub mod cache;
 pub mod clipboard;

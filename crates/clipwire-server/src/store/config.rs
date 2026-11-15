@@ -89,7 +89,8 @@ mod tests {
         let (old, new) = (GroupKey([1; 32]), GroupKey([2; 32]));
         let (g, g2) = (old.group_id(), new.group_id());
         join(&s, &old);
-        join(&s, &new);
+        s.join_rekey(&g2, &new.join_secret(), &DeviceId([1; 32]), 10)
+            .unwrap();
         s.set_group_config(&g, b"cfg", 1).unwrap();
         s.set_group_config(&g2, b"cfg2", 1).unwrap();
         let limits = RekeyLimits { max_envelope: 512 };

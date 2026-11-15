@@ -1,6 +1,7 @@
 //! Приложение Clipwire: трей, окно вставки и окно настроек поверх движка
 //! синхронизации из `clipwire-agent`.
 
+mod admin;
 mod cache;
 mod commands;
 mod devices;
@@ -45,6 +46,10 @@ pub struct AppState {
     pub excluded: std::sync::atomic::AtomicBool,
     /// События группы для окна настроек, пока оно их не забрало.
     pub group_notices: Mutex<devices::GroupNotices>,
+    /// Сервер не принял ключ администратора (его сменили), и сервис его
+    /// забыл: «Синхронизация» просит ввести новый код сервера администратора.
+    /// Снимается, когда ключ введён заново или устройство вышло из группы.
+    pub admin_stale: std::sync::atomic::AtomicBool,
 }
 
 /// Статус для интерфейса.
@@ -214,6 +219,7 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
                 let _ = handle.emit("clipwire://devices-changed", ());
             }
             UiEvent::ServerOutdated(v) => updates::server_outdated(&handle, v.as_deref()),
+            UiEvent::AdminKeyStale => admin::on_admin_key_stale(&handle),
             // Настройки хранилища группы (без секретов) и предупреждение,
             // что файл ушёл через сервер: для карточки «Хранилище файлов».
             UiEvent::GroupConfig(view) => {
@@ -285,6 +291,7 @@ fn load_state() -> anyhow::Result<AppState> {
         service_attempted: Default::default(),
         excluded: Default::default(),
         group_notices: Default::default(),
+        admin_stale: Default::default(),
         paths,
     })
 }
@@ -624,6 +631,18 @@ pub fn run() {
             commands::update_ready,
             commands::update_found,
             devices::group_notices_take,
+            admin::admin_state,
+            admin::admin_claim,
+            admin::admin_forget,
+            admin::server_settings_get,
+            admin::server_settings_set,
+            admin::server_summary,
+            admin::server_rotate_relay_token,
+            admin::server_rotate_admin_key,
+            admin::group_admin,
+            admin::device_make_admin,
+            admin::group_admin_claim,
+            admin::sync_update_invite,
         ])
         .setup(|app| {
             #[cfg(target_os = "linux")]

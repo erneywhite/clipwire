@@ -19,6 +19,10 @@ use clipwire_agent::sync::{Engine, Event, Outgoing, Status};
 use clipwire_core::blob::CHUNK;
 use clipwire_core::storage::{BlobPlace, S3Config, StorageConfig};
 use clipwire_core::{BlobId, Content, DeviceId, FileRef, GroupKey, Invite, Item, ServerInfo};
+
+/// Ключ администратора тестового сервера: лежит в его каталоге данных до
+/// запуска, с ним движок создаёт группу (`JoinAsAdmin`).
+const TEST_ADMIN: clipwire_core::AdminKey = clipwire_core::AdminKey([42; 32]);
 use clipwire_server::Config;
 use tokio::sync::mpsc;
 
@@ -46,6 +50,8 @@ async fn start_server(data_dir: &Path) -> Result<(clipwire_server::Running, Serv
         blob_total_quota: u64::MAX,
         blob_stall: Duration::from_secs(10),
     };
+    std::fs::create_dir_all(&config.data_dir)?;
+    std::fs::write(config.data_dir.join("admin.key"), TEST_ADMIN.0)?;
     let server = clipwire_server::start(&config).await?;
     tokio::time::timeout(T, server.endpoint().online()).await?;
     let port = server.relay_addr().context("нет relay")?.port();
@@ -86,6 +92,7 @@ impl Agent {
         let (local, lrx) = mpsc::channel(16);
         let (ctx, crx) = mpsc::channel::<Control>(4);
         let engine = Engine::new(state, "тест".into(), None, etx, Arc::new(|| {}))
+            .with_admin_key(Some(TEST_ADMIN))
             .with_blobs(blobs.clone())
             .with_control(crx);
         let storage = StorageController::new(ctx, blobs.storage().clone());

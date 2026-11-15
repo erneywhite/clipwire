@@ -3,7 +3,7 @@
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
 import type { GroupDevice } from './api'
 
-const { confirmText, deviceTitle, exposedAccessText, leftOut, rekeyedBy, seenLabel } = (await import('./devices' + '.ts')) as typeof import('./devices')
+const { canClaimAdmin, canManage, confirmText, deviceTitle, exposedAccessText, isAdmin, leftOut, rekeyedBy, rolesText, seenLabel } = (await import('./devices' + '.ts')) as typeof import('./devices')
 const fmt = (await import('./format' + '.ts')) as typeof import('./format')
 
 function check(cond: boolean, msg: string) {
@@ -36,8 +36,8 @@ const remove = confirmText(list, 'cccc', fmt)
 check(remove[0].includes('«Старый»'), 'первым — что будет с удаляемым')
 check(remove.some((s) => s.startsWith('1 устройство получит')), 'остальные с карточкой')
 check(remove.some((s) => s.includes('dddd')), 'предупреждение про устройство без карточки')
-check(remove.some((s) => s.startsWith('Токен сервера') && s.includes('CLIPWIRE_RELAY_TOKEN')), 'предупреждение про токен сервера')
-check(!confirmText([me, work, phone], null, fmt).some((s) => s.startsWith('Токен сервера')), 'смена ключа без удаления — без предупреждения про токен')
+check(remove.some((s) => s.startsWith('Токен доступа') && s.includes('«Сервер»')), 'предупреждение про токен доступа')
+check(!confirmText([me, work, phone], null, fmt).some((s) => s.startsWith('Токен доступа')), 'смена ключа без удаления — без предупреждения про токен')
 check(remove.at(-1)!.includes('Код приглашения сменится'), 'про код приглашения')
 
 // Внешнее хранилище: доступы к нему остаются у исключённого.
@@ -58,5 +58,22 @@ const rekey = confirmText([me, work, phone], null, fmt)
 check(!rekey.some((s) => s.includes('потеряет доступ')), 'без удаления никто не теряет доступ')
 check(rekey.some((s) => s.startsWith('2 устройства получат')), 'двое получат ключ')
 check(!rekey.some((s) => s.startsWith('Внимание')), 'без неизвестных нет предупреждения')
+
+// Админ группы.
+check(canManage(null, list) && canManage({ supported: false, admin: null }, list), 'не знаем или старый сервер — можно')
+check(canManage({ supported: true, admin: null }, list), 'группа без админа — можно')
+check(canManage({ supported: true, admin: 'aaaa' }, list), 'это устройство — админ')
+check(!canManage({ supported: true, admin: 'bbbb' }, list), 'админ — другое устройство')
+check(isAdmin({ supported: true, admin: 'bbbb' }, work) && !isAdmin({ supported: true, admin: 'bbbb' }, me), 'пометка админа')
+check(rolesText({ supported: true, admin: 'bbbb' }, list).includes('«Рабочий»'), 'кто админ — по имени')
+check(rolesText({ supported: true, admin: null }, list).includes('кодом сервера администратора'), 'группа без админа')
+check(rolesText({ supported: false, admin: null }, list) === '', 'старый сервер — без пояснения')
+
+// Администратор сервера забирает роль, только если админ — другое устройство.
+check(canClaimAdmin({ supported: true, admin: 'bbbb' }, list, true), 'админ другой — можно забрать')
+check(!canClaimAdmin({ supported: true, admin: 'bbbb' }, list, false), 'без ключа администратора — нет')
+check(!canClaimAdmin({ supported: true, admin: 'aaaa' }, list, true), 'уже админ — нет')
+check(!canClaimAdmin({ supported: true, admin: null }, list, true), 'без админа роль приходит сама')
+check(!canClaimAdmin({ supported: false, admin: null }, list, true) && !canClaimAdmin(null, list, true), 'старый сервер или нет связи — нет')
 
 console.log('devices: всё прошло')
