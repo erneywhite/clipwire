@@ -495,6 +495,8 @@ you delete the key, the server's address changes and every device has to be conn
 | `CLIPWIRE_MAX_DEVICES` | `64` | how many devices one group can hold; a new device over the limit is refused, known devices still join |
 | `CLIPWIRE_HISTORY_TOTAL_BYTES` | `1073741824` | total limit of item history per server (1 GiB); the excess is evicted from the largest group |
 | `CLIPWIRE_MAX_DEVICE_CONNS` | `4` | simultaneous connections from one device |
+| `CLIPWIRE_PIN_MAX` | `5000` | how many pinned entries one group can keep on the server; a new pin over the limit is refused |
+| `CLIPWIRE_PIN_BYTES` | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries and the records of removed pins. Files of pinned entries count toward `CLIPWIRE_BLOB_QUOTA` |
 
 ### What the server stores
 
@@ -510,6 +512,11 @@ you delete the key, the server's address changes and every device has to be conn
   in with the old key gets "removed" and does not create the group again. Tombstones do not count
   toward `CLIPWIRE_MAX_GROUPS`.
 - Encrypted deletion notes.
+- Encrypted pins of the group (`clipwire/8`) with their notes and the pinned entries
+  themselves, with no expiry: a pin lives until it is removed, and a removed pin stays as a
+  record of a few hundred bytes without content. Files of pinned entries are not deleted after
+  `CLIPWIRE_TTL_HOURS` while the pin exists. A group with live pins is not deleted as idle.
+  Pins are erased on a key change and together with the group.
 
 The server sees ciphertext only. When a device is removed, the server immediately erases the
 history and files of the old group, hands the remaining devices the new key (packed separately
