@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use clipwire_core::proto::ServerMsg;
 use clipwire_core::proto::io::write_msg;
+use clipwire_core::proto::{DeviceEntry, MAX_FRAME, ServerMsg};
 use clipwire_core::{BlobId, DeviceId, GroupId};
 use iroh::endpoint::SendStream;
 
@@ -59,9 +59,41 @@ pub fn publish_card(
 /// `ListDevices`: все устройства группы с карточками и кто сейчас на связи.
 pub fn list_devices(shared: &Shared, group: &GroupId) -> Result<ServerMsg> {
     let online = shared.hub.online_devices(group);
-    Ok(ServerMsg::Devices(
-        shared.store.list_devices(group, &online)?,
-    ))
+    let mut entries = shared.store.list_devices(group, &online)?;
+    fit_frame(&mut entries);
+    Ok(ServerMsg::Devices(entries))
+}
+
+/// Запас под служебные поля одной записи списка устройств (id, время, флаги
+/// и длины в сериализации) сверх карточки.
+const ENTRY_OVERHEAD: usize = 64;
+
+/// Урезать список устройств, чтобы ответ влез в кадр: иначе `write_msg`
+/// вернул бы ошибку и оборвал соединение. Предел устройств при входе
+/// (`CLIPWIRE_MAX_DEVICES`) такого не допускает, но группа с устройствами,
+/// набранными до него, могла перерасти кадр. Лишние отбрасываются с конца
+/// списка.
+/// shortcut: порядок по device_id, так что урезанными окажутся одни и те же
+/// устройства; переделать, если такие группы встретятся на практике.
+fn fit_frame(entries: &mut Vec<DeviceEntry>) {
+    let budget = MAX_FRAME - 1024;
+    let mut used = 0usize;
+    let mut keep = entries.len();
+    for (i, e) in entries.iter().enumerate() {
+        used = used.saturating_add(e.card.len() + ENTRY_OVERHEAD);
+        if used > budget {
+            keep = i;
+            break;
+        }
+    }
+    if keep < entries.len() {
+        tracing::warn!(
+            total = entries.len(),
+            kept = keep,
+            "список устройств не влез в кадр, отдан урезанным"
+        );
+        entries.truncate(keep);
+    }
 }
 
 /// `Rekey`: перевести группу в режим «ключ сменён». При успехе остальные
@@ -121,4 +153,36 @@ pub fn purge_rotated(shared: &Shared) -> Result<usize> {
     let now = now_ms();
     let before = now - shared.limits.rotated_keep.as_millis() as i64;
     shared.store.purge_rotated(before, now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clipwire_core::proto::encode_frame;
+
+    fn entry(n: u8, card: usize) -> DeviceEntry {
+        DeviceEntry {
+            device: DeviceId([n; 32]),
+            card: vec![0; card],
+            last_seen_ms: 0,
+            online: false,
+        }
+    }
+
+    #[test]
+    fn oversized_device_list_is_truncated_to_fit_frame() {
+        // 20 карточек по ~1 МиБ: целиком больше кадра в 16 МиБ.
+        let mut entries: Vec<_> = (0..20).map(|n| entry(n, 1024 * 1024)).collect();
+        assert!(encode_frame(&ServerMsg::Devices(entries.clone())).is_err());
+        fit_frame(&mut entries);
+        assert!(!entries.is_empty() && entries.len() < 20);
+        assert!(encode_frame(&ServerMsg::Devices(entries)).is_ok());
+    }
+
+    #[test]
+    fn normal_device_list_is_untouched() {
+        let mut entries: Vec<_> = (0..64).map(|n| entry(n, 4096)).collect();
+        fit_frame(&mut entries);
+        assert_eq!(entries.len(), 64);
+    }
 }

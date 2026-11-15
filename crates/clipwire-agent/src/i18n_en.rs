@@ -423,6 +423,14 @@ pub static EN: &[(&str, &str)] = &[
         "Settings were not saved: {e}",
     ),
     (
+        "сервер прислал слишком много истории",
+        "the server sent too much history",
+    ),
+    (
+        "Версия настроек группы на пределе, новее сохранить нельзя",
+        "The group settings version is at its limit, a newer one cannot be saved",
+    ),
+    (
         "Настройки слишком большие (длинный ключ SSH?)",
         "The settings are too large (a long SSH key?)",
     ),
@@ -598,6 +606,10 @@ pub static EN: &[(&str, &str)] = &[
     ),
     ("адрес «{endpoint}»: {e}", "address “{endpoint}”: {e}"),
     ("в адресе нет хоста", "the address has no host"),
+    (
+        "адрес link-local (169.254.x.x, fe80::) запрещён: там метаданные облака",
+        "link-local addresses (169.254.x.x, fe80::) are not allowed: cloud metadata lives there",
+    ),
     (
         "по HTTP можно только к localhost и адресам локальной сети, нужен HTTPS",
         "plain HTTP only works with localhost and local network addresses, HTTPS is required",

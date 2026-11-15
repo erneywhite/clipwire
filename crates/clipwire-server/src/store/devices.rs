@@ -304,7 +304,7 @@ pub(super) fn rotation_in(
     Ok(Some(envelope.map_or(Rotation::Excluded, Rotation::Rekeyed)))
 }
 
-fn is_member(conn: &Connection, group: &GroupId, device: &DeviceId) -> Result<bool> {
+pub(super) fn is_member(conn: &Connection, group: &GroupId, device: &DeviceId) -> Result<bool> {
     Ok(conn
         .query_row(
             "SELECT 1 FROM devices WHERE group_id = ?1 AND device_id = ?2",

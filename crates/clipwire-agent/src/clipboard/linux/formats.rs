@@ -133,7 +133,9 @@ pub fn read(targets: &[String], mut fetch: impl FnMut(&str) -> Option<Vec<u8>>) 
     if has(MARKER) {
         return None;
     }
-    if has(PASSWORD_HINT) && fetch(PASSWORD_HINT).is_some_and(|v| v.trim_ascii() == b"secret") {
+    // Тип объявлен, а значение не прочиталось (владелец не ответил) — тоже
+    // считаем приватным: лучше пропустить копию, чем разослать пароль.
+    if has(PASSWORD_HINT) && fetch(PASSWORD_HINT).is_none_or(|v| v.trim_ascii() == b"secret") {
         tracing::debug!("буфер помечен как пароль, не берём");
         return None;
     }
@@ -186,8 +188,8 @@ pub fn read(targets: &[String], mut fetch: impl FnMut(&str) -> Option<Vec<u8>>) 
 }
 
 fn decode_image(mime: &str, data: &[u8]) -> Option<Content> {
-    let img = match image::load_from_memory(data) {
-        Ok(i) => i.to_rgba8(),
+    let img = match crate::image::decode_bytes(data) {
+        Ok(i) => i,
         Err(e) => {
             tracing::info!("картинку {mime} из буфера не разобрали: {e}");
             return None;
@@ -268,6 +270,23 @@ mod tests {
         read(&t, |m| {
             data.iter().find(|(k, _)| *k == m).map(|(_, d)| d.to_vec())
         })
+    }
+
+    #[test]
+    fn password_hint_unreadable_counts_as_private() {
+        // Тип объявлен, владелец не ответил — не берём.
+        let t = names(&["UTF8_STRING", PASSWORD_HINT]);
+        let r = read(&t, |m| (m == "UTF8_STRING").then(|| b"pw".to_vec()));
+        assert_eq!(r, None);
+        // Подсказка есть, но не «secret» — обычный текст.
+        let r = read(&t, |m| {
+            Some(if m == PASSWORD_HINT {
+                b"".to_vec()
+            } else {
+                b"ok".to_vec()
+            })
+        });
+        assert_eq!(r, Some(Content::Text("ok".into())));
     }
 
     #[test]

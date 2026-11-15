@@ -31,6 +31,18 @@ use crate::storage::{ObjectStore, StoreError, open_store};
 
 /// Файл настроек группы в каталоге состояния.
 pub const CONFIG_FILE: &str = "group_config.bin";
+/// Насколько версия настроек (время в мс) может опережать часы устройства:
+/// запас на расхождение часов. Версия дальше — не настройки, а попытка
+/// закрепить их навсегда (`u64::MAX`): никакие следующие уже не были бы новее.
+pub const MAX_VERSION_AHEAD_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Годится ли версия, увиденная извне (в настройках с сервера или в элементе
+/// соседа): не дальше [`MAX_VERSION_AHEAD_MS`] от часов устройства.
+fn version_plausible(v: u64) -> bool {
+    let now = crate::history::now_ms().max(0) as u64;
+    v <= now.saturating_add(MAX_VERSION_AHEAD_MS)
+}
+
 /// Отметка последней чистки внешнего хранилища по сроку (мс Unix).
 pub const CLEANED_FILE: &str = "storage_cleaned";
 /// Не чаще этого чистить внешнее хранилище.
@@ -55,7 +67,7 @@ pub fn load_local(dir: &Path, key: &GroupKey) -> Option<GroupConfig> {
 /// Сохранить настройки: зашифрованы ключом группы и ещё раз защищены, как
 /// ключ группы на диске.
 pub fn save_local(dir: &Path, key: &GroupKey, cfg: &GroupConfig) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
+    crate::state::ensure_private_dir(dir)?;
     let sealed = key
         .seal_config(cfg)
         .context("настройки группы не зашифровались")?;
@@ -296,6 +308,13 @@ impl GroupStorage {
     /// больше своей, свои настройки устарели: попросить их у сервера заново.
     /// `true`, если устарели.
     pub fn note_version(&self, v: u64) -> bool {
+        if !version_plausible(v) {
+            tracing::warn!(
+                v,
+                "версия настроек у соседа из далёкого будущего, игнорирую"
+            );
+            return false;
+        }
         let stale = {
             let mut c = self.lock();
             if v > c.cfg.version {
@@ -341,6 +360,13 @@ impl GroupStorage {
     /// Применить настройки, если они новее текущих: сохранить на диск,
     /// открыть хранилище, сообщить интерфейсу. `true`, если применены.
     pub fn apply(&self, cfg: GroupConfig) -> bool {
+        if !version_plausible(cfg.version) {
+            tracing::warn!(
+                version = cfg.version,
+                "версия настроек группы из далёкого будущего, не применяю"
+            );
+            return false;
+        }
         let view = {
             let mut c = self.lock();
             if cfg.version <= c.cfg.version {
@@ -405,7 +431,11 @@ impl GroupStorage {
         if leaves_out && !matches!(cfg.storage, StorageConfig::Server) {
             cfg.access_exposed = true;
             let now = crate::history::now_ms().max(0) as u64;
-            cfg.version = now.max(cfg.version + 1);
+            let Some(next) = cfg.version.checked_add(1) else {
+                tracing::warn!("версия настроек группы на пределе, смена ключа без них");
+                return None;
+            };
+            cfg.version = now.max(next);
         }
         key.seal_config(&cfg).ok()
     }
@@ -477,20 +507,21 @@ fn access_rotated(old: &StorageConfig, new: &StorageConfig) -> bool {
 /// пометка [`GroupConfig::access_exposed`] снимается, только если доступы
 /// правда сменили ([`access_rotated`]); сохранение с прежним секретом
 /// (поменяли срок, нажали «Сохранить» с пустыми полями секрета) её
-/// оставляет.
+/// оставляет. `None`, если версия текущих настроек уже на пределе `u64` и
+/// новее неё не бывает.
 fn next_config(
     cur: &GroupConfig,
     storage: StorageConfig,
     file_ttl_hours: u32,
     now: u64,
-) -> GroupConfig {
+) -> Option<GroupConfig> {
     let access_exposed = cur.access_exposed && !access_rotated(&cur.storage, &storage);
-    GroupConfig {
-        version: now.max(cur.version + 1),
+    Some(GroupConfig {
+        version: now.max(cur.version.checked_add(1)?),
         storage,
         file_ttl_hours,
         access_exposed,
-    }
+    })
 }
 
 /// Как интерфейс работает с настройками хранилища группы.
@@ -534,7 +565,10 @@ impl StorageController {
             );
         }
         let now = crate::history::now_ms().max(0) as u64;
-        let cfg = next_config(&self.storage.config(), storage, file_ttl_hours, now);
+        let cfg =
+            next_config(&self.storage.config(), storage, file_ttl_hours, now).ok_or_else(|| {
+                tr("Версия настроек группы на пределе, новее сохранить нельзя").to_string()
+            })?;
         let sealed = self
             .storage
             .key
@@ -715,20 +749,41 @@ mod tests {
             StorageConfig::S3(c)
         };
         // Тот же секрет: поменяли срок или папку — пометка остаётся.
-        let same = next_config(&cur, cur.storage.clone(), 48, 5);
+        let same = next_config(&cur, cur.storage.clone(), 48, 5).unwrap();
         assert!(same.access_exposed && same.version == 11 && same.file_ttl_hours == 48);
-        assert!(next_config(&cur, with(&|c| c.prefix = "x".into()), 24, 0).access_exposed);
-        assert!(next_config(&cur, with(&|c| c.bucket = "b2".into()), 24, 0).access_exposed);
-        // Новый ключ или другое хранилище — снимается.
-        assert!(!next_config(&cur, with(&|c| c.secret_key = "новый".into()), 24, 0).access_exposed);
         assert!(
-            !next_config(&cur, with(&|c| c.endpoint = "https://other".into()), 24, 0)
+            next_config(&cur, with(&|c| c.prefix = "x".into()), 24, 0)
+                .unwrap()
                 .access_exposed
         );
-        assert!(!next_config(&cur, StorageConfig::Server, 24, 0).access_exposed);
+        assert!(
+            next_config(&cur, with(&|c| c.bucket = "b2".into()), 24, 0)
+                .unwrap()
+                .access_exposed
+        );
+        // Новый ключ или другое хранилище — снимается.
+        assert!(
+            !next_config(&cur, with(&|c| c.secret_key = "новый".into()), 24, 0)
+                .unwrap()
+                .access_exposed
+        );
+        assert!(
+            !next_config(&cur, with(&|c| c.endpoint = "https://other".into()), 24, 0)
+                .unwrap()
+                .access_exposed
+        );
+        assert!(
+            !next_config(&cur, StorageConfig::Server, 24, 0)
+                .unwrap()
+                .access_exposed
+        );
         // Без пометки она и не появляется.
         cur.access_exposed = false;
-        assert!(!next_config(&cur, cur.storage.clone(), 24, 0).access_exposed);
+        assert!(
+            !next_config(&cur, cur.storage.clone(), 24, 0)
+                .unwrap()
+                .access_exposed
+        );
 
         let sftp = |auth: SftpAuth, host: &str| {
             StorageConfig::Sftp(clipwire_core::storage::SftpConfig {
@@ -794,5 +849,46 @@ mod tests {
             "{json}"
         );
         assert!(json.contains("\"auth\":\"key\""));
+    }
+
+    #[test]
+    fn far_future_version_is_not_applied_and_does_not_pin_config() {
+        let d = dir("future");
+        let st = GroupStorage::load(GroupKey([7; 32]), &d);
+        assert!(st.apply(s3(5)));
+        // Версия u64::MAX закрепила бы настройки навсегда: не применяется.
+        assert!(!st.apply(s3(u64::MAX)));
+        let now = crate::history::now_ms() as u64;
+        assert!(!st.apply(s3(now + MAX_VERSION_AHEAD_MS + 60_000)));
+        assert_eq!(st.version(), 5);
+        // Версия в пределах запаса на часы применяется.
+        assert!(st.apply(s3(now + MAX_VERSION_AHEAD_MS / 2)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn far_future_neighbour_version_does_not_make_config_stale() {
+        let d = dir("future-note");
+        let st = GroupStorage::load(GroupKey([8; 32]), &d);
+        assert!(st.apply(s3(10)));
+        assert!(!st.note_version(u64::MAX));
+        assert!(
+            st.external().is_some(),
+            "настройки не должны стать устаревшими"
+        );
+        assert!(st.note_version(11));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn next_config_refuses_overflowing_version() {
+        let cur = s3(u64::MAX);
+        assert!(next_config(&cur, cur.storage.clone(), 24, 0).is_none());
+        assert_eq!(
+            next_config(&s3(u64::MAX - 1), StorageConfig::Server, 24, 0)
+                .unwrap()
+                .version,
+            u64::MAX
+        );
     }
 }

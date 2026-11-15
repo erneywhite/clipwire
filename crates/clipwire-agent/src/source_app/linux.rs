@@ -70,7 +70,19 @@ fn is_interpreter(name: &str) -> bool {
     let base = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     matches!(
         base,
-        "python" | "perl" | "ruby" | "node" | "nodejs" | "gjs" | "gjs-console" | "mono" | "java"
+        "python"
+            | "pypy"
+            | "perl"
+            | "ruby"
+            | "node"
+            | "nodejs"
+            | "electron"
+            | "gjs"
+            | "gjs-console"
+            | "mono"
+            | "mono-sgen"
+            | "dotnet"
+            | "java"
     )
 }
 
@@ -671,7 +683,7 @@ fn icon_png(name: &str) -> Option<Vec<u8>> {
     {
         render_svg(&data)?
     } else {
-        let img = image::load_from_memory(&data).ok()?.to_rgba8();
+        let img = crate::image::decode_bytes(&data).ok()?;
         if img.dimensions() == (ICON, ICON) {
             img.into_raw()
         } else {
@@ -806,6 +818,11 @@ mod tests {
         assert_eq!(snap_name("/snap/bin/firefox"), None);
         assert!(is_interpreter("python3.12"));
         assert!(is_interpreter("mono"));
+        assert!(is_interpreter("mono-sgen"));
+        assert!(is_interpreter("electron"));
+        assert!(is_interpreter("electron22"));
+        assert!(is_interpreter("pypy3"));
+        assert!(is_interpreter("dotnet"));
         assert!(!is_interpreter("gedit"));
         assert_eq!(
             script_arg(b"/usr/bin/python3\0-u\0/usr/bin/secrets\0--x\0"),

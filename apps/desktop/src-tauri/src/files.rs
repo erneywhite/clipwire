@@ -323,7 +323,8 @@ pub async fn files_download(app: AppHandle, id: String) -> Result<(), String> {
 
 /// Открыть папку из истории в файловом менеджере: свою на месте или скачанную
 /// в кэш. Путь проверяется по истории, как в предпросмотре, и это должна быть
-/// папка: открыть так файл значило бы запустить его.
+/// папка: открыть так файл значило бы запустить его. На macOS папка только
+/// показывается в Finder: бандл `.app` — тоже папка.
 #[tauri::command]
 pub fn folder_open(app: AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
@@ -333,9 +334,14 @@ pub fn folder_open(app: AppHandle, path: String) -> Result<(), String> {
     if !Path::new(&path).is_dir() {
         return Err(tr("Папки нет на месте: её переместили или удалили").into());
     }
-    app.opener()
-        .open_path(&path, None::<&str>)
-        .map_err(|e| trf("Папка не открылась: {e}", &[("e", &e)]))
+    // macOS: `open` на каталоге `Отчёт.app` запускает программу, поэтому там
+    // папка только показывается в Finder (выделяется в родительской), а не
+    // открывается. На Windows и Linux открыть каталог безопасно.
+    #[cfg(target_os = "macos")]
+    let res = app.opener().reveal_item_in_dir(&path);
+    #[cfg(not(target_os = "macos"))]
+    let res = app.opener().open_path(&path, None::<&str>);
+    res.map_err(|e| trf("Папка не открылась: {e}", &[("e", &e)]))
 }
 
 /// Текущие передачи файлов — начальное состояние окна.

@@ -248,7 +248,8 @@ even though the browser also puts a file on the clipboard.
 When the clipboard holds a link, Space shows a card with the page title, description and image
 taken from its og tags. Clipwire loads it itself instead of using a built-in browser, so the page
 is never opened or executed: it reads only the first 512 KB of HTML and one image up to 2 MB,
-with an 8 second timeout.
+with an 8 second timeout. The card always shows the domain of the link itself, not the name the
+page gives itself; if the link ends up on another domain, it shows "original → final".
 
 Links that look single-use (magic-link sign-in, password reset, email confirmation, signed file
 links) are not loaded at all, because opening such a link can burn it. Links to this computer or
@@ -294,7 +295,9 @@ transfer. On it, syncing stops and Sync offers **Leave group** and **Try again**
 history are not wiped automatically, because the server can say "you were removed" without a key
 change, and what was already on the device stays there. A new key is accepted only if it was
 issued by a device that this computer has already seen in the list; after the change, settings
-say which device changed it.
+say which device changed it. The removed device keeps the server token, so it can still create
+groups and take up file space. If the computer may have fallen into the wrong hands, change the
+token on the server (`CLIPWIRE_RELAY_TOKEN`) and hand out a new invitation code.
 
 **Changing the group key** does the same without removing anyone, which is useful if the
 invitation code ended up in the wrong place. The group's history on the server is erased, local
@@ -403,7 +406,9 @@ front of the relay) and, optionally, a UDP port for direct QUIC connections. Wit
 everything works through the relay, only slightly slower.
 
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
-and `:X.Y.Z` for releases.
+and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
+server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
+version number: `ghcr.io/erneywhite/clipwire-server:0.2.0`.
 
 **Through a Docker control panel or plain `docker compose`:**
 
@@ -452,6 +457,7 @@ you delete the key, the server's address changes and every device has to be conn
 | `CLIPWIRE_RESERVE_TTL_SECS` | `600` | after how long space reserved for a file is released if the upload never started |
 | `CLIPWIRE_MAX_RESERVES` | `512` | how many files one device may keep reserved without a single uploaded part |
 | `CLIPWIRE_MAX_GROUPS` | `100` | how many groups the server can hold (creating a group needs the server code; groups with no devices are deleted after 90 days) |
+| `CLIPWIRE_MAX_DEVICES` | `64` | how many devices one group can hold; a new device over the limit is refused, known devices still join |
 | `CLIPWIRE_HISTORY_TOTAL_BYTES` | `1073741824` | total limit of item history per server (1 GiB); the excess is evicted from the largest group |
 | `CLIPWIRE_MAX_DEVICE_CONNS` | `4` | simultaneous connections from one device |
 

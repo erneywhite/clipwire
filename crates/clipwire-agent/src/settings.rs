@@ -240,7 +240,7 @@ impl Settings {
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
-        std::fs::create_dir_all(dir)?;
+        crate::state::ensure_private_dir(dir)?;
         let tmp = file(dir).with_extension("tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)
             .with_context(|| format!("не записался {}", tmp.display()))?;

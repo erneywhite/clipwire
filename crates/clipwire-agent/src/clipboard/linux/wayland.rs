@@ -12,6 +12,7 @@
 
 use super::formats::{self, Offer as Data};
 use crate::i18n::tr;
+use crate::read_budget::{ReadBudget, TOTAL_TIMEOUT};
 use anyhow::{Context, Result};
 use clipwire_core::Content;
 use std::os::fd::{AsFd, OwnedFd};
@@ -343,13 +344,15 @@ fn receive(shared: &Shared, offer: &AnyOffer, mime: &str) -> Option<Vec<u8>> {
     drop(w);
     let mut out = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
-    let mut deadline = Instant::now() + READ_TIMEOUT;
+    // Общий срок на всё значение: сдвигать его с каждой частью нельзя, иначе
+    // медленный владелец держал бы поток буфера сколько угодно.
+    let budget = ReadBudget::new(TOTAL_TIMEOUT, READ_LIMIT);
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        let Some(deadline) = budget.next_deadline(READ_TIMEOUT) else {
             tracing::info!("программа не отдала буфер типа {mime} вовремя");
             return None;
-        }
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
         let ts = Timespec::try_from(left).ok()?;
         let mut fds = [PollFd::new(&r, PollFlags::IN)];
         match poll(&mut fds, Some(&ts)) {
@@ -361,8 +364,7 @@ fn receive(shared: &Shared, offer: &AnyOffer, mime: &str) -> Option<Vec<u8>> {
             Ok(0) => return Some(out),
             Ok(n) => {
                 out.extend_from_slice(&buf[..n]);
-                deadline = Instant::now() + READ_TIMEOUT;
-                if out.len() > READ_LIMIT {
+                if !budget.fits(out.len()) {
                     return None;
                 }
             }

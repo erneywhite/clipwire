@@ -63,7 +63,7 @@ pub fn play_copy() {
 }
 
 /// Сыграть звук копирования (Linux). WAV один раз кладётся в
-/// `$XDG_RUNTIME_DIR`; новый звук останавливает ещё играющий.
+/// `$XDG_RUNTIME_DIR` (или в каталог данных Clipwire); новый звук останавливает ещё играющий.
 #[cfg(target_os = "linux")]
 pub fn play_copy() {
     use std::process::{Child, Command, Stdio};
@@ -77,9 +77,21 @@ pub fn play_copy() {
 
     let Some(file) = FILE
         .get_or_init(|| {
-            let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            let dir: Option<std::path::PathBuf> = std::env::var_os("XDG_RUNTIME_DIR")
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir);
+                // Без него — каталог данных Clipwire, он личный; в общий /tmp
+                // с предсказуемым именем писать нельзя (подмена файла чужим
+                // пользователем или ссылкой).
+                .or_else(|| {
+                    clipwire_agent::state::Paths::resolve()
+                        .ok()
+                        .map(|p| p.dir)
+                        .filter(|d| std::fs::create_dir_all(d).is_ok())
+                });
+            let Some(dir) = dir else {
+                tracing::debug!("звук копирования: нет личного каталога");
+                return None;
+            };
             // Имя постоянное: файлы не копятся от запуска к запуску, а
             // содержимое у всех копий одинаковое.
             let path = dir.join("clipwire-copy.wav");

@@ -36,6 +36,8 @@ const remove = confirmText(list, 'cccc', fmt)
 check(remove[0].includes('«Старый»'), 'первым — что будет с удаляемым')
 check(remove.some((s) => s.startsWith('1 устройство получит')), 'остальные с карточкой')
 check(remove.some((s) => s.includes('dddd')), 'предупреждение про устройство без карточки')
+check(remove.some((s) => s.startsWith('Токен сервера') && s.includes('CLIPWIRE_RELAY_TOKEN')), 'предупреждение про токен сервера')
+check(!confirmText([me, work, phone], null, fmt).some((s) => s.startsWith('Токен сервера')), 'смена ключа без удаления — без предупреждения про токен')
 check(remove.at(-1)!.includes('Код приглашения сменится'), 'про код приглашения')
 
 // Внешнее хранилище: доступы к нему остаются у исключённого.

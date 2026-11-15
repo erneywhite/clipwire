@@ -412,6 +412,10 @@ fn unpack_into(archive: &Path, dir: &Path) -> Result<()> {
         .with_context(|| trf("не открылся {path}", &[("path", &archive.display())]))?;
     let mut ar = tar::Archive::new(io::BufReader::new(f));
     ar.set_preserve_permissions(false);
+    // Чужой архив не должен приносить исполняемые файлы: на macOS присланный
+    // «Отчёт.app» иначе запустился бы двойным щелчком. Снимаем биты исполнения
+    // у всего, что распаковывает tar (каталоги создаём сами).
+    ar.set_mask(0o111);
     ar.set_unpack_xattrs(false);
     ar.set_overwrite(true);
     let mut names = Namer::default();
@@ -634,6 +638,31 @@ mod tests {
             assert!(!case.join("inner").join("evil.txt").exists());
             assert!(!d.join("evil.txt").exists());
         }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unpack_strips_exec_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("exec");
+        let mut b = Builder::new(Vec::new());
+        let mut h = Header::new_gnu();
+        h.set_size(1);
+        h.set_mode(0o755);
+        h.set_entry_type(EntryType::Regular);
+        b.append_data(&mut h, "Report.app/run.sh", &b"x"[..])
+            .unwrap();
+        let ar = d.join("x.tar");
+        std::fs::write(&ar, b.into_inner().unwrap()).unwrap();
+        let out = d.join("out");
+        unpack_archive(&ar, &out).unwrap();
+        let mode = std::fs::metadata(out.join("Report.app/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0, "биты исполнения сняты, режим {mode:o}");
+        assert!(out.join("Report.app").is_dir());
         let _ = std::fs::remove_dir_all(d);
     }
 

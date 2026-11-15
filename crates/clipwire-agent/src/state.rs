@@ -78,8 +78,7 @@ impl Paths {
     }
 
     pub fn save(&self, state: &AgentState) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)
-            .with_context(|| format!("не создался каталог {}", self.dir.display()))?;
+        ensure_private_dir(&self.dir)?;
         let plain = postcard::to_stdvec(state)?;
         write_atomic(&self.state(), &crate::secret::protect(&plain)?)
     }
@@ -195,21 +194,72 @@ impl Paths {
     }
 
     pub fn save_cursor(&self, id: ItemId) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
+        ensure_private_dir(&self.dir)?;
         write_atomic(&self.cursor(), id.0.to_string().as_bytes())
     }
 }
 
-pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data).with_context(|| format!("не записался {}", tmp.display()))?;
+/// Создать каталог данных (и родителей), на unix с правами 0700: в нём лежат
+/// ключи, и читать их должен только владелец. Уже существующему каталогу
+/// права тоже приводятся к 0700.
+pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("не создался каталог {}", dir.display()))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("не выставились права на {}", dir.display()))?;
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("не записался {}", path.display()))?;
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("не создался каталог {}", dir.display()))?;
     Ok(())
+}
+
+/// Уникальное имя временного файла рядом с `path`:
+/// `<имя>.<pid>.<счётчик>.tmp`. Два одновременных вызова (и два процесса)
+/// не пишут в один временный файл.
+fn unique_tmp(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{n}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Записать файл целиком или не записывать вовсе: временный файл рядом
+/// (на unix сразу с правами 0600, без окна с правами по umask), `fsync`,
+/// переименование. При ошибке временный файл удаляется.
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = unique_tmp(path);
+    let result = (|| -> Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("не записался {}", tmp.display()))?;
+        f.write_all(data)
+            .with_context(|| format!("не записался {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("не записался {}", tmp.display()))?;
+        drop(f);
+        std::fs::rename(&tmp, path).with_context(|| format!("не записался {}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub fn random_key() -> Result<[u8; 32]> {
@@ -222,6 +272,40 @@ pub fn random_key() -> Result<[u8; 32]> {
 mod tests {
     use super::*;
     use clipwire_core::{GroupKey, ServerInfo};
+
+    #[test]
+    fn write_atomic_replaces_file_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join(format!("clipwire-atomic-{}", uuid::Uuid::now_v7()));
+        ensure_private_dir(&dir).unwrap();
+        let f = dir.join("data.bin");
+        write_atomic(&f, b"one").unwrap();
+        write_atomic(&f, b"two-longer").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"two-longer");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["data.bin"], "временные файлы не остаются");
+        // Ошибка (каталога нет) не оставляет следов и возвращается наружу.
+        assert!(write_atomic(&dir.join("no").join("x"), b"x").is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&f), 0o600);
+            assert_eq!(mode(&dir), 0o700);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_tmp_names_differ_and_stay_in_dir() {
+        let p = Path::new("some").join("state.bin");
+        let (a, b) = (unique_tmp(&p), unique_tmp(&p));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), p.parent());
+        assert!(a.to_string_lossy().ends_with(".tmp"));
+    }
 
     #[test]
     fn save_load_reset() {

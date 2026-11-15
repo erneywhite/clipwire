@@ -14,6 +14,7 @@ pub mod i18n_en;
 pub mod image;
 pub mod loopguard;
 pub mod p2p;
+pub mod read_budget;
 pub mod secret;
 pub mod service;
 pub mod settings;

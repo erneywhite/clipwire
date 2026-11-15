@@ -53,6 +53,27 @@ pub fn is_local_host(host: &str) -> bool {
     }
 }
 
+/// Адрес, куда ходить нельзя никогда, ни по HTTP, ни по HTTPS: link-local
+/// (`169.254.0.0/16`, `fe80::/10`), включая IPv4 внутри IPv6 (`::ffff:a.b.c.d`).
+/// Там облака отдают метаданные виртуальной машины с ключами доступа.
+// shortcut: проверяется только адрес, записанный в настройках; имя хоста,
+// которое DNS превращает в такой адрес, не ловится. Переделать вместе с
+// собственным резолвером для reqwest, если понадобится.
+// shortcut: частные сети и loopback разрешены (свой MinIO в локалке), и
+// настройки с чужого устройства группы на такие адреса человек не
+// подтверждает. Добавить подтверждение при применении настроек с сервера.
+pub fn is_forbidden_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    match h.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_link_local(),
+        Ok(IpAddr::V6(ip)) => {
+            (ip.segments()[0] & 0xffc0) == 0xfe80
+                || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+        Err(_) => false,
+    }
+}
+
 /// Подготовленный запрос: адрес и заголовки с подписью.
 #[derive(Debug)]
 pub(crate) struct Prepared {
@@ -72,6 +93,11 @@ impl S3Store {
             .host_str()
             .ok_or_else(|| StoreError::Config(tr("в адресе нет хоста").into()))?
             .to_string();
+        if is_forbidden_host(&host) {
+            return Err(StoreError::Config(
+                tr("адрес link-local (169.254.x.x, fe80::) запрещён: там метаданные облака").into(),
+            ));
+        }
         let insecure = match url.scheme() {
             "https" => false,
             "http" if is_local_host(&host) => true,
@@ -555,6 +581,38 @@ mod tests {
         }
         assert!(is_local_host("10.0.0.1") && is_local_host("172.16.0.1"));
         assert!(is_local_host("fd00::1") && !is_local_host("2001:db8::1"));
+    }
+
+    #[test]
+    fn link_local_endpoints_are_refused_for_http_and_https() {
+        for host in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "[fe80::1]",
+            "[febf::1]",
+            "[::ffff:169.254.169.254]",
+        ] {
+            for scheme in ["http", "https"] {
+                let c = cfg(&format!("{scheme}://{host}/"), true);
+                assert!(
+                    matches!(S3Store::new(c), Err(StoreError::Config(_))),
+                    "{scheme}://{host} должен быть запрещён"
+                );
+            }
+        }
+        // Шестнадцатеричная и десятичная записи IPv4 нормализуются разбором адреса.
+        assert!(S3Store::new(cfg("http://0xa9fea9fe/", true)).is_err());
+        assert!(S3Store::new(cfg("http://2852039166/", true)).is_err());
+        // Loopback и частные сети остаются: свой MinIO в локалке.
+        for ok in [
+            "http://127.0.0.1:9000",
+            "http://10.0.0.5:9000",
+            "http://192.168.1.2:9000",
+            "https://s3.example.com",
+        ] {
+            assert!(S3Store::new(cfg(ok, true)).is_ok(), "{ok}");
+        }
+        assert!(!is_forbidden_host("fd00::1") && !is_forbidden_host("169.255.0.1"));
     }
 
     #[test]

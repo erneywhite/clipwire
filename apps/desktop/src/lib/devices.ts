@@ -60,6 +60,13 @@ export function exposedAccessText(kind: StorageKind | null, removing = true, los
   return t('Внимание: {who} остались доступы к хранилищу файлов. {fix}', { who, fix })
 }
 
+/** Что остаётся у исключённого устройства на сервере и как это закрыть. */
+export function serverTokenText(): string {
+  return t(
+    'Токен сервера у исключённого устройства остаётся: с ним оно может создавать группы и занимать место под файлы. Если устройство могло попасть в чужие руки, поменяйте токен на сервере (переменная CLIPWIRE_RELAY_TOKEN) и раздайте новый код приглашения.',
+  )
+}
+
 /**
  * Объяснение перед подтверждением: что будет с удаляемым и с остальными.
  * `storage` — вид хранилища файлов группы (`null` — не знаем).
@@ -79,6 +86,9 @@ export function confirmText(list: GroupDevice[], removeId: string | null, _fmt: 
   // и у исключаемого, и у тех, кому новый ключ не передать.
   const exposed = exposedAccessText(storage, !!target, lost.length)
   if (exposed) out.push(exposed)
+  // Токен сервера из приглашения у исключённого остаётся: с ним можно создавать
+  // группы и занимать квоту файлов. Сменить его можно только на сервере.
+  if (target) out.push(serverTokenText())
   const others = list.filter((d) => !d.me && d.known && d.id !== removeId)
   if (others.length > 0) {
     out.push(

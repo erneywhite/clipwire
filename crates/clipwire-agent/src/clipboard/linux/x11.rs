@@ -11,6 +11,7 @@
 
 use super::formats::{self, Offer};
 use crate::i18n::tr;
+use crate::read_budget::{ReadBudget, TOTAL_TIMEOUT};
 use anyhow::{Context, Result};
 use clipwire_core::Content;
 use std::collections::HashMap;
@@ -547,9 +548,17 @@ impl Server {
         }
         // INCR: владелец кладёт части, мы читаем и удаляем каждую; пустая
         // часть — конец.
+        let budget = ReadBudget::new(TOTAL_TIMEOUT, READ_LIMIT);
+        // Смена буфера во время чтения помечает `changed`; если пометка уже
+        // стояла до чтения, новой не ждём.
+        let had_change = self.changed.is_some();
         let mut out = Vec::new();
         loop {
-            let ev = self.wait_for(Instant::now() + INCR_TIMEOUT, |e| {
+            let Some(deadline) = budget.next_deadline(INCR_TIMEOUT) else {
+                tracing::info!("передача буфера по частям слишком долгая, бросаем");
+                return Ok(None);
+            };
+            let ev = self.wait_for(deadline, |e| {
                 matches!(e, Event::PropertyNotify(p) if p.window == win && p.atom == prop && p.state == Property::NEW_VALUE)
             })?;
             if ev.is_none() {
@@ -564,8 +573,12 @@ impl Server {
                 return Ok(Some(out));
             }
             out.extend_from_slice(&part.value);
-            if out.len() > READ_LIMIT {
+            if !budget.fits(out.len()) {
                 tracing::info!("буфер больше {READ_LIMIT} байт, не читаем");
+                return Ok(None);
+            }
+            if self.changed.is_some() && !had_change {
+                tracing::info!("буфер сменился во время чтения по частям, бросаем");
                 return Ok(None);
             }
         }

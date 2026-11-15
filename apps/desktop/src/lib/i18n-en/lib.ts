@@ -31,6 +31,8 @@ const en: Record<string, string> = {
   'у исключённого устройства': 'the removed device',
   'Внимание: {who} остались доступы к хранилищу файлов. {fix}':
     'Warning: {who} still have access to the file storage. {fix}',
+  'Токен сервера у исключённого устройства остаётся: с ним оно может создавать группы и занимать место под файлы. Если устройство могло попасть в чужие руки, поменяйте токен на сервере (переменная CLIPWIRE_RELAY_TOKEN) и раздайте новый код приглашения.':
+    'The removed device keeps the server token: with it, it can create groups and take up file space. If the device may have fallen into the wrong hands, change the token on the server (the CLIPWIRE_RELAY_TOKEN variable) and hand out a new invite code.',
   '«{name}» потеряет доступ к группе: не получит новые элементы и файлы и не сможет вернуться по старому коду приглашения. То, что уже есть на нём, останется.':
     '“{name}” will lose access to the group: it will not receive new items and files and cannot rejoin with the old invite code. What is already on it will stay.',
   'Внимание: {count} без карточки ({ids}) новый ключ не получат. Их придётся подключить заново по новому коду.':
