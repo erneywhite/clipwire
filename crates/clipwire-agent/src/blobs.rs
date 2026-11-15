@@ -1394,8 +1394,15 @@ impl Blobs {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let f = lookup
-            .and_then(|l| l(blob))
+        // Поиск по истории обходит карточки: не на потоке асинхронных задач.
+        let found = match lookup {
+            Some(l) => tokio::task::spawn_blocking(move || l(blob))
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let f = found
             .filter(|f| f.p2p && f.blob == Some(blob))
             .ok_or(BlobFail::NotFound)?;
         if f.is_dir {

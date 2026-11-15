@@ -11,9 +11,13 @@
 //! только карточки, тело читается по требованию: предпросмотр, вставка,
 //! отправка истории в группу. В памяти живёт только маленький кэш значков
 //! программ-источников.
+//!
+//! Долгие обходы карточек (поиск редкого слова, проверки файлов) идут через
+//! [`HistoryReader`] — второе соединение с той же базой. В режиме WAL оно
+//! читает, не дожидаясь записи, и не держит замок `Mutex<History>`.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -23,7 +27,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use clipwire_core::item::ext;
 use clipwire_core::{BlobId, Content, DeviceId, Ext, ExtList, FileRef, ItemId, SourceApp};
 use hmac::{Hmac, Mac};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
@@ -42,6 +46,8 @@ pub const HEAD_CHARS: usize = 400;
 pub const SEARCH_BYTES: usize = 8 * 1024;
 /// Записей в одной транзакции перехода со старой базы.
 const MIGRATE_BATCH: usize = 500;
+/// Сколько поправок карточек копит один обход (карточка — до ~10 КБ).
+const MAX_FIXES: usize = 1000;
 /// Сколько расшифрованных значков держать в памяти.
 const ICON_CACHE: usize = 128;
 /// Метки, из которых выводятся ключи хэшей. Менять нельзя: ключевые хэши в
@@ -63,6 +69,17 @@ const CREATE_ENTRIES: &str = "CREATE TABLE entries (
     nonce       BLOB NOT NULL,
     data        BLOB NOT NULL
 )";
+
+/// Строка, у которой не читаются ни карточка, ни тело (чужой ключ, порча),
+/// помечается пустой карточкой `X''`. Списки, счётчики и проверки её не
+/// видят и тело не перечитывают; `fill_cards` её больше не трогает.
+const LIVE: &str = "card IS NOT X''";
+
+/// Копия старой базы на время перехода: `history.db` переименовывается в неё,
+/// новая раскладка собирается в `MIGRATE_TMP`. Удаляется, как только все
+/// карточки дописаны.
+const BACKUP_NAME: &str = "history.db.bak-v1";
+const MIGRATE_TMP: &str = "history.db.v2-tmp";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -280,7 +297,8 @@ pub struct Card {
     /// Файлы записи целиком, в исходном порядке.
     pub files: Vec<FileRef>,
     /// Сведения по меткам. Значок приложения-источника вынут в таблицу
-    /// `icons`, его ключ — `icon`.
+    /// `icons`, его ключ — `icon` (ключевой хэш байтов значка: у разных
+    /// программ с одинаковым именем exe значки не путаются).
     pub ext: Vec<Ext>,
     pub icon: Option<[u8; 32]>,
 }
@@ -460,7 +478,124 @@ pub struct History {
     /// Ключ для `hkey` (дубли) и ключ для имён значков, оба выведены из ключа истории.
     hkey_key: [u8; 32],
     icon_key: [u8; 32],
-    icons: Mutex<IconCache>,
+    /// Кэш значков общий с [`HistoryReader`].
+    icons: Arc<Mutex<IconCache>>,
+    /// Файл базы; `None` — база в памяти (тесты).
+    path: Option<PathBuf>,
+}
+
+/// Значок, вынутый из тела записи: ключ и PNG.
+type NewIcon = Option<([u8; 32], Vec<u8>)>;
+
+/// Поправка строки, найденная при чтении: дописать карточку из тела или
+/// пометить строку битой. Пишется после чтения, условно: только если тело
+/// с тех пор не переписали (`nonce` тела тот же).
+enum Fix {
+    Card {
+        id: ItemId,
+        nonce: Vec<u8>,
+        card: Box<Card>,
+        /// Значок, вынутый из тела, — в таблицу `icons`.
+        icon: NewIcon,
+    },
+    Broken {
+        id: Vec<u8>,
+        nonce: Vec<u8>,
+    },
+}
+
+/// Чтение истории вторым соединением с той же базой: долгие обходы карточек
+/// не держат замок `Mutex<History>` и не ждут записи (WAL). Клонируется
+/// дёшево; соединения переиспользуются.
+#[derive(Clone)]
+pub struct HistoryReader(Arc<ReaderShared>);
+
+struct ReaderShared {
+    path: PathBuf,
+    cipher: XChaCha20Poly1305,
+    hkey_key: [u8; 32],
+    icon_key: [u8; 32],
+    icons: Arc<Mutex<IconCache>>,
+    /// Свободные соединения.
+    pool: Mutex<Vec<Connection>>,
+}
+
+/// Соединений про запас у [`HistoryReader`]: обычно читают окно вставки и
+/// проверка файлов, редко больше двух сразу.
+const READER_POOL: usize = 2;
+
+/// История на соединении [`HistoryReader`]. Даёт только чтение (`&History`);
+/// соединение возвращается в запас при удалении.
+pub struct ReadLease {
+    h: Option<History>,
+    shared: Arc<ReaderShared>,
+}
+
+impl Deref for ReadLease {
+    type Target = History;
+    fn deref(&self) -> &History {
+        self.h.as_ref().expect("история на месте до удаления")
+    }
+}
+
+impl Drop for ReadLease {
+    fn drop(&mut self) {
+        if let Some(h) = self.h.take() {
+            let mut pool = self.shared.pool.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.len() < READER_POOL {
+                pool.push(h.conn);
+            }
+        }
+    }
+}
+
+impl HistoryReader {
+    /// Взять соединение для чтения.
+    pub fn lease(&self) -> Result<ReadLease> {
+        let s = &self.0;
+        let pooled = s.pool.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let conn = match pooled {
+            Some(c) => c,
+            None => {
+                // Чтение и мелкие поправки карточек (`Fix`); базу не создаёт.
+                let c = Connection::open_with_flags(
+                    &s.path,
+                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .context("не открылась history.db для чтения")?;
+                c.busy_timeout(std::time::Duration::from_millis(5000))?;
+                c.execute_batch("PRAGMA cache_size = -4000;")?;
+                c
+            }
+        };
+        Ok(ReadLease {
+            h: Some(History {
+                conn,
+                cipher: s.cipher.clone(),
+                hkey_key: s.hkey_key,
+                icon_key: s.icon_key,
+                icons: s.icons.clone(),
+                path: None,
+            }),
+            shared: s.clone(),
+        })
+    }
+}
+
+/// Прочитать историю: через [`HistoryReader`], если он есть, иначе (база в
+/// памяти или второе соединение не открылось) — под замком.
+pub fn read<R>(
+    history: &Mutex<History>,
+    reader: Option<&HistoryReader>,
+    f: impl FnOnce(&History) -> R,
+) -> R {
+    if let Some(r) = reader {
+        match r.lease() {
+            Ok(h) => return f(&h),
+            Err(err) => tracing::warn!("второе соединение с историей не открылось: {err:#}"),
+        }
+    }
+    f(&history.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 pub fn now_ms() -> i64 {
@@ -506,15 +641,29 @@ fn item_id(raw: &[u8]) -> Option<ItemId> {
         .map(|b| ItemId(Uuid::from_bytes(b)))
 }
 
+/// Колонки карточки (`card_nonce`, `card`) парой. Пустая карточка — пометка
+/// битой строки, у неё `nonce` нет.
+fn card_pair<'a>(nonce: Option<&'a [u8]>, card: Option<&'a [u8]>) -> Option<(&'a [u8], &'a [u8])> {
+    match (nonce, card) {
+        (_, Some(c)) if c.is_empty() => Some((&[], c)),
+        (Some(n), Some(c)) => Some((n, c)),
+        _ => None,
+    }
+}
+
 /// Для `LIMIT`: «без предела» у SQLite — отрицательное число.
 fn sql_limit(n: usize) -> i64 {
     i64::try_from(n).unwrap_or(-1)
 }
 
-/// AAD карточки: шифротекст привязан к строке, чужую карточку на её место не подложить.
-fn card_aad(id: &ItemId) -> Vec<u8> {
+/// AAD карточки: шифротекст привязан к строке и к её телу (`nonce` тела).
+/// Чужую карточку на место не подложить, а тело, переписанное без карточки
+/// (старой версией после отката), делает карточку нечитаемой — она
+/// пересобирается из тела.
+fn card_aad(id: &ItemId, body_nonce: &[u8]) -> Vec<u8> {
     let mut a = b"card\0".to_vec();
     a.extend_from_slice(id.as_bytes());
+    a.extend_from_slice(body_nonce);
     a
 }
 
@@ -539,6 +688,12 @@ impl History {
     pub fn open(dir: &Path) -> Result<Self> {
         let key = load_key(dir)?;
         let path = dir.join("history.db");
+        // Переход на новую раскладку. Не вышел — работаем со старой базой
+        // (`init` добавит колонки карточек), следующий запуск попробует снова.
+        recover_swap(&path);
+        if let Err(err) = migrate_file(&path) {
+            tracing::warn!("история не перешла на новую раскладку, работаю со старой: {err:#}");
+        }
         let conn = Connection::open(&path).context("не открылась history.db")?;
         Self::init(conn, key, Some(&path))
     }
@@ -565,75 +720,122 @@ impl History {
                 "{CREATE_ENTRIES}; PRAGMA user_version = {SCHEMA_VERSION};"
             ))?;
         } else if version < SCHEMA_VERSION {
-            migrate_layout(&conn, path)?;
+            // Переход не случился: колонки карточек в конце старой таблицы.
+            // Всё работает, только чтение карточки у большой записи проходит
+            // и по её телу.
+            add_card_columns(&conn)?;
         } else if version > SCHEMA_VERSION {
             tracing::warn!("история от более новой версии Clipwire (схема {version})");
         }
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "CREATE INDEX IF NOT EXISTS entries_seen ON entries (seen_ms DESC, id DESC);
+             CREATE INDEX IF NOT EXISTS entries_live ON entries (seen_ms DESC, id DESC)
+                 WHERE {LIVE};
              CREATE INDEX IF NOT EXISTS entries_hkey ON entries (hkey);
              CREATE INDEX IF NOT EXISTS entries_nocard ON entries (id) WHERE card IS NULL;
              CREATE TABLE IF NOT EXISTS icons (
                  key   BLOB PRIMARY KEY,
                  nonce BLOB NOT NULL,
                  data  BLOB NOT NULL
-             );",
-        )?;
+             );"
+        ))?;
         let h = Self {
             conn,
             cipher: XChaCha20Poly1305::new_from_slice(&key).expect("ключ 32 байта"),
             hkey_key: mac(&key, HKEY_LABEL),
             icon_key: mac(&key, ICON_LABEL),
-            icons: Mutex::new(IconCache::default()),
+            icons: Arc::new(Mutex::new(IconCache::default())),
+            path: path.map(Path::to_path_buf),
         };
-        h.fill_cards()?;
+        let complete = h.fill_cards();
+        // Копия старой базы нужна, пока переход не закончен. После неё в
+        // копии остались бы удалённые и вычищенные по сроку записи.
+        if complete && version >= SCHEMA_VERSION {
+            h.remove_backup();
+        }
         Ok(h)
     }
 
+    /// Второе соединение для долгих чтений (см. [`HistoryReader`]). У базы
+    /// в памяти его нет.
+    pub fn reader(&self) -> Option<HistoryReader> {
+        Some(HistoryReader(Arc::new(ReaderShared {
+            path: self.path.clone()?,
+            cipher: self.cipher.clone(),
+            hkey_key: self.hkey_key,
+            icon_key: self.icon_key,
+            icons: self.icons.clone(),
+            pool: Mutex::new(Vec::new()),
+        })))
+    }
+
+    /// Удалить копию старой базы, если она есть.
+    fn remove_backup(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let bak = path.with_file_name(BACKUP_NAME);
+        match std::fs::remove_file(&bak) {
+            Ok(()) => tracing::info!("копия истории до перехода удалена"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("копия истории до перехода не удалилась: {e:#}"),
+        }
+    }
+
     /// Карточки и ключевые хэши для строк без них: записи старой базы и
-    /// записанные старой версией. Пачками в транзакциях: упавший посреди
-    /// переход догонится при следующем открытии, а до тех пор читающий код
-    /// берёт данные из тела. Нерасшифровываемые строки пропускаются.
-    fn fill_cards(&self) -> Result<()> {
+    /// записанные старой версией. Пачками в транзакциях, по возможности:
+    /// сбой пачки пишется в журнал и обход останавливается, а читающий код до
+    /// следующего открытия берёт такие строки из тела. Строки, у которых не
+    /// читается и тело, помечаются битыми и больше не перебираются.
+    /// Возвращает, остались ли строки без карточек.
+    fn fill_cards(&self) -> bool {
         let mut after: Vec<u8> = Vec::new();
         let (mut filled, mut broken) = (0usize, 0usize);
-        loop {
-            let ids: Vec<Vec<u8>> = self
-                .conn
-                .prepare_cached(
-                    "SELECT id FROM entries WHERE card IS NULL AND id > ?1 ORDER BY id LIMIT ?2",
-                )?
-                .query_map(params![after, MIGRATE_BATCH as i64], |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
-            let Some(last) = ids.last() else {
-                break;
-            };
-            after = last.clone();
-            let tx = self.conn.unchecked_transaction()?;
-            for raw in &ids {
-                let Some(id) = item_id(raw) else {
-                    broken += 1;
-                    continue;
+        let res = (|| -> Result<()> {
+            loop {
+                let rows: Vec<(Vec<u8>, Vec<u8>)> = self
+                    .conn
+                    .prepare_cached(
+                        "SELECT id, nonce FROM entries WHERE card IS NULL AND id > ?1
+                         ORDER BY id LIMIT ?2",
+                    )?
+                    .query_map(params![after, MIGRATE_BATCH as i64], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?
+                    .collect::<Result<_, _>>()?;
+                let Some((last, _)) = rows.last() else {
+                    return Ok(());
                 };
-                // По одной: тела бывают в десятки мегабайт.
-                match self.body(id) {
-                    Ok(Some(e)) => {
-                        self.write_card(id, &e)?;
-                        filled += 1;
+                after = last.clone();
+                let tx = self.conn.unchecked_transaction()?;
+                for (raw, nonce) in rows {
+                    // По одной: тела бывают в десятки мегабайт.
+                    let fix = match item_id(&raw) {
+                        Some(id) => self.fix_from_body(id),
+                        None => Some(Fix::Broken { id: raw, nonce }),
+                    };
+                    match &fix {
+                        Some(Fix::Card { .. }) => filled += 1,
+                        Some(Fix::Broken { .. }) => broken += 1,
+                        None => {}
                     }
-                    Ok(None) => {}
-                    Err(err) => {
-                        broken += 1;
-                        tracing::warn!("запись истории не расшифровалась, пропускаю: {err:#}");
+                    if let Some(fix) = fix {
+                        self.apply_fix(fix)?;
                     }
                 }
+                tx.commit()?;
             }
-            tx.commit()?;
-        }
+        })();
         if filled > 0 || broken > 0 {
             tracing::info!(filled, broken, "карточки истории дописаны");
         }
-        Ok(())
+        match res {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!("карточки истории дописались не все, остальные — из тел: {err:#}");
+                false
+            }
+        }
     }
 
     // ---- шифрование ----
@@ -676,8 +878,8 @@ impl History {
         }
     }
 
-    fn open_card(&self, id: &ItemId, nonce: &[u8], data: &[u8]) -> Result<Card> {
-        let plain = self.open_blob(nonce, data, &card_aad(id))?;
+    fn open_card(&self, id: &ItemId, body_nonce: &[u8], nonce: &[u8], data: &[u8]) -> Result<Card> {
+        let plain = self.open_blob(nonce, data, &card_aad(id, body_nonce))?;
         match plain.split_first() {
             Some((&CARD_VERSION, rest)) => Ok(postcard::from_bytes(rest)?),
             _ => bail!("карточка неизвестной версии"),
@@ -690,13 +892,17 @@ impl History {
         mac(&self.hkey_key, hash)
     }
 
-    fn icon_id(&self, exe: &str) -> [u8; 32] {
-        mac(&self.icon_key, exe.as_bytes())
+    /// Ключ значка — ключевой хэш его байтов. Одинаковые значки разных
+    /// записей лежат один раз, разные значки программ с одним именем exe не
+    /// путаются.
+    fn icon_id(&self, png: &[u8]) -> [u8; 32] {
+        mac(&self.icon_key, png)
     }
 
     // ---- значки ----
 
-    /// Значок по ключу: из кэша или из таблицы `icons`.
+    /// Значок по ключу: из кэша или из таблицы `icons`. Промах не кэшируется:
+    /// значок могла только что записать другая транзакция.
     fn icon(&self, key: [u8; 32]) -> Option<Arc<[u8]>> {
         let mut cache = self.icons.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = cache.get(&key) {
@@ -713,52 +919,76 @@ impl History {
                 tracing::warn!("значок не прочитался: {e:#}");
                 None
             });
-        let icon = row
+        let icon: Option<Arc<[u8]>> = row
             .and_then(|(n, d)| self.open_blob(&n, &d, &key).ok())
             .map(Arc::from);
-        cache.put(key, icon.clone());
+        if icon.is_some() {
+            cache.put(key, icon.clone());
+        }
         icon
     }
 
     fn put_icon(&self, key: [u8; 32], png: &[u8]) -> Result<()> {
-        if self.icon(key).as_deref() == Some(png) {
+        if self.icon(key).is_some() {
             return Ok(());
         }
         let (nonce, data) = self.seal_blob(png, &key)?;
         self.conn
-            .prepare_cached(
-                "INSERT INTO icons (key, nonce, data) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (key) DO UPDATE SET nonce = excluded.nonce, data = excluded.data",
-            )?
+            .prepare_cached("INSERT OR IGNORE INTO icons (key, nonce, data) VALUES (?1, ?2, ?3)")?
             .execute(params![&key[..], &nonce[..], data])?;
-        self.icons
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .put(key, Some(Arc::from(png)));
         Ok(())
     }
 
     /// Вынуть значок приложения-источника из сведений записи: значок пишется
-    /// в `icons` один раз на программу. Возвращает сведения без значка, ключ
-    /// значка и сам значок, если он был в записи.
-    fn split_icon(&self, list: &[Ext]) -> (Vec<Ext>, Option<[u8; 32]>, Option<Vec<u8>>) {
+    /// в `icons` один раз. Возвращает сведения без значка и сам значок, если
+    /// он был в записи.
+    fn split_icon(&self, list: &[Ext]) -> (Vec<Ext>, Option<Vec<u8>>) {
         let mut out = list.to_vec();
         let Some(pos) = out.iter().position(|e| e.tag == ext::SOURCE_APP) else {
-            return (out, None, None);
+            return (out, None);
         };
         let Ok(mut app) = postcard::from_bytes::<SourceApp>(&out[pos].data) else {
-            return (out, None, None);
+            return (out, None);
         };
-        let key = self.icon_id(&app.exe);
         let icon = std::mem::take(&mut app.icon_png);
         if let Ok(data) = postcard::to_stdvec(&app) {
             out[pos].data = data;
         }
-        (out, Some(key), (!icon.is_empty()).then_some(icon))
+        (out, (!icon.is_empty()).then_some(icon))
     }
 
-    /// Вернуть в запись значок, вынутый при записи.
-    fn restore_icon(&self, e: &mut Entry) {
+    /// Карточка из тела. Ключ значка — по значку из тела, а если его там нет
+    /// (вынут при записи), то `prev_icon`: ключ из прежней карточки той же
+    /// записи. Возвращает и вынутый значок, его надо положить в `icons`.
+    fn card_from(&self, e: &Entry, prev_icon: Option<[u8; 32]>) -> (Card, NewIcon) {
+        let (list, png) = self.split_icon(&e.ext);
+        let has_app = list.iter().any(|x| x.tag == ext::SOURCE_APP);
+        let icon = match &png {
+            Some(p) => Some(self.icon_id(p)),
+            None if has_app => prev_icon,
+            None => None,
+        };
+        let card = Card::build(e, e.content.hash(), list, icon);
+        (card, icon.zip(png))
+    }
+
+    /// Ключ значка для тела без значка, когда прежней карточки нет. Базы
+    /// ветки разработки хранили значки по ключу от имени exe; если такой
+    /// значок есть, он подходит этой записи.
+    fn legacy_icon(&self, e: &Entry) -> Option<[u8; 32]> {
+        let app = e.source_app()?;
+        if !app.icon_png.is_empty() {
+            return None;
+        }
+        let key = mac(&self.icon_key, app.exe.as_bytes());
+        self.icon(key).map(|_| key)
+    }
+
+    /// Вернуть в запись значок, вынутый при записи (ключ — из карточки).
+    fn restore_icon(&self, e: &mut Entry, key: Option<[u8; 32]>) {
+        let Some(key) = key else {
+            return;
+        };
         let Some(pos) = e.ext.iter().position(|x| x.tag == ext::SOURCE_APP) else {
             return;
         };
@@ -768,7 +998,7 @@ impl History {
         if !app.icon_png.is_empty() {
             return;
         }
-        if let Some(icon) = self.icon(self.icon_id(&app.exe)) {
+        if let Some(icon) = self.icon(key) {
             app.icon_png = icon.to_vec();
             if let Ok(data) = postcard::to_stdvec(&app) {
                 e.ext[pos].data = data;
@@ -779,12 +1009,13 @@ impl History {
     // ---- чтение и запись строк ----
 
     /// Записать строку целиком: тело, карточку, ключевой хэш. Время и
-    /// закрепление — из `e`. Миниатюру не трогает.
-    fn write(&self, e: &Entry) -> Result<()> {
-        let hash = e.content.hash();
-        let (list, icon_key, icon) = self.split_icon(&e.ext);
-        if let (Some(k), Some(png)) = (icon_key, &icon) {
-            self.put_icon(k, png)?;
+    /// закрепление — из `e`, они же и в теле: старая версия после отката
+    /// читает их из тела. Миниатюру не трогает. `prev_icon` — см.
+    /// [`History::card_from`].
+    fn write(&self, e: &Entry, prev_icon: Option<[u8; 32]>) -> Result<()> {
+        let (card, icon) = self.card_from(e, prev_icon);
+        if let Some((k, png)) = &icon {
+            self.put_icon(*k, png)?;
         }
         let body = postcard::to_stdvec(&EntryOut {
             id: &e.id,
@@ -794,12 +1025,11 @@ impl History {
             content: &e.content,
             seen_ms: e.seen_ms,
             pinned: e.pinned,
-            ext: &list,
+            ext: &card.ext,
         })?;
         let (nonce, data) = self.seal_blob(&body, b"")?;
         drop(body);
-        let card = Card::build(e, hash, list, icon_key);
-        let (card_nonce, card) = self.seal_card(&e.id, &card)?;
+        let (card_nonce, sealed) = self.seal_card(&e.id, &nonce, &card)?;
         self.conn
             .prepare_cached(
                 "INSERT INTO entries (id, seen_ms, pinned, hkey, card_nonce, card, nonce, data)
@@ -813,46 +1043,95 @@ impl History {
                 &e.id.as_bytes()[..],
                 e.seen_ms,
                 e.pinned,
-                &self.hkey(&hash)[..],
+                &self.hkey(&card.hash)[..],
                 &card_nonce[..],
-                card,
+                sealed,
                 &nonce[..],
                 data
             ])?;
         Ok(())
     }
 
-    fn seal_card(&self, id: &ItemId, card: &Card) -> Result<([u8; 24], Vec<u8>)> {
+    fn seal_card(
+        &self,
+        id: &ItemId,
+        body_nonce: &[u8],
+        card: &Card,
+    ) -> Result<([u8; 24], Vec<u8>)> {
         let mut plain = vec![CARD_VERSION];
         plain.extend(postcard::to_stdvec(card)?);
-        self.seal_blob(&plain, &card_aad(id))
+        self.seal_blob(&plain, &card_aad(id, body_nonce))
     }
 
-    /// Дописать карточку и ключевой хэш к строке, тело не трогая (переход со
-    /// старой базы). Значок уходит в `icons`, тело его сохраняет.
-    fn write_card(&self, id: ItemId, e: &Entry) -> Result<()> {
-        let hash = e.content.hash();
-        let (list, icon_key, icon) = self.split_icon(&e.ext);
-        if let (Some(k), Some(png)) = (icon_key, &icon) {
-            self.put_icon(k, png)?;
+    /// Записать поправку. Условно: тело с тех пор не переписали (тот же
+    /// `nonce`), иначе поправка устарела и пропускается.
+    fn apply_fix(&self, fix: Fix) -> Result<()> {
+        match fix {
+            Fix::Card {
+                id,
+                nonce,
+                card,
+                icon,
+            } => {
+                if let Some((k, png)) = &icon {
+                    self.put_icon(*k, png)?;
+                }
+                let (n, c) = self.seal_card(&id, &nonce, &card)?;
+                self.conn
+                    .prepare_cached(
+                        "UPDATE entries SET hkey = ?1, card_nonce = ?2, card = ?3
+                         WHERE id = ?4 AND nonce = ?5",
+                    )?
+                    .execute(params![
+                        &self.hkey(&card.hash)[..],
+                        &n[..],
+                        c,
+                        &id.as_bytes()[..],
+                        nonce
+                    ])?;
+            }
+            Fix::Broken { id, nonce } => {
+                // Без ключевого хэша: новая копия того же содержимого станет
+                // новой записью, а не подъёмом нечитаемой.
+                self.conn
+                    .prepare_cached(
+                        "UPDATE entries SET hkey = NULL, card_nonce = NULL, card = X''
+                         WHERE id = ?1 AND nonce = ?2",
+                    )?
+                    .execute(params![id, nonce])?;
+            }
         }
-        let (n, c) = self.seal_card(&id, &Card::build(e, hash, list, icon_key))?;
-        self.conn
-            .prepare_cached(
-                "UPDATE entries SET hkey = ?1, card_nonce = ?2, card = ?3 WHERE id = ?4",
-            )?
-            .execute(params![
-                &self.hkey(&hash)[..],
-                &n[..],
-                c,
-                &id.as_bytes()[..]
-            ])?;
         Ok(())
     }
 
-    /// Тело записи. Время и закрепление — из колонок: они меняются без
-    /// перезаписи тела.
-    fn body(&self, id: ItemId) -> Result<Option<Entry>> {
+    /// Записать поправки по возможности: сбой — только в журнал, читающий код
+    /// в следующий раз возьмёт данные из тела.
+    fn apply_fixes(&self, fixes: Vec<Fix>) {
+        if fixes.is_empty() {
+            return;
+        }
+        let n = fixes.len();
+        // Точка сохранения, а не транзакция: поправка бывает и внутри
+        // транзакции записи (подъём записи читает её карточку).
+        let res = (|| -> Result<()> {
+            self.conn.execute_batch("SAVEPOINT fixes")?;
+            for fix in fixes {
+                if let Err(err) = self.apply_fix(fix) {
+                    let _ = self.conn.execute_batch("ROLLBACK TO fixes; RELEASE fixes");
+                    return Err(err);
+                }
+            }
+            self.conn.execute_batch("RELEASE fixes")?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => tracing::info!(n, "карточки истории поправлены"),
+            Err(err) => tracing::warn!("карточки истории не поправились: {err:#}"),
+        }
+    }
+
+    /// Тело записи и `nonce` тела. Время и закрепление — из колонок.
+    fn body_raw(&self, id: ItemId) -> Result<Option<(Entry, Vec<u8>)>> {
         let row: Option<(i64, bool, Vec<u8>, Vec<u8>)> = self
             .conn
             .prepare_cached("SELECT seen_ms, pinned, nonce, data FROM entries WHERE id = ?1")?
@@ -867,42 +1146,102 @@ impl History {
         e.id = id;
         e.seen_ms = seen_ms;
         e.pinned = pinned;
-        Ok(Some(e))
+        Ok(Some((e, nonce)))
     }
 
-    /// Карточка из колонки, а если её нет (переход не дошёл) — из тела.
-    fn card_of(&self, id: ItemId, nonce: Option<&[u8]>, data: Option<&[u8]>) -> Result<Card> {
-        if let (Some(n), Some(d)) = (nonce, data) {
-            match self.open_card(&id, n, d) {
-                Ok(c) => return Ok(c),
-                Err(err) => tracing::debug!("карточка не прочиталась, беру тело: {err:#}"),
+    /// Тело записи без значка (значок — по карточке, см. [`History::get`]).
+    fn body(&self, id: ItemId) -> Result<Option<Entry>> {
+        Ok(self.body_raw(id)?.map(|(e, _)| e))
+    }
+
+    /// Поправка по телу: карточка из него, а если не читается и тело —
+    /// пометка битой. `None` — строки уже нет.
+    fn fix_from_body(&self, id: ItemId) -> Option<Fix> {
+        match self.body_raw(id) {
+            Ok(Some((e, nonce))) => {
+                let (card, icon) = self.card_from(&e, self.legacy_icon(&e));
+                Some(Fix::Card {
+                    id,
+                    nonce,
+                    card: Box::new(card),
+                    icon,
+                })
+            }
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!("запись истории не расшифровалась, помечаю битой: {err:#}");
+                // `nonce` тела для условной пометки; не прочитался — пометки нет.
+                let nonce: Option<Vec<u8>> = self
+                    .conn
+                    .query_row(
+                        "SELECT nonce FROM entries WHERE id = ?1",
+                        [&id.as_bytes()[..]],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                nonce.map(|nonce| Fix::Broken {
+                    id: id.as_bytes().to_vec(),
+                    nonce,
+                })
             }
         }
-        let e = self.body(id)?.context(tr("Элемента уже нет в истории"))?;
-        // Сведения как есть, со значком: при перезаписи он уйдёт в `icons`.
-        Ok(Card::build(&e, e.content.hash(), e.ext.clone(), None))
     }
 
-    /// Время, закрепление и карточка записи.
-    fn meta(&self, id: ItemId) -> Result<Option<(i64, bool, Card)>> {
-        let mut st = self.conn.prepare_cached(
-            "SELECT seen_ms, pinned, card_nonce, card FROM entries WHERE id = ?1",
-        )?;
-        let mut rows = st.query([&id.as_bytes()[..]])?;
-        let Some(r) = rows.next()? else {
-            return Ok(None);
+    /// Карточка из колонки, а если её нет или она не открывается (переход
+    /// не дошёл, тело переписала старая версия) — из тела, с поправкой для
+    /// записи. `None` — строка нечитаема (уже помечена или помечается).
+    fn card_of(
+        &self,
+        id: ItemId,
+        card: Option<(&[u8], &[u8])>,
+        body_nonce: &[u8],
+    ) -> (Option<Card>, Option<Fix>) {
+        match card {
+            Some((_, [])) => return (None, None),
+            Some((n, c)) => match self.open_card(&id, body_nonce, n, c) {
+                Ok(c) => return (Some(c), None),
+                Err(err) => tracing::debug!("карточка не прочиталась, беру тело: {err:#}"),
+            },
+            None => {}
+        }
+        let fix = self.fix_from_body(id);
+        let card = match &fix {
+            Some(Fix::Card { card, .. }) => Some(Card::clone(card)),
+            _ => None,
         };
-        let card = self.card_of(
-            id,
-            r.get_ref(2)?.as_blob_or_null()?,
-            r.get_ref(3)?.as_blob_or_null()?,
-        )?;
-        Ok(Some((r.get(0)?, r.get(1)?, card)))
+        (card, fix)
+    }
+
+    /// Время, закрепление и карточка записи. Нечитаемая запись — `None`.
+    fn meta(&self, id: ItemId) -> Result<Option<(i64, bool, Card)>> {
+        let (found, fix) = {
+            let mut st = self.conn.prepare_cached(
+                "SELECT seen_ms, pinned, card_nonce, card, nonce FROM entries WHERE id = ?1",
+            )?;
+            let mut rows = st.query([&id.as_bytes()[..]])?;
+            let Some(r) = rows.next()? else {
+                return Ok(None);
+            };
+            let card = card_pair(
+                r.get_ref(2)?.as_blob_or_null()?,
+                r.get_ref(3)?.as_blob_or_null()?,
+            );
+            let (card, fix) = self.card_of(id, card, r.get_ref(4)?.as_blob()?);
+            (card.map(|c| (r.get(0), r.get(1), c)), fix)
+        };
+        self.apply_fixes(fix.into_iter().collect());
+        match found {
+            Some((seen, pinned, card)) => Ok(Some((seen?, pinned?, card))),
+            None => Ok(None),
+        }
     }
 
     /// Обход карточек от новых к старым, пока `f` не скажет хватит.
-    /// Нечитаемые строки пропускаются. `offset` — сколько строк пропустить, не
-    /// расшифровывая (когда подходит любая).
+    /// Нечитаемые строки пропускаются и помечаются, карточки из тел
+    /// дописываются — после обхода. `offset` — сколько живых строк
+    /// пропустить, не расшифровывая (когда подходит любая).
     fn scan(
         &self,
         pinned_only: bool,
@@ -910,34 +1249,56 @@ impl History {
         mut f: impl FnMut(ItemId, i64, bool, Card) -> ControlFlow<()>,
     ) -> Result<()> {
         let sql = if pinned_only {
-            "SELECT id, seen_ms, pinned, card_nonce, card FROM entries WHERE pinned = 1
-             ORDER BY seen_ms DESC, id DESC LIMIT -1 OFFSET ?1"
+            format!(
+                "SELECT id, seen_ms, pinned, card_nonce, card, nonce FROM entries
+                 WHERE pinned = 1 AND {LIVE}
+                 ORDER BY seen_ms DESC, id DESC LIMIT -1 OFFSET ?1"
+            )
         } else {
-            "SELECT id, seen_ms, pinned, card_nonce, card FROM entries
-             ORDER BY seen_ms DESC, id DESC LIMIT -1 OFFSET ?1"
+            format!(
+                "SELECT id, seen_ms, pinned, card_nonce, card, nonce FROM entries
+                 WHERE {LIVE}
+                 ORDER BY seen_ms DESC, id DESC LIMIT -1 OFFSET ?1"
+            )
         };
-        let mut st = self.conn.prepare_cached(sql)?;
-        let mut rows = st.query([sql_limit(offset)])?;
-        while let Some(r) = rows.next()? {
-            let Some(id) = item_id(r.get_ref(0)?.as_blob()?) else {
-                continue;
-            };
-            let card = match self.card_of(
-                id,
-                r.get_ref(3)?.as_blob_or_null()?,
-                r.get_ref(4)?.as_blob_or_null()?,
-            ) {
-                Ok(c) => c,
-                Err(err) => {
-                    tracing::debug!("запись истории не читается, пропускаю: {err:#}");
+        let mut fixes = Vec::new();
+        let res = (|| -> Result<()> {
+            let mut st = self.conn.prepare_cached(&sql)?;
+            let mut rows = st.query([sql_limit(offset)])?;
+            while let Some(r) = rows.next()? {
+                let raw = r.get_ref(0)?.as_blob()?;
+                let nonce = r.get_ref(5)?.as_blob()?;
+                let Some(id) = item_id(raw) else {
+                    fixes.push(Fix::Broken {
+                        id: raw.to_vec(),
+                        nonce: nonce.to_vec(),
+                    });
                     continue;
+                };
+                let card = card_pair(
+                    r.get_ref(3)?.as_blob_or_null()?,
+                    r.get_ref(4)?.as_blob_or_null()?,
+                );
+                let (card, fix) = self.card_of(id, card, nonce);
+                // Поправки ждут конца обхода в памяти; лишние догонятся
+                // следующими обходами.
+                if fixes.len() < MAX_FIXES {
+                    fixes.extend(fix);
                 }
-            };
-            if f(id, r.get(1)?, r.get(2)?, card).is_break() {
-                break;
+                let Some(card) = card else {
+                    tracing::debug!("запись истории не читается, пропускаю");
+                    continue;
+                };
+                if f(id, r.get(1)?, r.get(2)?, card).is_break() {
+                    break;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        // Поправки — после чтения: пока открыт запрос, писать нельзя (снимок
+        // второго соединения устарел бы).
+        self.apply_fixes(fixes);
+        res
     }
 
     /// Самая свежая запись с таким ключевым хэшем.
@@ -1056,17 +1417,19 @@ impl History {
             Some(id) => Some((id, true)),
             None => self.exists(entry.id)?.then_some((entry.id, false)),
         };
-        let Some((id, same)) = found else {
-            self.write(&entry)?;
+        // Найденная, но нечитаемая запись (чужой ключ) перезаписывается новой.
+        let found = match found {
+            Some((id, same)) => self.meta(id)?.map(|m| (id, same, m)),
+            None => None,
+        };
+        let Some((id, same, (_, pinned, card))) = found else {
+            self.write(&entry, None)?;
             if let Some(t) = thumb
                 && let Err(err) = self.store_thumb(entry.id, &t)
             {
                 tracing::warn!("миниатюра не сохранилась: {err:#}");
             }
             return Ok(true);
-        };
-        let Some((_, pinned, card)) = self.meta(id)? else {
-            bail!("запись пропала из истории");
         };
         // Тот же текст скопирован уже с форматированием — берём его. Обратно
         // (вставка без форматирования) форматирование у записи не отнимаем.
@@ -1085,22 +1448,31 @@ impl History {
             }
         };
         // Сведения нового копирования (другое приложение-источник)
-        // заменяют старые по метке; чего в новом нет, остаётся.
+        // заменяют старые по метке; чего в новом нет, остаётся. Значок
+        // прежний, только если и источник остался прежним.
+        let prev_icon = if entry.ext.iter().any(|x| x.tag == ext::SOURCE_APP) {
+            None
+        } else {
+            card.icon
+        };
         let mut list = card.ext;
         for x in entry.ext {
             list.retain(|e| e.tag != x.tag);
             list.push(x);
         }
-        self.write(&Entry {
-            id,
-            origin: entry.origin,
-            device_name: entry.device_name,
-            local: entry.local,
-            content,
-            seen_ms: entry.seen_ms,
-            pinned,
-            ext: list,
-        })?;
+        self.write(
+            &Entry {
+                id,
+                origin: entry.origin,
+                device_name: entry.device_name,
+                local: entry.local,
+                content,
+                seen_ms: entry.seen_ms,
+                pinned,
+                ext: list,
+            },
+            prev_icon,
+        )?;
         Ok(false)
     }
 
@@ -1146,7 +1518,7 @@ impl History {
         if self.id_by_hkey(&hkey)?.is_some() || self.exists(entry.id)? {
             return Ok(false);
         }
-        self.write(&entry)?;
+        self.write(&entry, None)?;
         if let Some(t) = thumb
             && let Err(err) = self.store_thumb(entry.id, &t)
         {
@@ -1155,14 +1527,19 @@ impl History {
         Ok(true)
     }
 
+    /// Закрепить или открепить. Тело переписывается вместе с колонкой:
+    /// старая версия после отката берёт закрепление из тела. Стоит это одно
+    /// перешифрование тела (у картинки — мегабайты, миллисекунды).
     pub fn set_pinned(&mut self, id: ItemId, pinned: bool) -> Result<()> {
-        let n = self
-            .conn
-            .prepare_cached("UPDATE entries SET pinned = ?1 WHERE id = ?2")?
-            .execute(params![pinned, &id.as_bytes()[..]])?;
-        if n == 0 {
-            bail!("{}", tr("Элемента уже нет в истории"));
+        let tx = self.conn.unchecked_transaction()?;
+        let gone = || anyhow::anyhow!("{}", tr("Элемента уже нет в истории"));
+        let (_, _, card) = self.meta(id)?.ok_or_else(gone)?;
+        let mut e = self.body(id)?.ok_or_else(gone)?;
+        if e.pinned != pinned {
+            e.pinned = pinned;
+            self.write(&e, card.icon)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1179,16 +1556,19 @@ impl History {
         self.conn
             .prepare_cached("DELETE FROM entries WHERE hkey = ?1 AND id != ?2")?
             .execute(params![&hkey[..], &id.as_bytes()[..]])?;
-        self.write(&Entry {
-            id,
-            origin: card.origin,
-            device_name: card.device_name,
-            local: card.local,
-            content,
-            seen_ms,
-            pinned,
-            ext: card.ext,
-        })?;
+        self.write(
+            &Entry {
+                id,
+                origin: card.origin,
+                device_name: card.device_name,
+                local: card.local,
+                content,
+                seen_ms,
+                pinned,
+                ext: card.ext,
+            },
+            card.icon,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1225,7 +1605,8 @@ impl History {
         Ok(())
     }
 
-    /// Очистить историю. Закреплённое остаётся, если `keep_pinned`.
+    /// Очистить историю. Закреплённое остаётся, если `keep_pinned`. Копия
+    /// базы до перехода (если ещё лежит) удаляется тоже: в ней та же история.
     pub fn clear(&mut self, keep_pinned: bool) -> Result<()> {
         if keep_pinned {
             self.conn
@@ -1233,6 +1614,7 @@ impl History {
         } else {
             self.conn.execute("DELETE FROM entries", [])?;
         }
+        self.remove_backup();
         Ok(())
     }
 
@@ -1269,7 +1651,8 @@ impl History {
     pub fn get(&self, id: ItemId) -> Option<Entry> {
         match self.body(id) {
             Ok(Some(mut e)) => {
-                self.restore_icon(&mut e);
+                let key = self.meta(id).ok().flatten().and_then(|(_, _, c)| c.icon);
+                self.restore_icon(&mut e, key);
                 Some(e)
             }
             Ok(None) => None,
@@ -1409,74 +1792,188 @@ impl History {
             .collect()
     }
 
+    /// Сколько записей в истории. Битые (нечитаемые) не считаются.
     pub fn len(&self) -> usize {
-        self.count("SELECT COUNT(*) FROM entries")
+        self.count(&format!("SELECT COUNT(*) FROM entries WHERE {LIVE}"))
     }
 
     /// Сколько записей закреплено.
     pub fn pinned_len(&self) -> usize {
-        self.count("SELECT COUNT(*) FROM entries WHERE pinned = 1")
+        self.count(&format!(
+            "SELECT COUNT(*) FROM entries WHERE pinned = 1 AND {LIVE}"
+        ))
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Блобы файлов всех записей: скачанное по ним в кэше ещё нужно.
-    pub fn blobs(&self) -> HashSet<BlobId> {
-        let mut out = HashSet::new();
+    /// Блобы и пути файлов всех записей, одним обходом: скачанное по блобам
+    /// в кэше ещё нужно, забранные виртуальные файлы по путям — тоже (см.
+    /// `cache::prune_virtual`). Обход всех карточек: звать через
+    /// [`HistoryReader`] и не из асинхронной задачи.
+    pub fn file_refs(&self) -> (HashSet<BlobId>, HashSet<PathBuf>) {
+        let (mut blobs, mut paths) = (HashSet::new(), HashSet::new());
         self.any_files(|_, files| {
-            out.extend(files.iter().filter_map(|f| f.blob));
+            blobs.extend(files.iter().filter_map(|f| f.blob));
+            paths.extend(files.iter().map(|f| PathBuf::from(&f.path)));
             false
         });
-        out
-    }
-
-    /// Пути файлов всех записей: забранные виртуальные файлы по ним ещё
-    /// нужны (см. `cache::prune_virtual`).
-    pub fn file_paths(&self) -> HashSet<PathBuf> {
-        let mut out = HashSet::new();
-        self.any_files(|_, files| {
-            out.extend(files.iter().map(|f| PathBuf::from(&f.path)));
-            false
-        });
-        out
+        (blobs, paths)
     }
 }
 
-/// Старая раскладка (до карточек) → новая. Таблица пересобирается одной
-/// транзакцией, чтобы тело стало последней колонкой; тела не
-/// перешифровываются. Карточки потом дописывает `fill_cards`. Перед этим
-/// рядом кладётся копия базы `history.db.bak-v1` (один раз).
-fn migrate_layout(conn: &Connection, path: Option<&Path>) -> Result<()> {
-    // Колонки миниатюр появились вместе с картинками — в старых базах их нет.
-    let has_thumb = conn
-        .prepare("SELECT 1 FROM pragma_table_info('entries') WHERE name = 'thumb'")?
-        .exists([])?;
-    if !has_thumb {
-        conn.execute_batch(
-            "ALTER TABLE entries ADD COLUMN thumb_nonce BLOB;
-             ALTER TABLE entries ADD COLUMN thumb BLOB;",
-        )?;
-    }
-    if let Some(path) = path {
-        let bak = path.with_file_name("history.db.bak-v1");
-        if !bak.exists() {
-            conn.execute("VACUUM INTO ?1", [bak.to_string_lossy()])
-                .context("не сохранилась копия history.db перед переходом")?;
+/// Колонки таблицы `entries`.
+fn entry_columns(conn: &Connection) -> Result<HashSet<String>> {
+    Ok(conn
+        .prepare("SELECT name FROM pragma_table_info('entries')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?)
+}
+
+/// Запасной путь, когда переход не случился: недостающие колонки в конец
+/// старой таблицы (меняется только схема, данные не копируются). Карточки
+/// тогда лежат после тел, и чтение карточки большой записи проходит по её
+/// телу — медленнее, но работает. Версия схемы остаётся старой: следующий
+/// запуск попробует перейти снова.
+fn add_card_columns(conn: &Connection) -> Result<()> {
+    let have = entry_columns(conn)?;
+    for col in ["hkey", "card_nonce", "card", "thumb_nonce", "thumb"] {
+        if !have.contains(col) {
+            conn.execute_batch(&format!("ALTER TABLE entries ADD COLUMN {col} BLOB"))?;
         }
     }
-    let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(&format!(
-        "{} ;
-         INSERT INTO entries_v2 (id, seen_ms, pinned, thumb_nonce, thumb, nonce, data)
-             SELECT id, seen_ms, pinned, thumb_nonce, thumb, nonce, data FROM entries;
-         DROP TABLE entries;
-         ALTER TABLE entries_v2 RENAME TO entries;
-         PRAGMA user_version = {SCHEMA_VERSION};",
-        CREATE_ENTRIES.replacen("CREATE TABLE entries", "CREATE TABLE entries_v2", 1)
-    ))?;
-    tx.commit()?;
+    Ok(())
+}
+
+/// Доделать прерванную подмену файлов (см. [`migrate_file`]): процесс умер
+/// между двумя переименованиями, и `history.db` нет.
+fn recover_swap(path: &Path) {
+    if path.exists() {
+        return;
+    }
+    let bak = path.with_file_name(BACKUP_NAME);
+    let tmp = path.with_file_name(MIGRATE_TMP);
+    if !bak.exists() {
+        return;
+    }
+    // Новая база к этому моменту собрана целиком: до первого переименования
+    // `history.db` на месте. Её нет — значит, осталось второе.
+    let from = if tmp.exists() { &tmp } else { &bak };
+    match std::fs::rename(from, path) {
+        Ok(()) => tracing::info!("история: доделана прерванная подмена базы"),
+        Err(e) => tracing::warn!("история: прерванная подмена базы не доделалась: {e:#}"),
+    }
+}
+
+/// Старая раскладка (до карточек) → новая. Новая база собирается рядом в
+/// `history.db.v2-tmp` (тело — последней колонкой, тела не
+/// перешифровываются), потом старый файл переименовывается в
+/// `history.db.bak-v1`, а новый занимает его место. Старый файл и есть копия
+/// на случай сбоя: места нужно на одну копию базы, без роста WAL и без
+/// VACUUM (новый файл плотный). Карточки потом дописывает `fill_cards`,
+/// после неё копия удаляется (см. `History::init`).
+///
+/// Ошибка не фатальна: старый файл остаётся на месте, и `init` открывает его
+/// в запасном режиме. Недособранный `v2-tmp` удаляется при следующей попытке.
+fn migrate_file(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let tmp = path.with_file_name(MIGRATE_TMP);
+    let bak = path.with_file_name(BACKUP_NAME);
+    let conn = Connection::open(path).context("не открылась history.db")?;
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let has_table = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entries'")?
+        .exists([])?;
+    if !has_table || version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    // Недособранная прошлая попытка.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => tracing::info!("история: удалена недособранная новая база"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("не удалилась недособранная новая база"),
+    }
+    let have = entry_columns(&conn)?;
+    // Колонки, которых в старой базе может не быть: миниатюры появились с
+    // картинками, карточки — в запасном режиме прошлого запуска.
+    let cols: Vec<&str> = [
+        "id",
+        "seen_ms",
+        "pinned",
+        "hkey",
+        "card_nonce",
+        "card",
+        "thumb_nonce",
+        "thumb",
+        "nonce",
+        "data",
+    ]
+    .into_iter()
+    .filter(|c| have.contains(*c))
+    .collect();
+    let cols = cols.join(", ");
+    let has_icons = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'icons'")?
+        .exists([])?;
+    let build = (|| -> Result<()> {
+        conn.execute("ATTACH DATABASE ?1 AS n", [tmp.to_string_lossy()])?;
+        // Журнал новой базе не нужен: сбой — и она собирается заново.
+        conn.execute_batch(&format!(
+            "PRAGMA n.journal_mode = OFF;
+             PRAGMA n.synchronous = FULL;
+             BEGIN;
+             {};
+             INSERT INTO n.entries ({cols}) SELECT {cols} FROM main.entries;
+             CREATE TABLE n.icons (key BLOB PRIMARY KEY, nonce BLOB NOT NULL, data BLOB NOT NULL);
+             {}
+             COMMIT;
+             PRAGMA n.user_version = {SCHEMA_VERSION};",
+            CREATE_ENTRIES.replacen("CREATE TABLE entries", "CREATE TABLE n.entries", 1),
+            if has_icons {
+                "INSERT INTO n.icons SELECT key, nonce, data FROM main.icons;"
+            } else {
+                ""
+            },
+        ))?;
+        conn.execute_batch("DETACH DATABASE n")?;
+        Ok(())
+    })();
+    if let Err(err) = build {
+        let _ = conn.execute_batch("ROLLBACK");
+        let _ = conn.execute_batch("DETACH DATABASE n");
+        drop(conn);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.context("новая база не собралась"));
+    }
+    // WAL старой базы — в сам файл, иначе часть записей осталась бы в
+    // `history.db-wal`, который после переименования достался бы новой базе.
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    conn.close()
+        .map_err(|(_, e)| e)
+        .context("не закрылась старая база")?;
+    // Последнее соединение удаляет WAL при закрытии. Остался — базу держит
+    // другой процесс (консольный клиент); переименовывать под ним нельзя.
+    let wal = path.with_file_name("history.db-wal");
+    if wal.exists() {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("history.db открыта другим процессом, переход в следующий раз");
+    }
+    let _ = std::fs::remove_file(&bak);
+    if let Err(e) = std::fs::rename(path, &bak) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).context("старая база не переименовалась");
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Вернуть старую на место: работаем с ней в запасном режиме.
+        let _ = std::fs::rename(&bak, path);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).context("новая база не встала на место");
+    }
+    let _ = std::fs::remove_file(path.with_file_name("history.db-shm"));
     tracing::info!("история переведена на карточки");
     Ok(())
 }
@@ -1727,7 +2224,7 @@ mod tests {
             )
             .unwrap();
         assert!(card.is_some());
-        assert_eq!(h.blobs(), HashSet::from([blob]));
+        assert_eq!(h.file_refs().0, HashSet::from([blob]));
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1884,7 +2381,7 @@ mod tests {
             h.hash_of(id),
             Some(Content::Text("без карточки".into()).hash())
         );
-        h.fill_cards().unwrap();
+        assert!(h.fill_cards());
         let filled: i64 = h
             .conn
             .query_row(
@@ -1965,7 +2462,9 @@ mod tests {
                 .unwrap();
         }
         let mut h = History::open(&dir).unwrap();
-        assert!(dir.join("history.db.bak-v1").exists());
+        // Карточки дописаны — копия старой базы больше не нужна.
+        assert!(!dir.join(BACKUP_NAME).exists());
+        assert!(!dir.join(MIGRATE_TMP).exists());
         let v: i64 = h
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -1986,13 +2485,346 @@ mod tests {
             ))
             .unwrap()
         );
-        assert_eq!(h.len(), 4, "битая строка осталась в базе");
+        // Битая строка помечена и не считается.
+        assert_eq!(h.len(), 4 - 1);
+        let marked: i64 = h
+            .conn
+            .query_row("SELECT COUNT(*) FROM entries WHERE card = X''", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(marked, 1);
         drop(h);
         // Второе открытие ничего не ломает.
         let h = History::open(&dir).unwrap();
         assert_eq!(texts(h.list("", false, 10)), ["один", "три", "два"]);
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// База 0.2 с этими текстами (тело в середине строки, без миниатюр).
+    fn old_db(dir: &Path, texts: &[&str]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let key = load_key(dir).unwrap();
+        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+        let conn = Connection::open(dir.join("history.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE entries (id BLOB PRIMARY KEY, seen_ms INTEGER NOT NULL,
+                 pinned INTEGER NOT NULL, nonce BLOB NOT NULL, data BLOB NOT NULL);",
+        )
+        .unwrap();
+        for (i, t) in texts.iter().enumerate() {
+            let mut e = local_entry(DeviceId([1; 32]), "ПК", Content::Text((*t).into()));
+            e.seen_ms = i as i64;
+            let nonce = [i as u8; 24];
+            let data = cipher
+                .encrypt(
+                    &XNonce::from(nonce),
+                    postcard::to_stdvec(&e).unwrap().as_slice(),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO entries VALUES (?1, ?2, 0, ?3, ?4)",
+                params![&e.id.as_bytes()[..], e.seen_ms, &nonce[..], data],
+            )
+            .unwrap();
+        }
+    }
+
+    fn user_version(h: &History) -> i64 {
+        h.conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn failed_migration_opens_old_database_and_retries_later() {
+        let dir = tmp("degraded");
+        old_db(&dir, &["один", "два"]);
+        // Новая база не собирается: на месте временного файла — папка.
+        std::fs::create_dir_all(dir.join(MIGRATE_TMP)).unwrap();
+        {
+            let mut h = History::open(&dir).expect("старая база открылась");
+            assert!(user_version(&h) < SCHEMA_VERSION);
+            assert_eq!(texts(h.list("", false, 10)), ["два", "один"]);
+            // Карточки дописаны в конец старой таблицы, всё работает.
+            assert_eq!(h.list("оди", false, 10).len(), 1);
+            text(&mut h, "три", 5);
+            assert_eq!(h.len(), 3);
+        }
+        std::fs::remove_dir_all(dir.join(MIGRATE_TMP)).unwrap();
+        // Недособранный файл прошлой попытки удаляется, переход идёт заново.
+        std::fs::write(dir.join(MIGRATE_TMP), b"not a database").unwrap();
+        let h = History::open(&dir).unwrap();
+        assert_eq!(user_version(&h), SCHEMA_VERSION);
+        assert_eq!(texts(h.list("", false, 10)), ["три", "два", "один"]);
+        assert!(!dir.join(MIGRATE_TMP).exists());
+        assert!(!dir.join(BACKUP_NAME).exists());
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migration_waits_while_another_process_holds_the_database() {
+        let dir = tmp("busy");
+        old_db(&dir, &["один"]);
+        let other = Connection::open(dir.join("history.db")).unwrap();
+        let _: i64 = other
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        {
+            let h = History::open(&dir).unwrap();
+            assert!(
+                user_version(&h) < SCHEMA_VERSION,
+                "под чужим соединением не меняем файл"
+            );
+            assert_eq!(texts(h.list("", false, 10)), ["один"]);
+        }
+        drop(other);
+        let h = History::open(&dir).unwrap();
+        assert_eq!(user_version(&h), SCHEMA_VERSION);
+        assert_eq!(texts(h.list("", false, 10)), ["один"]);
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn interrupted_swap_is_finished_and_clear_removes_backup() {
+        let dir = tmp("swap");
+        old_db(&dir, &["один"]);
+        // Процесс умер между переименованиями: новой базы нет на месте.
+        drop(History::open(&dir).unwrap());
+        std::fs::rename(dir.join("history.db"), dir.join(MIGRATE_TMP)).unwrap();
+        std::fs::write(dir.join(BACKUP_NAME), b"old").unwrap();
+        let mut h = History::open(&dir).unwrap();
+        assert_eq!(texts(h.list("", false, 10)), ["один"]);
+        // Копия, оставшаяся с прошлого запуска, удаляется очисткой.
+        drop(h);
+        std::fs::write(dir.join(BACKUP_NAME), b"old").unwrap();
+        h = History::open(&dir).unwrap();
+        assert!(
+            !dir.join(BACKUP_NAME).exists(),
+            "переход закончен — копии нет"
+        );
+        std::fs::write(dir.join(BACKUP_NAME), b"old").unwrap();
+        h.clear(false).unwrap();
+        assert!(!dir.join(BACKUP_NAME).exists());
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bad_cards_are_rebuilt_and_unreadable_rows_marked_once() {
+        let mut h = History::in_memory();
+        let good = text(&mut h, "карточка испорчена", 1);
+        let bad = text(&mut h, "нечитаемая", 2);
+        for i in 3..8 {
+            text(&mut h, &format!("запись {i}"), i);
+        }
+        // У одной испорчена карточка, у другой ещё и тело.
+        h.conn
+            .execute(
+                "UPDATE entries SET card = x'0102' WHERE id = ?1",
+                [&good.as_bytes()[..]],
+            )
+            .unwrap();
+        h.conn
+            .execute(
+                "UPDATE entries SET card = x'0102', data = x'0102' WHERE id = ?1",
+                [&bad.as_bytes()[..]],
+            )
+            .unwrap();
+        // Страницы без запроса подряд, без пропусков и повторов.
+        let mut seen = Vec::new();
+        for o in (0..10).step_by(2) {
+            seen.extend(
+                h.list_page("", false, Kind::All, o, 2)
+                    .into_iter()
+                    .map(|r| r.id),
+            );
+        }
+        assert_eq!(seen.len(), 6);
+        assert_eq!(seen.iter().collect::<HashSet<_>>().len(), 6);
+        assert!(seen.contains(&good) && !seen.contains(&bad));
+        assert_eq!(h.len(), 6);
+        // Карточка переписана из тела, нечитаемая помечена.
+        let card: (Vec<u8>, Vec<u8>, Vec<u8>) = h
+            .conn
+            .query_row(
+                "SELECT card_nonce, card, nonce FROM entries WHERE id = ?1",
+                [&good.as_bytes()[..]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(h.open_card(&good, &card.2, &card.0, &card.1).is_ok());
+        let marked: Vec<u8> = h
+            .conn
+            .query_row(
+                "SELECT card FROM entries WHERE id = ?1",
+                [&bad.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(marked.is_empty());
+        // Помеченную не перебирает и `fill_cards`, поиск её не видит.
+        assert!(h.fill_cards());
+        assert!(h.list("нечит", false, 10).is_empty());
+        assert!(h.row(bad).is_none());
+        // То же содержимое, скопированное снова, — новая запись.
+        assert!(
+            h.add(local_entry(
+                DeviceId([1; 32]),
+                "ПК",
+                Content::Text("нечитаемая".into())
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn body_rewritten_by_old_version_rebuilds_card() {
+        let mut h = History::in_memory();
+        let id = text(&mut h, "было", 1);
+        // Старая версия подняла запись: переписала тело и время, карточку нет.
+        let mut e = h.get(id).unwrap();
+        e.content = Content::Text("стало".into());
+        let (nonce, data) = h.seal_blob(&postcard::to_stdvec(&e).unwrap(), b"").unwrap();
+        h.conn
+            .execute(
+                "UPDATE entries SET seen_ms = 9, nonce = ?1, data = ?2 WHERE id = ?3",
+                params![&nonce[..], data, &id.as_bytes()[..]],
+            )
+            .unwrap();
+        assert_eq!(texts(h.list("", false, 10)), ["стало"]);
+        assert_eq!(h.hash_of(id), Some(Content::Text("стало".into()).hash()));
+        // Ключевой хэш поправлен: повтор нового текста — подъём, не дубль.
+        assert!(
+            !h.add(local_entry(
+                DeviceId([1; 32]),
+                "ПК",
+                Content::Text("стало".into())
+            ))
+            .unwrap()
+        );
+        assert_eq!(h.len(), 1);
+    }
+
+    #[test]
+    fn pin_is_written_to_body_too() {
+        let mut h = History::in_memory();
+        let mut e = local_entry(DeviceId([1; 32]), "ПК", Content::Text("закреп".into()));
+        e.set_source_app(&app("Telegram"));
+        let id = e.id;
+        h.add(e).unwrap();
+        h.set_pinned(id, true).unwrap();
+        let (n, d): (Vec<u8>, Vec<u8>) = h
+            .conn
+            .query_row(
+                "SELECT nonce, data FROM entries WHERE id = ?1",
+                [&id.as_bytes()[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            h.decrypt(&n, &d).unwrap().pinned,
+            "старая версия увидит закреп"
+        );
+        assert!(h.row(id).unwrap().pinned);
+        assert_eq!(h.get(id).unwrap().source_app(), Some(app("Telegram")));
+        h.set_pinned(id, false).unwrap();
+        assert_eq!(h.pinned_len(), 0);
+        assert!(h.set_pinned(ItemId::new(), true).is_err());
+    }
+
+    #[test]
+    fn icons_of_programs_with_same_exe_name_do_not_mix() {
+        let mut h = History::in_memory();
+        let with_icon = |t: &str, png: &[u8]| {
+            let mut e = local_entry(DeviceId([1; 32]), "ПК", Content::Text(t.into()));
+            e.set_source_app(&SourceApp {
+                name: "Python".into(),
+                exe: "python3".into(),
+                icon_png: png.to_vec(),
+            });
+            e
+        };
+        let a = with_icon("первая", b"ICON-A");
+        let b = with_icon("вторая", b"ICON-B");
+        let (ia, ib) = (a.id, b.id);
+        h.add(a).unwrap();
+        h.add(b).unwrap();
+        let icon = |h: &History, id| h.get(id).unwrap().source_app().unwrap().icon_png;
+        assert_eq!(icon(&h, ia), b"ICON-A");
+        assert_eq!(icon(&h, ib), b"ICON-B");
+        assert_eq!(h.row(ia).unwrap().source_app().unwrap().icon_png, b"ICON-A");
+        // Подъём без источника оставляет прежний значок.
+        assert!(
+            !h.add(local_entry(
+                DeviceId([1; 32]),
+                "ПК",
+                Content::Text("первая".into())
+            ))
+            .unwrap()
+        );
+        assert_eq!(icon(&h, ia), b"ICON-A");
+    }
+
+    #[test]
+    fn reader_reads_without_the_writer_and_sees_its_commits() {
+        let dir = tmp("reader");
+        let mut h = History::open(&dir).unwrap();
+        let reader = h.reader().expect("база на диске");
+        assert!(History::in_memory().reader().is_none());
+        text(&mut h, "до", 1);
+        let lease = reader.lease().unwrap();
+        assert_eq!(texts(lease.list("", false, 10)), ["до"]);
+        // Запись идёт, пока соединение чтения занято.
+        text(&mut h, "после", 2);
+        assert_eq!(texts(lease.list("", false, 10)), ["после", "до"]);
+        drop(lease);
+        // Испорченная карточка чинится и через второе соединение.
+        let id = h.list("до", false, 1)[0].id;
+        h.conn
+            .execute(
+                "UPDATE entries SET card = x'01' WHERE id = ?1",
+                [&id.as_bytes()[..]],
+            )
+            .unwrap();
+        let m = Mutex::new(h);
+        assert_eq!(read(&m, Some(&reader), |h| h.list("до", false, 5).len()), 1);
+        let h = m.into_inner().unwrap();
+        let card: Vec<u8> = h
+            .conn
+            .query_row(
+                "SELECT card FROM entries WHERE id = ?1",
+                [&id.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(card.len() > 1, "карточка переписана");
+        drop((h, reader));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_rows_are_counted_and_skipped_by_index() {
+        let h = History::in_memory();
+        let plan = |sql: &str| -> String {
+            let mut st = h
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows = st.query_map([], |r| r.get::<_, String>(3)).unwrap();
+            rows.map(Result::unwrap).collect::<Vec<_>>().join("; ")
+        };
+        // Пропуск по OFFSET и подсчёт идут по частичному индексу, без чтения строк.
+        let count = plan(&format!("SELECT COUNT(*) FROM entries WHERE {LIVE}"));
+        assert!(count.contains("entries_live"), "{count}");
+        let page = plan(&format!(
+            "SELECT id FROM entries WHERE {LIVE} ORDER BY seen_ms DESC, id DESC LIMIT -1 OFFSET 5"
+        ));
+        assert!(page.contains("entries_live"), "{page}");
     }
 
     #[test]
@@ -2199,7 +3031,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(h.local_p2p_file(blob), Some(f2));
-        assert_eq!(h.file_paths().len(), 2);
+        assert_eq!(h.file_refs().1.len(), 2);
         assert!(h.any_files(|local, files| local && files[0].path == "/home/a/other.iso"));
         assert!(!h.any_files(|local, files| local && files[0].path == "/home/a/big.iso"));
     }
@@ -2311,12 +3143,18 @@ mod tests {
         let n = h.len();
         println!("подсчёт ({n}): {:?}", t.elapsed());
         let t = Instant::now();
-        let blobs = h.blobs();
+        let (blobs, _) = h.file_refs();
         println!(
-            "blobs() по всем карточкам ({}): {:?}",
+            "file_refs() по всем карточкам ({}): {:?}",
             blobs.len(),
             t.elapsed()
         );
+        // То же вторым соединением, пока первое пишет.
+        let reader = h.reader().unwrap();
+        let t = Instant::now();
+        let hit = reader.lease().unwrap().list(&near, false, 200);
+        println!("поиск редкого слова через HistoryReader: {:?}", t.elapsed());
+        assert_eq!(hit.len(), 1);
         let t = Instant::now();
         let removed = h.prune(Retention::Year, now).unwrap();
         println!(

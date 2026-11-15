@@ -193,14 +193,15 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
     let mut history = History::open(&paths.dir)?;
     history.prune(settings.retention, clipwire_agent::history::now_ms())?;
     // Копии скачанного, на которые больше не ссылается ни одна запись.
+    let (blobs, file_paths) = history.file_refs();
     clipwire_agent::cache::prune(
         &clipwire_agent::blobs::files_dir(&paths.dir),
-        &history.blobs(),
+        &blobs,
         &Default::default(),
     );
     clipwire_agent::cache::prune_virtual(
         &clipwire_agent::clipboard::virtual_dir(&paths.dir),
-        &history.file_paths(),
+        &file_paths,
         clipwire_agent::cache::VIRTUAL_GRACE,
     );
     let rt = tokio::runtime::Runtime::new()?;

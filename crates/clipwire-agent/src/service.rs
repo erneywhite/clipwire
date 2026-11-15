@@ -326,12 +326,12 @@ impl Service {
         let local_tx = synced.then_some(local_tx);
         // Другие устройства просят напрямую только то, что есть в своей
         // истории с `p2p`.
+        // Поиск — обход карточек: вторым соединением, без замка истории.
         if let Some(b) = &blobs {
             let h = history.clone();
+            let reader = h.lock().unwrap_or_else(|e| e.into_inner()).reader();
             b.set_p2p_sources(Arc::new(move |blob| {
-                h.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .local_p2p_file(blob)
+                crate::history::read(&h, reader.as_ref(), |h| h.local_p2p_file(blob))
             }));
         }
         let copier = Copier {
