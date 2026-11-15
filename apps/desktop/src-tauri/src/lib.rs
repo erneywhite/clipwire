@@ -180,7 +180,11 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
         state.upload_limit_mb.clone(),
         std::sync::Arc::new(move |e| match e {
             UiEvent::Status(_) => publish_status(&handle),
-            UiEvent::Copied(_) | UiEvent::Received(_) | UiEvent::HistoryMerged(_) => {
+            // Записи из чужой истории приходят пачками (вход в группу, импорт
+            // на другом устройстве — тысячи подряд): окна перечитывают список
+            // не на каждую, а раз в полсекунды.
+            UiEvent::HistoryMerged(_) => history_changed_soon(&handle),
+            UiEvent::Copied(_) | UiEvent::Received(_) => {
                 // Своё копирование откладывает автообновление.
                 if updates::is_activity(&e) {
                     updates::touch(&handle);
@@ -593,6 +597,52 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// Склеивает частые «история изменилась» в одно событие.
+#[derive(Default)]
+struct Coalesce(std::sync::atomic::AtomicBool);
+
+impl Coalesce {
+    /// `true` — отложенной рассылки ещё нет, её надо запланировать.
+    fn request(&self) -> bool {
+        !self.0.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Отложенная рассылка ушла: следующее изменение запланирует новую.
+    fn sent(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Пауза склейки событий истории.
+const HISTORY_COALESCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// «История изменилась» не чаще раза в [`HISTORY_COALESCE`].
+fn history_changed_soon(app: &AppHandle) {
+    static PENDING: Coalesce = Coalesce(std::sync::atomic::AtomicBool::new(false));
+    if !PENDING.request() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(HISTORY_COALESCE).await;
+        PENDING.sent();
+        let _ = app.emit("clipwire://history-changed", ());
+    });
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    #[test]
+    fn many_changes_one_event() {
+        let c = super::Coalesce::default();
+        assert!(c.request());
+        assert!(!c.request());
+        assert!(!c.request());
+        c.sent();
+        assert!(c.request());
+    }
 }
 
 #[cfg(test)]
