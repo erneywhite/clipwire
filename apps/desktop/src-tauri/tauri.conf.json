@@ -12,6 +12,7 @@
     "windows": [
       {
         "label": "settings",
+        "create": false,
         "title": "Clipwire",
         "url": "index.html",
         "width": 760,
@@ -41,6 +42,7 @@
       },
       {
         "label": "preview",
+        "create": false,
         "title": "Clipwire",
         "url": "index.html",
         "width": 380,
@@ -56,6 +58,7 @@
       },
       {
         "label": "editor",
+        "create": false,
         "title": "Clipwire — редактор",
         "url": "index.html",
         "width": 1100,

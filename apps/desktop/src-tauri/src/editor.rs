@@ -11,17 +11,35 @@ const SHARE: f64 = 0.8;
 
 /// Открыть редактор для картинки из истории. Окно вставки прячется, но окно,
 /// которое было активным до него, запомнено: туда потом и вставим.
+///
+/// Окно редактора создаётся здесь и закрывается насовсем после работы
+/// (`crate::ensure_window`). Команда async: на Windows окно нельзя создавать
+/// из главного потока. Только что созданное окно ещё грузит страницу и
+/// событие `editor://open` пропустило бы, поэтому id картинки ему отдаётся
+/// скриптом инициализации, а событие — только уже открытому редактору.
 #[tauri::command]
-pub fn editor_open(app: AppHandle, id: String) -> Result<(), String> {
-    let w = app
-        .get_webview_window("editor")
-        .ok_or(tr("Окно редактора не создано"))?;
+pub async fn editor_open(app: AppHandle, id: String) -> Result<(), String> {
+    let init = format!(
+        "window.__CLIPWIRE_EDITOR_OPEN__ = {};",
+        serde_json::to_string(&id).map_err(|e| e.to_string())?
+    );
+    // Окно вставки прячется сразу, не дожидаясь создания редактора.
     if let Some(p) = app.get_webview_window("popup") {
         let _ = p.hide();
     }
     if let Some(p) = app.get_webview_window("preview") {
         let _ = p.hide();
     }
+    let a = app.clone();
+    let (w, created) = tauri::async_runtime::spawn_blocking(move || {
+        crate::ensure_window(&a, "editor", Some(init))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| {
+        tracing::warn!("окно редактора не создалось: {e}");
+        tr("Окно редактора не создано").to_string()
+    })?;
 
     let cursor = app
         .cursor_position()
@@ -52,7 +70,9 @@ pub fn editor_open(app: AppHandle, id: String) -> Result<(), String> {
     let _ = w.show();
     let _ = w.unminimize();
     let _ = w.set_focus();
-    let _ = app.emit_to("editor", "editor://open", id);
+    if !created {
+        let _ = app.emit_to("editor", "editor://open", id);
+    }
     Ok(())
 }
 
@@ -73,5 +93,12 @@ pub async fn editor_save(app: AppHandle, png: String, paste: bool) -> Result<(),
     crate::popup::copy(&app, content, None)?;
     let _ = app.emit("clipwire://history-changed", ());
     crate::popup::return_and_paste(&app, "editor", paste).await;
+    // Редактор спрятан (на маке он остаётся на экране, если просит доступ к
+    // универсальному доступу): закрыть окно насовсем вместе с картинкой.
+    if let Some(w) = app.get_webview_window("editor")
+        && !w.is_visible().unwrap_or(true)
+    {
+        let _ = w.destroy();
+    }
     Ok(())
 }

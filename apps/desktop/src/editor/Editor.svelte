@@ -572,10 +572,33 @@
     }
   }
 
-  function close() {
+  /** Отпустить картинку, холст и историю правок: полноразмерный кадр 4K —
+   *  это десятки мегабайт в процессе WebView. */
+  function release() {
+    image = null
+    W = 0
+    H = 0
+    shapes = []
+    crop = null
+    selected = null
+    undoStack = []
+    redoStack = []
+    draft = null
+    cropDraft = null
+    drag = null
     editing = null
     escArmed = false
-    win.hide()
+    if (canvas) {
+      canvas.width = 0
+      canvas.height = 0
+    }
+  }
+
+  function close() {
+    release()
+    // Окно закрывается насовсем (Rust не прячет его, а уничтожает), следующее
+    // «Изменить» создаст его заново.
+    win.close()
   }
 
   function onKey(e: KeyboardEvent) {
@@ -637,6 +660,10 @@
       render()
     })
     if (stage) ro.observe(stage)
+    // Только что созданное окно получает id картинки скриптом
+    // инициализации: событие `editor://open` пришло бы раньше подписки.
+    const first = (window as { __CLIPWIRE_EDITOR_OPEN__?: string }).__CLIPWIRE_EDITOR_OPEN__
+    if (first) open(first)
     const unlisten = [
       listen<string>('editor://open', (e) => open(e.payload)),
       listen<Settings>('clipwire://settings-changed', (e) => applySettings(e.payload)),

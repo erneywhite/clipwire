@@ -355,6 +355,8 @@ pub fn apply_window_background(app: &AppHandle, hex: &str) {
         return;
     }
     let color = tauri::window::Color((v >> 16) as u8, (v >> 8) as u8, v as u8, 255);
+    // Окна, которых сейчас нет, возьмут цвет при создании (`ensure_window`).
+    *WINDOW_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some(color);
     for label in ["settings", "popup", "preview", "editor"] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.set_background_color(Some(color));
@@ -362,12 +364,81 @@ pub fn apply_window_background(app: &AppHandle, hex: &str) {
     }
 }
 
+/// Последний цвет фона из темы, для окон, созданных после его выбора.
+static WINDOW_BACKGROUND: Mutex<Option<tauri::window::Color>> = Mutex::new(None);
+
+/// Взять окно по метке или создать его по описанию из `tauri.conf.json`.
+/// Второе значение — окно только что создано (страница ещё грузится).
+///
+/// Окно вставки создаётся вместе с приложением и живёт всегда: его показ по
+/// горячей клавише должен быть мгновенным. Настройки, превью размера и
+/// редактор помечены в конфиге `"create": false`: их WebView (на Windows —
+/// отдельный процесс рендера) появляется только по требованию и закрывается
+/// насовсем, а не прячется.
+///
+/// На Windows создание окна из главного потока (синхронная команда,
+/// обработчик событий окна, меню трея) зависает намертво: WebView2 ждёт тот
+/// же поток. Поэтому звать только из фонового потока или async-команды.
+pub fn ensure_window(
+    app: &AppHandle,
+    label: &str,
+    init_script: Option<String>,
+) -> Result<(tauri::WebviewWindow, bool), String> {
+    // Два одновременных вызова не должны создавать окно дважды: вторая
+    // попытка с той же меткой упала бы.
+    static CREATING: Mutex<()> = Mutex::new(());
+    let _guard = CREATING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(w) = app.get_webview_window(label) {
+        return Ok((w, false));
+    }
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|c| c.label == label)
+        .cloned()
+        .ok_or_else(|| format!("в конфиге нет окна {label}"))?;
+    let mut builder =
+        tauri::WebviewWindowBuilder::from_config(app, &config).map_err(|e| e.to_string())?;
+    let background = *WINDOW_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(color) = background {
+        builder = builder.background_color(color);
+    }
+    if let Some(script) = init_script {
+        builder = builder.initialization_script(script);
+    }
+    let w = builder.build().map_err(|e| e.to_string())?;
+    tracing::debug!("создано окно {label}");
+    Ok((w, true))
+}
+
+/// Включена ли «Скрывать окна при демонстрации экрана».
+fn hide_from_capture(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .hide_from_capture
+}
+
+/// Показать окно настроек, создав его при необходимости. Можно звать из
+/// любого потока: окно создаётся в фоновом.
 pub fn show_settings(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("settings") {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let w = match ensure_window(&app, "settings", None) {
+            Ok((w, _)) => w,
+            Err(e) => {
+                tracing::warn!("окно настроек не открылось: {e}");
+                return;
+            }
+        };
+        let _ = w.set_content_protected(hide_from_capture(&app));
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
-    }
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -503,23 +574,16 @@ pub fn run() {
             // Первым делом: обновление, скачанное в прошлый раз, ставится до
             // запуска движка, а после автоматической установки окно не нужно.
             let after_update = updates::on_startup(app.handle());
-            let hide_from_capture = app
-                .state::<AppState>()
-                .settings
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .hide_from_capture;
             // Окно вставки создаётся вместе с приложением, но показываться должно
             // только по горячей клавише. Прячем явно: на некоторых сборках WebView2
             // скрытое окно без рамки всплывало пустым белым прямоугольником.
-            for label in ["popup", "preview", "editor"] {
-                if let Some(p) = app.get_webview_window(label) {
-                    let _ = p.hide();
-                }
+            // Остальные окна на старте не создаются (`ensure_window`).
+            if let Some(p) = app.get_webview_window("popup") {
+                let _ = p.hide();
             }
             // Защиту от захвата трогаем, только если она включена: вызов на
             // скрытом окне может его показать.
-            if hide_from_capture {
+            if hide_from_capture(app.handle()) {
                 apply_capture_protection(app.handle(), true);
             }
             spawn_pruner(app.handle().clone());
@@ -563,14 +627,17 @@ pub fn run() {
             // Любое событие окна — признак, что программой пользуются.
             updates::touch(window.app_handle());
             match event {
-                // Закрытие окна прячет его: приложение живёт в трее до «Выход».
-                WindowEvent::CloseRequested { api, .. } => {
+                // Окно вставки при закрытии только прячется: оно нужно мгновенно
+                // по горячей клавише. Настройки, превью и редактор закрываются
+                // насовсем и освобождают свой WebView; приложение живёт в трее
+                // до «Выход» (см. `RunEvent::ExitRequested` ниже).
+                WindowEvent::CloseRequested { api, .. } if window.label() == "popup" => {
                     api.prevent_close();
                     let _ = window.hide();
-                    // Вместе с настройками прячется и пример окна вставки.
-                    if window.label() == "settings" {
-                        settings_window::size_preview_hide(window.app_handle().clone());
-                    }
+                }
+                // Вместе с настройками уходит и пример окна вставки.
+                WindowEvent::CloseRequested { .. } if window.label() == "settings" => {
+                    settings_window::size_preview_close(window.app_handle());
                 }
                 // Окно вставки исчезает, как только уходит фокус: как меню.
                 WindowEvent::Focused(true) if window.label() == "popup" => {
@@ -586,6 +653,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("приложение не собралось")
         .run(|app, event| {
+            // Закрылось последнее окно (`code` пустой): программа остаётся в
+            // трее. Выход из меню (`app.exit`) и перезапуск после обновления
+            // приходят с кодом и проходят.
+            if let tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } = &event
+            {
+                api.prevent_exit();
+                return;
+            }
             if let tauri::RunEvent::Exit = event {
                 // Дать движку дослать очередь перед выходом.
                 let state = app.state::<AppState>();
@@ -649,6 +726,19 @@ mod coalesce_tests {
 
 #[cfg(test)]
 mod config_tests {
+    /// На старте создаётся только окно вставки (быстрый первый показ),
+    /// остальные — по требованию через `ensure_window`.
+    #[test]
+    fn only_popup_is_created_at_startup() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
+        let conf: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for w in conf["app"]["windows"].as_array().unwrap() {
+            let created = w["create"].as_bool().unwrap_or(true);
+            assert_eq!(created, w["label"] == "popup", "окно {}", w["label"]);
+        }
+    }
+
     /// `tauri.macos.conf.json` при слиянии заменяет массив окон целиком, поэтому
     /// там копия окон из `tauri.conf.json`. Отличаться она может только
     /// заголовком macOS, иначе правка основного конфига потеряется на маке.

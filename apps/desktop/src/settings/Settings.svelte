@@ -415,6 +415,15 @@
       }),
     ]
     Promise.all(unlisten).then(refresh)
+    // Окно настроек создаётся при каждом открытии и событие фоновой проверки
+    // могло прийти, пока его не было. Скачанное обновление ждёт — показать
+    // его в «О программе» сразу.
+    api
+      .updateReady()
+      .then((v) => {
+        if (v) checkUpdates()
+      })
+      .catch(() => {})
     return () => unlisten.forEach((p) => p.then((f) => f()))
   })
 </script>

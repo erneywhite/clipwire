@@ -7,6 +7,12 @@
 //! поэтому на Windows показ и перемещение делаются напрямую: `SW_SHOWNOACTIVATE`
 //! и `SetWindowPos(SWP_NOACTIVATE)`. Окно превью подчинено окну настроек
 //! (owner): оно всегда над ним и не мелькает в Alt+Tab.
+//!
+//! Окно превью создаётся при первом показе и закрывается вместе с настройками
+//! (`size_preview_close`): между открытиями настроек его WebView не висит.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{AppHandle, Manager};
 #[cfg(not(windows))]
@@ -15,14 +21,62 @@ use tauri::{PhysicalPosition, PhysicalSize};
 /// Отступ превью от окна настроек, логические пиксели.
 const GAP: f64 = 16.0;
 
+/// Показ превью нужен: `size_preview` уже вызван, `size_preview_hide` ещё нет.
+/// Окно создаётся в фоне, а курсор за это время мог уйти с блока.
+static WANTED: AtomicBool = AtomicBool::new(false);
+/// Окно превью создаётся прямо сейчас: второй раз не начинать.
+static CREATING: AtomicBool = AtomicBool::new(false);
+/// Последний запрошенный размер, логические пиксели.
+static SIZE: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+
+/// Показать превью размера `width`×`height` рядом с настройками.
+///
+/// Команда синхронная (главный поток), как и `size_preview_hide`: показ и
+/// скрытие идут строго по очереди. Окна превью сначала нет: оно создаётся
+/// фоновым потоком (из главного создание на Windows зависает), а показ
+/// возвращается в главный поток и смотрит, нужен ли он ещё.
 #[tauri::command]
 pub fn size_preview(app: AppHandle, width: f64, height: f64) {
+    *SIZE.lock().unwrap_or_else(|e| e.into_inner()) = (width, height);
+    WANTED.store(true, Ordering::SeqCst);
+    if app.get_webview_window("settings").is_none() {
+        return;
+    }
+    if app.get_webview_window("preview").is_some() {
+        place(&app);
+        return;
+    }
+    if CREATING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let made = crate::ensure_window(&app, "preview", None);
+        CREATING.store(false, Ordering::SeqCst);
+        if let Err(e) = made {
+            tracing::warn!("окно превью размера не создалось: {e}");
+            return;
+        }
+        let a = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            // Настройки успели закрыться, пока окно создавалось: превью не нужно.
+            if a.get_webview_window("settings").is_none() {
+                size_preview_close(&a);
+            } else if WANTED.load(Ordering::SeqCst) {
+                place(&a);
+            }
+        });
+    });
+}
+
+/// Поставить превью рядом с настройками и показать, не активируя.
+fn place(app: &AppHandle) {
     let (Some(preview), Some(settings)) = (
         app.get_webview_window("preview"),
         app.get_webview_window("settings"),
     ) else {
         return;
     };
+    let (width, height) = *SIZE.lock().unwrap_or_else(|e| e.into_inner());
     let (Ok(pos), Ok(size)) = (settings.outer_position(), settings.outer_size()) else {
         return;
     };
@@ -79,6 +133,7 @@ pub fn settings_toggle_maximize(w: tauri::WebviewWindow) -> bool {
 
 #[tauri::command]
 pub fn size_preview_hide(app: AppHandle) {
+    WANTED.store(false, Ordering::SeqCst);
     if let Some(p) = app.get_webview_window("preview") {
         // Показывали в обход Tauri — и прячем так же: Tauri считает окно
         // скрытым и свой hide() пропустил бы.
@@ -86,6 +141,18 @@ pub fn size_preview_hide(app: AppHandle) {
         win::hide(&p);
         #[cfg(not(windows))]
         let _ = p.hide();
+    }
+}
+
+/// Настройки закрываются: превью закрыть насовсем, а не прятать. Оно
+/// подчинено окну настроек, и Windows всё равно уничтожила бы его вместе с
+/// владельцем, но в обход Tauri.
+pub fn size_preview_close(app: &AppHandle) {
+    WANTED.store(false, Ordering::SeqCst);
+    if let Some(p) = app.get_webview_window("preview")
+        && let Err(e) = p.destroy()
+    {
+        tracing::warn!("окно превью размера не закрылось: {e}");
     }
 }
 
