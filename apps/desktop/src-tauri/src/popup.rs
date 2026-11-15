@@ -368,7 +368,7 @@ pub async fn popup_paste(
         let state = app.state::<AppState>();
         let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
         match h.get(id) {
-            Some(e) => e.clone(),
+            Some(e) => e,
             None => return Err(tr("Элемента уже нет в истории").into()),
         }
     };

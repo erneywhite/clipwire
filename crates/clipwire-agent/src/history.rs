@@ -1,24 +1,68 @@
 //! Локальная история буфера.
 //!
-//! SQLite-файл `history.db`; каждая запись зашифрована локальным ключом
-//! (XChaCha20-Poly1305), ключ лежит в `history.key` под [`crate::secret`].
-//! Открыто хранится только время для очистки по сроку и флаг закрепления.
-//! В памяти — расшифрованный список для мгновенного поиска (история ограничена
-//! сроком, так что это килобайты-мегабайты текста).
+//! SQLite-файл `history.db`, схема и решения — в `docs/history-storage.md`.
+//! Каждая запись зашифрована локальным ключом (XChaCha20-Poly1305), ключ лежит
+//! в `history.key` под [`crate::secret`]. Открыто хранятся время для очистки по
+//! сроку, флаг закрепления и ключевой хэш содержимого для поиска дублей.
+//!
+//! В памяти история не держится. У записи две зашифрованные части: карточка
+//! (несколько сотен байт: всё, что нужно строке списка, поиску и служебным
+//! проверкам) и тело (полная запись `Entry`). Список и поиск расшифровывают
+//! только карточки, тело читается по требованию: предпросмотр, вставка,
+//! отправка истории в группу. В памяти живёт только маленький кэш значков
+//! программ-источников.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use clipwire_core::item::ext;
-use clipwire_core::{Content, DeviceId, Ext, ExtList, ItemId, SourceApp};
-use rusqlite::{Connection, params};
+use clipwire_core::{BlobId, Content, DeviceId, Ext, ExtList, FileRef, ItemId, SourceApp};
+use hmac::{Hmac, Mac};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use uuid::Uuid;
 
+use crate::i18n::tr;
 use crate::settings::Retention;
+
+/// Версия схемы базы (`PRAGMA user_version`). 0 — до карточек (0.2.x).
+const SCHEMA_VERSION: i64 = 2;
+/// Версия формата карточки: первый байт расшифрованной карточки.
+const CARD_VERSION: u8 = 1;
+/// Сколько символов текста лежит в карточке для строки списка.
+pub const HEAD_CHARS: usize = 400;
+/// Сколько байт начала текста лежит в карточке для поиска. Совпадение дальше
+/// не найдётся: поиск не читает тела (см. `docs/history-storage.md`).
+pub const SEARCH_BYTES: usize = 8 * 1024;
+/// Записей в одной транзакции перехода со старой базы.
+const MIGRATE_BATCH: usize = 500;
+/// Сколько расшифрованных значков держать в памяти.
+const ICON_CACHE: usize = 128;
+/// Метки, из которых выводятся ключи хэшей. Менять нельзя: ключевые хэши в
+/// базе перестанут совпадать.
+const HKEY_LABEL: &[u8] = b"clipwire/history/hkey/v1";
+const ICON_LABEL: &[u8] = b"clipwire/history/icon/v1";
+
+/// Таблица записей. Тело (`nonce`, `data`) — последним: карточки читаются без
+/// прохода по страницам переполнения больших тел.
+const CREATE_ENTRIES: &str = "CREATE TABLE entries (
+    id          BLOB PRIMARY KEY,
+    seen_ms     INTEGER NOT NULL,
+    pinned      INTEGER NOT NULL,
+    hkey        BLOB,
+    card_nonce  BLOB,
+    card        BLOB,
+    thumb_nonce BLOB,
+    thumb       BLOB,
+    nonce       BLOB NOT NULL,
+    data        BLOB NOT NULL
+)";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -53,18 +97,32 @@ impl Entry {
     pub fn set_source_app(&mut self, app: &SourceApp) {
         self.ext_set(ext::SOURCE_APP, app);
     }
+}
 
-    /// Только имя приложения-источника: для поиска не нужно разбирать иконку.
-    fn source_name(&self) -> Option<String> {
-        #[derive(Deserialize)]
-        struct NameOnly {
-            name: String,
-        }
-        let e = self.ext.iter().find(|e| e.tag == ext::SOURCE_APP)?;
-        postcard::take_from_bytes::<NameOnly>(&e.data)
-            .ok()
-            .map(|(n, _)| n.name)
+/// То же, что `Entry`, но по ссылкам: тело пишется без копии содержимого.
+/// Порядок и типы полей те же, поэтому postcard даёт те же байты.
+#[derive(Serialize)]
+struct EntryOut<'a> {
+    id: &'a ItemId,
+    origin: &'a DeviceId,
+    device_name: &'a str,
+    local: bool,
+    content: &'a Content,
+    seen_ms: i64,
+    pinned: bool,
+    ext: &'a [Ext],
+}
+
+/// Только имя приложения-источника: для поиска не нужно разбирать иконку.
+fn source_name(list: &[Ext]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct NameOnly {
+        name: String,
     }
+    let e = list.iter().find(|e| e.tag == ext::SOURCE_APP)?;
+    postcard::take_from_bytes::<NameOnly>(&e.data)
+        .ok()
+        .map(|(n, _)| n.name)
 }
 
 /// `Entry` до появления `ext`.
@@ -159,17 +217,250 @@ impl Kind {
             _ => false,
         }
     }
+
+    /// То же по карточке: признак ссылки посчитан по полному тексту при записи.
+    pub fn matches_card(self, c: &Card) -> bool {
+        match (self, c.kind) {
+            (Kind::All, _) => true,
+            (Kind::Text, CardKind::Text | CardKind::Rich) => !c.link,
+            (Kind::Link, CardKind::Text | CardKind::Rich) => c.link,
+            (Kind::Image, CardKind::Image) => true,
+            (Kind::Image, CardKind::Files) => {
+                !c.files.is_empty() && c.files.iter().all(|f| f.width > 0)
+            }
+            (Kind::Files, CardKind::Files) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Тип содержимого записи в карточке.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CardKind {
+    Text,
+    Rich,
+    Image,
+    Files,
+    /// Содержимое типа, которого эта версия не знает. Ни один фильтр его не берёт.
+    Other,
+}
+
+/// В каком виде у текста форматирование.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RichFormat {
+    Html,
+    Rtf,
+}
+
+/// Карточка записи: всё, что нужно строке списка, поиску и проверкам путей и
+/// блобов, без тела. Лежит зашифрованной рядом с телом.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Card {
+    /// `Content::hash()`: по нему удаление уходит на другие устройства.
+    pub hash: [u8; 32],
+    pub origin: DeviceId,
+    pub device_name: String,
+    pub local: bool,
+    pub kind: CardKind,
+    /// Весь текст — одна ссылка (`is_url` по полному тексту).
+    pub link: bool,
+    /// Первые [`HEAD_CHARS`] символов текста как есть.
+    pub head: String,
+    /// Первые [`SEARCH_BYTES`] байт текста в нижнем регистре.
+    pub search: String,
+    /// Полный текст: символов и строк.
+    pub chars: u64,
+    pub lines: u64,
+    /// Вес: у файлов — сумма размеров, иначе `Content::len()`.
+    pub bytes: u64,
+    pub rich: Option<RichFormat>,
+    /// Картинка или единственный файл-картинка: размеры, иначе 0.
+    pub width: u32,
+    pub height: u32,
+    /// Файлы записи целиком, в исходном порядке.
+    pub files: Vec<FileRef>,
+    /// Сведения по меткам. Значок приложения-источника вынут в таблицу
+    /// `icons`, его ключ — `icon`.
+    pub ext: Vec<Ext>,
+    pub icon: Option<[u8; 32]>,
+}
+
+impl ExtList for Card {
+    fn ext_list(&self) -> &[Ext] {
+        &self.ext
+    }
+    fn ext_list_mut(&mut self) -> &mut Vec<Ext> {
+        &mut self.ext
+    }
+}
+
+/// Самое длинное начало строки не длиннее `max` байт, по границе символа.
+fn prefix_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+impl Card {
+    fn build(e: &Entry, hash: [u8; 32], ext: Vec<Ext>, icon: Option<[u8; 32]>) -> Card {
+        let (kind, text) = match &e.content {
+            Content::Text(t) => (CardKind::Text, Some(t.as_str())),
+            Content::Rich { text, .. } => (CardKind::Rich, Some(text.as_str())),
+            Content::Image { .. } => (CardKind::Image, None),
+            Content::Files(_) => (CardKind::Files, None),
+            #[allow(unreachable_patterns)]
+            _ => (CardKind::Other, None),
+        };
+        let t = text.unwrap_or("");
+        let (width, height) = match &e.content {
+            Content::Image { width, height, .. } => (*width, *height),
+            Content::Files(f) if f.len() == 1 => (f[0].width, f[0].height),
+            _ => (0, 0),
+        };
+        let files = match &e.content {
+            Content::Files(f) => f.clone(),
+            _ => Vec::new(),
+        };
+        let bytes = match &e.content {
+            Content::Files(f) => f.iter().map(|f| f.size).sum(),
+            c => c.len() as u64,
+        };
+        let rich = match &e.content {
+            Content::Rich { html, .. } => Some(if html.is_some() {
+                RichFormat::Html
+            } else {
+                RichFormat::Rtf
+            }),
+            _ => None,
+        };
+        Card {
+            hash,
+            origin: e.origin,
+            device_name: e.device_name.clone(),
+            local: e.local,
+            kind,
+            link: text.is_some_and(is_url),
+            head: t.chars().take(HEAD_CHARS).collect(),
+            search: prefix_bytes(t, SEARCH_BYTES).to_lowercase(),
+            chars: t.chars().count() as u64,
+            lines: t.lines().count().max(1) as u64,
+            bytes,
+            rich,
+            width,
+            height,
+            files,
+            ext,
+            icon,
+        }
+    }
+
+    /// Приложение-источник без значка (значок — по `icon` из таблицы).
+    pub fn source_app(&self) -> Option<SourceApp> {
+        self.ext_get(ext::SOURCE_APP)
+    }
+
+    /// Подходит ли под запрос `q` (уже в нижнем регистре, без пробелов по краям).
+    fn matches_query(&self, q: &str) -> bool {
+        q.is_empty()
+            || match self.kind {
+                CardKind::Text | CardKind::Rich => self.search.contains(q),
+                // Файлы — по именам и по словам «файл», «папка».
+                CardKind::Files => {
+                    self.files.iter().any(|f| f.name.to_lowercase().contains(q))
+                        || ["файл", "папк", "file", "folder"]
+                            .iter()
+                            .any(|w| w.starts_with(q) || q.starts_with(w))
+                }
+                // Картинки находятся по словам «картинка», «скрин» и т. п.
+                CardKind::Image => ["картин", "изображ", "скрин", "снимок", "image", "фото"]
+                    .iter()
+                    .any(|w| w.starts_with(q) || q.starts_with(w)),
+                CardKind::Other => false,
+            }
+            || self.device_name.to_lowercase().contains(q)
+            || source_name(&self.ext).is_some_and(|n| n.to_lowercase().contains(q))
+    }
+}
+
+/// Запись для списка: карточка, миниатюра и значок, без тела.
+#[derive(Debug, Clone)]
+pub struct Row {
+    pub id: ItemId,
+    pub seen_ms: i64,
+    pub pinned: bool,
+    pub card: Card,
+    /// Миниатюра картинки (PNG), если есть.
+    pub thumb: Option<Vec<u8>>,
+    /// Значок приложения-источника (PNG), если есть.
+    pub icon: Option<Arc<[u8]>>,
+}
+
+impl Row {
+    /// Приложение-источник со значком.
+    pub fn source_app(&self) -> Option<SourceApp> {
+        let mut app = self.card.source_app()?;
+        if app.icon_png.is_empty()
+            && let Some(icon) = &self.icon
+        {
+            app.icon_png = icon.to_vec();
+        }
+        Some(app)
+    }
+
+    /// Начало текста (для строки списка).
+    pub fn text(&self) -> &str {
+        &self.card.head
+    }
+}
+
+/// Значок PNG; `None` — в базе его нет.
+type Icon = Option<Arc<[u8]>>;
+
+/// Небольшой LRU расшифрованных значков: ключ → (когда брали, значок).
+#[derive(Default)]
+struct IconCache {
+    tick: u64,
+    map: HashMap<[u8; 32], (u64, Icon)>,
+}
+
+impl IconCache {
+    fn get(&mut self, key: &[u8; 32]) -> Option<Icon> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(key).map(|(t, v)| {
+            *t = tick;
+            v.clone()
+        })
+    }
+
+    fn put(&mut self, key: [u8; 32], icon: Icon) {
+        self.tick += 1;
+        if self.map.len() >= ICON_CACHE
+            && !self.map.contains_key(&key)
+            && let Some(old) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(k, _)| *k)
+        {
+            self.map.remove(&old);
+        }
+        self.map.insert(key, (self.tick, icon));
+    }
 }
 
 pub struct History {
     conn: Connection,
     cipher: XChaCha20Poly1305,
-    /// Новые первыми.
-    entries: Vec<Entry>,
-    by_hash: HashMap<[u8; 32], ItemId>,
-    /// Миниатюры картинок (PNG) для списка в окне вставки. В базе — отдельной
-    /// зашифрованной колонкой, чтобы формат самих записей не менялся.
-    thumbs: HashMap<ItemId, Vec<u8>>,
+    /// Ключ для `hkey` (дубли) и ключ для имён значков, оба выведены из ключа истории.
+    hkey_key: [u8; 32],
+    icon_key: [u8; 32],
+    icons: Mutex<IconCache>,
 }
 
 pub fn now_ms() -> i64 {
@@ -199,80 +490,175 @@ fn load_key(dir: &Path) -> Result<[u8; 32]> {
     }
 }
 
+fn mac(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut m = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key)
+        .expect("HMAC принимает ключ любой длины");
+    m.update(data);
+    let out = m.finalize().into_bytes();
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&out);
+    a
+}
+
+fn item_id(raw: &[u8]) -> Option<ItemId> {
+    <[u8; 16]>::try_from(raw)
+        .ok()
+        .map(|b| ItemId(Uuid::from_bytes(b)))
+}
+
+/// Для `LIMIT`: «без предела» у SQLite — отрицательное число.
+fn sql_limit(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(-1)
+}
+
+/// AAD карточки: шифротекст привязан к строке, чужую карточку на её место не подложить.
+fn card_aad(id: &ItemId) -> Vec<u8> {
+    let mut a = b"card\0".to_vec();
+    a.extend_from_slice(id.as_bytes());
+    a
+}
+
+/// Миниатюра для новой записи: картинка или свой файл-картинка. Делается до
+/// замка истории: декодирование картинки — заметная работа. Ошибка не
+/// фатальна, в списке тогда будет значок вместо превью.
+pub fn make_thumb(e: &Entry) -> Option<Vec<u8>> {
+    let made = match &e.content {
+        Content::Image { png, .. } => crate::image::thumbnail(png),
+        // Свой файл-картинка: миниатюра из файла. У чужого путь с другого
+        // устройства, его миниатюра делается после скачивания.
+        Content::Files(f) if e.local && f.len() == 1 && f[0].width > 0 => {
+            crate::image::thumbnail_file(Path::new(&f[0].path))
+        }
+        _ => return None,
+    };
+    made.map_err(|err| tracing::warn!("миниатюра не сделалась: {err:#}"))
+        .ok()
+}
+
 impl History {
     pub fn open(dir: &Path) -> Result<Self> {
         let key = load_key(dir)?;
-        let conn = Connection::open(dir.join("history.db")).context("не открылась history.db")?;
-        Self::init(conn, key)
+        let path = dir.join("history.db");
+        let conn = Connection::open(&path).context("не открылась history.db")?;
+        Self::init(conn, key, Some(&path))
     }
 
     #[cfg(test)]
     fn in_memory() -> Self {
-        Self::init(Connection::open_in_memory().unwrap(), [7; 32]).unwrap()
+        Self::init(Connection::open_in_memory().unwrap(), [7; 32], None).unwrap()
     }
 
-    fn init(conn: Connection, key: [u8; 32]) -> Result<Self> {
+    fn init(conn: Connection, key: [u8; 32], path: Option<&Path>) -> Result<Self> {
+        // Консольный клиент и приложение могут открыть одну базу.
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             CREATE TABLE IF NOT EXISTS entries (
-                 id      BLOB PRIMARY KEY,
-                 seen_ms INTEGER NOT NULL,
-                 pinned  INTEGER NOT NULL,
-                 nonce   BLOB NOT NULL,
-                 data    BLOB NOT NULL
+             PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = -4000;",
+        )?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let has_table = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entries'")?
+            .exists([])?;
+        if !has_table {
+            conn.execute_batch(&format!(
+                "{CREATE_ENTRIES}; PRAGMA user_version = {SCHEMA_VERSION};"
+            ))?;
+        } else if version < SCHEMA_VERSION {
+            migrate_layout(&conn, path)?;
+        } else if version > SCHEMA_VERSION {
+            tracing::warn!("история от более новой версии Clipwire (схема {version})");
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS entries_seen ON entries (seen_ms DESC, id DESC);
+             CREATE INDEX IF NOT EXISTS entries_hkey ON entries (hkey);
+             CREATE INDEX IF NOT EXISTS entries_nocard ON entries (id) WHERE card IS NULL;
+             CREATE TABLE IF NOT EXISTS icons (
+                 key   BLOB PRIMARY KEY,
+                 nonce BLOB NOT NULL,
+                 data  BLOB NOT NULL
              );",
         )?;
-        // Колонки миниатюр появились вместе с картинками — в старых базах их нет.
-        let has_thumb: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('entries') WHERE name = 'thumb'")?
-            .exists([])?;
-        if !has_thumb {
-            conn.execute_batch(
-                "ALTER TABLE entries ADD COLUMN thumb_nonce BLOB;
-                 ALTER TABLE entries ADD COLUMN thumb BLOB;",
-            )?;
-        }
-        let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("ключ 32 байта");
-        let mut h = Self {
+        let h = Self {
             conn,
-            cipher,
-            entries: Vec::new(),
-            by_hash: HashMap::new(),
-            thumbs: HashMap::new(),
+            cipher: XChaCha20Poly1305::new_from_slice(&key).expect("ключ 32 байта"),
+            hkey_key: mac(&key, HKEY_LABEL),
+            icon_key: mac(&key, ICON_LABEL),
+            icons: Mutex::new(IconCache::default()),
         };
-        h.load_all()?;
+        h.fill_cards()?;
         Ok(h)
     }
 
-    fn load_all(&mut self) -> Result<()> {
-        type Row = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
-        let mut stmt = self
-            .conn
-            .prepare("SELECT nonce, data, thumb_nonce, thumb FROM entries ORDER BY seen_ms DESC")?;
-        let rows: Vec<Row> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-            .collect::<Result<_, _>>()?;
-        drop(stmt);
-        for (nonce, data, tn, tdata) in rows {
-            match self.decrypt(&nonce, &data) {
-                Ok(e) => {
-                    if let (Some(tn), Some(td)) = (tn, tdata)
-                        && let Ok(t) = self.open_blob(&tn, &td)
-                    {
-                        self.thumbs.insert(e.id, t);
+    /// Карточки и ключевые хэши для строк без них: записи старой базы и
+    /// записанные старой версией. Пачками в транзакциях: упавший посреди
+    /// переход догонится при следующем открытии, а до тех пор читающий код
+    /// берёт данные из тела. Нерасшифровываемые строки пропускаются.
+    fn fill_cards(&self) -> Result<()> {
+        let mut after: Vec<u8> = Vec::new();
+        let (mut filled, mut broken) = (0usize, 0usize);
+        loop {
+            let ids: Vec<Vec<u8>> = self
+                .conn
+                .prepare_cached(
+                    "SELECT id FROM entries WHERE card IS NULL AND id > ?1 ORDER BY id LIMIT ?2",
+                )?
+                .query_map(params![after, MIGRATE_BATCH as i64], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            let Some(last) = ids.last() else {
+                break;
+            };
+            after = last.clone();
+            let tx = self.conn.unchecked_transaction()?;
+            for raw in &ids {
+                let Some(id) = item_id(raw) else {
+                    broken += 1;
+                    continue;
+                };
+                // По одной: тела бывают в десятки мегабайт.
+                match self.body(id) {
+                    Ok(Some(e)) => {
+                        self.write_card(id, &e)?;
+                        filled += 1;
                     }
-                    self.by_hash.insert(e.content.hash(), e.id);
-                    self.entries.push(e);
+                    Ok(None) => {}
+                    Err(err) => {
+                        broken += 1;
+                        tracing::warn!("запись истории не расшифровалась, пропускаю: {err:#}");
+                    }
                 }
-                // Не убиваем всю историю из-за одной битой записи.
-                Err(err) => tracing::warn!("запись истории не расшифровалась, пропускаю: {err:#}"),
             }
+            tx.commit()?;
+        }
+        if filled > 0 || broken > 0 {
+            tracing::info!(filled, broken, "карточки истории дописаны");
         }
         Ok(())
     }
 
+    // ---- шифрование ----
+
+    fn open_blob(&self, nonce: &[u8], data: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        let nonce: [u8; 24] = nonce
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("битый nonce"))?;
+        self.cipher
+            .decrypt(&XNonce::from(nonce), Payload { msg: data, aad })
+            .map_err(|_| anyhow::anyhow!("чужой ключ или данные повреждены"))
+    }
+
+    fn seal_blob(&self, plain: &[u8], aad: &[u8]) -> Result<([u8; 24], Vec<u8>)> {
+        let mut nonce = [0u8; 24];
+        getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("нет случайных байтов: {e}"))?;
+        let data = self
+            .cipher
+            .encrypt(&XNonce::from(nonce), Payload { msg: plain, aad })
+            .map_err(|_| anyhow::anyhow!("не удалось зашифровать"))?;
+        Ok((nonce, data))
+    }
+
     fn decrypt(&self, nonce: &[u8], data: &[u8]) -> Result<Entry> {
-        let plain = self.open_blob(nonce, data)?;
+        let plain = self.open_blob(nonce, data, b"")?;
         // Запись прошлой версии читается по-старому и переводится. Каждый вид
         // принимаем, только если он съел все байты: запись старого формата
         // иначе могла бы разобраться со сдвинутыми полями.
@@ -290,285 +676,545 @@ impl History {
         }
     }
 
-    fn open_blob(&self, nonce: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-        let nonce: [u8; 24] = nonce
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("битый nonce"))?;
-        self.cipher
-            .decrypt(&XNonce::from(nonce), data)
-            .map_err(|_| anyhow::anyhow!("чужой ключ или данные повреждены"))
+    fn open_card(&self, id: &ItemId, nonce: &[u8], data: &[u8]) -> Result<Card> {
+        let plain = self.open_blob(nonce, data, &card_aad(id))?;
+        match plain.split_first() {
+            Some((&CARD_VERSION, rest)) => Ok(postcard::from_bytes(rest)?),
+            _ => bail!("карточка неизвестной версии"),
+        }
     }
 
-    fn seal_blob(&self, plain: &[u8]) -> Result<([u8; 24], Vec<u8>)> {
-        let mut nonce = [0u8; 24];
-        getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("нет случайных байтов: {e}"))?;
-        let data = self
-            .cipher
-            .encrypt(&XNonce::from(nonce), plain)
-            .map_err(|_| anyhow::anyhow!("не удалось зашифровать"))?;
-        Ok((nonce, data))
+    /// Ключевой хэш содержимого. По голому хэшу можно было бы проверять
+    /// догадки о содержимом, по ключевому — нет.
+    fn hkey(&self, hash: &[u8; 32]) -> [u8; 32] {
+        mac(&self.hkey_key, hash)
     }
 
-    /// Сделать и сохранить миниатюру картинки. Ошибка не фатальна: в списке
-    /// тогда будет значок вместо превью.
-    fn store_thumb(&mut self, e: &Entry) {
-        let made = match &e.content {
-            Content::Image { png, .. } => crate::image::thumbnail(png),
-            // Свой файл-картинка: миниатюра из файла. У чужого путь с другого
-            // устройства, его миниатюра делается после скачивания (`file_thumb`).
-            Content::Files(f) if e.local && f.len() == 1 && f[0].width > 0 => {
-                crate::image::thumbnail_file(std::path::Path::new(&f[0].path))
-            }
-            _ => return,
+    fn icon_id(&self, exe: &str) -> [u8; 32] {
+        mac(&self.icon_key, exe.as_bytes())
+    }
+
+    // ---- значки ----
+
+    /// Значок по ключу: из кэша или из таблицы `icons`.
+    fn icon(&self, key: [u8; 32]) -> Option<Arc<[u8]>> {
+        let mut cache = self.icons.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(&key) {
+            return hit;
+        }
+        let row: Option<(Vec<u8>, Vec<u8>)> = self
+            .conn
+            .prepare_cached("SELECT nonce, data FROM icons WHERE key = ?1")
+            .and_then(|mut s| {
+                s.query_row([&key[..]], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()
+            })
+            .unwrap_or_else(|e| {
+                tracing::warn!("значок не прочитался: {e:#}");
+                None
+            });
+        let icon = row
+            .and_then(|(n, d)| self.open_blob(&n, &d, &key).ok())
+            .map(Arc::from);
+        cache.put(key, icon.clone());
+        icon
+    }
+
+    fn put_icon(&self, key: [u8; 32], png: &[u8]) -> Result<()> {
+        if self.icon(key).as_deref() == Some(png) {
+            return Ok(());
+        }
+        let (nonce, data) = self.seal_blob(png, &key)?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO icons (key, nonce, data) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (key) DO UPDATE SET nonce = excluded.nonce, data = excluded.data",
+            )?
+            .execute(params![&key[..], &nonce[..], data])?;
+        self.icons
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(key, Some(Arc::from(png)));
+        Ok(())
+    }
+
+    /// Вынуть значок приложения-источника из сведений записи: значок пишется
+    /// в `icons` один раз на программу. Возвращает сведения без значка, ключ
+    /// значка и сам значок, если он был в записи.
+    fn split_icon(&self, list: &[Ext]) -> (Vec<Ext>, Option<[u8; 32]>, Option<Vec<u8>>) {
+        let mut out = list.to_vec();
+        let Some(pos) = out.iter().position(|e| e.tag == ext::SOURCE_APP) else {
+            return (out, None, None);
         };
-        self.save_thumb(e.id, made);
+        let Ok(mut app) = postcard::from_bytes::<SourceApp>(&out[pos].data) else {
+            return (out, None, None);
+        };
+        let key = self.icon_id(&app.exe);
+        let icon = std::mem::take(&mut app.icon_png);
+        if let Ok(data) = postcard::to_stdvec(&app) {
+            out[pos].data = data;
+        }
+        (out, Some(key), (!icon.is_empty()).then_some(icon))
     }
 
-    /// Миниатюра записи из скачанного файла-картинки, если её ещё нет.
-    pub fn file_thumb(&mut self, id: ItemId, path: &Path) {
-        if self.thumbs.contains_key(&id) || self.get(id).is_none() {
+    /// Вернуть в запись значок, вынутый при записи.
+    fn restore_icon(&self, e: &mut Entry) {
+        let Some(pos) = e.ext.iter().position(|x| x.tag == ext::SOURCE_APP) else {
+            return;
+        };
+        let Ok(mut app) = postcard::from_bytes::<SourceApp>(&e.ext[pos].data) else {
+            return;
+        };
+        if !app.icon_png.is_empty() {
             return;
         }
-        self.save_thumb(id, crate::image::thumbnail_file(path));
-    }
-
-    fn save_thumb(&mut self, id: ItemId, made: Result<Vec<u8>>) {
-        let res = made.and_then(|t| {
-            let (nonce, data) = self.seal_blob(&t)?;
-            self.conn.execute(
-                "UPDATE entries SET thumb_nonce = ?1, thumb = ?2 WHERE id = ?3",
-                params![&nonce[..], data, &id.as_bytes()[..]],
-            )?;
-            Ok(t)
-        });
-        match res {
-            Ok(t) => {
-                self.thumbs.insert(id, t);
+        if let Some(icon) = self.icon(self.icon_id(&app.exe)) {
+            app.icon_png = icon.to_vec();
+            if let Ok(data) = postcard::to_stdvec(&app) {
+                e.ext[pos].data = data;
             }
-            Err(err) => tracing::warn!("миниатюра не сделалась: {err:#}"),
         }
     }
 
-    /// Миниатюра картинки (PNG), если есть.
-    pub fn thumb(&self, id: ItemId) -> Option<&[u8]> {
-        self.thumbs.get(&id).map(Vec::as_slice)
+    // ---- чтение и запись строк ----
+
+    /// Записать строку целиком: тело, карточку, ключевой хэш. Время и
+    /// закрепление — из `e`. Миниатюру не трогает.
+    fn write(&self, e: &Entry) -> Result<()> {
+        let hash = e.content.hash();
+        let (list, icon_key, icon) = self.split_icon(&e.ext);
+        if let (Some(k), Some(png)) = (icon_key, &icon) {
+            self.put_icon(k, png)?;
+        }
+        let body = postcard::to_stdvec(&EntryOut {
+            id: &e.id,
+            origin: &e.origin,
+            device_name: &e.device_name,
+            local: e.local,
+            content: &e.content,
+            seen_ms: e.seen_ms,
+            pinned: e.pinned,
+            ext: &list,
+        })?;
+        let (nonce, data) = self.seal_blob(&body, b"")?;
+        drop(body);
+        let card = Card::build(e, hash, list, icon_key);
+        let (card_nonce, card) = self.seal_card(&e.id, &card)?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO entries (id, seen_ms, pinned, hkey, card_nonce, card, nonce, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (id) DO UPDATE SET seen_ms = excluded.seen_ms,
+                     pinned = excluded.pinned, hkey = excluded.hkey,
+                     card_nonce = excluded.card_nonce, card = excluded.card,
+                     nonce = excluded.nonce, data = excluded.data",
+            )?
+            .execute(params![
+                &e.id.as_bytes()[..],
+                e.seen_ms,
+                e.pinned,
+                &self.hkey(&hash)[..],
+                &card_nonce[..],
+                card,
+                &nonce[..],
+                data
+            ])?;
+        Ok(())
     }
 
-    fn write(&self, e: &Entry) -> Result<()> {
-        let mut nonce = [0u8; 24];
-        getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("нет случайных байтов: {e}"))?;
-        let plain = postcard::to_stdvec(e)?;
-        let data = self
-            .cipher
-            .encrypt(&XNonce::from(nonce), plain.as_slice())
-            .map_err(|_| anyhow::anyhow!("не удалось зашифровать запись"))?;
-        self.conn.execute(
-            "INSERT INTO entries (id, seen_ms, pinned, nonce, data) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (id) DO UPDATE SET seen_ms = excluded.seen_ms, pinned = excluded.pinned,
-                 nonce = excluded.nonce, data = excluded.data",
-            params![&e.id.as_bytes()[..], e.seen_ms, e.pinned, &nonce[..], data],
-        )?;
+    fn seal_card(&self, id: &ItemId, card: &Card) -> Result<([u8; 24], Vec<u8>)> {
+        let mut plain = vec![CARD_VERSION];
+        plain.extend(postcard::to_stdvec(card)?);
+        self.seal_blob(&plain, &card_aad(id))
+    }
+
+    /// Дописать карточку и ключевой хэш к строке, тело не трогая (переход со
+    /// старой базы). Значок уходит в `icons`, тело его сохраняет.
+    fn write_card(&self, id: ItemId, e: &Entry) -> Result<()> {
+        let hash = e.content.hash();
+        let (list, icon_key, icon) = self.split_icon(&e.ext);
+        if let (Some(k), Some(png)) = (icon_key, &icon) {
+            self.put_icon(k, png)?;
+        }
+        let (n, c) = self.seal_card(&id, &Card::build(e, hash, list, icon_key))?;
+        self.conn
+            .prepare_cached(
+                "UPDATE entries SET hkey = ?1, card_nonce = ?2, card = ?3 WHERE id = ?4",
+            )?
+            .execute(params![
+                &self.hkey(&hash)[..],
+                &n[..],
+                c,
+                &id.as_bytes()[..]
+            ])?;
         Ok(())
+    }
+
+    /// Тело записи. Время и закрепление — из колонок: они меняются без
+    /// перезаписи тела.
+    fn body(&self, id: ItemId) -> Result<Option<Entry>> {
+        let row: Option<(i64, bool, Vec<u8>, Vec<u8>)> = self
+            .conn
+            .prepare_cached("SELECT seen_ms, pinned, nonce, data FROM entries WHERE id = ?1")?
+            .query_row([&id.as_bytes()[..]], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .optional()?;
+        let Some((seen_ms, pinned, nonce, data)) = row else {
+            return Ok(None);
+        };
+        let mut e = self.decrypt(&nonce, &data)?;
+        e.id = id;
+        e.seen_ms = seen_ms;
+        e.pinned = pinned;
+        Ok(Some(e))
+    }
+
+    /// Карточка из колонки, а если её нет (переход не дошёл) — из тела.
+    fn card_of(&self, id: ItemId, nonce: Option<&[u8]>, data: Option<&[u8]>) -> Result<Card> {
+        if let (Some(n), Some(d)) = (nonce, data) {
+            match self.open_card(&id, n, d) {
+                Ok(c) => return Ok(c),
+                Err(err) => tracing::debug!("карточка не прочиталась, беру тело: {err:#}"),
+            }
+        }
+        let e = self.body(id)?.context(tr("Элемента уже нет в истории"))?;
+        // Сведения как есть, со значком: при перезаписи он уйдёт в `icons`.
+        Ok(Card::build(&e, e.content.hash(), e.ext.clone(), None))
+    }
+
+    /// Время, закрепление и карточка записи.
+    fn meta(&self, id: ItemId) -> Result<Option<(i64, bool, Card)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT seen_ms, pinned, card_nonce, card FROM entries WHERE id = ?1",
+        )?;
+        let mut rows = st.query([&id.as_bytes()[..]])?;
+        let Some(r) = rows.next()? else {
+            return Ok(None);
+        };
+        let card = self.card_of(
+            id,
+            r.get_ref(2)?.as_blob_or_null()?,
+            r.get_ref(3)?.as_blob_or_null()?,
+        )?;
+        Ok(Some((r.get(0)?, r.get(1)?, card)))
+    }
+
+    /// Обход карточек от новых к старым, пока `f` не скажет хватит.
+    /// Нечитаемые строки пропускаются. `offset` — сколько строк пропустить, не
+    /// расшифровывая (когда подходит любая).
+    fn scan(
+        &self,
+        pinned_only: bool,
+        offset: usize,
+        mut f: impl FnMut(ItemId, i64, bool, Card) -> ControlFlow<()>,
+    ) -> Result<()> {
+        let sql = if pinned_only {
+            "SELECT id, seen_ms, pinned, card_nonce, card FROM entries WHERE pinned = 1
+             ORDER BY seen_ms DESC, id DESC LIMIT -1 OFFSET ?1"
+        } else {
+            "SELECT id, seen_ms, pinned, card_nonce, card FROM entries
+             ORDER BY seen_ms DESC, id DESC LIMIT -1 OFFSET ?1"
+        };
+        let mut st = self.conn.prepare_cached(sql)?;
+        let mut rows = st.query([sql_limit(offset)])?;
+        while let Some(r) = rows.next()? {
+            let Some(id) = item_id(r.get_ref(0)?.as_blob()?) else {
+                continue;
+            };
+            let card = match self.card_of(
+                id,
+                r.get_ref(3)?.as_blob_or_null()?,
+                r.get_ref(4)?.as_blob_or_null()?,
+            ) {
+                Ok(c) => c,
+                Err(err) => {
+                    tracing::debug!("запись истории не читается, пропускаю: {err:#}");
+                    continue;
+                }
+            };
+            if f(id, r.get(1)?, r.get(2)?, card).is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Самая свежая запись с таким ключевым хэшем.
+    fn id_by_hkey(&self, hkey: &[u8; 32]) -> Result<Option<ItemId>> {
+        let raw: Option<Vec<u8>> = self
+            .conn
+            .prepare_cached(
+                "SELECT id FROM entries WHERE hkey = ?1 ORDER BY seen_ms DESC, id DESC LIMIT 1",
+            )?
+            .query_row([&hkey[..]], |r| r.get(0))
+            .optional()?;
+        Ok(raw.as_deref().and_then(item_id))
+    }
+
+    fn exists(&self, id: ItemId) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT 1 FROM entries WHERE id = ?1")?
+            .exists([&id.as_bytes()[..]])?)
+    }
+
+    fn count(&self, sql: &str) -> usize {
+        self.conn
+            .query_row(sql, [], |r| r.get::<_, i64>(0))
+            .map(|n| n as usize)
+            .unwrap_or_else(|e| {
+                tracing::warn!("история не посчиталась: {e:#}");
+                0
+            })
+    }
+
+    // ---- миниатюры ----
+
+    /// Миниатюра картинки (PNG), если есть.
+    pub fn thumb(&self, id: ItemId) -> Option<Vec<u8>> {
+        let (nonce, data) = self
+            .conn
+            .prepare_cached(
+                "SELECT thumb_nonce, thumb FROM entries WHERE id = ?1 AND thumb IS NOT NULL",
+            )
+            .and_then(|mut s| {
+                s.query_row([&id.as_bytes()[..]], |r| {
+                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .optional()
+            })
+            .ok()
+            .flatten()?;
+        self.open_blob(&nonce, &data, b"").ok()
+    }
+
+    /// Есть ли у записи миниатюра (без расшифровки).
+    pub fn has_thumb(&self, id: ItemId) -> bool {
+        self.conn
+            .prepare_cached("SELECT 1 FROM entries WHERE id = ?1 AND thumb IS NOT NULL")
+            .and_then(|mut s| s.exists([&id.as_bytes()[..]]))
+            .unwrap_or(false)
+    }
+
+    /// Сохранить миниатюру записи, если её ещё нет (скачанный файл-картинка).
+    /// Саму миниатюру делать до замка истории, см. [`make_thumb`].
+    pub fn set_thumb(&mut self, id: ItemId, png: &[u8]) {
+        if let Err(err) = self.store_thumb(id, png) {
+            tracing::warn!("миниатюра не сохранилась: {err:#}");
+        }
+    }
+
+    fn store_thumb(&self, id: ItemId, png: &[u8]) -> Result<()> {
+        let (nonce, data) = self.seal_blob(png, b"")?;
+        self.conn
+            .prepare_cached(
+                "UPDATE entries SET thumb_nonce = ?1, thumb = ?2 WHERE id = ?3 AND thumb IS NULL",
+            )?
+            .execute(params![&nonce[..], data, &id.as_bytes()[..]])?;
+        Ok(())
+    }
+
+    // ---- запись ----
+
+    /// Знакома ли запись: то же содержимое или тот же id уже есть. По этому
+    /// решают, делать ли миниатюру до замка.
+    pub fn knows(&self, e: &Entry) -> bool {
+        self.id_by_hkey(&self.hkey(&e.content.hash()))
+            .map(|x| x.is_some())
+            .unwrap_or(false)
+            || self.exists(e.id).unwrap_or(false)
     }
 
     /// Добавить элемент. То же содержимое не дублируется: существующая запись
     /// поднимается наверх с новым временем (закрепление сохраняется).
     /// Возвращает `true`, если появилась новая запись, и `false`, если
-    /// поднялась существующая.
-    pub fn add(&mut self, mut entry: Entry) -> Result<bool> {
-        let hash = entry.content.hash();
-        if let Some(&old) = self.by_hash.get(&hash)
-            && let Some(pos) = self.entries.iter().position(|e| e.id == old)
+    /// поднялась существующая. Миниатюра делается под замком; где это важно,
+    /// брать [`History::add_with_thumb`].
+    pub fn add(&mut self, entry: Entry) -> Result<bool> {
+        let thumb = if self.knows(&entry) {
+            None
+        } else {
+            make_thumb(&entry)
+        };
+        self.add_with_thumb(entry, thumb)
+    }
+
+    /// [`History::add`] с готовой миниатюрой (нужна только новой записи).
+    pub fn add_with_thumb(&mut self, entry: Entry, thumb: Option<Vec<u8>>) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let new = self.add_inner(entry, thumb)?;
+        tx.commit()?;
+        Ok(new)
+    }
+
+    fn add_inner(&self, entry: Entry, thumb: Option<Vec<u8>>) -> Result<bool> {
+        let hkey = self.hkey(&entry.content.hash());
+        // Тот же id без того же содержимого (запись правили, а она пришла
+        // снова) — тоже подъём, а не вторая строка с тем же id.
+        let found = match self.id_by_hkey(&hkey)? {
+            Some(id) => Some((id, true)),
+            None => self.exists(entry.id)?.then_some((entry.id, false)),
+        };
+        let Some((id, same)) = found else {
+            self.write(&entry)?;
+            if let Some(t) = thumb
+                && let Err(err) = self.store_thumb(entry.id, &t)
+            {
+                tracing::warn!("миниатюра не сохранилась: {err:#}");
+            }
+            return Ok(true);
+        };
+        let Some((_, pinned, card)) = self.meta(id)? else {
+            bail!("запись пропала из истории");
+        };
+        // Тот же текст скопирован уже с форматированием — берём его. Обратно
+        // (вставка без форматирования) форматирование у записи не отнимаем.
+        // Файлы берём новые: у них могли смениться `blob` (файл изменился
+        // или запись пришла с другого устройства с теми же путями). Иначе
+        // содержимое прежнее: при совпавшем хэше оно то же самое, кроме
+        // форматированного текста, его читаем из тела.
+        let content = if matches!(entry.content, Content::Rich { .. } | Content::Files(_))
+            || (same && card.kind != CardKind::Rich)
         {
-            let mut existing = self.entries.remove(pos);
-            existing.seen_ms = entry.seen_ms;
-            existing.local = entry.local;
-            existing.origin = entry.origin;
-            existing.device_name = std::mem::take(&mut entry.device_name);
-            // Тот же текст скопирован уже с форматированием — берём его. Обратно
-            // (вставка без форматирования) форматирование у записи не отнимаем.
-            // Файлы берём новые: у них могли смениться `blob` (файл изменился
-            // или запись пришла с другого устройства с теми же путями).
-            if matches!(entry.content, Content::Rich { .. } | Content::Files(_)) {
-                existing.content = entry.content;
+            entry.content
+        } else {
+            match self.body(id)? {
+                Some(old) => old.content,
+                None => entry.content,
             }
-            // Сведения нового копирования (другое приложение-источник)
-            // заменяют старые по метке; чего в новом нет, остаётся.
-            for x in entry.ext {
-                existing.ext.retain(|e| e.tag != x.tag);
-                existing.ext.push(x);
-            }
-            self.write(&existing)?;
-            self.entries.insert(0, existing);
-            return Ok(false);
+        };
+        // Сведения нового копирования (другое приложение-источник)
+        // заменяют старые по метке; чего в новом нет, остаётся.
+        let mut list = card.ext;
+        for x in entry.ext {
+            list.retain(|e| e.tag != x.tag);
+            list.push(x);
         }
-        self.write(&entry)?;
-        self.store_thumb(&entry);
-        self.by_hash.insert(hash, entry.id);
-        self.entries.insert(0, entry);
-        Ok(true)
+        self.write(&Entry {
+            id,
+            origin: entry.origin,
+            device_name: entry.device_name,
+            local: entry.local,
+            content,
+            seen_ms: entry.seen_ms,
+            pinned,
+            ext: list,
+        })?;
+        Ok(false)
     }
 
-    /// Влить элемент из чужой истории: если такое содержимое уже есть, ничего
-    /// не меняется; иначе запись встаёт на своё место по времени, а не наверх.
-    /// Возвращает `true`, если добавилось.
+    /// Влить элемент из чужой истории: если такое содержимое или такой id уже
+    /// есть, ничего не меняется; иначе запись встаёт на своё место по времени,
+    /// а не наверх. Возвращает `true`, если добавилось.
     pub fn merge(&mut self, entry: Entry) -> Result<bool> {
-        let hash = entry.content.hash();
-        if self.by_hash.contains_key(&hash) || self.get(entry.id).is_some() {
+        let thumb = if self.knows(&entry) {
+            None
+        } else {
+            make_thumb(&entry)
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let added = self.merge_inner(entry, thumb)?;
+        tx.commit()?;
+        Ok(added)
+    }
+
+    /// Влить пачку одной транзакцией. Миниатюры сделаны заранее (для тех, кого
+    /// [`History::knows`] не знает). Ошибка одной записи не мешает остальным.
+    /// Возвращает, сколько добавилось.
+    pub fn merge_many(
+        &mut self,
+        items: impl IntoIterator<Item = (Entry, Option<Vec<u8>>)>,
+    ) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut added = 0;
+        for (e, thumb) in items {
+            match self.merge_inner(e, thumb) {
+                Ok(true) => added += 1,
+                Ok(false) => {}
+                Err(err) => tracing::warn!("не записалось в историю: {err:#}"),
+            }
+        }
+        tx.commit()?;
+        Ok(added)
+    }
+
+    fn merge_inner(&self, entry: Entry, thumb: Option<Vec<u8>>) -> Result<bool> {
+        let hkey = self.hkey(&entry.content.hash());
+        // Id проверяется отдельно: у отредактированной записи хэш уже другой,
+        // а повтор исходной из истории группы не должен её вернуть.
+        if self.id_by_hkey(&hkey)?.is_some() || self.exists(entry.id)? {
             return Ok(false);
         }
         self.write(&entry)?;
-        self.store_thumb(&entry);
-        self.by_hash.insert(hash, entry.id);
-        let pos = self
-            .entries
-            .iter()
-            .position(|e| e.seen_ms < entry.seen_ms)
-            .unwrap_or(self.entries.len());
-        self.entries.insert(pos, entry);
+        if let Some(t) = thumb
+            && let Err(err) = self.store_thumb(entry.id, &t)
+        {
+            tracing::warn!("миниатюра не сохранилась: {err:#}");
+        }
         Ok(true)
-    }
-
-    /// Запись с тем же содержимым (по хэшу), если есть.
-    pub fn find(&self, content: &Content) -> Option<&Entry> {
-        let id = *self.by_hash.get(&content.hash())?;
-        self.get(id)
-    }
-
-    pub fn get(&self, id: ItemId) -> Option<&Entry> {
-        self.entries.iter().find(|e| e.id == id)
-    }
-
-    /// Файл или папка своей записи, который другие устройства берут напрямую
-    /// (`p2p`) по этому `blob`. Чужие записи и файлы через сервер — `None`.
-    pub fn local_p2p_file(&self, blob: clipwire_core::BlobId) -> Option<clipwire_core::FileRef> {
-        self.entries
-            .iter()
-            .filter(|e| e.local)
-            .find_map(|e| match &e.content {
-                Content::Files(files) => files
-                    .iter()
-                    .find(|f| f.p2p && f.blob == Some(blob))
-                    .cloned(),
-                _ => None,
-            })
-    }
-
-    /// Список для окна вставки: новые первыми, поиск без учёта регистра.
-    pub fn list(&self, query: &str, pinned_only: bool, limit: usize) -> Vec<&Entry> {
-        self.list_kind(query, pinned_only, Kind::All, limit)
-    }
-
-    /// То же с фильтром по типу записи.
-    pub fn list_kind(
-        &self,
-        query: &str,
-        pinned_only: bool,
-        kind: Kind,
-        limit: usize,
-    ) -> Vec<&Entry> {
-        self.list_page(query, pinned_only, kind, 0, limit)
-    }
-
-    /// Страница списка: `limit` записей, пропустив первые `offset` подходящих.
-    /// Окно вставки подгружает так ленту по мере прокрутки.
-    pub fn list_page(
-        &self,
-        query: &str,
-        pinned_only: bool,
-        kind: Kind,
-        offset: usize,
-        limit: usize,
-    ) -> Vec<&Entry> {
-        let q = query.trim().to_lowercase();
-        self.entries
-            .iter()
-            .filter(|e| !pinned_only || e.pinned)
-            .filter(|e| kind.matches(&e.content))
-            .filter(|e| {
-                q.is_empty()
-                    || match &e.content {
-                        Content::Text(t) | Content::Rich { text: t, .. } => {
-                            t.to_lowercase().contains(&q)
-                        }
-                        // Файлы — по именам и по словам «файл», «папка».
-                        Content::Files(files) => {
-                            files.iter().any(|f| f.name.to_lowercase().contains(&q))
-                                || ["файл", "папк", "file", "folder"]
-                                    .iter()
-                                    .any(|w| w.starts_with(q.as_str()) || q.starts_with(w))
-                        }
-                        // Картинки находятся по словам «картинка», «скрин» и т. п.
-                        Content::Image { .. } => {
-                            ["картин", "изображ", "скрин", "снимок", "image", "фото"]
-                                .iter()
-                                .any(|w| w.starts_with(q.as_str()) || q.starts_with(w))
-                        }
-                        #[allow(unreachable_patterns)]
-                        _ => false,
-                    }
-                    || e.device_name.to_lowercase().contains(&q)
-                    || e.source_name()
-                        .is_some_and(|n| n.to_lowercase().contains(&q))
-            })
-            .skip(offset)
-            .take(limit)
-            .collect()
     }
 
     pub fn set_pinned(&mut self, id: ItemId, pinned: bool) -> Result<()> {
-        let Some(e) = self.entries.iter_mut().find(|e| e.id == id) else {
-            bail!("элемента уже нет в истории");
-        };
-        e.pinned = pinned;
-        let e = e.clone();
-        self.write(&e)
+        let n = self
+            .conn
+            .prepare_cached("UPDATE entries SET pinned = ?1 WHERE id = ?2")?
+            .execute(params![pinned, &id.as_bytes()[..]])?;
+        if n == 0 {
+            bail!("{}", tr("Элемента уже нет в истории"));
+        }
+        Ok(())
     }
 
     /// Заменить текст элемента (правка в предпросмотре). Если такой текст уже
     /// есть в истории отдельным элементом, тот удаляется, чтобы не было дублей.
+    /// Позиция, время и миниатюра остаются.
     pub fn update_text(&mut self, id: ItemId, text: String) -> Result<()> {
-        let content = Content::Text(text);
-        let hash = content.hash();
-        if let Some(&other) = self.by_hash.get(&hash)
-            && other != id
-        {
-            self.delete(other)?;
-        }
-        let Some(e) = self.entries.iter_mut().find(|e| e.id == id) else {
-            bail!("элемента уже нет в истории");
+        let tx = self.conn.unchecked_transaction()?;
+        let Some((seen_ms, pinned, card)) = self.meta(id)? else {
+            bail!("{}", tr("Элемента уже нет в истории"));
         };
-        let old = e.content.hash();
-        e.content = content;
-        let e = e.clone();
-        self.write(&e)?;
-        self.by_hash.remove(&old);
-        self.by_hash.insert(hash, id);
+        let content = Content::Text(text);
+        let hkey = self.hkey(&content.hash());
+        self.conn
+            .prepare_cached("DELETE FROM entries WHERE hkey = ?1 AND id != ?2")?
+            .execute(params![&hkey[..], &id.as_bytes()[..]])?;
+        self.write(&Entry {
+            id,
+            origin: card.origin,
+            device_name: card.device_name,
+            local: card.local,
+            content,
+            seen_ms,
+            pinned,
+            ext: card.ext,
+        })?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Удаление с другого устройства: убрать записи с этими хэшами, кроме
     /// закреплённых (закрепы у каждого устройства свои) и появившихся после
-    /// удаления (то же содержимое скопировали снова). Возвращает, сколько
+    /// удаления (то же содержимое скопировали снова). Хэши простые
+    /// (`Content::hash`), здесь переводятся в ключевые. Возвращает, сколько
     /// удалено.
     pub fn delete_remote(&mut self, hashes: &[[u8; 32]], at_ms: i64) -> Result<usize> {
         // Часы устройств расходятся; запас, чтобы запись, удалённую сразу
         // после копирования на другом устройстве, всё же удалить.
         const SKEW_MS: i64 = 5_000;
-        let mut ids = Vec::new();
-        for h in hashes {
-            if let Some(&id) = self.by_hash.get(h)
-                && let Some(e) = self.get(id)
-                && !e.pinned
-                && e.seen_ms <= at_ms.saturating_add(SKEW_MS)
-            {
-                ids.push(id);
+        let until = at_ms.saturating_add(SKEW_MS);
+        let tx = self.conn.unchecked_transaction()?;
+        let mut removed = 0;
+        {
+            let mut st = self.conn.prepare_cached(
+                "DELETE FROM entries WHERE hkey = ?1 AND pinned = 0 AND seen_ms <= ?2",
+            )?;
+            for h in hashes {
+                removed += st.execute(params![&self.hkey(h)[..], until])?;
             }
         }
-        for id in &ids {
-            self.delete(*id)?;
-        }
-        Ok(ids.len())
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn delete(&mut self, id: ItemId) -> Result<()> {
@@ -576,75 +1222,263 @@ impl History {
             "DELETE FROM entries WHERE id = ?1",
             params![&id.as_bytes()[..]],
         )?;
-        if let Some(pos) = self.entries.iter().position(|e| e.id == id) {
-            let e = self.entries.remove(pos);
-            self.by_hash.remove(&e.content.hash());
-            self.thumbs.remove(&id);
-        }
         Ok(())
     }
 
     /// Очистить историю. Закреплённое остаётся, если `keep_pinned`.
     pub fn clear(&mut self, keep_pinned: bool) -> Result<()> {
-        let ids: Vec<ItemId> = self
-            .entries
-            .iter()
-            .filter(|e| !(keep_pinned && e.pinned))
-            .map(|e| e.id)
-            .collect();
-        for id in ids {
-            self.delete(id)?;
+        if keep_pinned {
+            self.conn
+                .execute("DELETE FROM entries WHERE pinned = 0", [])?;
+        } else {
+            self.conn.execute("DELETE FROM entries", [])?;
         }
         Ok(())
     }
 
     /// Удалить старше срока хранения (кроме закреплённого). Возвращает число удалённых.
+    // shortcut: значки программ, на которые больше не ссылается ни одна
+    // запись, остаются в `icons` (их по одному на программу, килобайты);
+    // чистить, если таблица заметно разрастётся.
     pub fn prune(&mut self, retention: Retention, now: i64) -> Result<usize> {
         let Some(max) = retention.max_age_ms() else {
             return Ok(0);
         };
-        let ids: Vec<ItemId> = self
-            .entries
-            .iter()
-            .filter(|e| !e.pinned && now - e.seen_ms > max)
-            .map(|e| e.id)
-            .collect();
-        for id in &ids {
-            self.delete(*id)?;
+        // Удаляется то, что старше строго: now - seen_ms > max.
+        let tx = self.conn.unchecked_transaction()?;
+        let n = self.conn.execute(
+            "DELETE FROM entries WHERE pinned = 0 AND seen_ms < ?1",
+            [now.saturating_sub(max)],
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    // ---- чтение ----
+
+    /// Запись с тем же содержимым (по хэшу), если есть.
+    pub fn find(&self, content: &Content) -> Option<Entry> {
+        let id = self
+            .id_by_hkey(&self.hkey(&content.hash()))
+            .ok()
+            .flatten()?;
+        self.get(id)
+    }
+
+    /// Запись целиком (с телом). Значок приложения-источника возвращается в неё.
+    pub fn get(&self, id: ItemId) -> Option<Entry> {
+        match self.body(id) {
+            Ok(Some(mut e)) => {
+                self.restore_icon(&mut e);
+                Some(e)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!("запись истории не прочиталась: {err:#}");
+                None
+            }
         }
-        Ok(ids.len())
+    }
+
+    /// Запись для списка (карточка, миниатюра, значок), без тела.
+    pub fn row(&self, id: ItemId) -> Option<Row> {
+        let (seen_ms, pinned, card) = self.meta(id).ok().flatten()?;
+        Some(self.finish_row(id, seen_ms, pinned, card))
+    }
+
+    fn finish_row(&self, id: ItemId, seen_ms: i64, pinned: bool, card: Card) -> Row {
+        Row {
+            id,
+            seen_ms,
+            pinned,
+            thumb: self.thumb(id),
+            icon: card.icon.and_then(|k| self.icon(k)),
+            card,
+        }
+    }
+
+    /// Простой хэш содержимого записи (`Content::hash`), из карточки.
+    pub fn hash_of(&self, id: ItemId) -> Option<[u8; 32]> {
+        self.meta(id).ok().flatten().map(|(_, _, c)| c.hash)
+    }
+
+    /// До `limit` id записей от новых к старым, чьи карточки подходят под `pred`.
+    pub fn ids_where(&self, limit: usize, mut pred: impl FnMut(&Card) -> bool) -> Vec<ItemId> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return out;
+        }
+        let res = self.scan(false, 0, |id, _, _, card| {
+            if pred(&card) {
+                out.push(id);
+                if out.len() >= limit {
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        if let Err(err) = res {
+            tracing::warn!("история не прочиталась: {err:#}");
+        }
+        out
+    }
+
+    /// Обход файлов всех записей (свои ли, файлы), пока `f` не вернёт `true`.
+    /// Возвращает, вернул ли.
+    pub fn any_files(&self, mut f: impl FnMut(bool, &[FileRef]) -> bool) -> bool {
+        let mut hit = false;
+        let res = self.scan(false, 0, |_, _, _, card| {
+            if card.kind == CardKind::Files && f(card.local, &card.files) {
+                hit = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+        if let Err(err) = res {
+            tracing::warn!("история не прочиталась: {err:#}");
+        }
+        hit
+    }
+
+    /// Файл или папка своей записи, который другие устройства берут напрямую
+    /// (`p2p`) по этому `blob`. Чужие записи и файлы через сервер — `None`.
+    pub fn local_p2p_file(&self, blob: BlobId) -> Option<FileRef> {
+        let mut found = None;
+        self.any_files(|local, files| {
+            found = local
+                .then(|| files.iter().find(|f| f.p2p && f.blob == Some(blob)))
+                .flatten()
+                .cloned();
+            found.is_some()
+        });
+        found
+    }
+
+    /// Список для окна вставки: новые первыми, поиск без учёта регистра.
+    pub fn list(&self, query: &str, pinned_only: bool, limit: usize) -> Vec<Row> {
+        self.list_kind(query, pinned_only, Kind::All, limit)
+    }
+
+    /// То же с фильтром по типу записи.
+    pub fn list_kind(&self, query: &str, pinned_only: bool, kind: Kind, limit: usize) -> Vec<Row> {
+        self.list_page(query, pinned_only, kind, 0, limit)
+    }
+
+    /// Страница списка: `limit` записей, пропустив первые `offset` подходящих.
+    /// Окно вставки подгружает так ленту по мере прокрутки. Карточки читаются
+    /// от новых к старым, чтение останавливается, как только страница набрана.
+    pub fn list_page(
+        &self,
+        query: &str,
+        pinned_only: bool,
+        kind: Kind,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<Row> {
+        let q = query.trim().to_lowercase();
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut found: Vec<(ItemId, i64, bool, Card)> = Vec::new();
+        // Без запроса и типа подходит любая: пропуск — силами SQLite, без расшифровки.
+        let any = q.is_empty() && kind == Kind::All;
+        let mut skip = if any { 0 } else { offset };
+        let res = self.scan(
+            pinned_only,
+            if any { offset } else { 0 },
+            |id, seen, pinned, card| {
+                if kind.matches_card(&card) && card.matches_query(&q) {
+                    if skip > 0 {
+                        skip -= 1;
+                    } else {
+                        found.push((id, seen, pinned, card));
+                        if found.len() >= limit {
+                            return ControlFlow::Break(());
+                        }
+                    }
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        if let Err(err) = res {
+            tracing::warn!("история не прочиталась: {err:#}");
+        }
+        found
+            .into_iter()
+            .map(|(id, seen, pinned, card)| self.finish_row(id, seen, pinned, card))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.count("SELECT COUNT(*) FROM entries")
     }
 
     /// Сколько записей закреплено.
     pub fn pinned_len(&self) -> usize {
-        self.entries.iter().filter(|e| e.pinned).count()
+        self.count("SELECT COUNT(*) FROM entries WHERE pinned = 1")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Блобы файлов всех записей: скачанное по ним в кэше ещё нужно.
-    pub fn blobs(&self) -> std::collections::HashSet<clipwire_core::BlobId> {
-        referenced_blobs(&self.entries)
+    pub fn blobs(&self) -> HashSet<BlobId> {
+        let mut out = HashSet::new();
+        self.any_files(|_, files| {
+            out.extend(files.iter().filter_map(|f| f.blob));
+            false
+        });
+        out
     }
 
     /// Пути файлов всех записей: забранные виртуальные файлы по ним ещё
     /// нужны (см. `cache::prune_virtual`).
-    pub fn file_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
-        self.entries
-            .iter()
-            .filter_map(|e| match &e.content {
-                Content::Files(f) => Some(f.iter().map(|f| std::path::PathBuf::from(&f.path))),
-                _ => None,
-            })
-            .flatten()
-            .collect()
+    pub fn file_paths(&self) -> HashSet<PathBuf> {
+        let mut out = HashSet::new();
+        self.any_files(|_, files| {
+            out.extend(files.iter().map(|f| PathBuf::from(&f.path)));
+            false
+        });
+        out
     }
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+/// Старая раскладка (до карточек) → новая. Таблица пересобирается одной
+/// транзакцией, чтобы тело стало последней колонкой; тела не
+/// перешифровываются. Карточки потом дописывает `fill_cards`. Перед этим
+/// рядом кладётся копия базы `history.db.bak-v1` (один раз).
+fn migrate_layout(conn: &Connection, path: Option<&Path>) -> Result<()> {
+    // Колонки миниатюр появились вместе с картинками — в старых базах их нет.
+    let has_thumb = conn
+        .prepare("SELECT 1 FROM pragma_table_info('entries') WHERE name = 'thumb'")?
+        .exists([])?;
+    if !has_thumb {
+        conn.execute_batch(
+            "ALTER TABLE entries ADD COLUMN thumb_nonce BLOB;
+             ALTER TABLE entries ADD COLUMN thumb BLOB;",
+        )?;
     }
+    if let Some(path) = path {
+        let bak = path.with_file_name("history.db.bak-v1");
+        if !bak.exists() {
+            conn.execute("VACUUM INTO ?1", [bak.to_string_lossy()])
+                .context("не сохранилась копия history.db перед переходом")?;
+        }
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(&format!(
+        "{} ;
+         INSERT INTO entries_v2 (id, seen_ms, pinned, thumb_nonce, thumb, nonce, data)
+             SELECT id, seen_ms, pinned, thumb_nonce, thumb, nonce, data FROM entries;
+         DROP TABLE entries;
+         ALTER TABLE entries_v2 RENAME TO entries;
+         PRAGMA user_version = {SCHEMA_VERSION};",
+        CREATE_ENTRIES.replacen("CREATE TABLE entries", "CREATE TABLE entries_v2", 1)
+    ))?;
+    tx.commit()?;
+    tracing::info!("история переведена на карточки");
+    Ok(())
 }
 
 /// Новая запись для локального копирования.
@@ -661,20 +1495,6 @@ pub fn local_entry(device: DeviceId, device_name: &str, content: Content) -> Ent
     }
 }
 
-/// Блобы файлов, на которые ссылаются записи (для чистки кэша скачанного).
-pub fn referenced_blobs<'a>(
-    entries: impl IntoIterator<Item = &'a Entry>,
-) -> std::collections::HashSet<clipwire_core::BlobId> {
-    entries
-        .into_iter()
-        .filter_map(|e| match &e.content {
-            Content::Files(f) => Some(f.iter().filter_map(|f| f.blob)),
-            _ => None,
-        })
-        .flatten()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,14 +1507,12 @@ mod tests {
         id
     }
 
-    fn texts(v: Vec<&Entry>) -> Vec<String> {
-        v.into_iter()
-            .map(|e| match &e.content {
-                Content::Text(t) => t.clone(),
-                #[allow(unreachable_patterns)]
-                _ => String::new(),
-            })
-            .collect()
+    fn texts(v: Vec<Row>) -> Vec<String> {
+        v.into_iter().map(|r| r.card.head).collect()
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("clipwire-{tag}-{}", Uuid::now_v7()))
     }
 
     #[test]
@@ -713,6 +1531,27 @@ mod tests {
     }
 
     #[test]
+    fn same_id_is_bumped_not_duplicated() {
+        let mut h = History::in_memory();
+        let mut e = local_entry(DeviceId([2; 32]), "Mac", Content::Text("исходное".into()));
+        e.seen_ms = 10;
+        e.local = false;
+        let id = e.id;
+        assert!(h.merge(e.clone()).unwrap());
+        h.update_text(id, "правка".into()).unwrap();
+        text(&mut h, "другое", 20);
+        // Та же запись пришла снова: хэш уже другой, но id тот же.
+        e.seen_ms = 30;
+        assert!(!h.add(e.clone()).unwrap());
+        assert_eq!(h.len(), 2);
+        let top = &h.list("", false, 1)[0];
+        assert_eq!((top.id, top.seen_ms), (id, 30));
+        assert_eq!(h.get(id).unwrap().content, Content::Text("правка".into()));
+        // Повтор исходной из истории группы правку не возвращает.
+        assert!(!h.merge(e).unwrap());
+    }
+
+    #[test]
     fn merge_places_by_time_and_skips_known_content() {
         let mut h = History::in_memory();
         text(&mut h, "старое", 10);
@@ -727,6 +1566,16 @@ mod tests {
         dup.seen_ms = 99;
         assert!(!h.merge(dup).unwrap());
         assert_eq!(texts(h.list("", false, 10)), ["новое", "с мака", "старое"]);
+        // Пачкой — так же.
+        let mut a = local_entry(DeviceId([2; 32]), "Mac", Content::Text("пачка".into()));
+        a.seen_ms = 25;
+        let mut b = local_entry(DeviceId([2; 32]), "Mac", Content::Text("новое".into()));
+        b.seen_ms = 26;
+        assert_eq!(h.merge_many([(a, None), (b, None)]).unwrap(), 1);
+        assert_eq!(
+            texts(h.list("", false, 10)),
+            ["новое", "пачка", "с мака", "старое"]
+        );
     }
 
     #[test]
@@ -742,16 +1591,20 @@ mod tests {
         e.seen_ms = 2;
         h.add(e).unwrap();
         assert_eq!(h.len(), 1);
-        assert_eq!(h.list("", false, 1)[0].content, rich);
+        let first = |h: &History| h.get(h.list("", false, 1)[0].id).unwrap().content;
+        assert_eq!(first(&h), rich);
         text(&mut h, "жирный", 3);
-        assert_eq!(h.list("", false, 1)[0].content, rich);
-        assert_eq!(h.list("ЖИР", false, 5).len(), 1);
+        assert_eq!(first(&h), rich);
+        let found = h.list("ЖИР", false, 5);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].card.rich, Some(RichFormat::Html));
+        assert_eq!(found[0].seen_ms, 3);
     }
 
     #[test]
     fn files_are_found_by_name_and_word() {
         let mut h = History::in_memory();
-        let f = |name: &str| clipwire_core::FileRef {
+        let f = |name: &str| FileRef {
             name: name.into(),
             path: format!("C:\\tmp\\{name}"),
             size: 10,
@@ -773,6 +1626,9 @@ mod tests {
         assert_eq!(h.list("СМЕТА", false, 5).len(), 1);
         assert_eq!(h.list("файл", false, 5).len(), 1);
         assert_eq!(h.list("текст", false, 5).len(), 1);
+        // Смещение считает только подходящие.
+        assert_eq!(h.list_page("т", false, Kind::Files, 0, 5).len(), 1);
+        assert!(h.list_page("т", false, Kind::Files, 1, 5).is_empty());
     }
 
     #[test]
@@ -787,7 +1643,7 @@ mod tests {
             width: u32,
             height: u32,
             modified_ms: u64,
-            blob: Option<clipwire_core::BlobId>,
+            blob: Option<BlobId>,
         }
         #[derive(Serialize)]
         #[allow(dead_code)]
@@ -815,7 +1671,7 @@ mod tests {
             seen_ms: i64,
             pinned: bool,
         }
-        let blob = clipwire_core::BlobId([5; 16]);
+        let blob = BlobId([5; 16]);
         let old = EntryV2Out {
             id: ItemId::new(),
             origin: DeviceId([1; 32]),
@@ -834,10 +1690,13 @@ mod tests {
             seen_ms: 42,
             pinned: true,
         };
-        let dir = std::env::temp_dir().join(format!("clipwire-legacy-{}", Uuid::now_v7()));
+        let dir = tmp("legacy");
         {
             let h = History::open(&dir).unwrap();
-            let (nonce, data) = h.seal_blob(&postcard::to_stdvec(&old).unwrap()).unwrap();
+            let (nonce, data) = h
+                .seal_blob(&postcard::to_stdvec(&old).unwrap(), b"")
+                .unwrap();
+            // Так пишет строку старая версия: без карточки и ключевого хэша.
             h.conn
                 .execute(
                     "INSERT INTO entries (id, seen_ms, pinned, nonce, data) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -858,6 +1717,17 @@ mod tests {
             }
             other => panic!("ждали файлы, пришло {other:?}"),
         }
+        // Карточка дописалась при открытии.
+        let card: Option<Vec<u8>> = h
+            .conn
+            .query_row(
+                "SELECT card FROM entries WHERE id = ?1",
+                [&old.id.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(card.is_some());
+        assert_eq!(h.blobs(), HashSet::from([blob]));
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -885,7 +1755,9 @@ mod tests {
             pinned: true,
         };
         let h = History::in_memory();
-        let (nonce, data) = h.seal_blob(&postcard::to_stdvec(&old).unwrap()).unwrap();
+        let (nonce, data) = h
+            .seal_blob(&postcard::to_stdvec(&old).unwrap(), b"")
+            .unwrap();
         let e = h.decrypt(&nonce, &data).expect("старая запись прочиталась");
         assert_eq!(e.id, old.id);
         assert_eq!(e.content, Content::Text("старая запись".into()));
@@ -894,7 +1766,9 @@ mod tests {
         // Новая запись с ext читается как новая, а не как старая с хвостом.
         let mut new = local_entry(DeviceId([1; 32]), "ПК", Content::Text("новая".into()));
         new.set_source_app(&app("Блокнот"));
-        let (nonce, data) = h.seal_blob(&postcard::to_stdvec(&new).unwrap()).unwrap();
+        let (nonce, data) = h
+            .seal_blob(&postcard::to_stdvec(&new).unwrap(), b"")
+            .unwrap();
         assert_eq!(h.decrypt(&nonce, &data).unwrap(), new);
     }
 
@@ -908,7 +1782,7 @@ mod tests {
 
     #[test]
     fn source_app_is_kept_found_and_replaced() {
-        let dir = std::env::temp_dir().join(format!("clipwire-src-{}", Uuid::now_v7()));
+        let dir = tmp("src");
         {
             let mut h = History::open(&dir).unwrap();
             let mut e = local_entry(DeviceId([1; 32]), "ПК", Content::Text("абв".into()));
@@ -937,7 +1811,186 @@ mod tests {
         let e = h.list("блокн", false, 10);
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].source_app(), Some(app("Блокнот")));
+        assert_eq!(h.get(e[0].id).unwrap().source_app(), Some(app("Блокнот")));
         assert!(h.list("telegram", false, 10).is_empty());
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn icon_is_stored_once_per_app_and_not_in_bodies() {
+        let mut h = History::in_memory();
+        let icon = SourceApp {
+            name: "Telegram".into(),
+            exe: "Telegram.exe".into(),
+            icon_png: b"ICON-PNG-BYTES-0123456789".to_vec(),
+        };
+        for t in ["раз", "два", "три"] {
+            let mut e = local_entry(DeviceId([1; 32]), "ПК", Content::Text(t.into()));
+            e.set_source_app(&icon);
+            h.add(e).unwrap();
+        }
+        let icons: i64 = h
+            .conn
+            .query_row("SELECT COUNT(*) FROM icons", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(icons, 1);
+        // В тело значок не попадает: тело без него короче тела со значком.
+        let id = h.list("два", false, 1)[0].id;
+        let (n, d): (Vec<u8>, Vec<u8>) = h
+            .conn
+            .query_row(
+                "SELECT nonce, data FROM entries WHERE id = ?1",
+                [&id.as_bytes()[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let body = h.decrypt(&n, &d).unwrap();
+        assert!(body.source_app().unwrap().icon_png.is_empty());
+        assert_eq!(h.get(id).unwrap().source_app(), Some(icon.clone()));
+        assert_eq!(h.list("два", false, 1)[0].source_app(), Some(icon));
+    }
+
+    #[test]
+    fn card_keeps_full_counts_and_search_covers_first_8k() {
+        let mut h = History::in_memory();
+        let long = format!("{}\nХВОСТ", "а".repeat(SEARCH_BYTES));
+        let id = text(&mut h, &long, 1);
+        let r = h.row(id).unwrap();
+        assert_eq!(r.card.chars, long.chars().count() as u64);
+        assert_eq!(r.card.lines, 2);
+        assert_eq!(r.card.bytes, long.len() as u64);
+        assert_eq!(r.card.head.chars().count(), HEAD_CHARS);
+        assert!(r.card.search.len() <= SEARCH_BYTES);
+        // Начало находится, хвост дальше 8 КБ — нет (так задумано).
+        assert_eq!(h.list("ааа", false, 5).len(), 1);
+        assert!(h.list("хвост", false, 5).is_empty());
+        // Ссылка определяется по полному тексту.
+        let url = format!("https://example.com/{}", "x".repeat(1000));
+        text(&mut h, &url, 2);
+        assert_eq!(h.list_kind("", false, Kind::Link, 5).len(), 1);
+        assert_eq!(h.list_kind("", false, Kind::Text, 5).len(), 1);
+    }
+
+    #[test]
+    fn row_without_card_is_read_from_body() {
+        let mut h = History::in_memory();
+        let id = text(&mut h, "без карточки", 1);
+        h.conn
+            .execute("UPDATE entries SET card = NULL, card_nonce = NULL", [])
+            .unwrap();
+        assert_eq!(texts(h.list("карточ", false, 5)), ["без карточки"]);
+        assert_eq!(
+            h.hash_of(id),
+            Some(Content::Text("без карточки".into()).hash())
+        );
+        h.fill_cards().unwrap();
+        let filled: i64 = h
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE card IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(filled, 1);
+    }
+
+    #[test]
+    fn card_of_another_row_is_rejected() {
+        let mut h = History::in_memory();
+        let a = text(&mut h, "первая", 1);
+        let b = text(&mut h, "вторая", 2);
+        // Карточку одной строки подложили в другую: AAD не сходится, читается тело.
+        h.conn
+            .execute(
+                "UPDATE entries SET (card_nonce, card) =
+                     (SELECT card_nonce, card FROM entries WHERE id = ?1) WHERE id = ?2",
+                [&a.as_bytes()[..], &b.as_bytes()[..]],
+            )
+            .unwrap();
+        assert_eq!(h.row(b).unwrap().card.head, "вторая");
+    }
+
+    #[test]
+    fn hkey_is_keyed() {
+        let mut h = History::in_memory();
+        text(&mut h, "пароль", 1);
+        let hk: Vec<u8> = h
+            .conn
+            .query_row("SELECT hkey FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_ne!(hk, Content::Text("пароль".into()).hash().to_vec());
+        let other = History::init(Connection::open_in_memory().unwrap(), [8; 32], None).unwrap();
+        assert_ne!(
+            h.hkey(&Content::Text("пароль".into()).hash()),
+            other.hkey(&Content::Text("пароль".into()).hash())
+        );
+    }
+
+    #[test]
+    fn old_database_is_migrated_with_backup() {
+        let dir = tmp("migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = load_key(&dir).unwrap();
+        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+        // База 0.2: тело в середине строки, колонок миниатюр нет.
+        {
+            let conn = Connection::open(dir.join("history.db")).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE entries (id BLOB PRIMARY KEY, seen_ms INTEGER NOT NULL,
+                     pinned INTEGER NOT NULL, nonce BLOB NOT NULL, data BLOB NOT NULL);",
+            )
+            .unwrap();
+            for (i, t) in ["один", "два", "три"].iter().enumerate() {
+                let mut e = local_entry(DeviceId([1; 32]), "ПК", Content::Text((*t).into()));
+                e.seen_ms = i as i64;
+                e.set_source_app(&app("Telegram"));
+                let nonce = [i as u8; 24];
+                let data = cipher
+                    .encrypt(
+                        &XNonce::from(nonce),
+                        postcard::to_stdvec(&e).unwrap().as_slice(),
+                    )
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO entries VALUES (?1, ?2, 0, ?3, ?4)",
+                    params![&e.id.as_bytes()[..], e.seen_ms, &nonce[..], data],
+                )
+                .unwrap();
+            }
+            // Битая строка: пропускается, но не мешает остальным.
+            conn.execute("INSERT INTO entries VALUES (x'00', 5, 0, x'00', x'00')", [])
+                .unwrap();
+        }
+        let mut h = History::open(&dir).unwrap();
+        assert!(dir.join("history.db.bak-v1").exists());
+        let v: i64 = h
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(texts(h.list("", false, 10)), ["три", "два", "один"]);
+        assert_eq!(h.list("telegr", false, 10).len(), 3);
+        assert_eq!(
+            h.list("два", false, 1)[0].source_app(),
+            Some(app("Telegram"))
+        );
+        // Дубль по ключевому хэшу находится и после перехода.
+        assert!(
+            !h.add(local_entry(
+                DeviceId([1; 32]),
+                "ПК",
+                Content::Text("один".into())
+            ))
+            .unwrap()
+        );
+        assert_eq!(h.len(), 4, "битая строка осталась в базе");
+        drop(h);
+        // Второе открытие ничего не ломает.
+        let h = History::open(&dir).unwrap();
+        assert_eq!(texts(h.list("", false, 10)), ["один", "три", "два"]);
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -958,16 +2011,20 @@ mod tests {
         let old = text(&mut h, "старое", 0);
         let pinned = text(&mut h, "закреплённое", 0);
         text(&mut h, "свежее", 10 * DAY);
+        // Ровно на границе срока — ещё не старше.
+        let edge = text(&mut h, "на границе", 3 * DAY);
         h.set_pinned(pinned, true).unwrap();
         assert_eq!(h.prune(Retention::Week, 10 * DAY).unwrap(), 1);
         assert!(h.get(old).is_none());
         assert!(h.get(pinned).is_some());
+        assert!(h.get(edge).is_some());
+        assert!(h.get(pinned).unwrap().pinned);
         assert_eq!(h.prune(Retention::Forever, 1000 * DAY).unwrap(), 0);
     }
 
     #[test]
     fn persisted_encrypted_and_reloaded() {
-        let dir = std::env::temp_dir().join(format!("clipwire-hist-{}", Uuid::now_v7()));
+        let dir = tmp("hist");
         {
             let mut h = History::open(&dir).unwrap();
             let id = text(&mut h, "секретный токен", 5);
@@ -983,6 +2040,7 @@ mod tests {
         let h = History::open(&dir).unwrap();
         assert_eq!(texts(h.list("", false, 10)), ["секретный токен"]);
         assert!(h.list("", true, 10)[0].pinned);
+        assert_eq!(h.pinned_len(), 1);
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -991,18 +2049,22 @@ mod tests {
     fn update_text_replaces_and_dedups() {
         let mut h = History::in_memory();
         let a = text(&mut h, "черновик", 1);
-        text(&mut h, "итог", 2);
+        let b = text(&mut h, "итог", 2);
         h.update_text(a, "итог".into()).unwrap();
         assert_eq!(texts(h.list("", false, 10)), ["итог"]);
         assert!(h.get(a).is_some());
+        assert!(h.get(b).is_none());
         // Повторное копирование того же текста поднимает отредактированный элемент.
         text(&mut h, "итог", 3);
         assert_eq!(h.len(), 1);
+        // Правка пропавшей записи не трогает другие.
+        assert!(h.update_text(ItemId::new(), "итог".into()).is_err());
+        assert!(h.get(a).is_some());
     }
 
     #[test]
     fn image_gets_encrypted_thumbnail_that_survives_reopen() {
-        let dir = std::env::temp_dir().join(format!("clipwire-thumb-{}", Uuid::now_v7()));
+        let dir = tmp("thumb");
         let px: Vec<u8> = (0..800 * 600)
             .flat_map(|i| [(i % 251) as u8, 120, 200, 255])
             .collect();
@@ -1013,14 +2075,17 @@ mod tests {
             let e = local_entry(DeviceId([1; 32]), "ПК", content.clone());
             id = e.id;
             h.add(e).unwrap();
-            let t = crate::image::decode_png(h.thumb(id).unwrap()).unwrap();
+            let t = crate::image::decode_png(&h.thumb(id).unwrap()).unwrap();
             assert_eq!(t.dimensions(), (320, 240));
             // Картинка находится поиском по слову «скрин».
             assert_eq!(h.list("скрин", false, 10).len(), 1);
+            assert!(h.list("скрин", false, 10)[0].thumb.is_some());
         }
         let h = History::open(&dir).unwrap();
-        assert!(h.thumb(id).is_some());
+        assert!(h.thumb(id).is_some() && h.has_thumb(id));
         assert_eq!(h.get(id).unwrap().content, content);
+        let r = h.row(id).unwrap();
+        assert_eq!((r.card.width, r.card.height), (800, 600));
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1039,7 +2104,6 @@ mod tests {
 
     #[test]
     fn kind_filter() {
-        use clipwire_core::FileRef;
         let file = |name: &str, width: u32| FileRef {
             name: name.into(),
             path: format!("/tmp/{name}"),
@@ -1072,11 +2136,20 @@ mod tests {
         for c in [&text, &link, &img, &pic, &doc] {
             assert!(Kind::All.matches(c));
         }
+        // По карточке — то же самое.
+        let all = [&text, &link, &two_links, &img, &pic, &doc];
+        for k in [Kind::All, Kind::Text, Kind::Link, Kind::Image, Kind::Files] {
+            for c in all {
+                let e = local_entry(DeviceId([1; 32]), "ПК", (*c).clone());
+                let card = Card::build(&e, c.hash(), Vec::new(), None);
+                assert_eq!(k.matches_card(&card), k.matches(c), "{k:?} {c:?}");
+            }
+        }
     }
 
     #[test]
     fn delete_remote_skips_pinned_and_newer() {
-        let dir = std::env::temp_dir().join(format!("clipwire-delrem-{}", uuid::Uuid::now_v7()));
+        let dir = tmp("delrem");
         let mut h = History::open(&dir).unwrap();
         let old = text(&mut h, "старое", 1_000);
         let pinned = text(&mut h, "закреп", 1_000);
@@ -1093,6 +2166,164 @@ mod tests {
             h.get(newer).is_some(),
             "скопированное после удаления остаётся"
         );
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn files_lookups_work_from_cards() {
+        let mut h = History::in_memory();
+        let blob = BlobId([9; 16]);
+        let f = FileRef {
+            name: "big.iso".into(),
+            path: "/home/a/big.iso".into(),
+            size: 5,
+            is_dir: false,
+            width: 0,
+            height: 0,
+            modified_ms: 0,
+            blob: Some(blob),
+            blob_size: 5,
+            p2p: true,
+        };
+        let mut remote = local_entry(DeviceId([2; 32]), "Mac", Content::Files(vec![f.clone()]));
+        remote.local = false;
+        h.merge(remote).unwrap();
+        assert_eq!(h.local_p2p_file(blob), None, "чужая запись не отдаётся");
+        let mut f2 = f.clone();
+        f2.path = "/home/a/other.iso".into();
+        h.add(local_entry(
+            DeviceId([1; 32]),
+            "ПК",
+            Content::Files(vec![f2.clone()]),
+        ))
+        .unwrap();
+        assert_eq!(h.local_p2p_file(blob), Some(f2));
+        assert_eq!(h.file_paths().len(), 2);
+        assert!(h.any_files(|local, files| local && files[0].path == "/home/a/other.iso"));
+        assert!(!h.any_files(|local, files| local && files[0].path == "/home/a/big.iso"));
+    }
+
+    /// Нагрузочная проверка: 100 тыс. записей. Запуск:
+    /// `cargo test -p clipwire-agent --release history::tests::bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_100k() {
+        use std::time::Instant;
+        const N: usize = 100_000;
+        const DAY: i64 = 24 * 3600 * 1000;
+        let dir = tmp("bench");
+        let now = now_ms();
+        let t = Instant::now();
+        {
+            let mut h = History::open(&dir).unwrap();
+            let px: Vec<u8> = (0..256 * 256)
+                .flat_map(|i| [(i % 251) as u8, 120, 200, 255])
+                .collect();
+            let img = crate::image::content_from_rgba(256, 256, &px).unwrap();
+            let mut batch = Vec::with_capacity(1000);
+            for i in 0..N {
+                let word = format!("слово{i:06}");
+                let content = match i % 100 {
+                    // Несколько картинок (разные, чтобы не схлопнулись в одну).
+                    0 if i % 2000 == 0 => {
+                        let Content::Image { width, height, png } = img.clone() else {
+                            unreachable!()
+                        };
+                        let mut png = png;
+                        png.extend_from_slice(word.as_bytes());
+                        Content::Image { width, height, png }
+                    }
+                    1..=14 => Content::Rich {
+                        text: format!("{word} форматированный текст {}", "ж".repeat(i % 300)),
+                        html: Some(format!("<b>{word}</b>{}", "<i>x</i>".repeat(i % 50))),
+                        rtf: None,
+                    },
+                    15..=27 => Content::Files(vec![FileRef {
+                        name: format!("{word}.pdf"),
+                        path: format!("C:\\Users\\a\\Documents\\{word}.pdf"),
+                        size: i as u64,
+                        is_dir: false,
+                        width: 0,
+                        height: 0,
+                        modified_ms: 0,
+                        blob: Some(BlobId([(i % 256) as u8; 16])),
+                        blob_size: i as u64,
+                        p2p: false,
+                    }]),
+                    // Изредка длинный текст.
+                    28 => Content::Text(format!("{word} {}", "длинный текст ".repeat(1500))),
+                    _ => Content::Text(format!("{word} {}", "обычный текст ".repeat(i % 40))),
+                };
+                let mut e = local_entry(DeviceId([1; 32]), "ПК", content);
+                // Записи за последние два года, новые — с большим i.
+                e.seen_ms = now - (N - i) as i64 * (730 * DAY / N as i64);
+                if i % 7 == 0 {
+                    e.set_source_app(&app(["Telegram", "Chrome", "Word"][i % 3]));
+                }
+                batch.push((e, None));
+                if batch.len() == 1000 {
+                    h.merge_many(std::mem::take(&mut batch)).unwrap();
+                }
+            }
+            h.merge_many(batch).unwrap();
+        }
+        println!("заполнение {N}: {:?}", t.elapsed());
+        let size = std::fs::metadata(dir.join("history.db"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        println!("history.db: {} МБ", size / 1024 / 1024);
+
+        let t = Instant::now();
+        let mut h = History::open(&dir).unwrap();
+        println!("открытие: {:?}", t.elapsed());
+        let t = Instant::now();
+        let page = h.list_page("", false, Kind::All, 0, 200);
+        println!("первая страница (200): {:?}", t.elapsed());
+        assert_eq!(page.len(), 200);
+        let t = Instant::now();
+        let deep = h.list_page("", false, Kind::All, 50_000, 200);
+        println!("страница на глубине 50 000: {:?}", t.elapsed());
+        assert_eq!(deep.len(), 200);
+        let near = format!("слово{:06}", N - 50);
+        let t = Instant::now();
+        let hit = h.list(&near, false, 1);
+        println!(
+            "поиск, совпадение у верха, нужна 1 запись: {:?}",
+            t.elapsed()
+        );
+        assert_eq!(hit.len(), 1);
+        let t = Instant::now();
+        let hit = h.list("слово09", false, 200);
+        println!("поиск, 200 совпадений у верха: {:?}", t.elapsed());
+        assert_eq!(hit.len(), 200);
+        let t = Instant::now();
+        let hit = h.list(&near, false, 200);
+        println!(
+            "поиск редкого слова, страница 200 (до конца истории): {:?}",
+            t.elapsed()
+        );
+        assert_eq!(hit.len(), 1);
+        let t = Instant::now();
+        assert!(h.list("нет-такого-слова", false, 200).is_empty());
+        println!("поиск без совпадений (все карточки): {:?}", t.elapsed());
+        let t = Instant::now();
+        let n = h.len();
+        println!("подсчёт ({n}): {:?}", t.elapsed());
+        let t = Instant::now();
+        let blobs = h.blobs();
+        println!(
+            "blobs() по всем карточкам ({}): {:?}",
+            blobs.len(),
+            t.elapsed()
+        );
+        let t = Instant::now();
+        let removed = h.prune(Retention::Year, now).unwrap();
+        println!(
+            "чистка по сроку «год» (удалено {removed}): {:?}",
+            t.elapsed()
+        );
+        drop(h);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

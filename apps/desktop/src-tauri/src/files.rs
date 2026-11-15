@@ -77,24 +77,29 @@ fn in_history(app: &AppHandle, path: &str) -> bool {
     let state = app.state::<AppState>();
     let dir = files_dir(&state.paths.dir);
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-    h.list("", false, usize::MAX)
-        .iter()
-        .any(|e| entry_has_path(e, &dir, Path::new(path)))
+    // Перебор карточек всех записей с файлами, без тел и без предела.
+    h.any_files(|local, files| files_have_path(local, files, &dir, Path::new(path)))
 }
 
 /// Это путь файла записи на этом компьютере: исходный у своей записи, в кэше
 /// у чужой. Чужой исходный путь не подходит: он с другого устройства, а
 /// здесь по нему может лежать совсем другой файл.
+fn files_have_path(local: bool, files: &[FileRef], files_dir: &Path, path: &Path) -> bool {
+    files.iter().any(|f| {
+        // Свой исходный путь подходит; кэш — у любой записи: туда пишем только мы.
+        (local && Path::new(&f.path) == path)
+            || f.blob
+                .is_some_and(|b| cache_path(files_dir, b, &f.name) == path)
+    })
+}
+
+/// То же для записи целиком.
+#[cfg(test)]
 fn entry_has_path(e: &Entry, files_dir: &Path, path: &Path) -> bool {
     let Content::Files(files) = &e.content else {
         return false;
     };
-    files.iter().any(|f| {
-        // Свой исходный путь подходит; кэш — у любой записи: туда пишем только мы.
-        (e.local && Path::new(&f.path) == path)
-            || f.blob
-                .is_some_and(|b| cache_path(files_dir, b, &f.name) == path)
-    })
+    files_have_path(e.local, files, files_dir, path)
 }
 
 fn entry(app: &AppHandle, id: &str) -> Result<Entry, String> {
@@ -102,7 +107,6 @@ fn entry(app: &AppHandle, id: &str) -> Result<Entry, String> {
     let state = app.state::<AppState>();
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
     h.get(id)
-        .cloned()
         .ok_or_else(|| tr("Элемента уже нет в истории").into())
 }
 
@@ -199,14 +203,34 @@ async fn download(app: &AppHandle, e: &Entry, files: &[FileRef]) -> Result<Vec<P
     // Даже при ошибке часть файлов могла скачаться — окну стоит перечитать.
     let _ = app.emit("clipwire://history-changed", ());
     let paths = res.map_err(|err| download_error(&err, &e.device_name))?;
-    // Миниатюра нужна только записи из одного файла-картинки.
+    // Миниатюра нужна только записи из одного файла-картинки. Декодирование
+    // картинки — без замка истории.
     if let (Content::Files(all), [f], [p]) = (&e.content, files, paths.as_slice())
         && all.len() == 1
         && f.width > 0
     {
         let state = app.state::<AppState>();
-        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        h.file_thumb(e.id, p);
+        let has = state
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_thumb(e.id);
+        if !has {
+            let p = p.clone();
+            let made = tauri::async_runtime::spawn_blocking(move || {
+                clipwire_agent::image::thumbnail_file(&p)
+            })
+            .await;
+            match made {
+                Ok(Ok(png)) => state
+                    .history
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_thumb(e.id, &png),
+                Ok(Err(err)) => tracing::warn!("миниатюра не сделалась: {err:#}"),
+                Err(err) => tracing::warn!("миниатюра не сделалась: {err}"),
+            }
+        }
     }
     Ok(paths)
 }
