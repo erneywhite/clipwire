@@ -86,6 +86,12 @@ pub struct LinkDto {
     /// Напрямую по UDP; иначе через relay.
     pub direct: bool,
     pub rtt_ms: u64,
+    /// Версия сервера; `None` — не сообщает (старше 0.3.1).
+    pub server_version: Option<String>,
+    /// Сервер старше этого приложения: образ пора обновить.
+    pub server_outdated: bool,
+    /// Версия приложения — для подписи «обновите до …».
+    pub client_version: &'static str,
 }
 
 #[tauri::command]
@@ -111,9 +117,18 @@ pub async fn stats_overview(app: AppHandle) -> StatsDto {
             Ok(s) => dto.server = Some(s),
             Err(e) => dto.server_error = Some(e),
         }
-        dto.link = link.ok().map(|l| LinkDto {
-            direct: l.direct,
-            rtt_ms: l.rtt_ms,
+        dto.link = link.ok().map(|l| {
+            let client = clipwire_agent::sync::CLIENT_VERSION;
+            LinkDto {
+                direct: l.direct,
+                rtt_ms: l.rtt_ms,
+                server_outdated: l
+                    .server_version
+                    .as_deref()
+                    .is_none_or(|v| clipwire_core::proto::version_older(v, client)),
+                server_version: l.server_version,
+                client_version: client,
+            }
         });
     }
     dto

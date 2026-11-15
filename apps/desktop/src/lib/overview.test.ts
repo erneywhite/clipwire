@@ -3,7 +3,7 @@
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
 import type { GroupDevice, StorageState } from './api'
 
-const { devicesLabel, historyLabel, serverFilesLabel, serverItemsLabel, storageLabel } = (await import('./overview' + '.ts')) as typeof import('./overview')
+const { devicesLabel, historyLabel, serverFilesLabel, serverItemsLabel, serverVersionLabel, storageLabel } = (await import('./overview' + '.ts')) as typeof import('./overview')
 const fmt = (await import('./format' + '.ts')) as typeof import('./format')
 
 function check(cond: boolean, msg: string) {
@@ -63,3 +63,11 @@ check(lastSyncLabel(now - 5 * 60_000, now - 10_000, fmt, now) === 'Отправ�
 check(lastSyncLabel(0, now - 3 * 3600_000, fmt, now) === 'Получено 3 ч назад', lastSyncLabel(0, now - 3 * 3600_000, fmt, now))
 
 console.log('overview: всё прошло')
+
+// Версия сервера: актуальная, старее приложения, без версии (до 0.3.1).
+const fresh = serverVersionLabel({ server_version: '0.3.1', server_outdated: false, client_version: '0.3.1' })
+check(fresh.text === '0.3.1' && fresh.tone === 'ok', 'актуальный сервер')
+const stale = serverVersionLabel({ server_version: '0.3.0', server_outdated: true, client_version: '0.3.1' })
+check(stale.text === '0.3.0 · обновите образ до 0.3.1' && stale.tone === 'warn', 'сервер старее приложения')
+const unknown = serverVersionLabel({ server_version: null, server_outdated: true, client_version: '0.3.1' })
+check(unknown.text === 'старше 0.3.1 · обновите образ до 0.3.1' && unknown.tone === 'warn', 'сервер без версии')

@@ -173,6 +173,18 @@ pub static EN: &[(&str, &str)] = &[
         "Clipwire updated to {current}",
     ),
     (
+        "Сервер Clipwire {server} старше приложения {client}: обновите образ сервера",
+        "Clipwire server {server} is older than the app {client}: update the server image",
+    ),
+    (
+        "Сервер Clipwire старше приложения {client}: обновите образ сервера",
+        "The Clipwire server is older than the app {client}: update the server image",
+    ),
+    (
+        "Сервер Clipwire устарел и не поддерживает эту версию: обновите образ сервера",
+        "The Clipwire server is too old for this version: update the server image",
+    ),
+    (
         "Обновление уже устанавливается",
         "An update is already being installed",
     ),

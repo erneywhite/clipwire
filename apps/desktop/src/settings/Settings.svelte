@@ -12,7 +12,7 @@
   import { applyTheme } from '../lib/theme'
   import * as fmt from '../lib/format'
   import { bytesLabel } from '../lib/format'
-  import { devicesLabel, historyLabel, lastSyncLabel, linkLabel, quotaLabel, serverFilesLabel, serverItemsLabel, storageLabel } from '../lib/overview'
+  import { devicesLabel, historyLabel, lastSyncLabel, linkLabel, quotaLabel, serverVersionLabel, serverFilesLabel, serverItemsLabel, storageLabel } from '../lib/overview'
   import { fromEvent, label as hotkeyLabel } from '../lib/hotkey'
   import Toggle from './Toggle.svelte'
   import TitleBar from './TitleBar.svelte'
@@ -880,6 +880,10 @@
             <div class="kv">
               <span>{t('Связь')}</span>
               <span>{linkLabel(stats.link)}</span>
+            </div>
+            <div class="kv">
+              <span>{t('Версия сервера')}</span>
+              <span class="tone" data-tone={serverVersionLabel(stats.link).tone}>{serverVersionLabel(stats.link).text}</span>
             </div>
           {/if}
           {#if configured && stats}

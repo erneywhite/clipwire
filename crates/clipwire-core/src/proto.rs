@@ -40,14 +40,62 @@ pub const ALPN_5: &[u8] = b"clipwire/5";
 /// без опроса.
 pub const ALPN_6: &[u8] = b"clipwire/6";
 
+/// Как [`ALPN_6`], плюс `ServerInfo`: после входа сервер сообщает свою
+/// версию, и клиент показывает, что образ сервера пора обновить.
+pub const ALPN_7: &[u8] = b"clipwire/7";
+
+/// Все ALPN, новейший первым: в этом порядке их предлагает агент и
+/// принимает сервер.
+pub const ALPNS: [&[u8]; 5] = [ALPN_7, ALPN_6, ALPN_5, ALPN_4, ALPN];
+
+/// Номер версии протокола из ALPN (`clipwire/7` → 7), 0 — не наш ALPN.
+/// Новые возможности проверяются сравнением номера, а не перечислением ALPN:
+/// иначе каждая новая версия молча теряла бы старые возможности.
+pub fn alpn_version(alpn: &[u8]) -> u32 {
+    alpn.strip_prefix(b"clipwire/")
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Знает ли соединение с этим ALPN удаление на всех устройствах.
 pub fn knows_deletes(alpn: &[u8]) -> bool {
-    alpn == ALPN_5 || alpn == ALPN_6
+    alpn_version(alpn) >= 5
 }
 
 /// Знает ли соединение с этим ALPN `GetStats`.
 pub fn knows_stats(alpn: &[u8]) -> bool {
-    alpn == ALPN_4 || knows_deletes(alpn)
+    alpn_version(alpn) >= 4
+}
+
+/// Знает ли соединение с этим ALPN `DevicesChanged`.
+pub fn knows_devices_changed(alpn: &[u8]) -> bool {
+    alpn_version(alpn) >= 6
+}
+
+/// Знает ли соединение с этим ALPN `ServerInfo`.
+pub fn knows_server_info(alpn: &[u8]) -> bool {
+    alpn_version(alpn) >= 7
+}
+
+/// Версия `a` младше `b` («0.3.0» < «0.3.1» < «0.10.0»). Части сравниваются
+/// числами; нечисловой хвост («-beta») отбрасывается, неразборная версия
+/// считается младше любой.
+pub fn version_older(a: &str, b: &str) -> bool {
+    fn parts(v: &str) -> Option<Vec<u64>> {
+        v.trim()
+            .split('.')
+            .map(|p| {
+                let digits: String = p.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect()
+    }
+    match (parts(a), parts(b)) {
+        (Some(a), Some(b)) => a < b,
+        (None, Some(_)) => true,
+        _ => false,
+    }
 }
 
 /// Предел одного кадра. Сервер может выставить свой лимит на элемент
@@ -173,6 +221,9 @@ pub enum ServerMsg {
     /// список устройств стоит перечитать (`ListDevices`). Только соединениям
     /// по [`ALPN_6`].
     DevicesChanged,
+    /// Версия сервера (`CARGO_PKG_VERSION`), сразу после входа в группу.
+    /// Только по [`ALPN_7`].
+    ServerInfo { version: String },
 }
 
 /// Первый кадр потока файла.
@@ -393,6 +444,33 @@ mod tests {
     use super::*;
     use crate::crypto::GroupKey;
     use crate::item::{Content, DeviceId, Item};
+
+    #[test]
+    fn alpn_versions_and_features() {
+        assert_eq!(alpn_version(ALPN), 3);
+        assert_eq!(alpn_version(ALPN_7), 7);
+        assert_eq!(alpn_version(b"clipwire/12"), 12);
+        assert_eq!(alpn_version(b"other/7"), 0);
+        // Новая версия не теряет старые возможности.
+        for a in ALPNS {
+            let v = alpn_version(a);
+            assert_eq!(knows_stats(a), v >= 4);
+            assert_eq!(knows_deletes(a), v >= 5);
+            assert_eq!(knows_devices_changed(a), v >= 6);
+            assert_eq!(knows_server_info(a), v >= 7);
+        }
+        assert!(knows_deletes(b"clipwire/9"));
+    }
+
+    #[test]
+    fn version_order() {
+        assert!(version_older("0.3.0", "0.3.1"));
+        assert!(version_older("0.3.9", "0.10.0"));
+        assert!(!version_older("0.3.1", "0.3.1"));
+        assert!(!version_older("1.0.0", "0.9.9"));
+        assert!(!version_older("0.3.1-beta", "0.3.1"));
+        assert!(version_older("мусор", "0.3.1"));
+    }
 
     #[test]
     fn frame_roundtrip() {

@@ -425,6 +425,8 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
 
 The **About** page shows the version and the update check, and below it a status block: the
 connection to the server and how it runs (direct over UDP or through the relay, with latency),
+the server version (highlighted, with a one-time notification, when the server is older than the
+app and its image should be updated),
 when an item last went out and came in, the group's file storage, how many entries the history
 has on this device and how much space downloaded files take, how many items and files of the
 group sit on the server, how much of the server's quota for files is used
@@ -457,7 +459,8 @@ version number: `ghcr.io/erneywhite/clipwire-server:0.3.0`.
    Russian: `код сервера: cwserver1-…`). The first device connects with it. `clipwire-server
    info` prints the same.
 
-**Updating:** pull the new image and recreate the container.
+**Updating:** pull the new image and recreate the container. When the app is newer than the
+server, About shows it next to the server version and you get a notification once.
 
 **Checking from outside:** `cargo run -p clipwire-server --example probe -- cwserver1-…` connects
 two clients through the relay, sends an encrypted item between them and shows which path the

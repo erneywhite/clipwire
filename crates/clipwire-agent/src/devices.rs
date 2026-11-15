@@ -334,11 +334,15 @@ pub enum Control {
     Delete(clipwire_core::delete::DeleteNote),
 }
 
-/// Путь до сервера: напрямую (UDP) или через relay, и задержка.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Путь до сервера: напрямую (UDP) или через relay, и задержка; версия
+/// протокола и самого сервера.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkInfo {
     pub direct: bool,
     pub rtt_ms: u64,
+    pub server_protocol: u32,
+    /// `None` — сервер не сообщает версию (до `clipwire/7`).
+    pub server_version: Option<String>,
 }
 
 /// Когда последний раз элемент ушёл в группу и пришёл из неё (мс Unix, 0 —

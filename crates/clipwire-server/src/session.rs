@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clipwire_core::delete::MAX_DELETE_BYTES;
 use clipwire_core::proto::io::{IoError, read_msg, read_msg_limited, write_msg};
-use clipwire_core::proto::{ALPN_6, ClientMsg, ServerMsg, knows_deletes};
+use clipwire_core::proto::{
+    ClientMsg, ServerMsg, knows_deletes, knows_devices_changed, knows_server_info,
+};
 use clipwire_core::storage::MAX_CONFIG_BYTES;
 use clipwire_core::{DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
 use iroh::endpoint::Connection;
@@ -285,8 +287,13 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
     // Записки об удалении — только клиентам по `clipwire/5`; старые оборвут
     // соединение на незнакомом `Deleted`. Регистрация раньше записок: удаление,
     // пришедшее между ними, придёт и рассылкой, повтор безвреден.
-    if conn.alpn() == ALPN_6 {
+    if knows_devices_changed(conn.alpn()) {
         reg.subscribe_devices();
+    }
+    // Своя версия — чтобы клиент подсказал обновить образ сервера.
+    if knows_server_info(conn.alpn()) {
+        let version = env!("CARGO_PKG_VERSION").to_string();
+        write_msg(&mut send, &ServerMsg::ServerInfo { version }).await?;
     }
     // Устройство вышло на связь: окна устройств остальных обновятся.
     shared.hub.devices_changed(&group, reg.id);
