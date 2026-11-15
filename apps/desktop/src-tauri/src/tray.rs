@@ -9,9 +9,11 @@
 //! Значок показывается через AppIndicator (StatusNotifierItem); меню
 //! открывается любым кликом, двойного клика там нет.
 
+use std::time::{Duration, Instant};
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+
 use tauri::{AppHandle, Manager, Wry};
 
 use clipwire_agent::i18n::{tr, trf};
@@ -164,9 +166,23 @@ fn icon(light_panel: bool, wire: Wire, dim: bool) -> tauri::Result<Image<'static
     }
 }
 
+/// Тема панели задач, прочитанная последней: `render` берёт её отсюда, а не
+/// из реестра на каждый кадр.
+static LIGHT_PANEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Светлая ли панель задач, по последней проверке ([`refresh_light_panel`]).
+fn light_panel() -> bool {
+    LIGHT_PANEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Перечитать тему панели задач.
+fn refresh_light_panel() {
+    LIGHT_PANEL.store(detect_light_panel(), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Светлая ли панель задач (Windows: SystemUsesLightTheme; Linux: светлая
 /// схема KDE). Иначе — тёмная.
-fn light_panel() -> bool {
+fn detect_light_panel() -> bool {
     #[cfg(windows)]
     {
         use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
@@ -241,14 +257,62 @@ fn render(app: &AppHandle) {
     }
 }
 
-/// Такт пульсации и проверка темы панели задач: раз в 0,7 с, иконка меняется
-/// только когда реально нужно.
+/// Кадр пульсации.
+const PULSE: Duration = Duration::from_millis(700);
+
+/// Как часто перечитывать тему панели задач. На Windows человек может
+/// переключить светлую и тёмную тему в любой момент; реестр читается раз в
+/// полминуты, а не на каждом кадре. На Linux тема читается один раз, на маке
+/// значок — шаблон, его перекрашивает система.
+const THEME_POLL: Option<Duration> = if cfg!(windows) {
+    Some(Duration::from_secs(30))
+} else {
+    None
+};
+
+/// Будит такт: начался или кончился статус с пульсацией.
+static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Когда такту проснуться в следующий раз: `None` — только по [`WAKE`].
+/// Пульсирует — через кадр; иначе — к следующей проверке темы, если она нужна.
+fn next_tick(pulsing: bool, theme_poll: Option<Duration>) -> Option<Duration> {
+    if pulsing { Some(PULSE) } else { theme_poll }
+}
+
+/// Пульсирует ли сейчас значок.
+fn pulsing() -> bool {
+    let look = LOOK.lock().unwrap_or_else(|e| e.into_inner());
+    look.status
+        .as_ref()
+        .is_some_and(|st| wire_for(st, look.update).1)
+}
+
+/// Такт пульсации и проверка темы панели задач. Без пульсации такт спит до
+/// смены статуса (или до проверки темы на Windows), а не будит процессор
+/// полтора раза в секунду всю жизнь программы.
 pub fn spawn_animator(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(700));
+        let mut theme_at = Instant::now();
         loop {
-            tick.tick().await;
+            let pulse = pulsing();
+            let woken = match next_tick(pulse, THEME_POLL) {
+                Some(wait) => tokio::select! {
+                    _ = tokio::time::sleep(wait) => false,
+                    _ = WAKE.notified() => true,
+                },
+                None => {
+                    WAKE.notified().await;
+                    true
+                }
+            };
+            if let Some(poll) = THEME_POLL
+                && theme_at.elapsed() >= poll
             {
+                refresh_light_panel();
+                theme_at = Instant::now();
+            }
+            // Кадр меняется только по таймеру: смена статуса рисует сама.
+            if pulse && !woken {
                 let mut look = LOOK.lock().unwrap_or_else(|e| e.into_inner());
                 look.phase = !look.phase;
             }
@@ -278,6 +342,7 @@ fn short(s: &str) -> String {
 }
 
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
+    refresh_light_panel();
     let status = MenuItem::with_id(app, "status", tr("Подключение…"), false, None::<&str>)?;
     let pause = CheckMenuItem::with_id(app, "pause", tr("Пауза"), true, false, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", tr("Настройки"), true, None::<&str>)?;
@@ -364,6 +429,7 @@ pub fn show_status(app: &AppHandle, st: &StatusDto) {
     }
     LOOK.lock().unwrap_or_else(|e| e.into_inner()).status = Some(st.clone());
     render(app);
+    WAKE.notify_one();
 }
 
 /// Язык сменили: переписать пункты меню и подсказку.
@@ -398,11 +464,31 @@ pub fn show_update(app: &AppHandle, version: &str) {
     }
     LOOK.lock().unwrap_or_else(|e| e.into_inner()).update = true;
     render(app);
+    WAKE.notify_one();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticker_runs_only_while_pulsing() {
+        let poll = Some(Duration::from_secs(30));
+        // Пульсация — каждый кадр, тема не мешает.
+        assert_eq!(next_tick(true, poll), Some(PULSE));
+        assert_eq!(next_tick(true, None), Some(PULSE));
+        // Спокойный значок: Windows проверяет тему редко, остальные спят.
+        assert_eq!(next_tick(false, poll), poll);
+        assert_eq!(next_tick(false, None), None);
+        // Пульсируют только подключение и найденное обновление.
+        assert!(wire_for(&StatusDto::Connecting, false).1);
+        assert!(wire_for(&StatusDto::Online, true).1);
+        assert!(wire_for(&StatusDto::Local, true).1);
+        assert!(!wire_for(&StatusDto::Online, false).1);
+        assert!(!wire_for(&StatusDto::Local, false).1);
+        assert!(!wire_for(&StatusDto::Paused, true).1);
+        assert!(!wire_for(&StatusDto::Offline("x".into()), true).1);
+    }
 
     #[test]
     fn mac_icon_by_state() {
