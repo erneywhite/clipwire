@@ -175,7 +175,30 @@ pub struct Updates {
 
 struct Ready {
     update: Update,
-    bytes: Vec<u8>,
+    bytes: Payload,
+}
+
+/// Где лежит скачанный установщик, пока ждёт удобного момента.
+enum Payload {
+    /// В `update/pending.bin`: читается в момент установки, а не держится
+    /// в памяти часами (установщик — десятки мегабайт). Подпись проверяет
+    /// `Update::install` над прочитанными байтами, как и при установке на
+    /// запуске, так что подмена файла на диске не пройдёт.
+    Disk(PathBuf),
+    /// На диск не записалось или скачано по кнопке и ставится сразу.
+    Memory(Vec<u8>),
+}
+
+impl Payload {
+    /// Байты установщика. Файл с диска читается заново при каждом вызове.
+    fn load(&self) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+        match self {
+            Payload::Memory(b) => Ok(std::borrow::Cow::Borrowed(b)),
+            Payload::Disk(p) => std::fs::read(p)
+                .map(std::borrow::Cow::Owned)
+                .map_err(|e| format!("скачанное обновление не прочиталось ({}): {e}", p.display())),
+        }
+    }
 }
 
 /// Пометка перед установкой: какую версию ставили и сами ли.
@@ -542,8 +565,9 @@ async fn check(app: &AppHandle) -> Result<Option<Update>, String> {
     updater.check().await.map_err(|e| e.to_string())
 }
 
-/// Скачать (плагин проверит подпись), сохранить на диск для следующего запуска
-/// и держать в памяти до удобного момента.
+/// Скачать (плагин проверит подпись) и сохранить на диск: оттуда обновление
+/// поставится в удобный момент или при следующем запуске. В памяти байты
+/// остаются, только если записать на диск не вышло.
 async fn download(app: &AppHandle, update: Update) -> Result<(), String> {
     let bytes = update
         .download(|_, _| {}, || {})
@@ -556,12 +580,17 @@ async fn download(app: &AppHandle, update: Update) -> Result<(), String> {
     };
     // Не записалось на диск — не страшно: поставим из памяти, а при выходе
     // раньше времени скачаем снова.
+    let bin = dir.join("pending.bin");
     let saved = std::fs::create_dir_all(&dir)
-        .and_then(|_| std::fs::write(dir.join("pending.bin"), &bytes))
+        .and_then(|_| std::fs::write(&bin, &bytes))
         .and_then(|_| write_json(&dir.join("pending.json"), &pending));
-    if let Err(e) = saved {
-        tracing::warn!("скачанное обновление не сохранилось на диск: {e}");
-    }
+    let bytes = match saved {
+        Ok(()) => Payload::Disk(bin),
+        Err(e) => {
+            tracing::warn!("скачанное обновление не сохранилось на диск: {e}");
+            Payload::Memory(bytes)
+        }
+    };
     *app.state::<Updates>()
         .ready
         .lock()
@@ -632,9 +661,19 @@ async fn install_now(app: &AppHandle, ready: Ready, auto: bool) -> Result<(), St
     }
     // Пауза живёт только в движке: запоминаем до остановки, чтобы вернуть
     // её и после перезапуска установщиком, и здесь, если он не запустился.
+    // Установщик читается до остановки движка: `run_installer` удаляет
+    // `pending.bin` ещё до запуска, а без файла ставить нечего.
+    let bytes = match ready.bytes.load() {
+        Ok(b) => b,
+        Err(e) => {
+            state.busy.store(false, Ordering::Release);
+            return Err(e);
+        }
+    };
     let paused = service_paused(app);
     crate::stop_service(app).await;
-    let res = run_installer(app, &ready.update, &ready.bytes, auto, paused);
+    let res = run_installer(app, &ready.update, &bytes, auto, paused);
+    drop(bytes);
     // Сюда попадаем только при ошибке.
     state.busy.store(false, Ordering::Release);
     match crate::start_service(app) {
@@ -666,7 +705,10 @@ pub async fn install(app: AppHandle) -> Result<(), String> {
                 .download(|_, _| {}, || {})
                 .await
                 .map_err(|e| e.to_string())?;
-            Ready { update, bytes }
+            Ready {
+                update,
+                bytes: Payload::Memory(bytes),
+            }
         }
     };
     install_now(&app, ready, false).await
@@ -683,6 +725,24 @@ mod tests {
             paused: false,
             idle: Duration::from_secs(idle_secs),
         }
+    }
+
+    /// Установщик с диска читается в момент установки: что лежит в файле
+    /// тогда, то и уйдёт на проверку подписи. Пропавший файл — ошибка, а не
+    /// пустая установка.
+    #[test]
+    fn payload_on_disk_is_read_at_install_time() {
+        let dir = std::env::temp_dir().join(format!("clipwire-upd-payload-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("pending.bin");
+        std::fs::write(&bin, b"first").unwrap();
+        let p = Payload::Disk(bin.clone());
+        std::fs::write(&bin, b"second").unwrap();
+        assert_eq!(&*p.load().unwrap(), b"second");
+        std::fs::remove_file(&bin).unwrap();
+        assert!(p.load().is_err());
+        assert_eq!(&*Payload::Memory(b"mem".to_vec()).load().unwrap(), b"mem");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
