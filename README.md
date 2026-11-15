@@ -115,7 +115,9 @@ The invitation code contains the group's encryption key. Share it only with your
 
 **Moving from Paste (macOS).** The history of [Paste](https://pasteapp.io) can be moved with a
 command-line tool for now; a button in Settings is planned. Text and formatted text are moved with
-their dates and source apps, pinboard entries become pinned. Files are skipped (Paste keeps only
+their dates and source apps, pinboard entries become pinned and their titles become notes. A
+repeated run pins and labels entries that were moved before; in a group the pins reach the other
+devices the next time Clipwire starts. Files are skipped (Paste keeps only
 links to them). Images are moved with `--images`; with `--send` everything being sent is held in
 memory until it is sent, so a large image archive is better moved without `--send`. Quit
 Clipwire, set history retention to "forever", keep your other devices online if you add `--send`,
@@ -179,7 +181,8 @@ The list scrolls through the whole history, with search and filters too: older e
 advance, about 50 entries before you reach the end. A new entry arriving at the top does not
 reset what is already loaded or where you are.
 
-Search looks at the first 8 KB of each text, at file names, the device and the source app; a
+Search looks at the first 8 KB of each text, at the notes of pinned entries, file names, the
+device and the source app; a
 match further into a very long text is not found. The history is read from disk page by page, so
 memory use does not grow with it (details in `docs/history-storage.md`).
 
@@ -188,6 +191,20 @@ memory use does not grow with it (details in `docs/history-storage.md`).
 Devices that are switched off apply it when they connect, within the server's retention period.
 Entries pinned on another device are not deleted. The server does not know what was deleted: the
 deletion note is encrypted with the group key. This needs server 0.1.3 or newer.
+
+**Pins and notes.** Pinned entries are the same on every device of the group, including devices
+that joined later or were off for a long time. A pinned entry can have a note of up to 80
+characters, and search looks at it too. Unpinning removes the pin everywhere and erases the note;
+the entry stays in the history as an ordinary one. Pinning, unpinning and notes work offline as
+well: the change waits on disk and is sent after the device connects. On its first connection to
+a server with pins a device uploads its earlier pins once. If two devices pinned the same thing
+while offline, one pin is kept with the note of the newer change. A pin can be removed on this
+device only: the other devices keep it, and it does not come back here unless you pin it here
+again. The server keeps pins with no expiry, encrypted with the group key, and refuses new ones
+over its limits (`CLIPWIRE_PIN_MAX`, `CLIPWIRE_PIN_BYTES`): such an entry stays pinned on this
+device only, and the app says so. On a group key change the device that changes the key moves the
+pins to the new group. This needs a server with protocol `clipwire/8`: the app does not sync with
+an older server and asks you to update the image.
 
 ## What gets synced
 
