@@ -77,7 +77,7 @@ async fn endpoint(relay_url: &str, token: &str) -> Result<Endpoint> {
 
 struct Client {
     ep: Endpoint,
-    conn: Connection,
+    _conn: Connection,
     send: SendStream,
     recv: RecvStream,
 }
@@ -99,7 +99,7 @@ impl Client {
         let (send, recv) = conn.open_bi().await?;
         Ok(Self {
             ep,
-            conn,
+            _conn: conn,
             send,
             recv,
         })
