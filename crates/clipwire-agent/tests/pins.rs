@@ -21,8 +21,17 @@ use tokio::sync::mpsc;
 const T: Duration = Duration::from_secs(30);
 
 async fn start_server(guards: Guards) -> Result<(clipwire_server::Running, ServerInfo)> {
+    let dir = std::env::temp_dir().join(format!("clipwire-pins-test-{}", uuid::Uuid::now_v7()));
+    start_server_at(dir, guards).await
+}
+
+/// Сервер с базой в `data_dir`: перезапуск с той же папкой — та же база.
+async fn start_server_at(
+    data_dir: PathBuf,
+    guards: Guards,
+) -> Result<(clipwire_server::Running, ServerInfo)> {
     let config = Config {
-        data_dir: std::env::temp_dir().join(format!("clipwire-pins-test-{}", uuid::Uuid::now_v7())),
+        data_dir,
         public_url: "http://unused".into(),
         self_relay_url: "http://127.0.0.1:0".into(),
         relay_bind: "127.0.0.1:0".parse()?,
@@ -67,7 +76,11 @@ impl Mem {
 
     /// Скопировать текст здесь (закрепить сразу или нет). Возвращает хэш.
     fn add(&self, text: &str, pinned: bool, note: &str) -> [u8; 32] {
-        let item = Item::new(self.device, Content::Text(text.into()));
+        self.add_content(Content::Text(text.into()), pinned, note)
+    }
+
+    fn add_content(&self, content: Content, pinned: bool, note: &str) -> [u8; 32] {
+        let item = Item::new(self.device, content);
         let hash = item.content.hash();
         self.rows.lock().unwrap().insert(
             hash,
@@ -664,5 +677,324 @@ async fn delete_everywhere_unpins_before_delete_note() -> Result<()> {
     assert!(b.wait(f).await?, "после входа снятие тоже раньше записки");
     a.stop().await?;
     b.stop().await?;
+    server.shutdown().await
+}
+
+/// Снятие, сделанное без связи (часы устройства «отстают» на час от чужой
+/// правки подписи), доходит до всех: порядок держат `rev` и `seq`, а не
+/// время правки.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_unpin_after_foreign_note_reaches_everyone() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.start();
+    b.start();
+    a.online().await?;
+    b.online().await?;
+    let h = a.mem.add("снимут без связи", true, "");
+    a.pins.pin(h, "первая");
+    b.until("закреп пришёл", |m, _| {
+        m.state(&h) == Some((true, "первая".into()))
+    })
+    .await?;
+    b.stop().await?;
+
+    // B снимает без связи; его часы на час позади.
+    b.mem.set(&h, false, "");
+    b.pins.unpin(h);
+    b.pins.update(|book| book.outbox[0].at_ms -= 3600 * 1000);
+    // A тем временем правит подпись.
+    a.mem.set(&h, true, "вторая");
+    a.pins.set_note(h, "вторая");
+    a.synced().await?;
+
+    b.start();
+    b.online().await?;
+    b.synced().await?;
+    a.until("снятие B дошло до A", |m, p| {
+        m.state(&h) == Some((false, String::new())) && p.read(|b| b.live_count()) == 0
+    })
+    .await?;
+    // Третье устройство видит то же.
+    let mut c = Dev::new("C", &info, &key)?;
+    c.mem.add("снимут без связи", false, "");
+    c.start();
+    c.online().await?;
+    c.synced().await?;
+    assert_eq!(c.mem.state(&h), Some((false, String::new())));
+    assert_eq!(c.pins.read(|b| b.live_count()), 0);
+    for d in [&mut a, &mut b, &mut c] {
+        d.stop().await?;
+    }
+    server.shutdown().await
+}
+
+/// Повторное закрепление (после «снять только здесь» подпись в истории
+/// стёрта) не стирает подпись группы, и история после своей правки
+/// сверяется с книгой: подпись, поправленная другим, приходит и сюда.
+#[tokio::test(flavor = "multi_thread")]
+async fn repin_keeps_group_note_and_history_follows_book() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.start();
+    b.start();
+    a.online().await?;
+    b.online().await?;
+    let h = a.mem.add("закреп с подписью", true, "");
+    a.pins.pin(h, "старая");
+    b.until("закреп пришёл", |m, _| {
+        m.state(&h) == Some((true, "старая".into()))
+    })
+    .await?;
+    b.stop().await?;
+    a.mem.set(&h, true, "новая");
+    a.pins.set_note(h, "новая");
+    a.synced().await?;
+    // B без связи снял только здесь и закрепил снова: подпись в истории пуста.
+    b.pins.unpin_here(h);
+    b.mem.set(&h, true, "");
+    b.pins.pin(h, "");
+    b.start();
+    b.online().await?;
+    b.synced().await?;
+    b.until("у B подпись группы", |m, _| {
+        m.state(&h) == Some((true, "новая".into()))
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.until("у A подпись не стёрлась", |m, _| {
+        m.state(&h) == Some((true, "новая".into()))
+    })
+    .await?;
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Содержимое больше 256 КиБ не идёт в рассылке `Pinned`: устройство на
+/// связи спрашивает его отдельно (`PinContent`) и добавляет запись.
+#[tokio::test(flavor = "multi_thread")]
+async fn large_pin_content_comes_by_request() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.start();
+    b.start();
+    a.online().await?;
+    b.online().await?;
+    a.synced().await?;
+    b.synced().await?;
+    let big = "ж".repeat(300 * 1024);
+    let h = a.mem.add(&big, true, "");
+    a.pins.pin(h, "большой");
+    b.until("большой закреп пришёл", |m, _| {
+        m.state(&h) == Some((true, "большой".into()))
+    })
+    .await?;
+    let item = b.mem.item(&h).context("записи нет")?;
+    assert_eq!(item.content, Content::Text(big));
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Файлы закреплённой записи приходят открытым списком сервера: устройство
+/// без содержимого закрепа знает их и не чистит во внешнем хранилище.
+#[tokio::test(flavor = "multi_thread")]
+async fn pin_blobs_reach_devices_without_content() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.start();
+    a.online().await?;
+    let blob = BlobId::random()?;
+    let file = clipwire_core::FileRef {
+        name: "отчёт.pdf".into(),
+        path: "C:\\нет\\отчёт.pdf".into(),
+        size: 10,
+        is_dir: false,
+        width: 0,
+        height: 0,
+        modified_ms: 1,
+        blob: Some(blob),
+        blob_size: 10,
+        p2p: false,
+    };
+    let h = a.mem.add_content(Content::Files(vec![file]), true, "");
+    a.pins.pin(h, "");
+    a.synced().await?;
+    assert!(a.pins.kept_blobs().contains(&blob));
+    // B входит позже: список файлов приходит в записи сервера.
+    b.start();
+    b.online().await?;
+    b.synced().await?;
+    b.until("файлы закрепа известны", |_, p| {
+        p.kept_blobs().contains(&blob)
+    })
+    .await?;
+    // Сняли везде — файлы больше не держатся.
+    a.mem.set(&h, false, "");
+    a.pins.unpin(h);
+    b.until("файлы отпущены", |_, p| {
+        p.kept_blobs().is_empty()
+    })
+    .await?;
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// База сервера пропала (новый сервер, та же группа): метка базы другая,
+/// устройство забирает всё с начала и выгружает живые закрепы заново.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_reset_restarts_cursor_and_reuploads() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    a.start();
+    a.online().await?;
+    let h = a.mem.add("переживёт сброс", true, "");
+    a.pins.pin(h, "сброс");
+    // Ещё одна правка, чтобы курсор ушёл вперёд.
+    a.pins.set_note(h, "сброс сервера");
+    a.mem.set(&h, true, "сброс сервера");
+    a.synced().await?;
+    a.stop().await?;
+    server.shutdown().await?;
+
+    let (server2, info2) = start_server(Guards::default()).await?;
+    a.info = info2.clone();
+    a.start();
+    a.online().await?;
+    a.until("закреп выгружен заново", |_, p| {
+        p.read(|b| b.seeded && b.outbox.is_empty() && b.live_count() == 1)
+    })
+    .await?;
+    let mut b = Dev::new("B", &info2, &key)?;
+    b.start();
+    b.online().await?;
+    b.until("закреп на новом сервере", |m, _| {
+        m.state(&h) == Some((true, "сброс сервера".into()))
+    })
+    .await?;
+    a.stop().await?;
+    b.stop().await?;
+    server2.shutdown().await
+}
+
+/// Смена ключа, пока B выключен: после перехода B не выгружает в новую
+/// группу закрепы, снятые другими до смены, и всё закреплённое в истории.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_device_after_rekey_does_not_resurrect_pins() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.start();
+    b.start();
+    a.online().await?;
+    b.online().await?;
+    a.devices_with_cards(2).await?;
+    b.devices_with_cards(2).await?;
+    let keep = a.mem.add("остаётся", true, "");
+    let gone = a.mem.add("снимут без B", true, "");
+    a.pins.pin(keep, "");
+    a.pins.pin(gone, "");
+    b.until("закрепы пришли", |m, _| {
+        m.state(&keep).is_some_and(|s| s.0) && m.state(&gone).is_some_and(|s| s.0)
+    })
+    .await?;
+    b.synced().await?;
+    b.stop().await?;
+    // Пока B выключен: A снимает закреп, а у B в истории есть закреплённое,
+    // которого нет в группе (закрепили давно, до группы).
+    a.mem.set(&gone, false, "");
+    a.pins.unpin(gone);
+    a.synced().await?;
+    let only_b = b.mem.add("только в истории B", true, "");
+    let k2 = a.ctl.rekey(None).await.map_err(anyhow::Error::msg)?.key;
+    a.stop().await?;
+
+    // B входит в старую группу, получает новый ключ и переходит.
+    b.start();
+    let n = b
+        .wait(|e| match e {
+            Event::Rekeyed(n) => Some(n.key.clone()),
+            _ => None,
+        })
+        .await?;
+    assert_eq!(n, k2);
+    b.stop().await?;
+    for d in [&mut a, &mut b] {
+        d.key = k2.clone();
+        d.start();
+        d.online().await?;
+        d.synced().await?;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.until(
+        "в новой группе только живой закреп",
+        |_, p| p.read(|b| b.live_count() == 1 && b.live(&keep).len() == 1),
+    )
+    .await?;
+    assert!(
+        a.pins.read(|b| b.live(&gone).is_empty()),
+        "снятое не воскресло"
+    );
+    assert!(a.pins.read(|b| b.live(&only_b).is_empty()));
+    assert_eq!(b.pins.read(|b| b.live_count()), 1);
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Смена ключа, а в новую группу закрепы не влезают (квоту на сервере
+/// уменьшили): отказ приходит событием с понятным текстом.
+#[tokio::test(flavor = "multi_thread")]
+async fn rekey_reports_pins_refused_by_quota() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("clipwire-pins-test-{}", uuid::Uuid::now_v7()));
+    let two = Guards {
+        pin_max: 2,
+        ..Guards::default()
+    };
+    let (server, info) = start_server_at(dir.clone(), two).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    a.start();
+    a.online().await?;
+    for t in ["первый", "второй"] {
+        let h = a.mem.add(t, true, "");
+        a.pins.pin(h, "");
+    }
+    a.synced().await?;
+    assert_eq!(a.pins.read(|b| b.live_count()), 2);
+    a.stop().await?;
+    server.shutdown().await?;
+
+    // Та же база, квота меньше.
+    let one = Guards {
+        pin_max: 1,
+        ..Guards::default()
+    };
+    let (server, info) = start_server_at(dir, one).await?;
+    a.info = info;
+    a.start();
+    a.online().await?;
+    a.synced().await?;
+    a.ctl.rekey(None).await.map_err(anyhow::Error::msg)?;
+    let why = a
+        .wait(|e| match e {
+            Event::PinFailed(w) => Some(w.clone()),
+            _ => None,
+        })
+        .await?;
+    assert!(why.contains("1"), "{why}");
+    a.stop().await?;
     server.shutdown().await
 }
