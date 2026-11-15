@@ -7,7 +7,7 @@ use clipwire_agent::history::{CardKind, Entry, RichFormat, Row};
 use clipwire_agent::i18n::tr;
 use clipwire_agent::settings::Settings;
 use clipwire_agent::state::{AgentState, random_key};
-use clipwire_core::{Content, GroupKey, Invite, ItemId, ServerInfo};
+use clipwire_core::{Content, GroupKey, Invite, ItemId};
 use serde::Serialize;
 use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
@@ -57,14 +57,22 @@ fn ensure_unconfigured(app: &AppHandle) -> CmdResult<()> {
     Ok(())
 }
 
-/// Первое устройство: создать группу по коду сервера. Возвращает код приглашения.
+/// Первое устройство: создать группу по коду сервера администратора
+/// (`cwserver2-…`). Ключ администратора сохраняется: с ним движок создаёт
+/// группу, а устройство видит раздел «Сервер». Возвращает код приглашения.
 #[tauri::command]
 pub async fn create_group(app: AppHandle, server_code: String) -> CmdResult<String> {
-    let server = ServerInfo::decode(&server_code).map_err(err)?;
+    let admin = clipwire_agent::admin::creation_code(server_code.trim())?;
     ensure_unconfigured(&app)?;
+    let paths = &app.state::<AppState>().paths;
+    // Ключ раньше состояния: сервис, который запустится по состоянию, должен
+    // уже найти ключ, иначе группа не создастся.
+    paths
+        .save_admin_key(admin.server.server_id, &admin.admin_key)
+        .map_err(err)?;
     let agent = AgentState {
         invite: Invite {
-            server,
+            server: admin.server,
             group_key: GroupKey::generate().map_err(err)?,
         },
         device_key: random_key().map_err(err)?,

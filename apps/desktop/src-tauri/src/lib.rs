@@ -1,6 +1,7 @@
 //! Приложение Clipwire: трей, окно вставки и окно настроек поверх движка
 //! синхронизации из `clipwire-agent`.
 
+mod admin;
 mod cache;
 mod commands;
 mod devices;
@@ -624,6 +625,16 @@ pub fn run() {
             commands::update_ready,
             commands::update_found,
             devices::group_notices_take,
+            admin::admin_state,
+            admin::admin_claim,
+            admin::admin_forget,
+            admin::server_settings_get,
+            admin::server_settings_set,
+            admin::server_summary,
+            admin::server_rotate_relay_token,
+            admin::server_rotate_admin_key,
+            admin::group_admin,
+            admin::device_make_admin,
         ])
         .setup(|app| {
             #[cfg(target_os = "linux")]
