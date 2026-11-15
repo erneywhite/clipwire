@@ -1,8 +1,11 @@
 //! Строки, которыми обмениваются люди: код сервера и код приглашения.
 //!
-//! - **Код сервера** (`cwserver1-…`) печатает `clipwire-server info`. В нём только
-//!   адрес и открытые данные сервера, секретов группы там нет. С ним первое
-//!   устройство создаёт группу.
+//! - **Код сервера** (`cwserver2-…`) печатает `clipwire-server info`: адрес и
+//!   открытые данные сервера, токен relay и ключ администратора сервера
+//!   ([`AdminServerInfo`]). Секретов группы там нет. С ним устройство создаёт
+//!   группы и управляет сервером. Старый код `cwserver1-…` (без ключа
+//!   администратора) по-прежнему разбирается ([`ServerCode`]), но группу с ним
+//!   не создать.
 //! - **Код приглашения** (`clipwire1-…`) — код сервера плюс ключ группы. С ним
 //!   входят остальные устройства. Передавать только по надёжному каналу: кто
 //!   видел код, тот знает ключ. На этапе 6 его заменит pairing по PIN/QR.
@@ -15,9 +18,11 @@ use data_encoding::BASE32_NOPAD;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::admin::AdminKey;
 use crate::crypto::GroupKey;
 
 const SERVER_PREFIX: &str = "cwserver1-";
+const ADMIN_SERVER_PREFIX: &str = "cwserver2-";
 const INVITE_PREFIX: &str = "clipwire1-";
 
 /// Как достучаться до сервера.
@@ -30,6 +35,22 @@ pub struct ServerInfo {
     pub relay_url: String,
     /// Токен доступа к relay.
     pub relay_token: String,
+}
+
+/// Код сервера администратора (`cwserver2-…`): всё из [`ServerInfo`] и ключ
+/// администратора сервера.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminServerInfo {
+    pub server: ServerInfo,
+    pub admin_key: AdminKey,
+}
+
+/// Любой код сервера: старый `cwserver1-…` или `cwserver2-…` с ключом
+/// администратора.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerCode {
+    Plain(ServerInfo),
+    Admin(AdminServerInfo),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +92,46 @@ impl ServerInfo {
 
     pub fn decode(s: &str) -> Result<Self, InviteError> {
         decode(SERVER_PREFIX, s)
+    }
+}
+
+impl AdminServerInfo {
+    pub fn encode(&self) -> String {
+        encode(ADMIN_SERVER_PREFIX, self)
+    }
+
+    pub fn decode(s: &str) -> Result<Self, InviteError> {
+        decode(ADMIN_SERVER_PREFIX, s)
+    }
+}
+
+impl ServerCode {
+    /// Разобрать код сервера любой версии. Ошибка префикса — про новый
+    /// формат (`cwserver2-`): его и печатает сервер.
+    pub fn decode(s: &str) -> Result<Self, InviteError> {
+        match AdminServerInfo::decode(s) {
+            Ok(a) => Ok(Self::Admin(a)),
+            Err(InviteError::Prefix(p)) => match ServerInfo::decode(s) {
+                Ok(i) => Ok(Self::Plain(i)),
+                Err(InviteError::Prefix(_)) => Err(InviteError::Prefix(p)),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn server(&self) -> &ServerInfo {
+        match self {
+            Self::Plain(i) => i,
+            Self::Admin(a) => &a.server,
+        }
+    }
+
+    pub fn admin_key(&self) -> Option<&AdminKey> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Admin(a) => Some(&a.admin_key),
+        }
     }
 }
 
@@ -127,6 +188,62 @@ mod tests {
             Err(InviteError::Prefix(_))
         ));
         assert!(ServerInfo::decode(&sample().encode()).is_err());
+    }
+
+    fn admin() -> AdminServerInfo {
+        AdminServerInfo {
+            server: server(),
+            admin_key: AdminKey([7; 32]),
+        }
+    }
+
+    #[test]
+    fn admin_code_roundtrip_and_any_version() {
+        let code = admin().encode();
+        assert!(code.starts_with(ADMIN_SERVER_PREFIX));
+        assert_eq!(AdminServerInfo::decode(&code).unwrap(), admin());
+        // Регистр и пробелы не мешают, как у остальных кодов.
+        let loud = format!(
+            " {}
+",
+            code.to_uppercase()
+        );
+        assert_eq!(
+            ServerCode::decode(&loud).unwrap(),
+            ServerCode::Admin(admin())
+        );
+        let any = ServerCode::decode(&code).unwrap();
+        assert_eq!(any.server(), &server());
+        assert_eq!(any.admin_key(), Some(&AdminKey([7; 32])));
+
+        // Старый код разбирается, но ключа администратора в нём нет.
+        let old = ServerCode::decode(&server().encode()).unwrap();
+        assert_eq!(old, ServerCode::Plain(server()));
+        assert_eq!(old.admin_key(), None);
+    }
+
+    #[test]
+    fn admin_code_is_not_interchangeable() {
+        // Код приглашения — не код сервера, и наоборот.
+        assert!(matches!(
+            ServerCode::decode(&sample().encode()),
+            Err(InviteError::Prefix("cwserver2-"))
+        ));
+        assert!(Invite::decode(&admin().encode()).is_err());
+        assert!(ServerInfo::decode(&admin().encode()).is_err());
+        // Битое тело с верным префиксом — «повреждён», а не «префикс».
+        assert!(matches!(
+            ServerCode::decode("cwserver2-!!!"),
+            Err(InviteError::Corrupt)
+        ));
+        let mut code = admin().encode();
+        code.truncate(code.len() - 5);
+        assert!(matches!(
+            ServerCode::decode(&code),
+            Err(InviteError::Corrupt)
+        ));
+        // Ключ администратора в отладочном выводе не печатается.
+        assert!(!format!("{:?}", admin()).contains("7, 7"));
     }
 
     #[test]

@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::admin::{AdminFail, AdminKey, ServerSettings, ServerSummary};
 use crate::blob::BlobId;
 use crate::crypto::{GroupId, JoinSecret, SealedItem};
 use crate::item::DeviceId;
@@ -50,9 +51,15 @@ pub const ALPN_7: &[u8] = b"clipwire/7";
 /// только соединениям с этим ALPN.
 pub const ALPN_8: &[u8] = b"clipwire/8";
 
+/// Как [`ALPN_8`], плюс администрирование сервера и роли в группе (см.
+/// [`crate::admin`]): `AdminAuth` и запросы администратора сервера,
+/// `TransferGroupAdmin`, `GetGroupAdmin`. Без запроса сервер новых сообщений
+/// не шлёт, так что клиенту, который их не знает, `clipwire/9` безопасен.
+pub const ALPN_9: &[u8] = b"clipwire/9";
+
 /// Все ALPN, новейший первым: в этом порядке их предлагает агент и
 /// принимает сервер.
-pub const ALPNS: [&[u8]; 6] = [ALPN_8, ALPN_7, ALPN_6, ALPN_5, ALPN_4, ALPN];
+pub const ALPNS: [&[u8]; 7] = [ALPN_9, ALPN_8, ALPN_7, ALPN_6, ALPN_5, ALPN_4, ALPN];
 
 /// Номер версии протокола из ALPN (`clipwire/7` → 7), 0 — не наш ALPN.
 /// Новые возможности проверяются сравнением номера, а не перечислением ALPN:
@@ -87,6 +94,11 @@ pub fn knows_server_info(alpn: &[u8]) -> bool {
 /// Знает ли соединение с этим ALPN закрепы группы.
 pub fn knows_pins(alpn: &[u8]) -> bool {
     alpn_version(alpn) >= 8
+}
+
+/// Знает ли соединение с этим ALPN администрирование сервера и админа группы.
+pub fn knows_admin(alpn: &[u8]) -> bool {
+    alpn_version(alpn) >= 9
 }
 
 /// Версия `a` младше `b` («0.3.0» < «0.3.1» < «0.10.0»). Части сравниваются
@@ -204,6 +216,47 @@ pub enum ClientMsg {
     PinContent { pin_id: PinId },
     /// Сколько у группы закрепов на сервере — ответ `PinStats`.
     GetPinStats,
+    /// Вход с ключом администратора сервера (из кода `cwserver2-…`). Только
+    /// так создаётся новая группа (кроме новой группы при смене ключа, см.
+    /// `Rekey`); создатель становится админом группы. В существующую группу
+    /// без админа входящий так становится её админом. Соединение сразу
+    /// считается прошедшим `AdminAuth`.
+    JoinAsAdmin {
+        group_id: GroupId,
+        join_secret: JoinSecret,
+        admin_key: AdminKey,
+    },
+    /// Войти как администратор сервера (только по [`ALPN_9`]). Ответ —
+    /// `AdminOk` или `AdminFailed(BadKey)`, соединение остаётся. Можно
+    /// первым сообщением (соединение только для администрирования, без
+    /// группы) или после входа в группу: тогда группа без админа получает
+    /// админом это устройство.
+    AdminAuth { key: AdminKey },
+    /// Настройки сервера — ответ `ServerSettings`. Только после `AdminAuth`,
+    /// как и всё до `RotateAdminKey` включительно; без него —
+    /// `AdminFailed(NotAuthorized)`.
+    GetServerSettings,
+    /// Поменять настройки сервера: `Some` — новое значение, `None` — сброс к
+    /// значению по умолчанию. Проверяются все сразу: при отказе
+    /// (`AdminFailed`) не меняется ни одна. Ответ — `ServerSettings`.
+    /// Действуют сразу, без перезапуска.
+    SetServerSettings { values: Vec<(String, Option<u64>)> },
+    /// Сводка сервера — ответ `ServerSummary`.
+    GetServerSummary,
+    /// Сменить токен relay. Ответ — `RelayTokenRotated` с новым кодом
+    /// сервера, затем сервер закрывает все соединения, и это тоже. Старые
+    /// коды приглашения перестают работать: устройства вводят новый.
+    RotateRelayToken,
+    /// Сменить ключ администратора. Ответ — `AdminKeyRotated` с новым кодом
+    /// сервера. Другие соединения, вошедшие со старым ключом, теряют права
+    /// администратора.
+    RotateAdminKey,
+    /// Передать роль админа группы другому устройству группы. Только по
+    /// [`ALPN_9`] и только от текущего админа. Ответ — `GroupAdmin`,
+    /// остальным — `DevicesChanged`.
+    TransferGroupAdmin { device: DeviceId },
+    /// Кто админ группы — ответ `GroupAdmin`. Только по [`ALPN_9`].
+    GetGroupAdmin,
 }
 
 /// Закреп на сервере (в `Pins`, `Pinned`, `PinRejected`).
@@ -353,6 +406,24 @@ pub enum ServerMsg {
     PinFailed { pin_id: PinId, reason: PinFail },
     /// Ответ на `GetPinStats`.
     PinStats(PinStats),
+    /// `AdminAuth` принят. Только по [`ALPN_9`], как и всё ниже.
+    AdminOk,
+    /// Ответ на `GetServerSettings` и `SetServerSettings`.
+    ServerSettings(ServerSettings),
+    /// Ответ на `GetServerSummary`.
+    ServerSummary(ServerSummary),
+    /// Токен relay сменён: новый код сервера `cwserver2-…`. Следом сервер
+    /// закрывает соединение.
+    RelayTokenRotated { server_code: String },
+    /// Ключ администратора сменён: новый код сервера `cwserver2-…`.
+    AdminKeyRotated { server_code: String },
+    /// Админ группы (ответ на `GetGroupAdmin` и `TransferGroupAdmin`).
+    /// `None` — у группы админа нет (создана до 0.5.0, и никто ещё не входил
+    /// в неё с ключом администратора сервера).
+    GroupAdmin { admin: Option<DeviceId> },
+    /// Запрос администратора или админа группы не выполнен. Соединение
+    /// остаётся.
+    AdminFailed(AdminFail),
 }
 
 /// Первый кадр потока файла.
@@ -579,7 +650,8 @@ mod tests {
         assert_eq!(alpn_version(ALPN), 3);
         assert_eq!(alpn_version(ALPN_7), 7);
         assert_eq!(alpn_version(ALPN_8), 8);
-        assert_eq!(ALPNS[0], ALPN_8);
+        assert_eq!(ALPNS[0], ALPN_9);
+        assert_eq!(alpn_version(ALPN_9), 9);
         assert_eq!(alpn_version(b"clipwire/12"), 12);
         assert_eq!(alpn_version(b"other/7"), 0);
         // Новая версия не теряет старые возможности.
@@ -590,6 +662,7 @@ mod tests {
             assert_eq!(knows_devices_changed(a), v >= 6);
             assert_eq!(knows_server_info(a), v >= 7);
             assert_eq!(knows_pins(a), v >= 8);
+            assert_eq!(knows_admin(a), v >= 9);
         }
         assert!(knows_deletes(b"clipwire/9"));
     }
@@ -617,6 +690,21 @@ mod tests {
         assert_eq!(tag(postcard::to_stdvec(&info).unwrap()), 13);
         let stats = ServerMsg::PinStats(PinStats::default());
         assert_eq!(tag(postcard::to_stdvec(&stats).unwrap()), 20);
+        let join = ClientMsg::JoinAsAdmin {
+            group_id: GroupId([0; 32]),
+            join_secret: JoinSecret([0; 32]),
+            admin_key: AdminKey([0; 32]),
+        };
+        assert_eq!(tag(postcard::to_stdvec(&join).unwrap()), 15);
+        assert_eq!(
+            tag(postcard::to_stdvec(&ClientMsg::GetGroupAdmin).unwrap()),
+            23
+        );
+        assert_eq!(tag(postcard::to_stdvec(&ServerMsg::AdminOk).unwrap()), 21);
+        let fail = ServerMsg::AdminFailed(AdminFail::BadKey);
+        assert_eq!(tag(postcard::to_stdvec(&fail).unwrap()), 27);
+        // Вход администратора влезает в предел первого кадра сервера (512).
+        assert!(postcard::to_stdvec(&join).unwrap().len() < 128);
     }
 
     #[test]
