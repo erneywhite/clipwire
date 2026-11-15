@@ -29,6 +29,44 @@ static CREATING: AtomicBool = AtomicBool::new(false);
 /// Последний запрошенный размер, логические пиксели.
 static SIZE: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 
+/// Что сделать по запросу показа превью.
+#[derive(Debug, PartialEq, Eq)]
+enum OnRequest {
+    /// Настроек нет: превью некуда ставить.
+    Skip,
+    /// Окно превью уже есть: только поставить на место.
+    Place,
+    /// Окна нет: создать в фоне (если уже не создаётся).
+    Create,
+}
+
+fn on_request(settings_open: bool, preview_exists: bool) -> OnRequest {
+    match (settings_open, preview_exists) {
+        (false, _) => OnRequest::Skip,
+        (true, true) => OnRequest::Place,
+        (true, false) => OnRequest::Create,
+    }
+}
+
+/// Что сделать, когда окно превью создалось в фоне.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterCreate {
+    /// Настройки открыты и показ ещё нужен.
+    Place,
+    /// Настройки успели закрыться: превью не нужно, закрыть насовсем.
+    Close,
+    /// Курсор ушёл с блока: окно остаётся спрятанным до следующего показа.
+    Nothing,
+}
+
+fn after_create(settings_open: bool, wanted: bool) -> AfterCreate {
+    match (settings_open, wanted) {
+        (false, _) => AfterCreate::Close,
+        (true, true) => AfterCreate::Place,
+        (true, false) => AfterCreate::Nothing,
+    }
+}
+
 /// Показать превью размера `width`×`height` рядом с настройками.
 ///
 /// Команда синхронная (главный поток), как и `size_preview_hide`: показ и
@@ -39,12 +77,13 @@ static SIZE: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 pub fn size_preview(app: AppHandle, width: f64, height: f64) {
     *SIZE.lock().unwrap_or_else(|e| e.into_inner()) = (width, height);
     WANTED.store(true, Ordering::SeqCst);
-    if app.get_webview_window("settings").is_none() {
-        return;
-    }
-    if app.get_webview_window("preview").is_some() {
-        place(&app);
-        return;
+    match on_request(
+        app.get_webview_window("settings").is_some(),
+        app.get_webview_window("preview").is_some(),
+    ) {
+        OnRequest::Skip => return,
+        OnRequest::Place => return place(&app),
+        OnRequest::Create => {}
     }
     if CREATING.swap(true, Ordering::SeqCst) {
         return;
@@ -58,11 +97,13 @@ pub fn size_preview(app: AppHandle, width: f64, height: f64) {
         }
         let a = app.clone();
         let _ = app.run_on_main_thread(move || {
-            // Настройки успели закрыться, пока окно создавалось: превью не нужно.
-            if a.get_webview_window("settings").is_none() {
-                size_preview_close(&a);
-            } else if WANTED.load(Ordering::SeqCst) {
-                place(&a);
+            match after_create(
+                a.get_webview_window("settings").is_some(),
+                WANTED.load(Ordering::SeqCst),
+            ) {
+                AfterCreate::Place => place(&a),
+                AfterCreate::Close => size_preview_close(&a),
+                AfterCreate::Nothing => {}
             }
         });
     });
@@ -201,5 +242,28 @@ mod win {
                 let _ = ShowWindow(HWND(p.0), SW_HIDE);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_needs_open_settings() {
+        assert_eq!(on_request(false, false), OnRequest::Skip);
+        assert_eq!(on_request(false, true), OnRequest::Skip);
+        assert_eq!(on_request(true, true), OnRequest::Place);
+        assert_eq!(on_request(true, false), OnRequest::Create);
+    }
+
+    /// Окно создаётся в фоне; за это время настройки могли закрыться, а
+    /// курсор — уйти с блока.
+    #[test]
+    fn after_create_checks_settings_then_wanted() {
+        assert_eq!(after_create(false, true), AfterCreate::Close);
+        assert_eq!(after_create(false, false), AfterCreate::Close);
+        assert_eq!(after_create(true, true), AfterCreate::Place);
+        assert_eq!(after_create(true, false), AfterCreate::Nothing);
     }
 }
