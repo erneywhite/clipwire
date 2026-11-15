@@ -618,7 +618,7 @@ mod tests {
     fn displayed_host_is_the_source_one() {
         assert_eq!(host_label(&u("https://www.github.com/a")), "github.com");
         // IDN показываем в punycode: кириллическая «а» не прячется.
-        assert_eq!(host_label(&u("https://gіthub.com/")), "xn--gthub-8ve.com");
+        assert_eq!(host_label(&u("https://gіthub.com/")), "xn--gthub-n2e.com");
         // og:site_name в выбор не входит: поля для него нет, `Meta.site`
         // только разбирается и в карточку не попадает.
         let site_name = parse_meta(r#"<meta property="og:site_name" content="github.com">"#).site;
