@@ -27,16 +27,45 @@ use tauri::{PhysicalPosition, PhysicalSize};
 /// Отступ превью от окна настроек, логические пиксели.
 const GAP: f64 = 16.0;
 
-/// Размер и положение окна настроек, физические пиксели.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Как стояло окно настроек: левый верхний угол в физических пикселях
+/// (координаты рабочего стола на Windows физические у всех мониторов),
+/// внутренний размер в логических и масштаб монитора, на котором окно было.
+///
+/// Размер хранится в логических единицах, чтобы окно не росло на смешанных
+/// мониторах: физические 1140×1080 с монитора на 150% — это 760×720, а
+/// поставленные на 100% и перенесённые обратно на 150% (Windows при смене
+/// DPI сохраняет логический размер) дали бы 1710×1620.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Geometry {
+    x: i32,
+    y: i32,
+    w: f64,
+    h: f64,
+    /// Нужен маку: там координаты рабочего стола логические.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    scale: f64,
+}
+
+/// Рабочая область монитора (без панели задач), физические пиксели, и его масштаб.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Area {
     x: i32,
     y: i32,
     w: u32,
     h: u32,
+    scale: f64,
 }
 
-/// Как окно настроек выглядело при закрытии: обычные размер и положение
+/// Куда и каким поставить заново созданное окно настроек.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Placement {
+    /// Физический угол; `None` — запомненное место не годится, по центру.
+    pos: Option<(i32, i32)>,
+    /// Логический внутренний размер.
+    size: (f64, f64),
+}
+
+/// Как стояло окно настроек при закрытии: обычные размер и положение
 /// (у развёрнутого — те, что были до разворота) и было ли оно развёрнуто.
 static GEOMETRY: Mutex<(Option<Geometry>, bool)> = Mutex::new((None, false));
 /// Раздел настроек, открытый последним.
@@ -44,21 +73,38 @@ static SECTION: Mutex<Option<String>> = Mutex::new(None);
 /// В окне несохранённая форма хранилища: закрытие сначала спрашивает.
 static CLOSE_GUARD: AtomicBool = AtomicBool::new(false);
 
-/// Видна ли полоса заголовка окна `g` хотя бы на одном мониторе из `areas`
-/// (x, y, ширина, высота): иначе запомненное место не годится — монитор
-/// отключили, и окно открылось бы за краем экрана.
-fn grabbable(g: Geometry, areas: &[(i32, i32, u32, u32)]) -> bool {
-    // Полоса заголовка — верхние 32 пикселя; хватит куска 64×16.
-    const BAR: i64 = 32;
-    let (gx0, gy0) = (g.x as i64, g.y as i64);
-    let (gx1, gy1) = (gx0 + g.w as i64, gy0 + BAR.min(g.h as i64));
-    areas.iter().any(|&(x, y, w, h)| {
-        let (ax0, ay0) = (x as i64, y as i64);
-        let (ax1, ay1) = (ax0 + w as i64, ay0 + h as i64);
-        let ix = gx1.min(ax1) - gx0.max(ax0);
-        let iy = gy1.min(ay1) - gy0.max(ay0);
-        ix >= 64 && iy >= 16
-    })
+/// Видна ли полоса заголовка окна `g` в рабочей области `a`: иначе
+/// запомненное место не годится — монитор отключили, панель задач
+/// переехала наверх, и окно открылось бы за краем экрана или под ней.
+fn grabbable(g: Geometry, a: Area) -> bool {
+    // Полоса заголовка — верхние 32 логических пикселя; хватит куска 64×16.
+    let s = a.scale.max(0.1);
+    let (gx0, gy0) = (g.x as f64, g.y as f64);
+    let (gx1, gy1) = (gx0 + g.w * s, gy0 + (32.0 * s).min(g.h * s));
+    let (ax0, ay0) = (a.x as f64, a.y as f64);
+    let (ax1, ay1) = (ax0 + a.w as f64, ay0 + a.h as f64);
+    let ix = gx1.min(ax1) - gx0.max(ax0);
+    let iy = gy1.min(ay1) - gy0.max(ay0);
+    ix >= 64.0 && iy >= 16.0
+}
+
+/// Где поставить окно по запомненному `g` среди рабочих областей `areas`
+/// (первая — основной монитор). Размер не больше рабочей области монитора,
+/// на который окно встанет: даже если где-то масштаб посчитан не так, окно
+/// не растёт от открытия к открытию дальше экрана.
+fn placement(g: Geometry, areas: &[Area]) -> Placement {
+    let home = areas.iter().copied().find(|&a| grabbable(g, a));
+    let size = match home.or(areas.first().copied()) {
+        Some(a) => {
+            let s = a.scale.max(0.1);
+            (g.w.min(a.w as f64 / s), g.h.min(a.h as f64 / s))
+        }
+        None => (g.w, g.h),
+    };
+    Placement {
+        pos: home.map(|_| (g.x, g.y)),
+        size,
+    }
 }
 
 /// Окно настроек закрывается: запомнить, как оно стояло.
@@ -70,40 +116,77 @@ pub fn remember_geometry(w: &tauri::Window) {
     if maximized || minimized {
         return;
     }
-    if let (Ok(p), Ok(s)) = (w.outer_position(), w.inner_size()) {
+    if let (Ok(p), Ok(s), Ok(scale)) = (w.outer_position(), w.inner_size(), w.scale_factor()) {
+        let size = s.to_logical::<f64>(scale);
         g.0 = Some(Geometry {
             x: p.x,
             y: p.y,
-            w: s.width,
-            h: s.height,
+            w: size.width,
+            h: size.height,
+            scale,
         });
     }
 }
 
 /// Только что созданное окно настроек: поставить, как стояло в прошлый раз.
-/// Развернуть — после показа (`maximize_if_was`).
+/// Сначала положение, потом размер: размер логический и пересчитывается
+/// под масштаб монитора, на котором окно уже стоит. Развернуть — после
+/// показа (`maximize_if_was`).
+//
+// shortcut: на macOS координаты рабочего стола логические, а Tauri считает
+// физические через масштаб окна. Угол там ставится логическим (физический,
+// делённый на запомненный масштаб), но проверка `grabbable` по физическим
+// областям мониторов разного масштаба приблизительна. Переделать, если на
+// маке с двумя мониторами окно встанет не туда.
 pub fn restore_geometry(w: &tauri::WebviewWindow) {
     let Some(g) = GEOMETRY.lock().unwrap_or_else(|e| e.into_inner()).0 else {
         return;
     };
-    let areas: Vec<_> = w
-        .available_monitors()
-        .unwrap_or_default()
+    let monitors = w.available_monitors().unwrap_or_default();
+    let primary = w.primary_monitor().ok().flatten();
+    let mut areas: Vec<Area> = monitors
         .iter()
         .map(|m| {
-            let (p, s) = (m.position(), m.size());
-            (p.x, p.y, s.width, s.height)
+            let r = m.work_area();
+            Area {
+                x: r.position.x,
+                y: r.position.y,
+                w: r.size.width,
+                h: r.size.height,
+                scale: m.scale_factor(),
+            }
         })
         .collect();
-    let _ = w.set_size(tauri::PhysicalSize::new(g.w, g.h));
-    if grabbable(g, &areas) {
-        let _ = w.set_position(tauri::PhysicalPosition::new(g.x, g.y));
-    } else {
+    // Основной монитор — первым: по нему ограничивается размер окна по центру.
+    if let Some(p) = primary {
+        let r = p.work_area();
+        if let Some(i) = areas
+            .iter()
+            .position(|a| (a.x, a.y) == (r.position.x, r.position.y))
+        {
+            areas.swap(0, i);
+        }
+    }
+    let plan = placement(g, &areas);
+    if let Some((x, y)) = plan.pos {
+        #[cfg(target_os = "macos")]
+        let _ = w.set_position(tauri::LogicalPosition::new(
+            x as f64 / g.scale,
+            y as f64 / g.scale,
+        ));
+        #[cfg(not(target_os = "macos"))]
+        let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+    }
+    let _ = w.set_size(tauri::LogicalSize::new(plan.size.0, plan.size.1));
+    if plan.pos.is_none() {
+        // Окно создано на основном мониторе; по центру — уже с новым размером.
         let _ = w.center();
     }
 }
 
-/// Окно было развёрнуто, когда его закрыли: развернуть снова.
+/// Окно было развёрнуто, когда его закрыли: развернуть снова. Только для
+/// только что созданного окна: уже открытое человек мог вернуть в обычный
+/// размер, и повторное «Настройки» не должно разворачивать его обратно.
 pub fn maximize_if_was(w: &tauri::WebviewWindow) {
     if GEOMETRY.lock().unwrap_or_else(|e| e.into_inner()).1 {
         let _ = w.maximize();
@@ -366,26 +449,86 @@ mod win {
 mod tests {
     use super::*;
 
-    #[test]
-    fn remembered_place_must_be_on_a_monitor() {
-        let one = [(0, 0, 1920, 1040)];
-        let g = |x, y| Geometry {
+    fn area(x: i32, y: i32, w: u32, h: u32, scale: f64) -> Area {
+        Area { x, y, w, h, scale }
+    }
+
+    fn g(x: i32, y: i32) -> Geometry {
+        Geometry {
             x,
             y,
-            w: 760,
-            h: 720,
-        };
-        assert!(grabbable(g(100, 100), &one));
+            w: 760.0,
+            h: 720.0,
+            scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn remembered_place_must_be_on_a_monitor() {
+        let main = area(0, 0, 1920, 1040, 1.0);
+        assert!(grabbable(g(100, 100), main));
         // Край окна за экраном, но заголовок виден.
-        assert!(grabbable(g(-600, 0), &one));
+        assert!(grabbable(g(-600, 0), main));
         // Монитор справа отключили.
-        assert!(!grabbable(g(2000, 100), &one));
+        assert!(!grabbable(g(2000, 100), main));
         // Заголовок ушёл выше экрана.
-        assert!(!grabbable(g(100, -100), &one));
+        assert!(!grabbable(g(100, -100), main));
         // Второй монитор слева, с отрицательными координатами.
-        let two = [(0, 0, 1920, 1040), (-1280, 0, 1280, 1024)];
-        assert!(grabbable(g(-1000, 50), &two));
-        assert!(!grabbable(g(100, 100), &[]));
+        assert!(grabbable(g(-1000, 50), area(-1280, 0, 1280, 1024, 1.0)));
+        assert_eq!(placement(g(100, 100), &[]).pos, None);
+    }
+
+    /// Панель задач сверху: рабочая область начинается с y = 48, окно с
+    /// заголовком под панелью не годится.
+    #[test]
+    fn title_under_top_taskbar_is_not_grabbable() {
+        let below_bar = area(0, 48, 1920, 1032, 1.0);
+        assert!(!grabbable(g(100, 0), below_bar));
+        assert!(grabbable(g(100, 48), below_bar));
+        // На 150% заголовок выше (48 физических), и окно, вылезшее на 20
+        // пикселей над областью, всё ещё можно взять.
+        assert!(grabbable(g(100, 28), area(0, 48, 2880, 1600, 1.5)));
+    }
+
+    /// Окно, закрытое на втором мониторе 150%, встаёт туда же и с тем же
+    /// логическим размером: физический размер не попадает в расчёт, и окно
+    /// не растёт от открытия к открытию.
+    #[test]
+    fn mixed_dpi_restore_keeps_logical_size() {
+        let areas = [area(0, 0, 1920, 1040, 1.0), area(1920, 0, 3840, 2100, 1.5)];
+        let closed = Geometry {
+            x: 2200,
+            y: 200,
+            w: 760.0,
+            h: 720.0,
+            scale: 1.5,
+        };
+        let p = placement(closed, &areas);
+        assert_eq!(p.pos, Some((2200, 200)));
+        assert_eq!(p.size, (760.0, 720.0));
+        // Повторное открытие с тем же запомненным — то же самое.
+        assert_eq!(placement(closed, &areas), p);
+    }
+
+    /// Размер не больше рабочей области монитора, даже если запомненный
+    /// уже вырос; без подходящего монитора — по центру основного.
+    #[test]
+    fn size_is_clamped_to_the_work_area() {
+        let areas = [area(0, 0, 1920, 1040, 1.0), area(1920, 0, 2880, 1560, 1.5)];
+        let huge = Geometry {
+            x: 2000,
+            y: 10,
+            w: 2500.0,
+            h: 1600.0,
+            scale: 1.5,
+        };
+        let p = placement(huge, &areas);
+        assert_eq!(p.pos, Some((2000, 10)));
+        assert_eq!(p.size, (1920.0, 1040.0));
+        let gone = Geometry { x: 9000, ..huge };
+        let p = placement(gone, &areas);
+        assert_eq!(p.pos, None);
+        assert_eq!(p.size, (1920.0, 1040.0));
     }
 
     #[test]

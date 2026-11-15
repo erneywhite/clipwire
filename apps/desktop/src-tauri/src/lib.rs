@@ -425,22 +425,23 @@ fn hide_from_capture(app: &AppHandle) -> bool {
 pub fn show_settings(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let w = match ensure_window(&app, "settings") {
-            Ok((w, created)) => {
-                if created {
-                    settings_window::restore_geometry(&w);
-                }
-                w
-            }
+        let (w, created) = match ensure_window(&app, "settings") {
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!("окно настроек не открылось: {e}");
                 return;
             }
         };
+        if created {
+            settings_window::restore_geometry(&w);
+        }
         let _ = w.set_content_protected(hide_from_capture(&app));
         let _ = w.show();
         let _ = w.unminimize();
-        settings_window::maximize_if_was(&w);
+        // Уже открытое окно человек мог вернуть из развёрнутого: не трогать.
+        if created {
+            settings_window::maximize_if_was(&w);
+        }
         let _ = w.set_focus();
     });
 }
