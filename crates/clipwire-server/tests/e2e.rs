@@ -1438,6 +1438,7 @@ fn sealed_pin(
         pinned,
         note: note.into(),
         at_ms: 1,
+        seq: 1,
         device,
     };
     Ok((
@@ -1485,7 +1486,7 @@ impl Client {
     ) -> Result<(Vec<clipwire_core::proto::PinRecord>, bool)> {
         write_msg(&mut self.send, &ClientMsg::PinsSince { rev }).await?;
         match self.next_pin().await? {
-            ServerMsg::Pins { records, more } => Ok((records, more)),
+            ServerMsg::Pins { records, more, .. } => Ok((records, more)),
             other => anyhow::bail!("ждали Pins, пришло {other:?}"),
         }
     }

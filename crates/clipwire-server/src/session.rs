@@ -392,8 +392,9 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         }
                     }
                     Some(ClientMsg::PinsSince { rev }) => {
+                        let epoch = shared.store.pin_epoch(&group)?;
                         let (records, more) = shared.store.pins_since(&group, rev)?;
-                        write_msg(&mut send, &ServerMsg::Pins { records, more }).await?;
+                        write_msg(&mut send, &ServerMsg::Pins { epoch, records, more }).await?;
                     }
                     Some(ClientMsg::PinContent { pin_id }) => {
                         let content = shared.store.pin_content(&group, &pin_id)?;

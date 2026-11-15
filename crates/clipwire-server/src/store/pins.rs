@@ -64,6 +64,12 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     if !has_rev {
         conn.execute_batch("ALTER TABLE groups ADD COLUMN pin_rev INTEGER NOT NULL DEFAULT 0;")?;
     }
+    let has_epoch: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups') WHERE name = 'pin_epoch'")?
+        .exists([])?;
+    if !has_epoch {
+        conn.execute_batch("ALTER TABLE groups ADD COLUMN pin_epoch BLOB;")?;
+    }
     Ok(())
 }
 
@@ -249,8 +255,9 @@ impl Store {
         let mut out = Vec::new();
         let mut bytes = 0u64;
         while let Some(r) = rows.next()? {
-            let rec = row_record(r)?;
-            let len = rec.content.as_ref().map_or(0, |c| c.len() as u64);
+            let rec = row_record(&conn, group, r)?;
+            let len = rec.content.as_ref().map_or(0, |c| c.len() as u64)
+                + (rec.blobs.len() * std::mem::size_of::<BlobId>()) as u64;
             if out.len() == PAGE_RECORDS || (!out.is_empty() && bytes + len > PAGE_BYTES) {
                 // Не влезло: эта запись придёт следующей страницей.
                 return Ok((out, true));
@@ -286,6 +293,40 @@ impl Store {
         )?;
         Ok((pins as u64, bytes as u64))
     }
+
+    /// Метка закрепов группы в этой базе (`ServerMsg::Pins::epoch`):
+    /// случайная, заводится при первом запросе. Новая база (сброс сервера)
+    /// — новая метка, и устройства понимают, что `rev` пошли заново.
+    pub fn pin_epoch(&self, group: &GroupId) -> Result<[u8; 16]> {
+        let g = &group.0[..];
+        let conn = self.conn();
+        let old: Option<Option<Vec<u8>>> = conn
+            .query_row(
+                "SELECT pin_epoch FROM groups WHERE group_id = ?1",
+                params![g],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(e) = old.flatten().and_then(|e| <[u8; 16]>::try_from(e).ok()) {
+            return Ok(e);
+        }
+        let mut e = [0u8; 16];
+        getrandom::fill(&mut e).map_err(|e| anyhow::anyhow!("нет случайных байтов: {e}"))?;
+        // Две сессии одновременно: остаётся метка первой.
+        conn.execute(
+            "UPDATE groups SET pin_epoch = ?2 WHERE group_id = ?1 AND pin_epoch IS NULL",
+            params![g, &e[..]],
+        )?;
+        let now: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT pin_epoch FROM groups WHERE group_id = ?1",
+                params![g],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(now.and_then(|v| v.try_into().ok()).unwrap_or(e))
+    }
 }
 
 /// Запись закрепа с содержимым до [`INLINE_BYTES`].
@@ -297,21 +338,35 @@ fn record_in(conn: &Connection, group: &GroupId, pin: &PinId) -> Result<Option<P
     )?;
     let mut rows = stmt.query(params![&group.0[..], &pin.0[..], INLINE_BYTES as i64])?;
     match rows.next()? {
-        Some(r) => Ok(Some(row_record(r)?)),
+        Some(r) => Ok(Some(row_record(conn, group, r)?)),
         None => Ok(None),
     }
 }
 
-/// Строка `pin_id, rev, pinned, state, content_len, content` в запись.
-fn row_record(r: &rusqlite::Row<'_>) -> Result<PinRecord> {
+/// Строка `pin_id, rev, pinned, state, content_len, content` в запись,
+/// файлы — из `pin_blobs`.
+fn row_record(conn: &Connection, group: &GroupId, r: &rusqlite::Row<'_>) -> Result<PinRecord> {
     let id: Vec<u8> = r.get(0)?;
+    let pin_id = PinId(id.try_into().ok().context("битый pin_id в базе")?);
+    let mut stmt = conn.prepare_cached(
+        "SELECT blob_id FROM pin_blobs WHERE group_id = ?1 AND pin_id = ?2 ORDER BY blob_id",
+    )?;
+    let blobs = stmt
+        .query_map(params![&group.0[..], &pin_id.0[..]], |r| {
+            r.get::<_, Vec<u8>>(0)
+        })?
+        .map(|b| -> Result<BlobId> {
+            Ok(BlobId(b?.try_into().ok().context("битый blob_id в базе")?))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(PinRecord {
-        pin_id: PinId(id.try_into().ok().context("битый pin_id в базе")?),
+        pin_id,
         rev: r.get::<_, i64>(1)? as u64,
         pinned: r.get(2)?,
         state: r.get(3)?,
         content_len: r.get::<_, i64>(4)? as u64,
         content: r.get(5)?,
+        blobs,
     })
 }
 
@@ -536,14 +591,30 @@ mod tests {
         };
         put(&s, &g, pin(1), 0, true, Some(b"c"), &[b1, b2, b1], Q);
         assert_eq!(refs(&s).len(), 2);
+        // Список открыт: в записи (рассылка, страница, отказ) он есть.
+        assert_eq!(s.pin(&g, &pin(1)).unwrap().unwrap().blobs, vec![b1, b2]);
+        assert_eq!(s.pins_since(&g, 0).unwrap().0[0].blobs, vec![b1, b2]);
         // Правка подписи список не трогает, новое содержимое заменяет его.
         put(&s, &g, pin(1), 1, true, None, &[], Q);
         assert_eq!(refs(&s).len(), 2);
+        assert_eq!(s.pin(&g, &pin(1)).unwrap().unwrap().blobs, vec![b1, b2]);
         put(&s, &g, pin(1), 2, true, Some(b"d"), &[b2], Q);
         assert_eq!(refs(&s), vec![b2.0.to_vec()]);
         // Снятый закреп файлы не держит.
         put(&s, &g, pin(1), 3, false, None, &[], Q);
         assert!(refs(&s).is_empty());
+        assert!(s.pin(&g, &pin(1)).unwrap().unwrap().blobs.is_empty());
+    }
+
+    #[test]
+    fn epoch_is_stable_per_database() {
+        let (s, g) = store_with_group();
+        let e = s.pin_epoch(&g).unwrap();
+        assert_eq!(s.pin_epoch(&g).unwrap(), e);
+        // Новая база (сброс сервера) — другая метка у той же группы.
+        let (s2, g2) = store_with_group();
+        assert_eq!(g, g2);
+        assert_ne!(s2.pin_epoch(&g2).unwrap(), e);
     }
 
     /// Начать файл размером 10 байт в момент `now`.
