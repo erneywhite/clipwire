@@ -324,6 +324,11 @@ export const api = {
   hidePopup: () => invoke<void>('popup_hide'),
   sizePreview: (width: number, height: number) => invoke<void>('size_preview', { width, height }),
   sizePreviewHide: () => invoke<void>('size_preview_hide'),
+  /** Раздел настроек, открытый в прошлый раз: окно закрывается насовсем. */
+  settingsSectionGet: () => invoke<string | null>('settings_section_get'),
+  settingsSectionSet: (section: string) => invoke<void>('settings_section_set', { section }),
+  /** Спрашивать ли перед закрытием окна настроек (несохранённая форма хранилища). */
+  settingsCloseGuard: (on: boolean) => invoke<void>('settings_close_guard', { on }),
   leaveGroup: () => invoke<void>('leave_group'),
   deviceInfo: () => invoke<DeviceInfo>('device_info'),
   /** Поставить обновление сейчас; на Windows программа закроется и запустится заново. */

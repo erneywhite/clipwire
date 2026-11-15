@@ -426,7 +426,12 @@ pub fn show_settings(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let w = match ensure_window(&app, "settings") {
-            Ok((w, _)) => w,
+            Ok((w, created)) => {
+                if created {
+                    settings_window::restore_geometry(&w);
+                }
+                w
+            }
             Err(e) => {
                 tracing::warn!("окно настроек не открылось: {e}");
                 return;
@@ -435,6 +440,7 @@ pub fn show_settings(app: &AppHandle) {
         let _ = w.set_content_protected(hide_from_capture(&app));
         let _ = w.show();
         let _ = w.unminimize();
+        settings_window::maximize_if_was(&w);
         let _ = w.set_focus();
     });
 }
@@ -542,6 +548,9 @@ pub fn run() {
             settings_window::size_preview,
             settings_window::size_preview_hide,
             settings_window::settings_toggle_maximize,
+            settings_window::settings_section_get,
+            settings_window::settings_section_set,
+            settings_window::settings_close_guard,
             commands::history_update,
             editor::editor_open,
             editor::editor_save,
@@ -636,8 +645,15 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.hide();
                 }
-                // Вместе с настройками уходит и пример окна вставки.
-                WindowEvent::CloseRequested { .. } if window.label() == "settings" => {
+                // Несохранённая форма хранилища: окно спросит человека само.
+                // Иначе запомнить, как стояло окно, и вместе с настройками
+                // закрыть пример окна вставки.
+                WindowEvent::CloseRequested { api, .. } if window.label() == "settings" => {
+                    if !settings_window::may_close(window.app_handle()) {
+                        api.prevent_close();
+                        return;
+                    }
+                    settings_window::remember_geometry(window);
                     settings_window::size_preview_close(window.app_handle());
                 }
                 // Окно вставки исчезает, как только уходит фокус: как меню.

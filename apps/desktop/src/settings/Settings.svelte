@@ -3,6 +3,7 @@
   import { onMount } from 'svelte'
   import { t } from '../lib/i18n'
   import { listen } from '@tauri-apps/api/event'
+  import { getCurrentWindow } from '@tauri-apps/api/window'
   import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart'
   import { check, type Update } from '@tauri-apps/plugin-updater'
   import { openUrl } from '@tauri-apps/plugin-opener'
@@ -40,6 +41,10 @@
   ]
 
   let section = $state<Section>('general')
+  /** Раздел из прошлого открытия уже вернули: только после этого его запоминать. */
+  let sectionRestored = $state(false)
+  /** Окно просят закрыть, а форма хранилища не сохранена. */
+  let confirmClose = $state(false)
   let s = $state<Settings | null>(null)
   let status = $state<Status>({ kind: 'connecting' })
   let info = $state<DeviceInfo | null>(null)
@@ -406,7 +411,21 @@
     return 'error'
   }
 
+  // Окно настроек закрывается насовсем: открытый раздел запоминает Rust.
+  $effect(() => {
+    if (sectionRestored) api.settingsSectionSet(section).catch(() => {})
+  })
+
+  async function closeAnyway() {
+    confirmClose = false
+    await api.settingsCloseGuard(false)
+    await getCurrentWindow().close()
+  }
+
   onMount(() => {
+    // Свежая страница: несохранённой формы нет (могла остаться от
+    // перезагрузки при смене языка).
+    api.settingsCloseGuard(false).catch(() => {})
     api.settings().then((v) => {
       s = v
       demoSize = { w: v.popup_width, h: v.popup_height }
@@ -431,13 +450,23 @@
       listen('clipwire://group-rekeyed', pullGroupNotices),
       listen('clipwire://group-rekey-failed', pullGroupNotices),
       listen('clipwire://group-excluded', pullGroupNotices),
+      listen('settings://close-blocked', () => {
+        section = 'sync'
+        confirmClose = true
+      }),
     ]
     // Окно настроек создаётся при каждом открытии: события группы и фоновой
-    // проверки обновлений могли прийти, пока его не было.
-    Promise.all(unlisten).then(() => {
-      refresh()
-      pullGroupNotices()
-    })
+    // проверки обновлений могли прийти, пока его не было. Сначала вернуть
+    // прошлый раздел: исключение из группы потом переключит на «Синхронизацию».
+    Promise.all(unlisten)
+      .then(() => api.settingsSectionGet())
+      .catch(() => null)
+      .then((prev) => {
+        if (prev && sections.some((x) => x.id === prev)) section = prev as Section
+        sectionRestored = true
+        refresh()
+        pullGroupNotices()
+      })
     // Найденное (или уже скачанное) обновление — показать в «О программе» сразу.
     api
       .updateFound()
@@ -471,6 +500,15 @@
     <main>
       {#if error}<p class="error" role="alert">{error}</p>{/if}
       {#if notice}<p class="notice" role="status">{notice}</p>{/if}
+      {#if confirmClose}
+        <div class="card pad close-confirm" role="alertdialog">
+          <div class="confirm">
+            <span>{t('Настройки хранилища не сохранены. Закрыть окно без них?')}</span>
+            <button class="danger" onclick={closeAnyway}>{t('Закрыть без сохранения')}</button>
+            <button onclick={() => (confirmClose = false)}>{t('Остаться')}</button>
+          </div>
+        </div>
+      {/if}
 
       {#if section === 'general'}
         <h1>{t('Основные')}</h1>
@@ -1378,6 +1416,9 @@
   .notice {
     color: var(--c-accent);
     margin: 0 0 var(--space-3);
+  }
+  .close-confirm {
+    margin-bottom: var(--space-3);
   }
   button.link {
     border: 0;

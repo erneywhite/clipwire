@@ -10,6 +10,12 @@
 //!
 //! Окно превью создаётся при первом показе и закрывается вместе с настройками
 //! (`size_preview_close`): между открытиями настроек его WebView не висит.
+//!
+//! Само окно настроек тоже закрывается насовсем, поэтому его размер,
+//! положение, развёрнутость и открытый раздел запоминаются здесь, в памяти
+//! процесса, и возвращаются при следующем открытии. Прокрутка и недописанные
+//! поля теряются; о несохранённой форме хранилища окно спрашивает перед
+//! закрытием (`settings_close_guard`).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +26,117 @@ use tauri::{PhysicalPosition, PhysicalSize};
 
 /// Отступ превью от окна настроек, логические пиксели.
 const GAP: f64 = 16.0;
+
+/// Размер и положение окна настроек, физические пиксели.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Geometry {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+
+/// Как окно настроек выглядело при закрытии: обычные размер и положение
+/// (у развёрнутого — те, что были до разворота) и было ли оно развёрнуто.
+static GEOMETRY: Mutex<(Option<Geometry>, bool)> = Mutex::new((None, false));
+/// Раздел настроек, открытый последним.
+static SECTION: Mutex<Option<String>> = Mutex::new(None);
+/// В окне несохранённая форма хранилища: закрытие сначала спрашивает.
+static CLOSE_GUARD: AtomicBool = AtomicBool::new(false);
+
+/// Видна ли полоса заголовка окна `g` хотя бы на одном мониторе из `areas`
+/// (x, y, ширина, высота): иначе запомненное место не годится — монитор
+/// отключили, и окно открылось бы за краем экрана.
+fn grabbable(g: Geometry, areas: &[(i32, i32, u32, u32)]) -> bool {
+    // Полоса заголовка — верхние 32 пикселя; хватит куска 64×16.
+    const BAR: i64 = 32;
+    let (gx0, gy0) = (g.x as i64, g.y as i64);
+    let (gx1, gy1) = (gx0 + g.w as i64, gy0 + BAR.min(g.h as i64));
+    areas.iter().any(|&(x, y, w, h)| {
+        let (ax0, ay0) = (x as i64, y as i64);
+        let (ax1, ay1) = (ax0 + w as i64, ay0 + h as i64);
+        let ix = gx1.min(ax1) - gx0.max(ax0);
+        let iy = gy1.min(ay1) - gy0.max(ay0);
+        ix >= 64 && iy >= 16
+    })
+}
+
+/// Окно настроек закрывается: запомнить, как оно стояло.
+pub fn remember_geometry(w: &tauri::Window) {
+    let maximized = w.is_maximized().unwrap_or(false);
+    let minimized = w.is_minimized().unwrap_or(false);
+    let mut g = GEOMETRY.lock().unwrap_or_else(|e| e.into_inner());
+    g.1 = maximized;
+    if maximized || minimized {
+        return;
+    }
+    if let (Ok(p), Ok(s)) = (w.outer_position(), w.inner_size()) {
+        g.0 = Some(Geometry {
+            x: p.x,
+            y: p.y,
+            w: s.width,
+            h: s.height,
+        });
+    }
+}
+
+/// Только что созданное окно настроек: поставить, как стояло в прошлый раз.
+/// Развернуть — после показа (`maximize_if_was`).
+pub fn restore_geometry(w: &tauri::WebviewWindow) {
+    let Some(g) = GEOMETRY.lock().unwrap_or_else(|e| e.into_inner()).0 else {
+        return;
+    };
+    let areas: Vec<_> = w
+        .available_monitors()
+        .unwrap_or_default()
+        .iter()
+        .map(|m| {
+            let (p, s) = (m.position(), m.size());
+            (p.x, p.y, s.width, s.height)
+        })
+        .collect();
+    let _ = w.set_size(tauri::PhysicalSize::new(g.w, g.h));
+    if grabbable(g, &areas) {
+        let _ = w.set_position(tauri::PhysicalPosition::new(g.x, g.y));
+    } else {
+        let _ = w.center();
+    }
+}
+
+/// Окно было развёрнуто, когда его закрыли: развернуть снова.
+pub fn maximize_if_was(w: &tauri::WebviewWindow) {
+    if GEOMETRY.lock().unwrap_or_else(|e| e.into_inner()).1 {
+        let _ = w.maximize();
+    }
+}
+
+/// Раздел, открытый в прошлый раз, или `null`.
+#[tauri::command]
+pub fn settings_section_get() -> Option<String> {
+    SECTION.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Запомнить открытый раздел.
+#[tauri::command]
+pub fn settings_section_set(section: String) {
+    *SECTION.lock().unwrap_or_else(|e| e.into_inner()) = Some(section);
+}
+
+/// Включить или снять вопрос перед закрытием окна настроек.
+#[tauri::command]
+pub fn settings_close_guard(on: bool) {
+    CLOSE_GUARD.store(on, Ordering::SeqCst);
+}
+
+/// Окно настроек просят закрыть: `false` — закрывать нельзя, окну отправлен
+/// `settings://close-blocked`, и оно спросит человека само.
+pub fn may_close(app: &AppHandle) -> bool {
+    if !CLOSE_GUARD.load(Ordering::SeqCst) {
+        return true;
+    }
+    let _ = tauri::Emitter::emit_to(app, "settings", "settings://close-blocked", ());
+    false
+}
 
 /// Показ превью нужен: `size_preview` уже вызван, `size_preview_hide` ещё нет.
 /// Окно создаётся в фоне, а курсор за это время мог уйти с блока.
@@ -248,6 +365,28 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remembered_place_must_be_on_a_monitor() {
+        let one = [(0, 0, 1920, 1040)];
+        let g = |x, y| Geometry {
+            x,
+            y,
+            w: 760,
+            h: 720,
+        };
+        assert!(grabbable(g(100, 100), &one));
+        // Край окна за экраном, но заголовок виден.
+        assert!(grabbable(g(-600, 0), &one));
+        // Монитор справа отключили.
+        assert!(!grabbable(g(2000, 100), &one));
+        // Заголовок ушёл выше экрана.
+        assert!(!grabbable(g(100, -100), &one));
+        // Второй монитор слева, с отрицательными координатами.
+        let two = [(0, 0, 1920, 1040), (-1280, 0, 1280, 1024)];
+        assert!(grabbable(g(-1000, 50), &two));
+        assert!(!grabbable(g(100, 100), &[]));
+    }
 
     #[test]
     fn request_needs_open_settings() {
