@@ -390,7 +390,11 @@ list. Only the admin removes devices and changes the group key: other devices do
 buttons, and a note under the list says who the admin is. The role is handed over with **Make
 admin** next to another device of the group. Groups created before server 0.5.0 have no admin: there any
 device can still change the key, and the first device that connects with the administrator
-code becomes the admin. After a key change the admin stays the same.
+code becomes the admin. After a key change the admin stays the same. If the admin is lost (the
+computer broke or went missing), the server administrator presses **Become the group admin (you
+are the server administrator)** under the list on their device in that group and confirms: the
+role moves to them even while the old admin exists. One device can change the group key at most
+10 times a day.
 
 Details of the protocol are in [docs/devices.md](docs/devices.md).
 
@@ -484,7 +488,12 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
 - Device name, invitation code (**Show code**), leaving the group (it also removes the server
   administrator key from the device).
 - **I am the server administrator** in Sync: the `cwserver2-…` code for a device that is already
-  in a group.
+  in a group. If the administrator key was changed on another device, the app forgets the old one,
+  sync goes on without it, and Sync shows a hint to enter the new code.
+- **New invite code** in Sync: after the access token is changed, a device enters a new invite
+  code to the same group without leaving it. The field opens by itself when the server refuses
+  the old code, otherwise it is folded into a link. An invite to another group is not accepted
+  there.
 - The **Server** section, for the server administrator only: a summary (groups, devices, space
   used by history, files and pins, version), server limits and secret changes (see
   [Administrator code](#administrator-code)).
@@ -527,7 +536,9 @@ version number: `ghcr.io/erneywhite/clipwire-server:0.4.0`.
    [deploy/nginx-clipwire.conf](deploy/nginx-clipwire.conf).
 5. Find the server code line in the container log (Clipwire's own log line is in Russian:
    `код сервера: cwserver2-…`). Your first device connects with it. `clipwire-server info`
-   prints the same.
+   prints the same. **This line contains the server administrator key**: whoever can read the
+   container log can create groups and change limits. Do not show the log to others and do not
+   paste it whole into chats or issues.
 
 **Updating:** pull the new image and recreate the container. When the app is newer than the
 server, About shows it next to the server version and you get a notification once.
@@ -550,9 +561,14 @@ invitation code. The administrator key (32 random bytes, `admin.key` in the data
 created on the first start of server 0.5.0 and is only in the server code `cwserver2-…`, never in
 an invitation code. Where to find the code:
 
-- the container log in the Docker panel, line `код сервера: cwserver2-…` (printed at every start
-  and after the administrator changes a secret from the app);
+- the container log in the Docker panel, line `код сервера: cwserver2-…` (printed at every
+  start). When the administrator changes a secret from the app, the new code is not written to the
+  log: the app shows it, and the log prints it at the next container start;
 - `clipwire-server info` in the container console, if your panel has one.
+
+The container log contains the administrator code, so access to it is server administrator
+access. Printing it on start is deliberate: the server is deployed through panels, and without SSH
+the log is the only way to get the code.
 
 With the administrator code a device can create groups and sees the **Server** section in
 settings: limits (the same as the variables below), a server summary, changing the relay token
@@ -562,20 +578,25 @@ default, and **Reset** returns a limit set from the app to it. Sizes are entered
 durations in hours; the app does not send a value outside the allowed range.
 
 On a device that is already in a group, enter the code in **Sync → I am the server
-administrator**. The app checks that the code belongs to the same server and that the key works.
+administrator**. The app checks that the code belongs to the same server and that the key works;
+if the access token in the code is newer than the stored one, the key is checked over a separate
+connection with the new code and saved only if that works.
 The key is stored encrypted on the device, like the group key; it can be forgotten in the
 **Server** section, and leaving the group removes it too.
 
 Changing the relay token disconnects every device, and old invitation codes stop working: hand
 out a new one. The device that changed the token saves the new server code and reconnects on its
 own, and the app shows the new server code and the new invitation code for its group. Other
-devices leave the group and join again with the new invitation code. An administrator device in
+devices enter the new invitation code under **Sync → New invite code**: the group, history and
+keys stay, only the token changes. An administrator device in
 another group comes back online once you enter the new server code on it under **I am the server
 administrator**; it then shows the new invitation code of its group. A token set with `CLIPWIRE_RELAY_TOKEN` can only be changed in the container
 settings. After changing the administrator key, the old server code stops working, enter the new
 one on your administrator device.
 
-An old server code `cwserver1-…` still connects, but it cannot create groups. Devices connected
+An old server code `cwserver1-…` still connects, but it cannot create groups: app 0.5.0 creates
+groups only on server 0.5.0 or newer and only with a `cwserver2-…` code. If the server is old,
+update its image and it prints the new code. Devices connected
 before the update keep working with their invitation codes; to get the Server section, enter the
 new server code once on your administrator device.
 
@@ -601,7 +622,7 @@ app without restarting the container.
 | `CLIPWIRE_BLOB_STALL_SECS` | `120` | how long to wait for the next part of a file before an upload counts as abandoned |
 | `CLIPWIRE_RESERVE_TTL_SECS` | `600` | after how long space reserved for a file is released if the upload never started |
 | `CLIPWIRE_MAX_RESERVES`\* | `512` | how many files one device may keep reserved without a single uploaded part |
-| `CLIPWIRE_MAX_GROUPS`\* | `100` | how many groups the server can hold (creating a group needs the administrator code; groups with no devices are deleted after 90 days) |
+| `CLIPWIRE_MAX_GROUPS`\* | `100` | how many groups the server can hold (creating a group needs the administrator code; the data of a group nobody joined for 90 days is deleted, and its first device with the old invitation code creates it again; groups with a changed key do not count) |
 | `CLIPWIRE_MAX_DEVICES`\* | `64` | how many devices one group can hold; a new device over the limit is refused, known devices still join |
 | `CLIPWIRE_HISTORY_TOTAL_BYTES`\* | `1073741824` | total limit of item history per server (1 GiB); the excess is evicted from the largest group |
 | `CLIPWIRE_MAX_DEVICE_CONNS`\* | `4` | simultaneous connections from one device |
@@ -705,7 +726,7 @@ CLIPWIRE_SFTP_HOST=127.0.0.1 CLIPWIRE_SFTP_PORT=2222 CLIPWIRE_SFTP_USER=... CLIP
 `platform.test.ts` and `transfer.test.ts`.
 
 The agent crate also has a console client for debugging: `create <cwserver2-…>`, `join <invite
-code> [<cwserver2-…>]`, `admin <cwserver2-…>` (store the administrator key), `run` (sync without a
+code> [<cwserver2-…>]`, `admin <cwserver2-…>` (store the administrator key), `reinvite <invite code>` (a new invite code to the same group), `run` (sync without a
 UI), `listen`, `send <text>`. The `CLIPWIRE_HOME` variable sets another settings directory, so
 two clients can run on one machine.
 
