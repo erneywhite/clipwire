@@ -329,6 +329,8 @@ pub enum Control {
     Stats(oneshot::Sender<Result<clipwire_core::proto::GroupStats, String>>),
     /// Как сейчас идёт связь с сервером.
     Link(oneshot::Sender<Result<LinkInfo, String>>),
+    /// Сколько у группы закрепов на сервере (`GetPinStats`).
+    PinStats(oneshot::Sender<Result<clipwire_core::proto::PinStats, String>>),
     /// Удалить записи на остальных устройствах (`Delete`). Без связи движок
     /// отправит после входа.
     Delete(clipwire_core::delete::DeleteNote),
@@ -461,6 +463,16 @@ impl Controller {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Control::Stats(reply))
+            .await
+            .map_err(|_| offline().to_string())?;
+        rx.await.map_err(|_| offline().to_string())?
+    }
+
+    /// Сколько у группы закрепов на сервере и сколько места они занимают.
+    pub async fn pin_stats(&self) -> Result<clipwire_core::proto::PinStats, String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Control::PinStats(reply))
             .await
             .map_err(|_| offline().to_string())?;
         rx.await.map_err(|_| offline().to_string())?

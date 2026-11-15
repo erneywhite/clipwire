@@ -210,6 +210,9 @@ pub struct GroupStorage {
     refresh: Notify,
     /// Версия применённых настроек — для тех, кто ждёт новых.
     applied: watch::Sender<u64>,
+    /// Файлы живых закрепов группы: чистка внешнего хранилища по сроку их
+    /// не трогает (движок обновляет по книге закрепов).
+    kept: Mutex<std::collections::HashSet<clipwire_core::BlobId>>,
 }
 
 fn build(cfg: &GroupConfig) -> (Option<Arc<dyn ObjectStore>>, Option<String>) {
@@ -240,6 +243,7 @@ impl GroupStorage {
             sink: Mutex::new(None),
             refresh: Notify::new(),
             applied,
+            kept: Mutex::default(),
         })
     }
 
@@ -440,6 +444,11 @@ impl GroupStorage {
         key.seal_config(&cfg).ok()
     }
 
+    /// Файлы живых закрепов: их чистка по сроку не удаляет.
+    pub fn set_kept(&self, blobs: std::collections::HashSet<clipwire_core::BlobId>) {
+        *self.kept.lock().unwrap_or_else(|e| e.into_inner()) = blobs;
+    }
+
     /// Версия текущих настроек.
     pub fn version(&self) -> u64 {
         self.lock().cfg.version
@@ -467,7 +476,8 @@ impl GroupStorage {
         let _ = crate::state::write_atomic(&mark, now.to_string().as_bytes());
         let ttl = self.config().file_ttl_hours;
         let group = self.group();
-        let run = crate::storage::external::cleanup(store.as_ref(), &group, ttl);
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let run = crate::storage::external::cleanup(store.as_ref(), &group, ttl, &kept);
         match tokio::time::timeout(CLEANUP_TIMEOUT, run).await {
             Ok(Ok(0)) => {}
             Ok(Ok(n)) => tracing::info!(n, "из внешнего хранилища удалены файлы старше срока"),

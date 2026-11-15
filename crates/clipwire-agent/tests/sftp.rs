@@ -629,7 +629,9 @@ async fn file_roundtrip_overwrite_list_and_cleanup() {
     // Чистка по сроку удаляет файлы и пустые папки.
     let later = clipwire_agent::history::now_ms() as u64 + 48 * 3600 * 1000;
     assert_eq!(
-        external::cleanup_at(&store, &g, 24, later).await.unwrap(),
+        external::cleanup_at(&store, &g, 24, later, &Default::default())
+            .await
+            .unwrap(),
         1
     );
     let fs = s.fs.lock().unwrap();

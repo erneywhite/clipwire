@@ -465,10 +465,14 @@ pub async fn store_clock(
 /// часами иначе удалило бы свежие файлы всей группы. Удаление идемпотентно,
 /// гонка устройств безвредна. Возвращает, сколько файлов удалено.
 /// `ttl_hours = 0` — без срока.
+///
+/// Файлы из `kept` (живые закрепы группы, `crate::pins`) не удаляются:
+/// закреп живёт без срока, пока его не снимут.
 pub async fn cleanup(
     store: &dyn ObjectStore,
     group: &GroupId,
     ttl_hours: u32,
+    kept: &std::collections::HashSet<BlobId>,
 ) -> Result<usize, StoreError> {
     if ttl_hours == 0 {
         return Ok(0);
@@ -485,7 +489,7 @@ pub async fn cleanup(
             "часы устройства и хранилища расходятся больше чем на час; чистка идёт по часам хранилища"
         );
     }
-    cleanup_at(store, group, ttl_hours, now).await
+    cleanup_at(store, group, ttl_hours, now, kept).await
 }
 
 /// То же, что [`cleanup`], с заданным «сейчас» по часам хранилища.
@@ -494,6 +498,7 @@ pub async fn cleanup_at(
     group: &GroupId,
     ttl_hours: u32,
     now_ms: u64,
+    kept: &std::collections::HashSet<BlobId>,
 ) -> Result<usize, StoreError> {
     if ttl_hours == 0 {
         return Ok(0);
@@ -514,8 +519,13 @@ pub async fn cleanup_at(
         let e = newest.entry(entry).or_insert((0, is_dir));
         e.0 = e.0.max(o.modified_ms);
     }
+    let kept: std::collections::HashSet<String> =
+        kept.iter().map(|b| blob_dir(group, *b)).collect();
     let mut removed = 0;
     for (name, (modified, is_dir)) in newest {
+        if kept.contains(&name) {
+            continue;
+        }
         // Время 0 — хранилище его не дало: не трогаем.
         if modified == 0
             || modified
@@ -745,25 +755,58 @@ mod tests {
         reserve(&store, &key, BlobId([2; 16]), 5).await.unwrap();
         let now = crate::history::now_ms() as u64;
         // Свежие не трогаются, в том числе по часам хранилища.
-        assert_eq!(cleanup_at(&store, &g, 1, now).await.unwrap(), 0);
-        assert_eq!(cleanup(&store, &g, 1).await.unwrap(), 0);
-        // Срок вышел, но запас ещё нет — не трогаются.
         assert_eq!(
-            cleanup_at(&store, &g, 24, now + 24 * 3600 * 1000 + 1000)
+            cleanup_at(&store, &g, 1, now, &Default::default())
                 .await
                 .unwrap(),
             0
         );
-        // Через сутки с лишним — удаляются обе папки; срок 0 — без чистки.
         assert_eq!(
-            cleanup_at(&store, &g, 24, now + 25 * 3600 * 1000)
+            cleanup(&store, &g, 1, &Default::default()).await.unwrap(),
+            0
+        );
+        // Срок вышел, но запас ещё нет — не трогаются.
+        assert_eq!(
+            cleanup_at(
+                &store,
+                &g,
+                24,
+                now + 24 * 3600 * 1000 + 1000,
+                &Default::default()
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        // Через сутки с лишним — удаляется папка, файл закрепа остаётся.
+        let kept = std::collections::HashSet::from([BlobId([2; 16])]);
+        assert_eq!(
+            cleanup_at(&store, &g, 24, now + 25 * 3600 * 1000, &kept)
                 .await
                 .unwrap(),
-            2
+            1
+        );
+        let left = store.list(&group_dir(&g)).await.unwrap();
+        assert!(!left.is_empty());
+        assert!(
+            left.iter()
+                .all(|o| o.name.starts_with(&blob_dir(&g, BlobId([2; 16]))))
+        );
+        // Закреп сняли — уходит и он; срок 0 — без чистки.
+        assert_eq!(
+            cleanup_at(&store, &g, 24, now + 25 * 3600 * 1000, &Default::default())
+                .await
+                .unwrap(),
+            1
         );
         assert!(store.list(&group_dir(&g)).await.unwrap().is_empty());
         reserve(&store, &key, BlobId([3; 16]), 5).await.unwrap();
-        assert_eq!(cleanup_at(&store, &g, 0, u64::MAX).await.unwrap(), 0);
+        assert_eq!(
+            cleanup_at(&store, &g, 0, u64::MAX, &Default::default())
+                .await
+                .unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -859,7 +902,10 @@ mod tests {
         assert!(
             store.list(&group_dir(&g)).await.unwrap()[0].modified_ms + 24 * 3600 * 1000 < local
         );
-        assert_eq!(cleanup(&store, &g, 24).await.unwrap(), 0);
+        assert_eq!(
+            cleanup(&store, &g, 24, &Default::default()).await.unwrap(),
+            0
+        );
         assert_eq!(store.list(&group_dir(&g)).await.unwrap().len(), 2);
         // Отметка времени за собой не осталась.
         assert!(
