@@ -280,7 +280,11 @@ mod tests {
         assert_eq!(r, None);
         // Подсказка есть, но не «secret» — обычный текст.
         let r = read(&t, |m| {
-            Some(if m == PASSWORD_HINT { b"".to_vec() } else { b"ok".to_vec() })
+            Some(if m == PASSWORD_HINT {
+                b"".to_vec()
+            } else {
+                b"ok".to_vec()
+            })
         });
         assert_eq!(r, Some(Content::Text("ok".into())));
     }

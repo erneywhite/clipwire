@@ -651,7 +651,8 @@ mod tests {
         h.set_size(1);
         h.set_mode(0o755);
         h.set_entry_type(EntryType::Regular);
-        b.append_data(&mut h, "Report.app/run.sh", &b"x"[..]).unwrap();
+        b.append_data(&mut h, "Report.app/run.sh", &b"x"[..])
+            .unwrap();
         let ar = d.join("x.tar");
         std::fs::write(&ar, b.into_inner().unwrap()).unwrap();
         let out = d.join("out");

@@ -12,12 +12,12 @@
 
 use super::formats::{self, Offer as Data};
 use crate::i18n::tr;
+use crate::read_budget::{ReadBudget, TOTAL_TIMEOUT};
 use anyhow::{Context, Result};
 use clipwire_core::Content;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use crate::read_budget::{ReadBudget, TOTAL_TIMEOUT};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{wl_registry::WlRegistry, wl_seat::WlSeat};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, event_created_child};

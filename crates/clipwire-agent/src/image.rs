@@ -72,7 +72,8 @@ fn decode_limited<R: std::io::BufRead + std::io::Seek>(
 /// теми же пределами, что у остальных путей: размеры из заголовка проверяются
 /// до выделения памяти.
 pub fn decode_bytes(data: &[u8]) -> Result<RgbaImage> {
-    let img = decode_limited(|| Ok(image::ImageReader::new(Cursor::new(data)).with_guessed_format()?))?;
+    let img =
+        decode_limited(|| Ok(image::ImageReader::new(Cursor::new(data)).with_guessed_format()?))?;
     Ok(img.to_rgba8())
 }
 
