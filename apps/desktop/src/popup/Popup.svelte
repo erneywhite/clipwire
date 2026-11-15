@@ -142,11 +142,42 @@
     }
   }
 
+  // Лента: записи подгружаются страницами по мере прокрутки. Следующая
+  // страница запрашивается заранее, когда до конца остаётся AHEAD записей.
+  const PAGE = 200
+  const AHEAD = 50
+  // Больше этого история за один запрос не отдаёт (commands.rs).
+  const MAX_CALL = 1000
+  // Записей дальше нет: история кончилась.
+  let exhausted = false
+  let loadingMore = false
+  // Номер списка: смена запроса, вкладки или фильтра его меняет, и ответы
+  // на старые запросы отбрасываются.
+  let gen = 0
+
+  /** `count` записей подряд начиная с `offset` (несколькими запросами, если много). */
+  async function fetchRange(offset: number, count: number): Promise<Entry[]> {
+    const out: Entry[] = []
+    while (out.length < count) {
+      const n = Math.min(MAX_CALL, count - out.length)
+      const page = await api.list(query, tab === 'pinned', kind, n, offset + out.length)
+      out.push(...page)
+      if (page.length < n) break
+    }
+    return out
+  }
+
   // Чужую ошибку (скачивания, вставки) load() не стирает: её сбрасывают явные
   // действия — новый запрос, смена вкладки, новое открытие окна, новая вставка.
-  async function load() {
+  // Перечитывает столько записей, сколько уже подгружено: новая запись не
+  // сбрасывает ленту и место прокрутки.
+  async function load(want = Math.max(PAGE, items.length)) {
+    const g = gen
     try {
-      items = await api.list(query, tab === 'pinned', kind)
+      const list = await fetchRange(0, want)
+      if (g !== gen) return
+      items = list
+      exhausted = list.length < want
       if (sel >= items.length) sel = Math.max(0, items.length - 1)
       if (loadFailed) {
         loadFailed = false
@@ -158,12 +189,48 @@
     }
   }
 
+  /** Следующая страница ленты, если она есть и ещё не грузится. */
+  async function loadMore() {
+    if (exhausted || loadingMore || !items.length) return
+    loadingMore = true
+    const g = gen
+    try {
+      const page = await fetchRange(items.length, PAGE)
+      if (g !== gen) return
+      // Пока шёл запрос, сверху могли прийти новые записи и сдвинуть
+      // страницу: уже показанные не дублируем.
+      const seen = new Set(items.map((e) => e.id))
+      items = [...items, ...page.filter((e) => !seen.has(e.id))]
+      exhausted = page.length < PAGE
+    } catch (e) {
+      error = String(e)
+    } finally {
+      loadingMore = false
+    }
+  }
+
+  /** Подгрузить, если до конца ленты осталось меньше AHEAD записей. */
+  function maybeMore() {
+    if (exhausted || !items.length) return
+    let left = items.length - 1 - sel
+    if (listEl && listEl.scrollHeight > 0) {
+      // Строки разной высоты: считаем по средней.
+      const row = listEl.scrollHeight / items.length
+      const below = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight
+      left = Math.min(left, below / row)
+    }
+    if (left < AHEAD) loadMore()
+  }
+
   /** Явная смена списка: новый запрос или вкладка. Старая ошибка уже ни к чему. */
   function reload() {
+    gen++
     sel = 0
     error = ''
     loadFailed = false
-    load()
+    exhausted = false
+    load(PAGE)
+    if (listEl) listEl.scrollTop = 0
   }
 
   async function scrollToSel() {
@@ -173,8 +240,12 @@
 
   function move(d: number) {
     if (!items.length) return
-    sel = (sel + d + items.length) % items.length
+    // Вниз с последней записи: по кругу наверх, только если история кончилась,
+    // иначе ждём следующую страницу на последней строке.
+    if (d > 0 && sel + d >= items.length && !exhausted) sel = items.length - 1
+    else sel = (sel + d + items.length) % items.length
     scrollToSel()
+    maybeMore()
     if (preview) openPreview()
   }
 
@@ -465,7 +536,9 @@
         error = ''
         needAccess = false
         loadFailed = false
-        await load()
+        gen++
+        exhausted = false
+        await load(PAGE)
         await tick()
         // Окно не пересоздаётся, а прокрутка остаётся с прошлого раза: без этого
         // список мог открыться в середине, и свежие элементы были не видны.
@@ -541,7 +614,7 @@
         {/if}
       </div>
     {:else}
-      <ul class="list" bind:this={listEl} role="listbox" aria-label={t('История буфера')}>
+      <ul class="list" bind:this={listEl} onscroll={maybeMore} role="listbox" aria-label={t('История буфера')}>
         {#each items as item, i (item.id)}
           <EntryRow {item} {transfers} index={i} selected={i === sel} onselect={() => (sel = i)} onpaste={() => paste(item)} onpin={() => togglePin(item)} onremove={() => remove(item)} onmenu={(x, y) => openMenu(item, x, y)} />
         {/each}

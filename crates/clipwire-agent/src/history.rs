@@ -467,6 +467,19 @@ impl History {
         kind: Kind,
         limit: usize,
     ) -> Vec<&Entry> {
+        self.list_page(query, pinned_only, kind, 0, limit)
+    }
+
+    /// Страница списка: `limit` записей, пропустив первые `offset` подходящих.
+    /// Окно вставки подгружает так ленту по мере прокрутки.
+    pub fn list_page(
+        &self,
+        query: &str,
+        pinned_only: bool,
+        kind: Kind,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<&Entry> {
         let q = query.trim().to_lowercase();
         self.entries
             .iter()
@@ -498,6 +511,7 @@ impl History {
                     || e.source_name()
                         .is_some_and(|n| n.to_lowercase().contains(&q))
             })
+            .skip(offset)
             .take(limit)
             .collect()
     }
@@ -690,6 +704,11 @@ mod tests {
         text(&mut h, "b", 2);
         text(&mut h, "a", 3);
         assert_eq!(texts(h.list("", false, 10)), ["a", "b"]);
+        // Страницы идут подряд, за концом — пусто.
+        let page = |o, l| texts(h.list_page("", false, Kind::All, o, l));
+        assert_eq!(page(0, 1), ["a"]);
+        assert_eq!(page(1, 1), ["b"]);
+        assert!(page(2, 1).is_empty());
         assert_eq!(h.len(), 2);
     }
 

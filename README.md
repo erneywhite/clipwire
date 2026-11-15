@@ -174,6 +174,10 @@ portal (the desktop may ask to confirm once). On Sway, which has none of these, 
 In the preview you can fix text before pasting: Ctrl+Enter pastes the edited version,
 Ctrl+S saves it to the history.
 
+The list scrolls through the whole history, with search and filters too: older entries load in
+advance, about 50 entries before you reach the end. A new entry arriving at the top does not
+reset what is already loaded or where you are.
+
 **Deleting.** By default a deleted entry disappears only on this device. Turn on
 **Delete on all devices** under Sync and the deletion is sent to the rest of the group as well.
 Devices that are switched off apply it when they connect, within the server's retention period.

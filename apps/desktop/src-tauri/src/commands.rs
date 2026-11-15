@@ -316,16 +316,19 @@ pub fn history_list(
     query: String,
     pinned_only: bool,
     kind: Option<clipwire_agent::history::Kind>,
+    offset: Option<usize>,
     limit: usize,
 ) -> Vec<EntryDto> {
     let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
     let uploaded = uploaded_check(&state);
     let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-    h.list_kind(
+    // Окно вставки берёт ленту страницами; одна страница не больше 1000.
+    h.list_page(
         &query,
         pinned_only,
         kind.unwrap_or_default(),
-        limit.min(500),
+        offset.unwrap_or(0),
+        limit.min(1000),
     )
     .into_iter()
     .map(|e| to_dto(e, h.thumb(e.id), false, &files_dir, &uploaded))
