@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clipwire_agent::state::{AgentState, Paths, random_key};
-use clipwire_core::{GroupKey, Invite, ServerInfo};
+use clipwire_core::{GroupKey, Invite};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "\
@@ -8,8 +8,14 @@ clipwire-agent — общий буфер обмена Clipwire
 
 Команды:
   create <код сервера>        создать группу на сервере (первое устройство)
-                              и напечатать код приглашения для остальных
-  join <код приглашения>      подключить это устройство к группе
+                              и напечатать код приглашения для остальных;
+                              нужен код сервера администратора (cwserver2-…)
+  join <код приглашения> [<код сервера>]
+                              подключить это устройство к группе; с кодом
+                              сервера администратора устройство станет
+                              администратором сервера
+  admin <код сервера>         сохранить ключ администратора сервера на
+                              устройстве, которое уже в группе
   invite                      снова напечатать код приглашения
   run                         синхронизировать буфер без интерфейса (до Ctrl+C)
   reset                       забыть группу и ключи на этом устройстве
@@ -26,7 +32,8 @@ clipwire-agent — общий буфер обмена Clipwire
                               посчитать, --send — отправить и в группу,
                               --images — с картинками. Clipwire должен быть закрыт
 
-Код сервера (cwserver1-…) печатает сервер при запуске.
+Код сервера администратора (cwserver2-…) печатает сервер при запуске и команда
+clipwire-server info. В нём ключ администратора: с ним создают группы.
 Код приглашения (clipwire1-…) содержит ключ группы — передавайте его только себе.";
 
 fn main() -> Result<()> {
@@ -46,16 +53,17 @@ fn main() -> Result<()> {
         "create" => {
             let code = args
                 .get(1)
-                .context("нужен код сервера: create cwserver1-…")?;
-            let server = ServerInfo::decode(code)?;
+                .context("нужен код сервера: create cwserver2-…")?;
+            let admin = clipwire_agent::admin::creation_code(code).map_err(anyhow::Error::msg)?;
             ensure_empty(&paths)?;
             let state = AgentState {
                 invite: Invite {
-                    server,
+                    server: admin.server.clone(),
                     group_key: GroupKey::generate()?,
                 },
                 device_key: random_key()?,
             };
+            paths.save_admin_key(admin.server.server_id, &admin.admin_key)?;
             paths.save(&state)?;
             println!("Группа создана. Код приглашения для остальных устройств:\n");
             println!("{}\n", state.invite.encode());
@@ -68,11 +76,32 @@ fn main() -> Result<()> {
                 .context("нужен код приглашения: join clipwire1-…")?;
             let invite = Invite::decode(code)?;
             ensure_empty(&paths)?;
-            paths.save(&AgentState {
+            let state = AgentState {
                 invite,
                 device_key: random_key()?,
-            })?;
+            };
+            // Код сервера администратора — проверить, что он от того же сервера.
+            let admin = args
+                .get(2)
+                .map(|c| clipwire_agent::admin::claim_code(c, &state).map_err(anyhow::Error::msg))
+                .transpose()?;
+            if let Some(a) = &admin {
+                paths.save_admin_key(a.server.server_id, &a.admin_key)?;
+            }
+            paths.save(&state)?;
             println!("Устройство подключено к группе. Запуск синхронизации: clipwire-agent run");
+        }
+        "admin" => {
+            let code = args
+                .get(1)
+                .context("нужен код сервера администратора: admin cwserver2-…")?;
+            let state = paths.load()?.context("устройство ещё не в группе")?;
+            let a = clipwire_agent::admin::claim_code(code, &state).map_err(anyhow::Error::msg)?;
+            // shortcut: ключ сохраняется без проверки на сервере; неверный
+            // сервер отвергнет при входе (в логе run). Проверять через
+            // AdminAuth, если консольный агент станет кому-то основным.
+            paths.save_admin_key(a.server.server_id, &a.admin_key)?;
+            println!("Ключ администратора сервера сохранён. Он действует со следующего запуска run.");
         }
         "invite" => {
             let state = paths.load()?.context("устройство ещё не в группе")?;
@@ -100,7 +129,7 @@ fn main() -> Result<()> {
         }
         "listen" => {
             let state = paths.load()?.context("устройство ещё не в группе")?;
-            headless(state, None)?;
+            headless(state, &paths, None)?;
         }
         "send" => {
             let text = args[1..].join(" ");
@@ -108,7 +137,7 @@ fn main() -> Result<()> {
                 bail!("нечего отправлять: send <текст>");
             }
             let state = paths.load()?.context("устройство ещё не в группе")?;
-            headless(state, Some(text))?;
+            headless(state, &paths, Some(text))?;
         }
         #[cfg(target_os = "macos")]
         "import-paste" => import_paste(&paths, &args[1..])?,
@@ -126,7 +155,7 @@ fn ensure_empty(paths: &Paths) -> Result<()> {
 }
 
 /// Движок без буфера ОС: для отладки и для систем без GUI-клиента.
-fn headless(state: AgentState, send: Option<String>) -> Result<()> {
+fn headless(state: AgentState, paths: &Paths, send: Option<String>) -> Result<()> {
     use clipwire_agent::sync::{Engine, Event, Status};
     use clipwire_core::Content;
     use std::sync::Arc;
@@ -138,7 +167,8 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
         let (ltx, lrx) = mpsc::channel(4);
         // Курсор не сохраняем и не берём: режим отладочный, историю не применяем.
         let name = clipwire_agent::settings::default_device_name();
-        let engine = Engine::new(state, name, None, etx, Arc::new(|| {}));
+        let admin = paths.load_admin_key(state.invite.server.server_id);
+        let engine = Engine::new(state, name, None, etx, Arc::new(|| {})).with_admin_key(admin);
         let task = tokio::spawn(engine.run(lrx));
         let mut ltx = Some(ltx);
         while let Some(ev) = erx.recv().await {
@@ -464,7 +494,9 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
     rt.block_on(async move {
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
         let (ltx, lrx) = tokio::sync::mpsc::channel(4);
+        let admin = paths.load_admin_key(state.invite.server.server_id);
         let engine = Engine::new(state, settings.device_name, None, etx, Arc::new(|| {}))
+            .with_admin_key(admin)
             .with_backfill(outgoing);
         let task = tokio::spawn(engine.run(lrx));
         // Движок шлёт историю сразу после входа; закрытый канал — сигнал

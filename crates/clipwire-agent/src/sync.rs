@@ -312,6 +312,10 @@ pub struct Engine {
     ps: pin_engine::PinSession,
     /// Ждут ответа `PinStats`, по порядку запросов.
     pin_stats_waiters: VecDeque<tokio::sync::oneshot::Sender<Result<PinStats, String>>>,
+    /// Ждут ответа на запросы администратора, по порядку запросов.
+    admin_waiters: VecDeque<crate::admin::AdminWaiter>,
+    /// Ключ администратора сменили в этой сессии: войти с новым.
+    admin_reauth: bool,
 }
 
 impl Engine {
@@ -371,6 +375,8 @@ impl Engine {
             pin_source: None,
             ps: Default::default(),
             pin_stats_waiters: VecDeque::new(),
+            admin_waiters: VecDeque::new(),
+            admin_reauth: false,
         }
     }
 
@@ -516,6 +522,10 @@ impl Engine {
             for w in self.pin_stats_waiters.drain(..) {
                 let _ = w.send(Err(tr("Связь с сервером оборвалась").into()));
             }
+            for w in self.admin_waiters.drain(..).filter_map(|w| w.reply) {
+                let _ = w.send(Err(tr("Связь с сервером оборвалась").into()));
+            }
+            self.admin_reauth = false;
             match res {
                 // Сессия кончается без ошибки, только когда закрыт канал локальных изменений.
                 Ok(()) => {
@@ -871,6 +881,15 @@ impl Engine {
                             write_msg(&mut send, &ClientMsg::GetGroupConfig).await?;
                             self.config_check = Some(Instant::now());
                         }
+                        if std::mem::take(&mut self.admin_reauth)
+                            && let Some(k) = self.admin_key.clone()
+                        {
+                            write_msg(&mut send, &ClientMsg::AdminAuth { key: k.clone() }).await?;
+                            self.admin_waiters.push_back(crate::admin::AdminWaiter {
+                                reply: None,
+                                auth: Some(k),
+                            });
+                        }
                         if let Some(sealed) = self.config_push.take() {
                             tracing::info!("свои настройки группы новее серверных, отправляю");
                             write_msg(&mut send, &ClientMsg::SetGroupConfig(sealed)).await?;
@@ -916,6 +935,17 @@ impl Engine {
                             self.pin_stats_waiters.push_back(reply);
                         } else {
                             let _ = reply.send(Err(crate::devices::old_server_stats().into()));
+                        }
+                    }
+                    Control::Admin { req, reply } => {
+                        if knows_admin(conn.alpn()) {
+                            write_msg(&mut send, &req.msg()).await?;
+                            self.admin_waiters.push_back(crate::admin::AdminWaiter {
+                                reply: Some(reply),
+                                auth: req.auth_key(),
+                            });
+                        } else {
+                            crate::admin::refuse_old(reply);
                         }
                     }
                     Control::SetGroupConfig { sealed, config, reply } => {
@@ -976,6 +1006,10 @@ impl Engine {
         // ответы уходят серверу).
         if pin_engine::is_pin_msg(&msg) {
             self.ps.inbox.push_back(msg);
+            return Ok(());
+        }
+        if crate::admin::is_admin_reply(&msg) {
+            self.answer_admin(msg);
             return Ok(());
         }
         match msg {
@@ -1059,6 +1093,41 @@ impl Engine {
         // ему свои (например, база сервера пропала).
         if first && storage.version() > server_version {
             self.config_push = storage.seal_current(key);
+        }
+    }
+
+    /// Ответ на запрос администратора — первому, кто его ждёт. Вход с ключом
+    /// (`AdminOk`) и смена ключа (`AdminKeyRotated`) меняют ключ, с которым
+    /// движок входит дальше.
+    fn answer_admin(&mut self, msg: ServerMsg) {
+        let Some(w) = self.admin_waiters.pop_front() else {
+            tracing::debug!("лишний ответ администратору: {msg:?}");
+            return;
+        };
+        match &msg {
+            ServerMsg::AdminOk => {
+                if let Some(k) = w.auth {
+                    self.admin_key = Some(k);
+                }
+            }
+            ServerMsg::AdminKeyRotated { server_code } => {
+                match clipwire_core::AdminServerInfo::decode(server_code) {
+                    Ok(info) => {
+                        // Права этого соединения пропали вместе со старым
+                        // ключом: войти с новым.
+                        self.admin_key = Some(info.admin_key);
+                        self.admin_reauth = true;
+                    }
+                    Err(e) => tracing::warn!("сервер прислал неразборчивый код: {e}"),
+                }
+            }
+            ServerMsg::AdminFailed(f) if w.reply.is_none() => {
+                tracing::warn!("повторный вход администратора не прошёл: {f}");
+            }
+            _ => {}
+        }
+        if let Some(reply) = w.reply {
+            let _ = reply.send(Ok(msg));
         }
     }
 
@@ -1728,6 +1797,9 @@ fn refuse_control(ctl: Control, why: &str) {
         }
         // Удаление на этом устройстве уже сделано, в группу оно не уйдёт.
         Control::Delete(_) => tracing::info!("удаление не ушло в группу: {why}"),
+        Control::Admin { reply, .. } => {
+            let _ = reply.send(Err(why.to_string()));
+        }
     }
 }
 

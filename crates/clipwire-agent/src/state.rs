@@ -8,7 +8,8 @@
 //!   отметка «устройство исключено» (`crate::devices`);
 //! - `group_config.bin` — настройки группы (хранилище файлов и доступы к
 //!   нему), защищены как `state.bin` (`crate::group_config`);
-//! - `pins.bin` — книга закрепов группы (`crate::pins`), защищена так же.
+//! - `pins.bin` — книга закрепов группы (`crate::pins`), защищена так же;
+//! - `admin.bin` — ключ администратора сервера (`crate::admin`), защищён так же.
 
 use std::path::{Path, PathBuf};
 
@@ -101,6 +102,7 @@ impl Paths {
         let config = self.dir.join(crate::group_config::CONFIG_FILE);
         let cleaned = self.dir.join(crate::group_config::CLEANED_FILE);
         let pins = self.dir.join(crate::pins::PINS_FILE);
+        let admin = self.dir.join(crate::admin::ADMIN_FILE);
         for p in [
             self.state(),
             self.cursor(),
@@ -110,6 +112,7 @@ impl Paths {
             config,
             cleaned,
             pins,
+            admin,
         ] {
             match std::fs::remove_file(&p) {
                 Ok(()) => {}

@@ -381,6 +381,9 @@ impl Service {
             Some(state) => {
                 let (ctl_tx, ctl_rx) = mpsc::channel(8);
                 let group_key = state.invite.group_key.clone();
+                // Ключ администратора сервера, если он есть у устройства: с ним
+                // движок создаёт группу и входит с правами администратора.
+                let admin_key = paths.load_admin_key(state.invite.server.server_id);
                 let local_history = if backfill {
                     local_backfill(&history.lock().unwrap_or_else(|e| e.into_inner()))
                 } else {
@@ -393,6 +396,7 @@ impl Service {
                     event_tx,
                     Arc::new(|| {}),
                 )
+                .with_admin_key(admin_key)
                 .with_backfill(local_history)
                 .with_known_devices(crate::devices::load_known(&paths, group_key.group_id()))
                 .with_blobs(blobs.clone().expect("в группе передача файлов есть"))

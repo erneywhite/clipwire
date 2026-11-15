@@ -334,6 +334,12 @@ pub enum Control {
     /// Удалить записи на остальных устройствах (`Delete`). Без связи движок
     /// отправит после входа.
     Delete(clipwire_core::delete::DeleteNote),
+    /// Запрос администратора сервера или админа группы (`crate::admin`).
+    /// Ответ — сообщение сервера как есть, `AdminFailed` тоже.
+    Admin {
+        req: crate::admin::AdminRequest,
+        reply: crate::admin::AdminReply,
+    },
 }
 
 /// Путь до сервера: напрямую (UDP) или через relay, и задержка; версия
