@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::blob::BlobId;
 use crate::crypto::{GroupId, JoinSecret, SealedItem};
 use crate::item::DeviceId;
+use crate::pin::PinId;
 
 /// ALPN протокола. Меняем номер при несовместимых изменениях формата.
 pub const ALPN: &[u8] = b"clipwire/3";
@@ -44,9 +45,14 @@ pub const ALPN_6: &[u8] = b"clipwire/6";
 /// версию, и клиент показывает, что образ сервера пора обновить.
 pub const ALPN_7: &[u8] = b"clipwire/7";
 
+/// Как [`ALPN_7`], плюс закрепы, общие для группы (`PinSet`, `PinsSince`,
+/// `Pinned` и остальные `Pin*`, см. [`crate::pin`]). `Pinned` сервер шлёт
+/// только соединениям с этим ALPN.
+pub const ALPN_8: &[u8] = b"clipwire/8";
+
 /// Все ALPN, новейший первым: в этом порядке их предлагает агент и
 /// принимает сервер.
-pub const ALPNS: [&[u8]; 5] = [ALPN_7, ALPN_6, ALPN_5, ALPN_4, ALPN];
+pub const ALPNS: [&[u8]; 6] = [ALPN_8, ALPN_7, ALPN_6, ALPN_5, ALPN_4, ALPN];
 
 /// Номер версии протокола из ALPN (`clipwire/7` → 7), 0 — не наш ALPN.
 /// Новые возможности проверяются сравнением номера, а не перечислением ALPN:
@@ -76,6 +82,11 @@ pub fn knows_devices_changed(alpn: &[u8]) -> bool {
 /// Знает ли соединение с этим ALPN `ServerInfo`.
 pub fn knows_server_info(alpn: &[u8]) -> bool {
     alpn_version(alpn) >= 7
+}
+
+/// Знает ли соединение с этим ALPN закрепы группы.
+pub fn knows_pins(alpn: &[u8]) -> bool {
+    alpn_version(alpn) >= 8
 }
 
 /// Версия `a` младше `b` («0.3.0» < «0.3.1» < «0.10.0»). Части сравниваются
@@ -154,6 +165,94 @@ pub enum ClientMsg {
     /// `delete::MAX_DELETE_BYTES`). Сервер хранит её в пределах своего срока
     /// хранения и раздаёт остальным `Deleted`. Только по [`ALPN_5`].
     Delete(Vec<u8>),
+    /// Записать закреп (только по [`ALPN_8`]). Сервер принимает правку,
+    /// только если `base_rev` равен его текущему `rev` этого закрепа (0 —
+    /// закрепа ещё нет), ставит новый `rev` и отвечает `PinAccepted`, а
+    /// остальным рассылает `Pinned`. Иначе — `PinRejected` с текущей записью.
+    ///
+    /// `pinned` открыт: по нему сервер считает квоту, решает, хранить ли
+    /// содержимое и держать ли файлы без срока. Должен совпадать с
+    /// `PinState::pinned` внутри `state`.
+    /// - `pinned`, `content: Some` — новое содержимое, `blobs` заменяют
+    ///   прежний список;
+    /// - `pinned`, `content: None` — содержимое и файлы остаются прежними
+    ///   (правка подписи), `blobs` должен быть пустым; у нового закрепа так
+    ///   нельзя;
+    /// - `!pinned` — закреп снят: содержимое и список файлов удаляются,
+    ///   `content` и `blobs` должны быть пустыми.
+    PinSet {
+        pin_id: PinId,
+        base_rev: u64,
+        pinned: bool,
+        /// `GroupKey::seal_pin_state`, до `pin::MAX_PIN_STATE_BYTES`.
+        state: Vec<u8>,
+        /// `GroupKey::seal_pin_content`.
+        content: Option<Vec<u8>>,
+        /// Все файлы закреплённой записи: и в хранилище сервера, и во
+        /// внешнем хранилище группы (S3/SFTP). Свои сервер держит без срока,
+        /// пока закреп не снят, а список отдаёт в [`PinRecord::blobs`]: по
+        /// нему устройства не чистят файлы закрепов во внешнем хранилище,
+        /// даже если содержимого закрепа у них нет. Id файлов случайные и о
+        /// содержимом ничего не говорят.
+        blobs: Vec<BlobId>,
+    },
+    /// Закрепы с `rev` больше указанного, по возрастанию `rev`. Ответ —
+    /// `Pins` (страница; `more` — есть ещё, спросить снова с последним `rev`).
+    PinsSince { rev: u64 },
+    /// Содержимое закрепа, которое не вошло в `Pins` или `Pinned`. Ответ —
+    /// `PinContentIs`.
+    PinContent { pin_id: PinId },
+    /// Сколько у группы закрепов на сервере — ответ `PinStats`.
+    GetPinStats,
+}
+
+/// Закреп на сервере (в `Pins`, `Pinned`, `PinRejected`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinRecord {
+    pub pin_id: PinId,
+    /// Номер правки: ставит сервер, растёт на всю группу.
+    pub rev: u64,
+    pub pinned: bool,
+    /// Запечатанное состояние (`GroupKey::open_pin_state`).
+    pub state: Vec<u8>,
+    /// Длина запечатанного содержимого, 0 — содержимого нет (закреп снят).
+    pub content_len: u64,
+    /// Запечатанное содержимое (`GroupKey::open_pin_content`). Большое
+    /// сервер не кладёт: `None` при `content_len > 0` — спросить
+    /// `PinContent`.
+    pub content: Option<Vec<u8>>,
+    /// Файлы закреплённой записи (`PinSet::blobs`); пусто у снятого.
+    pub blobs: Vec<BlobId>,
+}
+
+/// Почему сервер не принял `PinSet` (кроме устаревшего `base_rev`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum PinFail {
+    /// Закреплённых записей у группы уже `CLIPWIRE_PIN_MAX`.
+    #[error("на сервере уже {max} закрепов группы, больше нельзя")]
+    TooMany { max: u64 },
+    /// Закрепы группы не влезают в `CLIPWIRE_PIN_BYTES`.
+    #[error("закрепы группы заняли всё место на сервере ({max} байт)")]
+    NoSpace { max: u64 },
+    /// Состояние или содержимое больше предела сервера.
+    #[error("закреп больше {max} байт — предела сервера")]
+    TooLarge { max: u64 },
+    /// Сообщение не по правилам `PinSet`.
+    #[error("ошибка протокола: {0}")]
+    Invalid(String),
+}
+
+/// Закрепы группы на сервере (ответ на `GetPinStats`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinStats {
+    /// Закреплённых записей (снятые не считаются).
+    pub pins: u64,
+    /// Сколько места занимают все записи закрепов, включая снятые, байт.
+    pub bytes: u64,
+    /// `CLIPWIRE_PIN_MAX`.
+    pub max_pins: u64,
+    /// `CLIPWIRE_PIN_BYTES`.
+    pub max_bytes: u64,
 }
 
 /// Что лежит на сервере у группы (ответ на `GetStats`).
@@ -224,6 +323,36 @@ pub enum ServerMsg {
     /// Версия сервера (`CARGO_PKG_VERSION`), сразу после входа в группу.
     /// Только по [`ALPN_7`].
     ServerInfo { version: String },
+    /// `PinSet` принят, у закрепа теперь этот `rev`. Только по [`ALPN_8`],
+    /// как и все `Pin*` ниже.
+    PinAccepted { pin_id: PinId, rev: u64 },
+    /// `PinSet` не принят: `base_rev` устарел. `current` — запись на сервере
+    /// (`None` — такого закрепа нет, слать с `base_rev: 0`).
+    PinRejected {
+        pin_id: PinId,
+        current: Option<PinRecord>,
+    },
+    /// Страница ответа на `PinsSince`, по возрастанию `rev`. `epoch` —
+    /// случайная метка закрепов группы на этом сервере: другая метка значит,
+    /// что база сервера новая (сброс, другой сервер) и `rev` пошли заново.
+    /// Устройство тогда сбрасывает курсор и забирает всё с начала.
+    Pins {
+        epoch: [u8; 16],
+        records: Vec<PinRecord>,
+        more: bool,
+    },
+    /// Закреп поменяли с другого устройства группы.
+    Pinned(PinRecord),
+    /// Ответ на `PinContent`: `None` — содержимого нет (закреп снят или
+    /// его нет).
+    PinContentIs {
+        pin_id: PinId,
+        content: Option<Vec<u8>>,
+    },
+    /// `PinSet` не принят по другой причине. Соединение остаётся.
+    PinFailed { pin_id: PinId, reason: PinFail },
+    /// Ответ на `GetPinStats`.
+    PinStats(PinStats),
 }
 
 /// Первый кадр потока файла.
@@ -449,6 +578,8 @@ mod tests {
     fn alpn_versions_and_features() {
         assert_eq!(alpn_version(ALPN), 3);
         assert_eq!(alpn_version(ALPN_7), 7);
+        assert_eq!(alpn_version(ALPN_8), 8);
+        assert_eq!(ALPNS[0], ALPN_8);
         assert_eq!(alpn_version(b"clipwire/12"), 12);
         assert_eq!(alpn_version(b"other/7"), 0);
         // Новая версия не теряет старые возможности.
@@ -458,8 +589,34 @@ mod tests {
             assert_eq!(knows_deletes(a), v >= 5);
             assert_eq!(knows_devices_changed(a), v >= 6);
             assert_eq!(knows_server_info(a), v >= 7);
+            assert_eq!(knows_pins(a), v >= 8);
         }
         assert!(knows_deletes(b"clipwire/9"));
+    }
+
+    /// Новые варианты только в конце: номера старых не сдвинулись, иначе
+    /// старые клиенты и серверы читали бы одно сообщение как другое.
+    #[test]
+    fn variant_numbers_are_stable() {
+        let tag = |b: Vec<u8>| b[0];
+        assert_eq!(
+            tag(postcard::to_stdvec(&ClientMsg::Delete(vec![])).unwrap()),
+            10
+        );
+        assert_eq!(
+            tag(postcard::to_stdvec(&ClientMsg::PinsSince { rev: 0 }).unwrap()),
+            12
+        );
+        assert_eq!(
+            tag(postcard::to_stdvec(&ClientMsg::GetPinStats).unwrap()),
+            14
+        );
+        let info = ServerMsg::ServerInfo {
+            version: String::new(),
+        };
+        assert_eq!(tag(postcard::to_stdvec(&info).unwrap()), 13);
+        let stats = ServerMsg::PinStats(PinStats::default());
+        assert_eq!(tag(postcard::to_stdvec(&stats).unwrap()), 20);
     }
 
     #[test]

@@ -175,6 +175,9 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
                     server = v.as_deref().unwrap_or("старше 0.3.1"),
                     "сервер старше клиента, обновите образ сервера"
                 ),
+                // Без книги закрепов движок их не синхронизирует.
+                Event::Pin(_) => {}
+                Event::PinFailed(why) => eprintln!("{why}"),
             }
         }
         task.await??;
@@ -264,6 +267,8 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
             UiEvent::RekeyLost(why) => eprintln!("{why}"),
             UiEvent::GroupConfig(v) => eprintln!("настройки группы: хранилище {}", v.kind),
             UiEvent::StorageWarning(w) => eprintln!("{w}"),
+            UiEvent::PinsChanged => eprintln!("закрепы изменились на другом устройстве"),
+            UiEvent::PinFailed(why) => eprintln!("{why}"),
         }),
     )?;
     eprintln!("синхронизация буфера запущена, Ctrl+C — выход");
@@ -356,7 +361,11 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
     // shortcut: с --send отправляемое копится в памяти целиком (движку нужен
     // список); с картинками это много. Переделать на чтение тел из истории
     // по мере отправки, если --send --images понадобится на больших архивах.
-    let (mut added, mut outgoing) = (0usize, Vec::new());
+    let (mut added, mut outgoing, mut repinned) = (0usize, Vec::new(), 0usize);
+    let mut to_pin = Vec::new();
+    let pins = state
+        .as_ref()
+        .map(|s| clipwire_agent::pins::Pins::open(&paths.dir, s.invite.group_key.group_id()));
     let sum = clipwire_agent::paste_import::read(&dir, images, |it| {
         let app = it.app.and_then(|a| {
             apps.entry((a.bundle_id.clone(), a.name.clone()))
@@ -369,6 +378,10 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
                 .clone()
         });
         let sent = send.then(|| it.content.clone());
+        let hash = it.content.hash();
+        // Название записи в Paste — подпись; подпись бывает только у
+        // закреплённого.
+        let note = it.title.filter(|_| it.pinned).unwrap_or_default();
         let mut entry = Entry {
             id: ItemId::at_ms(it.seen_ms.max(0) as u64),
             origin: device,
@@ -382,9 +395,24 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
         if let Some(app) = &app {
             entry.set_source_app(app);
         }
+        entry.set_note(&note);
         // Записи идут по одной, каждая своей транзакцией: тела картинок не
         // копятся в памяти, а `merge` сам отбрасывает уже перенесённое.
-        if history.merge(entry)? {
+        // Уже перенесённой записи с доски ставится закреп, а подпись —
+        // только если у записи её ещё нет: поправленную в Clipwire повторный
+        // импорт не затирает.
+        let new = history.merge(entry)?;
+        let note = match history.id_by_hash(&hash).and_then(|id| history.row(id)) {
+            Some(r) if !new => r.note().unwrap_or(note),
+            _ => note,
+        };
+        if !new && it.pinned && history.apply_pin(&hash, true, &note, None)? {
+            repinned += 1;
+        }
+        if it.pinned {
+            to_pin.push((hash, note));
+        }
+        if new {
             added += 1;
             if let Some(content) = sent {
                 outgoing.push((
@@ -400,6 +428,29 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
         "в историю Clipwire добавлено: {added} (уже были: {})",
         sum.text + sum.rich + sum.images - added
     );
+    if repinned > 0 {
+        eprintln!("уже перенесённым записям поставлены закреп и подпись: {repinned}");
+    }
+    // Закрепы с доски уходят в группу закрепами: книга закрепов (одной
+    // записью на диск) отправит их при следующем запуске Clipwire.
+    // Закрепление подпись живого закрепа группы не меняет (`Op::Pin`):
+    // название из Paste встаёт, только если подписи там ещё нет.
+    if let Some(p) = &pins
+        && !to_pin.is_empty()
+    {
+        let at_ms = clipwire_agent::history::now_ms();
+        p.update(|b| {
+            for (hash, note) in to_pin {
+                b.queue(clipwire_agent::pins::Edit::new(
+                    hash,
+                    clipwire_agent::pins::Op::Pin,
+                    &clipwire_agent::history::clean_note(&note),
+                    at_ms,
+                ));
+            }
+        });
+        eprintln!("закрепы уйдут в группу при следующем запуске Clipwire");
+    }
     drop(history);
     let Some(state) = state.filter(|_| send && !outgoing.is_empty()) else {
         return Ok(());

@@ -168,6 +168,56 @@ impl Entry {
     pub fn set_source_app(&mut self, app: &SourceApp) {
         self.ext_set(ext::SOURCE_APP, app);
     }
+
+    /// Подпись закреплённой записи; `None` — без подписи.
+    pub fn note(&self) -> Option<String> {
+        note_of(&self.ext)
+    }
+
+    /// Задать подпись (пустая — убрать). Длину и вид приводит [`clean_note`].
+    pub fn set_note(&mut self, note: &str) {
+        set_note_in(&mut self.ext, note);
+    }
+}
+
+/// Подпись к виду, в котором она хранится и уходит в группу: без пробелов
+/// по краям, переводы строк и прочие управляющие символы — пробелами, не
+/// длиннее `pin::MAX_NOTE_CHARS` символов.
+pub fn clean_note(note: &str) -> String {
+    note.trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(clipwire_core::pin::MAX_NOTE_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+fn note_of(list: &[Ext]) -> Option<String> {
+    let e = list.iter().find(|e| e.tag == ext::NOTE)?;
+    postcard::from_bytes::<String>(&e.data)
+        .ok()
+        .filter(|n| !n.is_empty())
+}
+
+fn set_note_in(list: &mut Vec<Ext>, note: &str) {
+    list.retain(|e| e.tag != ext::NOTE);
+    let note = clean_note(note);
+    if note.is_empty() {
+        return;
+    }
+    if let Ok(data) = postcard::to_stdvec(&note) {
+        list.push(Ext {
+            tag: ext::NOTE,
+            data,
+        });
+    }
+}
+
+/// Убрать подпись из сведений элемента, пришедшего с другого устройства или
+/// уходящего в группу: подпись живёт только в состоянии закрепа.
+pub fn strip_note(list: &mut Vec<Ext>) {
+    list.retain(|e| e.tag != ext::NOTE);
 }
 
 /// То же, что `Entry`, но по ссылкам: тело пишется без копии содержимого.
@@ -436,9 +486,15 @@ impl Card {
         self.ext_get(ext::SOURCE_APP)
     }
 
+    /// Подпись закреплённой записи.
+    pub fn note(&self) -> Option<String> {
+        note_of(&self.ext)
+    }
+
     /// Подходит ли под запрос `q` (уже в нижнем регистре, без пробелов по краям).
     fn matches_query(&self, q: &str) -> bool {
         q.is_empty()
+            || self.note().is_some_and(|n| n.to_lowercase().contains(q))
             || match self.kind {
                 CardKind::Text | CardKind::Rich => self.search.contains(q),
                 // Файлы — по именам и по словам «файл», «папка».
@@ -487,6 +543,11 @@ impl Row {
     /// Начало текста (для строки списка).
     pub fn text(&self) -> &str {
         &self.card.head
+    }
+
+    /// Подпись (только у закреплённых).
+    pub fn note(&self) -> Option<String> {
+        self.card.note()
     }
 }
 
@@ -877,7 +938,7 @@ impl History {
     }
 
     #[cfg(test)]
-    fn in_memory() -> Self {
+    pub(crate) fn in_memory() -> Self {
         Self::init(Connection::open_in_memory().unwrap(), [7; 32], None).unwrap()
     }
 
@@ -1880,17 +1941,127 @@ impl History {
     /// Закрепить или открепить. Тело переписывается вместе с колонкой:
     /// старая версия после отката берёт закрепление из тела. Стоит это одно
     /// перешифрование тела (у картинки — мегабайты, миллисекунды).
+    /// Подпись бывает только у закреплённого: открепление её стирает.
     pub fn set_pinned(&mut self, id: ItemId, pinned: bool) -> Result<()> {
         let tx = self.tx()?;
         let gone = || anyhow::anyhow!("{}", tr("Элемента уже нет в истории"));
         let (_, _, card) = self.meta(id)?.ok_or_else(gone)?;
         let mut e = self.body(id)?.ok_or_else(gone)?;
-        if e.pinned != pinned {
+        if e.pinned != pinned || (!pinned && e.note().is_some()) {
             e.pinned = pinned;
+            if !pinned {
+                strip_note(&mut e.ext);
+            }
             self.write(&e, card.icon, Thumb::Keep)?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Задать подпись закреплённой записи (пустая — убрать). Незакреплённой
+    /// подпись не ставится. Возвращает подпись в том виде, в каком она
+    /// сохранена ([`clean_note`]).
+    pub fn set_note(&mut self, id: ItemId, note: &str) -> Result<String> {
+        let tx = self.tx()?;
+        let gone = || anyhow::anyhow!("{}", tr("Элемента уже нет в истории"));
+        let (_, pinned, card) = self.meta(id)?.ok_or_else(gone)?;
+        if !pinned {
+            bail!("{}", tr("Подписать можно только закреплённую запись"));
+        }
+        let note = clean_note(note);
+        if card.note().unwrap_or_default() != note {
+            let mut e = self.body(id)?.ok_or_else(gone)?;
+            e.set_note(&note);
+            self.write(&e, card.icon, Thumb::Keep)?;
+        }
+        tx.commit()?;
+        Ok(note)
+    }
+
+    /// Закреп с другого устройства (или из импорта): запись с этим простым
+    /// хэшем (`Content::hash`) закрепить или открепить и поставить подпись.
+    /// Если такой записи нет, а закреп живой, запись добавляется из `entry`
+    /// (содержимое закрепа) на своё место по времени, с миниатюрой `thumb`
+    /// ([`make_thumb`]; её считают до замка истории). Снятый закреп без
+    /// записи ничего не добавляет. Возвращает, изменилась ли история.
+    pub fn apply_pin(
+        &mut self,
+        hash: &[u8; 32],
+        pinned: bool,
+        note: &str,
+        entry: Option<(Entry, Option<Vec<u8>>)>,
+    ) -> Result<bool> {
+        let note = if pinned {
+            clean_note(note)
+        } else {
+            String::new()
+        };
+        let tx = self.tx()?;
+        let changed = match self.id_by_hkey(&self.hkey(hash))? {
+            Some(id) => match self.meta(id)? {
+                Some((_, was, card))
+                    if was == pinned && card.note().unwrap_or_default() == note =>
+                {
+                    false
+                }
+                Some((_, _, card)) => match self.body(id)? {
+                    Some(mut e) => {
+                        e.pinned = pinned;
+                        e.set_note(&note);
+                        self.write(&e, card.icon, Thumb::Keep)?;
+                        true
+                    }
+                    None => false,
+                },
+                None => false,
+            },
+            None => match entry {
+                Some((mut e, thumb)) if pinned => {
+                    anyhow::ensure!(
+                        e.content.hash() == *hash,
+                        "содержимое закрепа не совпадает с его хэшем"
+                    );
+                    e.pinned = true;
+                    e.set_note(&note);
+                    if self.live_exists(e.id)? {
+                        // Тот же id у другой записи (правленой): свой id.
+                        e.id = ItemId::new();
+                    }
+                    self.write(&e, None, Thumb::Set(thumb.as_deref()))?;
+                    true
+                }
+                _ => false,
+            },
+        };
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Самая свежая запись с этим простым хэшем (`Content::hash`).
+    pub fn id_by_hash(&self, hash: &[u8; 32]) -> Option<ItemId> {
+        self.id_by_hkey(&self.hkey(hash)).ok().flatten()
+    }
+
+    /// Закреплённые записи: простой хэш, подпись и время (от новых к старым).
+    /// Для первой выгрузки закрепов в группу.
+    pub fn pinned_notes(&self) -> Vec<([u8; 32], String, i64)> {
+        let mut out = Vec::new();
+        let res = self.scan(true, 0, |_, seen_ms, _, card| {
+            out.push((card.hash, card.note().unwrap_or_default(), seen_ms));
+            ControlFlow::Continue(())
+        });
+        if let Err(err) = res {
+            tracing::warn!("история не прочиталась: {err:#}");
+        }
+        out
+    }
+
+    /// Блобы файлов записи с этим простым хэшем (по карточке, без тела).
+    pub fn blobs_of(&self, hash: &[u8; 32]) -> Vec<BlobId> {
+        self.id_by_hash(hash)
+            .and_then(|id| self.meta(id).ok().flatten())
+            .map(|(_, _, c)| c.files.iter().filter_map(|f| f.blob).collect())
+            .unwrap_or_default()
     }
 
     /// Заменить текст элемента (правка в предпросмотре). Если такой текст уже
@@ -3447,6 +3618,86 @@ mod tests {
         h.set_pinned(id, false).unwrap();
         assert_eq!(h.pinned_len(), 0);
         assert!(h.set_pinned(ItemId::new(), true).is_err());
+    }
+
+    #[test]
+    fn note_only_on_pinned_found_by_search_and_cleared_by_unpin() {
+        let mut h = History::in_memory();
+        let id = text(&mut h, "длинный токен abc123", 1);
+        text(&mut h, "другое", 2);
+        assert!(
+            h.set_note(id, "ключ").is_err(),
+            "незакреплённое не подписать"
+        );
+        h.set_pinned(id, true).unwrap();
+        // Переводы строк — пробелами, края обрезаются, длина до 80 символов.
+        let saved = h.set_note(id, "  Ключ\nот стенда  ").unwrap();
+        assert_eq!(saved, "Ключ от стенда");
+        let long: String = "я".repeat(100);
+        assert_eq!(h.set_note(id, &long).unwrap().chars().count(), 80);
+        h.set_note(id, "Ключ от стенда").unwrap();
+        assert_eq!(h.row(id).unwrap().note().as_deref(), Some("Ключ от стенда"));
+        assert_eq!(h.get(id).unwrap().note().as_deref(), Some("Ключ от стенда"));
+        // Поиск ищет и по подписи, без учёта регистра.
+        assert_eq!(texts(h.list("стенда", false, 10)), ["длинный токен abc123"]);
+        assert_eq!(texts(h.list("КЛЮЧ", true, 10)), ["длинный токен abc123"]);
+        // Повторное копирование того же подпись не теряет.
+        text(&mut h, "длинный токен abc123", 3);
+        assert_eq!(h.row(id).unwrap().note().as_deref(), Some("Ключ от стенда"));
+        // Пустая подпись убирается.
+        assert_eq!(h.set_note(id, "   ").unwrap(), "");
+        assert_eq!(h.row(id).unwrap().note(), None);
+        h.set_note(id, "снова").unwrap();
+        // Открепление стирает подпись.
+        h.set_pinned(id, false).unwrap();
+        assert_eq!(h.row(id).unwrap().note(), None);
+        assert!(h.list("снова", false, 10).is_empty());
+    }
+
+    #[test]
+    fn apply_pin_marks_existing_adds_missing_and_unpins() {
+        let mut h = History::in_memory();
+        let id = text(&mut h, "есть здесь", 5);
+        let hash = Content::Text("есть здесь".into()).hash();
+        assert_eq!(h.id_by_hash(&hash), Some(id));
+        // Есть запись — закреп и подпись на неё, новой строки нет.
+        assert!(h.apply_pin(&hash, true, "моя", None).unwrap());
+        assert!(
+            !h.apply_pin(&hash, true, "моя", None).unwrap(),
+            "повтор — без изменений"
+        );
+        assert_eq!(h.len(), 1);
+        let r = h.row(id).unwrap();
+        assert!(r.pinned);
+        assert_eq!(r.note().as_deref(), Some("моя"));
+        assert_eq!(h.pinned_notes(), vec![(hash, "моя".to_string(), 5)]);
+        // Нет записи — добавляется из содержимого закрепа на своё место.
+        let other = Content::Text("с другого".into());
+        let mut e = local_entry(DeviceId([2; 32]), "Мак", other.clone());
+        e.local = false;
+        e.seen_ms = 1;
+        // Без содержимого живой закреп ничего не добавляет.
+        assert!(!h.apply_pin(&other.hash(), true, "x", None).unwrap());
+        // Содержимое не того хэша не принимается.
+        assert!(h.apply_pin(&hash, false, "", None).unwrap());
+        assert!(
+            h.apply_pin(&[9; 32], true, "x", Some((e.clone(), None)))
+                .is_err()
+        );
+        assert!(
+            h.apply_pin(&other.hash(), true, "чужая", Some((e, None)))
+                .unwrap()
+        );
+        assert_eq!(texts(h.list("", false, 10)), ["есть здесь", "с другого"]);
+        let added = h.id_by_hash(&other.hash()).unwrap();
+        assert!(h.row(added).unwrap().pinned);
+        assert_eq!(h.row(added).unwrap().note().as_deref(), Some("чужая"));
+        // Снятый закреп снимает и подпись; без записи — ничего не добавляет.
+        assert!(h.apply_pin(&other.hash(), false, "игнор", None).unwrap());
+        let r = h.row(added).unwrap();
+        assert!(!r.pinned && r.note().is_none());
+        assert!(!h.apply_pin(&[8; 32], false, "", None).unwrap());
+        assert_eq!(h.len(), 2);
     }
 
     #[test]

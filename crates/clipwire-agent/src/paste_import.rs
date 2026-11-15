@@ -3,7 +3,8 @@
 //! База Paste — Core Data в SQLite, не зашифрована:
 //! `~/Library/Containers/com.wiheads.paste/Data/Library/Application Support/Paste/db.sqlite`.
 //! - `ZITEMENTITY` — запись: время (`ZCREATEDAT`, `ZTIMESTAMP` — секунды от
-//!   2001-01-01), программа-источник (`ZSOURCEAPPLICATION`), доска (`ZLIST`).
+//!   2001-01-01), программа-источник (`ZSOURCEAPPLICATION`), доска (`ZLIST`),
+//!   название (`ZTITLE`; колонка читается, только если она есть).
 //! - `ZITEMDATAENTITY.ZRAWPASTEBOARDITEMS` — содержимое буфера: первый байт
 //!   0x01 — данные здесь же, 0x02 — дальше имя файла в
 //!   `.db_SUPPORT/_EXTERNAL_DATA` (так Core Data выносит большие значения).
@@ -36,6 +37,9 @@ pub struct Imported {
     pub app: Option<PasteApp>,
     /// Лежала на доске Paste (в Clipwire — закреплённая).
     pub pinned: bool,
+    /// Название записи в Paste (`ZITEMENTITY.ZTITLE`), в Clipwire — подпись
+    /// закреплённой записи. `None` — нет названия или колонки в этой версии.
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,11 +104,19 @@ pub fn read(
         }
     }
 
-    let mut st = db.prepare(
-        "SELECT d.ZRAWPASTEBOARDITEMS, i.ZCREATEDAT, i.ZTIMESTAMP, i.ZSOURCEAPPLICATION, i.ZLIST
+    // Название записи есть не во всех версиях Paste: колонку берём, только
+    // если она есть.
+    let title = if has_column(&db, "ZITEMENTITY", "ZTITLE")? {
+        "i.ZTITLE"
+    } else {
+        "NULL"
+    };
+    let mut st = db.prepare(&format!(
+        "SELECT d.ZRAWPASTEBOARDITEMS, i.ZCREATEDAT, i.ZTIMESTAMP, i.ZSOURCEAPPLICATION, i.ZLIST,
+                {title}
          FROM ZITEMENTITY i JOIN ZITEMDATAENTITY d ON d.ZITEM = i.Z_PK
-         ORDER BY max(coalesce(i.ZCREATEDAT, 0), coalesce(i.ZTIMESTAMP, 0))",
-    )?;
+         ORDER BY max(coalesce(i.ZCREATEDAT, 0), coalesce(i.ZTIMESTAMP, 0))"
+    ))?;
     let rows = st.query_map([], |r| {
         Ok((
             r.get::<_, Option<Vec<u8>>>(0)?,
@@ -112,12 +124,15 @@ pub fn read(
             r.get::<_, Option<f64>>(2)?,
             r.get::<_, Option<i64>>(3)?,
             r.get::<_, Option<i64>>(4)?,
+            // Тип колонки в Core Data — строка, но SQLite отдаст и иное:
+            // нестроковое название просто не берём.
+            r.get::<_, Option<String>>(5).ok().flatten(),
         ))
     })?;
 
     let mut sum = Summary::default();
     for row in rows {
-        let (raw, created, used, app, list) = row?;
+        let (raw, created, used, app, list, title) = row?;
         sum.total += 1;
         let data = match raw.as_deref().map(|r| load(r, &external)) {
             Some(Ok(d)) => d,
@@ -164,9 +179,22 @@ pub fn read(
             seen_ms: (secs * 1000.0) as i64,
             app: app.and_then(|pk| apps.get(&pk).cloned()),
             pinned,
+            title: title.filter(|t| !t.trim().is_empty()),
         })?;
     }
     Ok(sum)
+}
+
+/// Есть ли у таблицы колонка (`PRAGMA table_info`).
+fn has_column(db: &rusqlite::Connection, table: &str, column: &str) -> Result<bool> {
+    let mut st = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = st.query_map([], |r| r.get::<_, String>(1))?;
+    for n in names {
+        if n?.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Почему запись не переносится.

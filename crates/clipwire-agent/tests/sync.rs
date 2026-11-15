@@ -181,7 +181,8 @@ async fn cursor_from_future_does_not_block_new_items() -> Result<()> {
 }
 
 /// Старый сервер не знает `JoinWithToken`: не разобрав кадр, он рвёт
-/// соединение. Агент должен войти повторно обычным `Join`.
+/// соединение. Агент входит повторно обычным `Join`, а раз протокол такого
+/// сервера ниже `MIN_SERVER_PROTOCOL`, сообщает, что сервер устарел.
 #[tokio::test(flavor = "multi_thread")]
 async fn old_server_without_join_with_token_still_works() -> Result<()> {
     use clipwire_core::proto::io::{read_msg, write_msg};
@@ -237,7 +238,19 @@ async fn old_server_without_join_with_token_still_works() -> Result<()> {
         ..info.clone()
     };
     let mut a = Agent::spawn(&fake_info, &GroupKey::generate()?, None)?;
-    a.online().await?;
+    // Вход обычным `Join` проходит, но протокол `/3` ниже
+    // `MIN_SERVER_PROTOCOL`: агент не синхронизируется и просит обновить
+    // образ сервера.
+    a.wait(|e| matches!(e, Event::ServerOutdated(None)).then_some(()))
+        .await?;
+    let why = a
+        .wait(|e| match e {
+            Event::Status(Status::Offline(r)) => Some(r.clone()),
+            Event::Status(Status::Online) => Some("на связи".into()),
+            _ => None,
+        })
+        .await?;
+    assert!(why.contains("устарел"), "{why}");
     assert_eq!(seen.recv().await, Some("с токеном"));
     assert_eq!(seen.recv().await, Some("обычный"));
     accept.abort();

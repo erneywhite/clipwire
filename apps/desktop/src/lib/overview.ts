@@ -1,5 +1,5 @@
 // Подписи для блока «Состояние» в «О программе».
-import type { GroupDevice, GroupStats, StorageState } from './api'
+import type { GroupDevice, GroupStats, PinStats, StorageState } from './api'
 import type * as format from './format'
 import { t, tn } from './i18n.ts'
 
@@ -31,8 +31,28 @@ export function serverFilesLabel(s: GroupStats, { bytesLabel }: Fmt): string {
 export function quotaLabel(s: GroupStats, { bytesLabel }: Fmt): { text: string; tone: Tone } {
   if (s.quota <= 0) return { text: '—', tone: 'ok' }
   const pct = Math.min(100, Math.round((s.quota_used / s.quota) * 100))
-  const tone: Tone = pct >= 95 ? 'error' : pct >= 80 ? 'warn' : 'ok'
+  const tone = fillTone(pct)
   return { text: t('{used} из {quota} ({pct} %)', { used: bytesLabel(s.quota_used), quota: bytesLabel(s.quota), pct }), tone }
+}
+
+/** Тон по заполнению: с 80 % предупреждение, с 95 % ошибка. */
+function fillTone(pct: number): Tone {
+  return pct >= 95 ? 'error' : pct >= 80 ? 'warn' : 'ok'
+}
+
+/**
+ * Закрепы группы на сервере: «12 · 3,4 МБ из 2,0 ГБ». Тон — по тому пределу,
+ * что ближе к концу (число закрепов или место). Когда упирается число, оно
+ * показывается с пределом: «950 из 1000 · 3,4 МБ из 2,0 ГБ».
+ */
+export function pinsLabel(p: PinStats, { bytesLabel }: Fmt): { text: string; tone: Tone } {
+  const pct = (used: number, max: number) => (max > 0 ? Math.min(100, Math.round((used / max) * 100)) : 0)
+  const byCount = pct(p.pins, p.max_pins)
+  const byBytes = pct(p.bytes, p.max_bytes)
+  const count = byCount >= 80 ? t('{used} из {max}', { used: p.pins, max: p.max_pins }) : String(p.pins)
+  const size =
+    p.max_bytes > 0 ? t('{used} из {max}', { used: bytesLabel(p.bytes), max: bytesLabel(p.max_bytes) }) : bytesLabel(p.bytes)
+  return { text: `${count} · ${size}`, tone: fillTone(Math.max(byCount, byBytes)) }
 }
 
 /** Версия сервера: «0.3.1», «0.3.0 · обновите образ до 0.3.1». */

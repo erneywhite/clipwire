@@ -115,7 +115,9 @@ The invitation code contains the group's encryption key. Share it only with your
 
 **Moving from Paste (macOS).** The history of [Paste](https://pasteapp.io) can be moved with a
 command-line tool for now; a button in Settings is planned. Text and formatted text are moved with
-their dates and source apps, pinboard entries become pinned. Files are skipped (Paste keeps only
+their dates and source apps, pinboard entries become pinned and their titles become notes. A
+repeated run pins and labels entries that were moved before; in a group the pins reach the other
+devices the next time Clipwire starts. Files are skipped (Paste keeps only
 links to them). Images are moved with `--images`; with `--send` everything being sent is held in
 memory until it is sent, so a large image archive is better moved without `--send`. Quit
 Clipwire, set history retention to "forever", keep your other devices online if you add `--send`,
@@ -165,9 +167,10 @@ portal (the desktop may ask to confirm once). On Sway, which has none of these, 
 | Ctrl+1…9 | paste the entry with that number |
 | Space | preview (when the search field is empty) |
 | Ctrl+P, click the pin on the right of a row | pin or unpin |
+| Ctrl+R | add or edit the note of a pinned entry (Enter saves, Esc cancels) |
 | Ctrl+E | edit an image |
-| Delete (with an empty search), Shift+Delete, the bin icon in a row | delete from history |
-| Right click, Menu key, Shift+F10 | entry menu: paste, preview, edit, pin, delete |
+| Delete (with an empty search), Shift+Delete, the bin icon in a row | delete from history; on a pinned entry, first a choice of what to do |
+| Right click, Menu key, Shift+F10 | entry menu: paste, preview, edit, pin, note, delete |
 | Tab | switch between History and Pinned |
 | Alt+Left, Alt+Right, the icons next to the tabs | filter: text, links, images, files |
 | Typing | search |
@@ -179,7 +182,8 @@ The list scrolls through the whole history, with search and filters too: older e
 advance, about 50 entries before you reach the end. A new entry arriving at the top does not
 reset what is already loaded or where you are.
 
-Search looks at the first 8 KB of each text, at file names, the device and the source app; a
+Search looks at the first 8 KB of each text, at the notes of pinned entries, file names, the
+device and the source app; a
 match further into a very long text is not found. The history is read from disk page by page, so
 memory use does not grow with it (details in `docs/history-storage.md`).
 
@@ -188,6 +192,53 @@ memory use does not grow with it (details in `docs/history-storage.md`).
 Devices that are switched off apply it when they connect, within the server's retention period.
 Entries pinned on another device are not deleted. The server does not know what was deleted: the
 deletion note is encrypted with the group key. This needs server 0.1.3 or newer.
+
+**Pins and notes.** Pinned entries are the same on every device of the group, including devices
+that joined later or were off for a long time. A pinned entry can have a note of up to 80
+characters, and search looks at it too. Unpinning removes the pin everywhere and erases the note;
+the entry stays in the history as an ordinary one. Pinning, unpinning and notes work offline as
+well: the change waits on disk and is sent after the device connects. On its first connection to
+a server with pins a device uploads its earlier pins once. If two devices pinned the same thing
+while offline, one pin is kept with the note of the newer change. A pin can be removed on this
+device only: the other devices keep it, and it does not come back here unless you pin it here
+again. The server keeps pins with no expiry, encrypted with the group key, and refuses new ones
+over its limits (`CLIPWIRE_PIN_MAX`, `CLIPWIRE_PIN_BYTES`): such an entry stays pinned on this
+device only, and the app says so. The order of changes is decided by the server, not by device
+clocks: an unpin or a note made offline reaches every device even if this device's clock is
+behind. Simply deleting a pinned entry removes the pin on this device only; the other devices keep it
+pinned. Pinning again and importing from Paste again do not change an existing note: only
+editing the note does.
+
+Files in pinned entries. Files under the upload limit are kept in the group storage (the server
+or external S3/SFTP) and are not deleted after the retention period while the pin exists.
+Folders and files over the limit are not uploaded: other devices see the file card and can fetch
+the file directly only while the source device is online. External storage is cleaned by the
+devices themselves, using the list of pinned files the server provides. Devices with an older
+Clipwire (before pins) do not know this list and may delete pinned files from S3/SFTP after the
+retention period, so update the app on every device of the group.
+
+On a group key change the device that changes the key moves the pins to the new group and tells
+you if the server refused some of them (the pin limit). Files of pinned entries are not moved:
+the server and external storage delete the files of the old group, so in the new group such a
+pin keeps the file card, and the file itself is only where it lies on disk. A device that was off
+during the key change does not upload pins that other devices removed in the meantime. If the
+server database was lost or restored from an old backup, devices notice it, fetch the pins from
+the start and upload their live pins again.
+
+This needs a server with protocol `clipwire/8`: the app does not sync with an older server and
+asks you to update the image.
+
+A note is shown as the row's title in the theme's accent colour, with the usual content under it:
+the text, the image or the file name. Pasting pastes the entry, never the note. To add or change a
+note press Ctrl+R (Cmd+R on macOS) or pick **Edit note…** in the entry menu: a field opens in place
+of the title, Enter saves, Esc cancels, and an empty field removes the note. In the preview the
+note sits at the top, and clicking it opens the same field.
+
+Delete, the bin icon or **Delete** on a pinned entry first asks what to do: **Unpin on this device
+only**, **Unpin everywhere** (the entry stays in the history) or **Delete everywhere**. Pick with
+the arrow keys and Enter or with the mouse; Esc closes the choice. Ordinary entries are deleted
+right away, as before. How many pins the server holds and how much space they take is shown in
+About → Status, in the **Pins on the server** row.
 
 ## What gets synced
 
@@ -495,6 +546,8 @@ you delete the key, the server's address changes and every device has to be conn
 | `CLIPWIRE_MAX_DEVICES` | `64` | how many devices one group can hold; a new device over the limit is refused, known devices still join |
 | `CLIPWIRE_HISTORY_TOTAL_BYTES` | `1073741824` | total limit of item history per server (1 GiB); the excess is evicted from the largest group |
 | `CLIPWIRE_MAX_DEVICE_CONNS` | `4` | simultaneous connections from one device |
+| `CLIPWIRE_PIN_MAX` | `5000` | how many pinned entries one group can keep on the server; a new pin over the limit is refused |
+| `CLIPWIRE_PIN_BYTES` | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries and the records of removed pins. Files of pinned entries count toward `CLIPWIRE_BLOB_QUOTA` |
 
 ### What the server stores
 
@@ -510,6 +563,11 @@ you delete the key, the server's address changes and every device has to be conn
   in with the old key gets "removed" and does not create the group again. Tombstones do not count
   toward `CLIPWIRE_MAX_GROUPS`.
 - Encrypted deletion notes.
+- Encrypted pins of the group (`clipwire/8`) with their notes and the pinned entries
+  themselves, with no expiry: a pin lives until it is removed, and a removed pin stays as a
+  record of a few hundred bytes without content. Files of pinned entries are not deleted after
+  `CLIPWIRE_TTL_HOURS` while the pin exists. A group with live pins is not deleted as idle.
+  Pins are erased on a key change and together with the group.
 
 The server sees ciphertext only. When a device is removed, the server immediately erases the
 history and files of the old group, hands the remaining devices the new key (packed separately

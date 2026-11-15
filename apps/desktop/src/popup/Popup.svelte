@@ -2,7 +2,9 @@
   import { deviceName, isMac, keys } from '../lib/platform'
   import { onMount, tick } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
-  import { api, type Entry, type FileInfo, type KindFilter, type Settings, type Transfer } from '../lib/api'
+  import { api, type Entry, type FileInfo, type KindFilter, type PinnedDelete, type Settings, type Transfer } from '../lib/api'
+  import { canNote, deleteChoices, noteChanged, removeAction } from '../lib/pins'
+  import NoteEdit from '../lib/NoteEdit.svelte'
   import { applyTheme } from '../lib/theme'
   import { ago, bytesLabel, filesMeta, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
   import { canDownload, canDrop, entriesByBlob, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
@@ -357,7 +359,7 @@
       (e.shiftKey && e.key === 'F10') ||
       (e.key === 'Delete' && (e.shiftKey || query === '')) ||
       (e.key === ' ' && query === '') ||
-      (mod && /^(KeyE|KeyP|Digit[1-9])$/.test(e.code)) ||
+      (mod && /^(KeyE|KeyP|KeyR|Digit[1-9])$/.test(e.code)) ||
       (isMac && e.metaKey && e.key === 'Backspace')
     )
   }
@@ -592,6 +594,7 @@
     const entry = await api.get(current.id)
     const side = preview ? preview.side : await api.preview(true)
     if (preview?.entry.id !== entry.id) picked = null
+    if (noting?.where === 'preview' && noting.id !== entry.id) noting = null
     preview = { entry, side }
     draft = entry.text
     richView = true
@@ -600,6 +603,7 @@
   async function closePreview() {
     if (!preview) return
     preview = null
+    if (noting?.where === 'preview') noting = null
     await api.preview(false)
   }
 
@@ -638,19 +642,101 @@
     await load()
   }
 
+  /**
+   * Del, корзина, пункт «Удалить» и кнопка в предпросмотре. Обычная запись
+   * удаляется сразу, у закреплённой сначала выбор из трёх (меню 'delete'):
+   * закреп синхронизируется по группе, и молча снимать его везде нельзя.
+   * `at` — где открыть выбор; без него — у выбранной строки.
+   */
+  async function askRemove(entry: Entry | undefined, at?: Anchor) {
+    if (!entry) return
+    if (removeAction(entry) === 'remove') return remove(entry)
+    if (!at) {
+      if (entry.id === current?.id) await scrollToSel()
+      const r = listEl?.querySelector<HTMLElement>(`[data-i="${sel}"]`)?.getBoundingClientRect()
+      at = { x: r ? r.left + 24 : 24, y: r ? r.bottom - 6 : 60 }
+    }
+    openMenu(entry, at.x, at.y, true, 'delete', at.top)
+  }
+
+  /** Где открыть меню: x, y — левый верхний угол; top — верх кнопки, над ним меню встаёт, если внизу не влезает. */
+  type Anchor = { x: number; y: number; top?: number }
+
+  /** Под кнопкой, а у нижнего края окна — над ней, не закрывая её. */
+  function below(el: EventTarget | null): Anchor | undefined {
+    const r = (el as HTMLElement | null)?.getBoundingClientRect()
+    return r ? { x: r.left, y: r.bottom + 2, top: r.top - 2 } : undefined
+  }
+
+  /** Пункт выбора у закреплённой записи. */
+  async function removePinned(entry: Entry, mode: PinnedDelete) {
+    closeMenu()
+    if (mode === 'delete' && preview?.entry.id === entry.id) await closePreview()
+    try {
+      await api.deletePinned(entry.id, mode)
+    } catch (e) {
+      error = String(e)
+    }
+    await load()
+    await refreshPreview()
+  }
+
+  // Подпись, которая сейчас правится: в строке списка или в предпросмотре.
+  let noting = $state<{ id: string; where: 'row' | 'preview' } | null>(null)
+
+  /** Ctrl+R и пункт «Подписать…»: поле правки на месте заголовка. */
+  async function startNote(entry: Entry | undefined) {
+    if (!entry) return
+    if (!canNote(entry)) {
+      error = t('Подпись бывает только у закреплённых записей: сначала закрепите (Ctrl+P)')
+      return
+    }
+    error = ''
+    if (preview?.entry.id === entry.id) {
+      noting = { id: entry.id, where: 'preview' }
+      return
+    }
+    noting = { id: entry.id, where: 'row' }
+    if (entry.id !== current?.id) return
+    // Строка может быть за краем окна, а с полем вместо новой подписи она
+    // выше на строку: вернуть её в окно сейчас и ещё раз после замера высоты.
+    await scrollToSel()
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(() => revealSelected())
+  }
+
+  async function saveNote(entry: Entry, text: string) {
+    noting = null
+    input?.focus()
+    if (!noteChanged(entry.note, text)) return
+    try {
+      await api.note(entry.id, text)
+    } catch (e) {
+      error = String(e)
+    }
+    await load()
+    await refreshPreview()
+  }
+
+  function cancelNote() {
+    if (!noting) return
+    noting = null
+    input?.focus()
+  }
+
   // Меню по правому клику: координаты в окне и запись, к которой оно.
-  let menu = $state<{ x: number; y: number; entry: Entry } | null>(null)
+  // 'delete' — выбор, как убрать закреплённую запись.
+  let menu = $state<{ x: number; y: number; entry: Entry; kind: 'actions' | 'delete' } | null>(null)
   let menuEl: HTMLElement | undefined = $state()
 
-  async function openMenu(entry: Entry, x: number, y: number, keyboard = false) {
-    menu = { entry, x, y }
+  async function openMenu(entry: Entry, x: number, y: number, keyboard = false, kind: 'actions' | 'delete' = 'actions', top = y) {
+    menu = { entry, x, y, kind }
     await tick()
     if (!menuEl) return
     // Прижать к краям окна: оно маленькое, меню у нижних строк иначе уедет.
     const r = menuEl.getBoundingClientRect()
     const nx = Math.max(4, Math.min(x, window.innerWidth - r.width - 4))
-    const ny = y + r.height > window.innerHeight - 4 ? Math.max(4, y - r.height) : y
-    menu = { entry, x: nx, y: ny }
+    const ny = y + r.height > window.innerHeight - 4 ? Math.max(4, top - r.height) : y
+    menu = { entry, x: nx, y: ny, kind }
     if (keyboard) menuEl.querySelector<HTMLButtonElement>('button')?.focus()
   }
 
@@ -660,10 +746,15 @@
     input?.focus()
   }
 
-  /** Пункт меню: закрыть меню, потом действие. */
-  function act(fn: () => unknown) {
+  /**
+   * Пункт меню: закрыть меню, потом действие над его записью. Запись берётся
+   * до закрытия: `m` в разметке ({@const m = menu.entry}) — производное от
+   * menu, и после closeMenu() чтение m падало на null, действие не выполнялось.
+   */
+  function act(fn: (e: Entry) => unknown) {
+    const entry = menu?.entry
     closeMenu()
-    fn()
+    if (entry) fn(entry)
   }
 
   /** Стрелки внутри меню переходят между пунктами, Esc и Tab закрывают. */
@@ -693,6 +784,9 @@
   }
 
   async function onKey(e: KeyboardEvent) {
+    // Поле подписи держит клавиши у себя (NoteEdit). Сюда они доходить не
+    // должны, но если дойдут — ни списку, ни поиску они не принадлежат.
+    if ((e.target as HTMLElement | null)?.closest?.('.note-edit')) return
     // Открытое меню обрабатывает клавиши само (menuKey); Esc мимо него — закрыть.
     if (menu) {
       if (e.key === 'Escape') {
@@ -778,6 +872,11 @@
     } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyP') {
       e.preventDefault()
       togglePin(current)
+    } else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyR') {
+      // Ctrl+R в окне не перезагружает страницу (main.ts гасит), здесь он — подпись.
+      // Открыт предпросмотр — подпись того, что в нём (обычно это и есть выбранная).
+      e.preventDefault()
+      startNote(preview?.entry ?? current)
     } else if (
       (e.key === 'Delete' && (e.shiftKey || query === '')) ||
       (isMac && e.metaKey && e.key === 'Backspace')
@@ -786,7 +885,7 @@
       // символ, тогда удаление — Shift+Delete. На маке клавиша «delete» — это
       // Backspace, удаление записи — ⌘⌫, как «в корзину» в Finder.
       e.preventDefault()
-      remove(current)
+      askRemove(current)
     } else if ((e.ctrlKey || e.metaKey) && /^Digit[1-9]$/.test(e.code)) {
       e.preventDefault()
       paste(items[Number(e.code.slice(5)) - 1])
@@ -811,6 +910,9 @@
       listen<Transfer>('clipwire://transfer', (e) => onTransfer(e.payload)),
       listen('clipwire://history-changed', historyChanged),
       listen('clipwire://need-accessibility', () => (needAccess = true)),
+      // Сервер не принял закреп (квота, предел числа закрепов): здесь он уже
+      // закреплён, но до других устройств не дойдёт.
+      listen<string>('clipwire://pin-failed', (e) => (error = String(e.payload))),
       listen<Settings>('clipwire://settings-changed', (e) => applySettings(e.payload)),
       // Живое превью размера из настроек: ширина списка меняется вместе с окном.
       listen('popup://opened', async () => {
@@ -825,6 +927,7 @@
         // Фильтр — на один показ: в новый раз окно открывается со всем подряд.
         kind = 'all'
         menu = null
+        noting = null
         sel = 0
         preview = null
         error = ''
@@ -888,6 +991,7 @@
     preview = null
     draft = ''
     menu = null
+    noting = null
     heights.keepOnly(new Set(items.map((e) => e.id)))
     setScroll(0)
   }
@@ -972,8 +1076,11 @@
             onselect={() => (sel = i)}
             onpaste={() => paste(item)}
             onpin={() => togglePin(item)}
-            onremove={() => remove(item)}
+            onremove={(r) => askRemove(item, { x: r.left, y: r.bottom + 2, top: r.top - 2 })}
             onmenu={(x, y) => openMenu(item, x, y)}
+            noting={noting?.where === 'row' && noting.id === item.id}
+            onnotesave={(text) => saveNote(item, text)}
+            onnotecancel={cancelNote}
           />
         {/each}
       </ul>
@@ -985,6 +1092,8 @@
       <span><kbd>␣</kbd> {t('просмотр')}</span>
       {#if editable(current)}
         <span><kbd>{keys('Ctrl E')}</kbd> {t('изменить')}</span>
+      {:else if current?.pinned}
+        <span><kbd>{keys('Ctrl R')}</kbd> {t('подписать')}</span>
       {:else}
         <span><kbd>{keys('Ctrl P')}</kbd> {t('закрепить')}</span>
       {/if}
@@ -994,6 +1103,21 @@
 
   {#if preview}
     <section class="preview-pane" aria-label={t('Предпросмотр')}>
+      {#if canNote(preview.entry)}
+        {@const pe = preview.entry}
+        <!-- Подпись закрепа сверху; щелчок по ней (или Ctrl+R) — правка на месте. -->
+        <div class="preview-note">
+          {#if noting?.where === 'preview' && noting.id === pe.id}
+            <NoteEdit value={pe.note ?? ''} onsave={(text) => saveNote(pe, text)} oncancel={cancelNote} />
+          {:else}
+            <button
+              class:empty={!pe.note}
+              title={t('Изменить подпись ({keys})', { keys: keys('Ctrl+R') })}
+              onclick={() => startNote(pe)}>{pe.note || t('+ подпись')}</button
+            >
+          {/if}
+        </div>
+      {/if}
       {#if preview.entry.kind === 'image'}
         <div class="image-view">
           {#if preview.entry.image}
@@ -1009,7 +1133,7 @@
           <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
             {preview.entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
-          <button class="danger" onclick={() => remove(preview?.entry)}>{t('Удалить')}</button>
+          <button class="danger" onclick={(e) => askRemove(preview?.entry, below(e.currentTarget))}>{t('Удалить')}</button>
         </div>
       {:else if preview.entry.kind === 'files'}
         {@const entry = preview.entry}
@@ -1079,7 +1203,7 @@
           <button onclick={() => togglePin(entry).then(openPreview)}>
             {entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
-          <button class="danger" onclick={() => remove(entry)}>{t('Удалить')}</button>
+          <button class="danger" onclick={(e) => askRemove(entry, below(e.currentTarget))}>{t('Удалить')}</button>
         </div>
       {:else}
       {#if preview.entry.html || isUrl(preview.entry.text)}
@@ -1125,7 +1249,7 @@
           <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
             {preview.entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
-          <button class="danger" onclick={() => remove(preview?.entry)}>{t('Удалить')}</button>
+          <button class="danger" onclick={(e) => askRemove(preview?.entry, below(e.currentTarget))}>{t('Удалить')}</button>
         {/if}
       </div>
       {/if}
@@ -1145,24 +1269,49 @@
       closeMenu()
     }}
   ></div>
-  <div class="menu" role="menu" tabindex="-1" bind:this={menuEl} style:left="{menu.x}px" style:top="{menu.y}px" onkeydown={menuKey}>
-    <button role="menuitem" onclick={() => act(() => paste(m))}>{canPaste ? t('Вставить') : t('В буфер')}<kbd>Enter</kbd></button>
+  <div
+    class="menu"
+    role="menu"
+    tabindex="-1"
+    aria-label={menu.kind === 'delete' ? t('Убрать закреплённую запись') : undefined}
+    bind:this={menuEl}
+    style:left="{menu.x}px"
+    style:top="{menu.y}px"
+    onkeydown={menuKey}
+  >
+    {#if menu.kind === 'delete'}
+      <!-- Закреп живёт на всех устройствах группы: что именно убрать. -->
+      <p class="menu-head">{t('Закреплённая запись')}</p>
+      {#each deleteChoices() as c (c.mode)}
+        <button role="menuitem" class="choice" class:danger={c.danger} onclick={() => removePinned(m, c.mode)}>
+          <span>{c.label}</span><small>{c.hint}</small>
+        </button>
+      {/each}
+    {:else}
+    <button role="menuitem" onclick={() => act((e) => paste(e))}>{canPaste ? t('Вставить') : t('В буфер')}<kbd>Enter</kbd></button>
     {#if m.kind === 'text' && m.rich}
-      <button role="menuitem" onclick={() => act(() => paste(m, undefined, true))}>{t('Без форматирования')}<kbd>Shift Enter</kbd></button>
+      <button role="menuitem" onclick={() => act((e) => paste(e, undefined, true))}>{t('Без форматирования')}<kbd>Shift Enter</kbd></button>
     {/if}
     <button role="menuitem" onclick={() => act(openPreview)}>{t('Просмотр')}<kbd>{t('Пробел')}</kbd></button>
     {#if editable(m)}
-      <button role="menuitem" onclick={() => act(() => edit(m))}>{t('Изменить')}<kbd>{keys('Ctrl E')}</kbd></button>
+      <button role="menuitem" onclick={() => act((e) => edit(e))}>{t('Изменить')}<kbd>{keys('Ctrl E')}</kbd></button>
     {/if}
     {#if m.kind === 'text' && isUrl(m.text)}
-      <button role="menuitem" onclick={() => act(() => openUrl(m.text.trim()))}>{t('Открыть в браузере')}</button>
+      <button role="menuitem" onclick={() => act((e) => openUrl(e.text.trim()))}>{t('Открыть в браузере')}</button>
     {/if}
     {#if m.kind === 'files' && m.files[0]?.local_path}
-      <button role="menuitem" onclick={() => act(() => showInFolder(m.files[0]))}>{t('Показать в папке')}</button>
+      <button role="menuitem" onclick={() => act((e) => showInFolder(e.files[0]))}>{t('Показать в папке')}</button>
     {/if}
-    <button role="menuitem" onclick={() => act(() => togglePin(m))}>{m.pinned ? t('Открепить') : t('Закрепить')}<kbd>{keys('Ctrl P')}</kbd></button>
+    <button role="menuitem" onclick={() => act((e) => togglePin(e))}>{m.pinned ? t('Открепить') : t('Закрепить')}<kbd>{keys('Ctrl P')}</kbd></button>
+    {#if canNote(m)}
+      <button role="menuitem" onclick={() => act((e) => startNote(e))}>{t('Подписать…')}<kbd>{keys('Ctrl R')}</kbd></button>
+    {/if}
     <hr />
-    <button role="menuitem" class="danger" onclick={() => remove(m)}>{t('Удалить')}<kbd>Del</kbd></button>
+    <!-- У закреплённой записи «Удалить» открывает выбор на том же месте. -->
+    <button role="menuitem" class="danger" onclick={() => menu && askRemove(m, { x: menu.x, y: menu.y })}
+      >{t('Удалить')}{#if m.pinned}…{/if}<kbd>{isMac ? '⌘⌫' : 'Del'}</kbd></button
+    >
+    {/if}
   </div>
 {/if}
 
@@ -1208,6 +1357,47 @@
   }
   .menu kbd {
     color: var(--c-muted);
+  }
+  .menu-head {
+    margin: 2px 10px 4px;
+    font-size: var(--text-xs);
+    color: var(--c-muted);
+  }
+  /* Пункт выбора у закрепа: действие и под ним пояснение. */
+  .menu button.choice {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
+  }
+  .menu button.choice small {
+    font-size: var(--text-xs);
+    color: var(--c-muted);
+  }
+  .preview-note {
+    min-width: 0;
+  }
+  .preview-note button {
+    display: block;
+    max-width: 100%;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: color-mix(in oklch, var(--c-accent) 75%, var(--c-text));
+    font: inherit;
+    font-weight: 500;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: text;
+  }
+  .preview-note button.empty {
+    color: var(--c-muted);
+    font-weight: 400;
+    font-size: var(--text-s);
+  }
+  .preview-note button:hover {
+    text-decoration: underline;
   }
   .menu hr {
     border: 0;

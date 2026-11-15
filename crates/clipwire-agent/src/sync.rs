@@ -13,8 +13,8 @@ use clipwire_core::device::{DeviceCard, Rekey, open_rekey, rekey_public};
 use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{
-    ALPNS, ClientMsg, DeviceEntry, GroupStats, ServerMsg, alpn_version, knows_deletes,
-    knows_server_info, knows_stats, version_older,
+    ALPNS, ClientMsg, DeviceEntry, GroupStats, PinStats, ServerMsg, alpn_version, knows_deletes,
+    knows_pins, knows_server_info, knows_stats, version_older,
 };
 use clipwire_core::{Content, DeviceId, Ext, ExtList, GroupId, GroupKey, Item, ItemId, SourceApp};
 use iroh::endpoint::{Connection, presets};
@@ -23,7 +23,10 @@ use tokio::sync::mpsc;
 
 use crate::blobs::Blobs;
 use crate::devices::{Control, RekeyNotice, Rekeyed};
+use crate::pins::{PinApply, PinSource, Pins};
 use crate::state::AgentState;
+
+mod pin_engine;
 
 /// Сколько элементов истории отправлять подряд без паузы: половина очереди
 /// получателя на сервере (`hub::QUEUE` = 64).
@@ -175,6 +178,13 @@ pub enum Event {
     /// Сервер старше этого клиента: образ сервера пора обновить. `None` —
     /// сервер не сообщает версию (до `clipwire/7`, то есть старше 0.3.1).
     ServerOutdated(Option<String>),
+    /// Закреп группы изменился (с другого устройства, при входе или после
+    /// разбора дублей): поставить в истории закреп и подпись, добавить запись
+    /// из содержимого, если её здесь нет (`History::apply_pin`).
+    Pin(PinApply),
+    /// Сервер не принял закреп (квота, размер): текст для человека. Запись
+    /// остаётся закреплённой только на этом устройстве.
+    PinFailed(String),
 }
 
 /// Своя версия: сервер младше неё — подсказка обновить образ.
@@ -182,7 +192,7 @@ pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// С сервером, чей протокол младше, клиент не синхронизируется: новые
 /// возможности ему нужны обязательно. Поднимается вместе с ними.
-pub const MIN_SERVER_PROTOCOL: u32 = 3;
+pub const MIN_SERVER_PROTOCOL: u32 = 8;
 
 /// Сервер с этим протоколом слишком стар для синхронизации.
 pub fn server_too_old(protocol: u32) -> bool {
@@ -289,6 +299,14 @@ pub struct Engine {
     /// Свои настройки новее серверных (сервер их потерял или ключ сменили):
     /// отправить серверу.
     config_push: Option<Vec<u8>>,
+    /// Книга закрепов группы и откуда брать записи истории для них. Без
+    /// них (проверки, отладочный режим) закрепы не синхронизируются.
+    pins: Option<Arc<Pins>>,
+    pin_source: Option<Arc<dyn PinSource>>,
+    /// Закрепы в текущей сессии: страницы, ответы, отправленное.
+    ps: pin_engine::PinSession,
+    /// Ждут ответа `PinStats`, по порядку запросов.
+    pin_stats_waiters: VecDeque<tokio::sync::oneshot::Sender<Result<PinStats, String>>>,
 }
 
 impl Engine {
@@ -343,7 +361,19 @@ impl Engine {
             want_config: false,
             config_supported: false,
             config_push: None,
+            pins: None,
+            pin_source: None,
+            ps: Default::default(),
+            pin_stats_waiters: VecDeque::new(),
         }
+    }
+
+    /// Синхронизировать закрепы группы: книга `pins` и записи истории из
+    /// `source`.
+    pub fn with_pins(mut self, pins: Arc<Pins>, source: Arc<dyn PinSource>) -> Self {
+        self.pins = Some(pins);
+        self.pin_source = Some(source);
+        self
     }
 
     /// Карточки устройств группы, проверенные раньше (`devices::load_known`).
@@ -468,6 +498,9 @@ impl Engine {
                 let _ = w.send(Err(tr("Связь с сервером оборвалась").into()));
             }
             for w in self.stats_waiters.drain(..) {
+                let _ = w.send(Err(tr("Связь с сервером оборвалась").into()));
+            }
+            for w in self.pin_stats_waiters.drain(..) {
                 let _ = w.send(Err(tr("Связь с сервером оборвалась").into()));
             }
             match res {
@@ -764,10 +797,24 @@ impl Engine {
         }
         self.send_backfill(&mut send).await?;
         self.send_deletes(&key, &mut send).await?;
+        // Закрепы: страницы с курсора, потом свои правки из очереди.
+        self.pins_start(knows_pins(alpn));
+        self.pin_send(&conn, &key, &mut send).await?;
         let storage = self.blobs.as_ref().map(|b| b.storage().clone());
+        let pins = self.pins.clone();
 
         loop {
             tokio::select! {
+                // В очереди закрепов новая правка (здесь или из импорта).
+                _ = async {
+                    match &pins {
+                        Some(p) => p.wake.notified().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.ps.ready => {
+                    self.ps.dirty = true;
+                    self.pin_send(&conn, &key, &mut send).await?;
+                }
                 // В элементе соседа настройки хранилища новее своих:
                 // спросить их у сервера заново.
                 _ = async {
@@ -801,6 +848,7 @@ impl Engine {
                 msg = read_msg::<_, ServerMsg>(&mut recv) => match msg? {
                     Some(m) => {
                         self.handle_msg(&key, m)?;
+                        self.pin_send(&conn, &key, &mut send).await?;
                         // Настройки группы спрашиваем, когда сервер ответил
                         // на проверку карточек: сервер без карточек их тем
                         // более не знает, а обрыв от незнакомого сообщения
@@ -844,6 +892,14 @@ impl Engine {
                         if self.stats_supported {
                             write_msg(&mut send, &ClientMsg::GetStats).await?;
                             self.stats_waiters.push_back(reply);
+                        } else {
+                            let _ = reply.send(Err(crate::devices::old_server_stats().into()));
+                        }
+                    }
+                    Control::PinStats(reply) => {
+                        if knows_pins(conn.alpn()) {
+                            write_msg(&mut send, &ClientMsg::GetPinStats).await?;
+                            self.pin_stats_waiters.push_back(reply);
                         } else {
                             let _ = reply.send(Err(crate::devices::old_server_stats().into()));
                         }
@@ -902,6 +958,12 @@ impl Engine {
 
     /// Сообщение сервера посреди сессии. Ошибка заканчивает сессию.
     fn handle_msg(&mut self, key: &GroupKey, msg: ServerMsg) -> Result<()> {
+        // Закрепы разбираются асинхронно, в `pin_send` (там же, где их
+        // ответы уходят серверу).
+        if pin_engine::is_pin_msg(&msg) {
+            self.ps.inbox.push_back(msg);
+            return Ok(());
+        }
         match msg {
             ServerMsg::Deliver(sealed) => {
                 if sealed.origin != self.device && !self.known.contains_key(&sealed.origin) {
@@ -923,8 +985,29 @@ impl Engine {
             ServerMsg::Error(e) => bail!(trf("сервер: {e}", &[("e", &e)])),
             ServerMsg::GroupConfig(sealed) => self.group_config(key, sealed),
             ServerMsg::Deleted(sealed) => match key.open_delete(&sealed) {
+                // До первых страниц закрепов записки ждут: удаление
+                // закреплённого везде приходит снятием закрепа и запиской,
+                // и снятие должно успеть раньше (закреплённое записка не
+                // удаляет). Так же ждут, пока в очереди лежат неразобранные
+                // закрепы: снятие могло прийти раньше записки.
+                Ok(note) if self.pins_on() && (!self.ps.ready || !self.ps.inbox.is_empty()) => {
+                    self.ps.deferred.push(note)
+                }
                 Ok(note) => self.emit(Event::Deleted(note)),
                 Err(e) => tracing::warn!("записка об удалении не открылась: {e}"),
+            },
+            ServerMsg::Pins { .. }
+            | ServerMsg::Pinned(_)
+            | ServerMsg::PinAccepted { .. }
+            | ServerMsg::PinRejected { .. }
+            | ServerMsg::PinContentIs { .. }
+            // Ушли в очередь выше (`is_pin_msg`).
+            | ServerMsg::PinFailed { .. } => {}
+            ServerMsg::PinStats(stats) => match self.pin_stats_waiters.pop_front() {
+                Some(reply) => {
+                    let _ = reply.send(Ok(stats));
+                }
+                None => tracing::debug!("лишний ответ PinStats"),
             },
             ServerMsg::DevicesChanged => self.emit(Event::DevicesChanged),
             ServerMsg::ServerInfo { version } => {
@@ -1057,8 +1140,15 @@ impl Engine {
         {
             write_msg(&mut send2, &ClientMsg::SetGroupConfig(sealed)).await?;
         }
-        // Ответ на список значит, что карточка (и настройки) уже записаны.
+        // Закрепы — тоже до рассылки пакетов: сервер чистит закрепы старой
+        // группы при смене ключа, и устройства с новым ключом подтянут их
+        // уже из новой группы.
+        self.reseal_pins(&new_key, &mut send2).await?;
+        // Ответ на список значит, что карточка (и настройки, и закрепы) уже
+        // записаны.
         write_msg(&mut send2, &ClientMsg::ListDevices).await?;
+        // Закрепы, которые новая группа не приняла (квота сервера).
+        let mut pin_fails: Vec<clipwire_core::proto::PinFail> = Vec::new();
         loop {
             match tokio::time::timeout(CONNECT_TIMEOUT, read_msg::<_, ServerMsg>(&mut recv2))
                 .await
@@ -1066,9 +1156,26 @@ impl Engine {
             {
                 Some(ServerMsg::Devices(_)) => break,
                 Some(ServerMsg::Error(e)) => bail!(trf("новая группа: {e}", &[("e", &e)])),
+                Some(ServerMsg::PinFailed { reason, .. }) => pin_fails.push(reason),
+                // Новые id в новой группе: отказ по rev значит, что запись
+                // там уже есть (повтор), — не ошибка.
+                Some(ServerMsg::PinRejected { .. }) => {}
                 Some(_) => {}
                 None => bail!(tr("сервер закрыл соединение с новой группой")),
             }
+        }
+        if let Some(first) = pin_fails.first() {
+            tracing::warn!(
+                n = pin_fails.len(),
+                "новая группа не приняла закрепы: {first}"
+            );
+            self.emit(Event::PinFailed(trf(
+                "После смены ключа сервер не принял закрепов: {n}. {why}",
+                &[
+                    ("n", &pin_fails.len()),
+                    ("why", &pin_engine::fail_text(first)),
+                ],
+            )));
         }
 
         let envelopes =
@@ -1591,6 +1698,9 @@ fn refuse_control(ctl: Control, why: &str) {
             let _ = reply.send(Err(why.to_string()));
         }
         Control::Link(reply) => {
+            let _ = reply.send(Err(why.to_string()));
+        }
+        Control::PinStats(reply) => {
             let _ = reply.send(Err(why.to_string()));
         }
         // Удаление на этом устройстве уже сделано, в группу оно не уйдёт.

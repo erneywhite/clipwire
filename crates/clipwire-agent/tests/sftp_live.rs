@@ -127,10 +127,21 @@ async fn sftp_store_against_openssh() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    assert_eq!(external::cleanup(store.as_ref(), &g, 24).await.unwrap(), 0);
-    let removed = external::cleanup_at(store.as_ref(), &g, 24, now + 365 * 24 * 3600 * 1000)
-        .await
-        .unwrap();
+    assert_eq!(
+        external::cleanup(store.as_ref(), &g, 24, &Default::default())
+            .await
+            .unwrap(),
+        0
+    );
+    let removed = external::cleanup_at(
+        store.as_ref(),
+        &g,
+        24,
+        now + 365 * 24 * 3600 * 1000,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     assert!(removed >= 1, "чистка ничего не удалила");
     store.delete_dir(&group_dir(&g)).await.unwrap();
     assert!(store.list(&group_dir(&g)).await.unwrap().is_empty());

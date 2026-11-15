@@ -1419,3 +1419,373 @@ async fn server_info_reaches_v7_only() -> Result<()> {
     }
     Ok(())
 }
+
+// --- Закрепы группы (`clipwire/8`) ---
+
+/// Закреп с текстом `text` и подписью `note`: запечатанные состояние и
+/// содержимое.
+fn sealed_pin(
+    key: &GroupKey,
+    pin: &clipwire_core::PinId,
+    device: DeviceId,
+    text: &str,
+    note: &str,
+    pinned: bool,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let item = Item::new(device, Content::Text(text.into()));
+    let state = clipwire_core::PinState {
+        hash: item.content.hash(),
+        pinned,
+        note: note.into(),
+        at_ms: 1,
+        seq: 1,
+        device,
+    };
+    Ok((
+        key.seal_pin_state(pin, &state)?,
+        key.seal_pin_content(pin, &item)?,
+    ))
+}
+
+impl Client {
+    /// Следующее сообщение о закрепах: прочие (`ServerInfo`,
+    /// `DevicesChanged`) пропускаются.
+    async fn next_pin(&mut self) -> Result<ServerMsg> {
+        loop {
+            match self.next().await? {
+                ServerMsg::ServerInfo { .. } | ServerMsg::DevicesChanged => {}
+                other => return Ok(other),
+            }
+        }
+    }
+
+    async fn pin_set(
+        &mut self,
+        pin_id: clipwire_core::PinId,
+        base_rev: u64,
+        pinned: bool,
+        state: Vec<u8>,
+        content: Option<Vec<u8>>,
+        blobs: Vec<BlobId>,
+    ) -> Result<ServerMsg> {
+        let msg = ClientMsg::PinSet {
+            pin_id,
+            base_rev,
+            pinned,
+            state,
+            content,
+            blobs,
+        };
+        write_msg(&mut self.send, &msg).await?;
+        self.next_pin().await
+    }
+
+    async fn pins_since(
+        &mut self,
+        rev: u64,
+    ) -> Result<(Vec<clipwire_core::proto::PinRecord>, bool)> {
+        write_msg(&mut self.send, &ClientMsg::PinsSince { rev }).await?;
+        match self.next_pin().await? {
+            ServerMsg::Pins { records, more, .. } => Ok((records, more)),
+            other => anyhow::bail!("ждали Pins, пришло {other:?}"),
+        }
+    }
+}
+
+/// Закреп: создание, рассылка `Pinned` только по `clipwire/8`, отказ на
+/// устаревший `base_rev`, правка подписи без содержимого, снятие, выдача
+/// при входе через `PinsSince`.
+#[tokio::test]
+async fn pins_cas_and_broadcast_reach_v8_only() -> Result<()> {
+    use clipwire_core::PinId;
+    use clipwire_core::proto::{ALPN_7, ALPN_8};
+    let (server, relay) = start_server().await?;
+    let info = server.info.clone();
+    let key = GroupKey::generate()?;
+
+    let mut a = Client::connect_alpn(&info, &relay, ALPN_8).await?;
+    a.join(&key).await?;
+    let mut b = Client::connect_alpn(&info, &relay, ALPN_8).await?;
+    b.join(&key).await?;
+    let mut old = Client::connect_alpn(&info, &relay, ALPN_7).await?;
+    old.join(&key).await?;
+
+    let pin = PinId::random()?;
+    let (state, content) = sealed_pin(&key, &pin, a.device, "ssh-ключ", "сервер", true)?;
+    match a
+        .pin_set(pin, 0, true, state.clone(), Some(content.clone()), vec![])
+        .await?
+    {
+        ServerMsg::PinAccepted { pin_id, rev } => assert_eq!((pin_id, rev), (pin, 1)),
+        other => anyhow::bail!("ждали PinAccepted, пришло {other:?}"),
+    }
+    match b.next_pin().await? {
+        ServerMsg::Pinned(rec) => {
+            assert_eq!((rec.pin_id, rec.rev, rec.pinned), (pin, 1, true));
+            let st = key.open_pin_state(&pin, &rec.state)?;
+            assert_eq!(st.note, "сервер");
+            let item = key.open_pin_content(&pin, rec.content.as_ref().context("содержимое")?)?;
+            assert!(st.matches(&item));
+            assert_eq!(rec.content_len, content.len() as u64);
+        }
+        other => anyhow::bail!("ждали Pinned, пришло {other:?}"),
+    }
+
+    // b не видел правки 1: отказ с текущей записью.
+    let (s2, _) = sealed_pin(&key, &pin, b.device, "ssh-ключ", "старый", true)?;
+    match b.pin_set(pin, 0, true, s2, None, vec![]).await? {
+        ServerMsg::PinRejected { pin_id, current } => {
+            assert_eq!(pin_id, pin);
+            let cur = current.context("текущая запись")?;
+            assert_eq!((cur.rev, cur.state), (1, state.clone()));
+        }
+        other => anyhow::bail!("ждали PinRejected, пришло {other:?}"),
+    }
+    // С верным base_rev — только подпись, содержимое прежнее.
+    let (s3, _) = sealed_pin(&key, &pin, b.device, "ssh-ключ", "прод", true)?;
+    match b.pin_set(pin, 1, true, s3, None, vec![]).await? {
+        ServerMsg::PinAccepted { rev, .. } => assert_eq!(rev, 2),
+        other => anyhow::bail!("ждали PinAccepted, пришло {other:?}"),
+    }
+    match a.next_pin().await? {
+        ServerMsg::Pinned(rec) => {
+            assert_eq!(rec.rev, 2);
+            assert_eq!(key.open_pin_state(&pin, &rec.state)?.note, "прод");
+            assert_eq!(rec.content.as_deref(), Some(&content[..]));
+        }
+        other => anyhow::bail!("ждали Pinned, пришло {other:?}"),
+    }
+    // Закреп, о котором сервер не знает, с base_rev не 0.
+    let ghost = PinId::random()?;
+    let (s4, c4) = sealed_pin(&key, &ghost, a.device, "x", "", true)?;
+    match a.pin_set(ghost, 7, true, s4, Some(c4), vec![]).await? {
+        ServerMsg::PinRejected { current: None, .. } => {}
+        other => anyhow::bail!("ждали PinRejected без записи, пришло {other:?}"),
+    }
+    // Снятие: запись остаётся без содержимого.
+    let (s5, _) = sealed_pin(&key, &pin, a.device, "ssh-ключ", "", false)?;
+    match a.pin_set(pin, 2, false, s5, None, vec![]).await? {
+        ServerMsg::PinAccepted { rev, .. } => assert_eq!(rev, 3),
+        other => anyhow::bail!("ждали PinAccepted, пришло {other:?}"),
+    }
+    match b.next_pin().await? {
+        ServerMsg::Pinned(rec) => assert_eq!(
+            (rec.rev, rec.pinned, rec.content_len, rec.content),
+            (3, false, 0, None)
+        ),
+        other => anyhow::bail!("ждали Pinned, пришло {other:?}"),
+    }
+
+    // Новое устройство забирает закрепы само; с курсора — только новее.
+    let mut c = Client::connect_alpn(&info, &relay, ALPN_8).await?;
+    c.join(&key).await?;
+    let (records, more) = c.pins_since(0).await?;
+    assert!(!more);
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        (records[0].pin_id, records[0].rev, records[0].pinned),
+        (pin, 3, false)
+    );
+    assert_eq!(c.pins_since(3).await?, (vec![], false));
+    write_msg(&mut c.send, &ClientMsg::PinContent { pin_id: pin }).await?;
+    match c.next_pin().await? {
+        ServerMsg::PinContentIs { content: None, .. } => {}
+        other => anyhow::bail!("ждали PinContentIs без содержимого, пришло {other:?}"),
+    }
+
+    // Клиент /7 ничего из этого не получал: первым к нему приходит элемент.
+    a.push_text(&key, "проверка").await?;
+    loop {
+        match old.next().await? {
+            ServerMsg::Deliver(_) => break,
+            ServerMsg::DevicesChanged | ServerMsg::ServerInfo { .. } => {}
+            other => anyhow::bail!("клиент /7: пришло {other:?}"),
+        }
+    }
+    Ok(())
+}
+
+/// Страницы `PinsSince`: по числу записей, а большое содержимое не кладётся
+/// ни в страницу, ни в рассылку и отдаётся по `PinContent`.
+#[tokio::test]
+async fn pins_come_in_pages_and_large_content_on_request() -> Result<()> {
+    use clipwire_core::PinId;
+    use clipwire_core::proto::ALPN_8;
+    let (server, relay) = start_server_with(|c| c.max_item_bytes = 1024 * 1024).await?;
+    let info = server.info.clone();
+    let key = GroupKey::generate()?;
+    let mut a = Client::connect_alpn(&info, &relay, ALPN_8).await?;
+    a.join(&key).await?;
+
+    let total = 260;
+    for i in 0..total {
+        let pin = PinId::random()?;
+        let (s, c) = sealed_pin(&key, &pin, a.device, &format!("запись {i}"), "", true)?;
+        match a.pin_set(pin, 0, true, s, Some(c), vec![]).await? {
+            ServerMsg::PinAccepted { .. } => {}
+            other => anyhow::bail!("ждали PinAccepted, пришло {other:?}"),
+        }
+    }
+    let (first, more) = a.pins_since(0).await?;
+    assert!(more);
+    assert!(first.len() < total);
+    let (rest, more) = a.pins_since(first.last().unwrap().rev).await?;
+    assert!(!more);
+    assert_eq!(first.len() + rest.len(), total);
+    assert!(first.iter().chain(&rest).all(|r| r.content.is_some()));
+
+    // 300 КиБ — больше, чем кладётся в рассылку.
+    let mut b = Client::connect_alpn(&info, &relay, ALPN_8).await?;
+    b.join(&key).await?;
+    let big = PinId::random()?;
+    let (s, c) = sealed_pin(&key, &big, a.device, &"я".repeat(150 * 1024), "", true)?;
+    match a.pin_set(big, 0, true, s, Some(c.clone()), vec![]).await? {
+        ServerMsg::PinAccepted { .. } => {}
+        other => anyhow::bail!("ждали PinAccepted, пришло {other:?}"),
+    }
+    match b.next_pin().await? {
+        ServerMsg::Pinned(rec) => {
+            assert_eq!((rec.pin_id, rec.content.as_ref()), (big, None));
+            assert_eq!(rec.content_len, c.len() as u64);
+        }
+        other => anyhow::bail!("ждали Pinned, пришло {other:?}"),
+    }
+    write_msg(&mut b.send, &ClientMsg::PinContent { pin_id: big }).await?;
+    match b.next_pin().await? {
+        ServerMsg::PinContentIs { pin_id, content } => {
+            assert_eq!(pin_id, big);
+            let item = key.open_pin_content(&big, &content.context("содержимое")?)?;
+            assert!(matches!(item.content, Content::Text(t) if t.chars().count() == 150 * 1024));
+        }
+        other => anyhow::bail!("ждали PinContentIs, пришло {other:?}"),
+    }
+    Ok(())
+}
+
+/// Квоты на число и объём закрепов и предел размера: отказ `PinFailed`,
+/// соединение остаётся; `GetPinStats` показывает занятое.
+#[tokio::test]
+async fn pin_quotas_refuse_without_disconnect() -> Result<()> {
+    use clipwire_core::PinId;
+    use clipwire_core::proto::{ALPN_8, PinFail, PinStats};
+    let guards = Guards {
+        pin_max: 2,
+        pin_bytes: 2000,
+        ..Guards::default()
+    };
+    let (server, relay) = start_server_guarded(|_| {}, guards).await?;
+    let info = server.info.clone();
+    let key = GroupKey::generate()?;
+    let mut a = Client::connect_alpn(&info, &relay, ALPN_8).await?;
+    a.join(&key).await?;
+
+    let mut used = 0u64;
+    let mut pins = Vec::new();
+    for i in 0..2 {
+        let pin = PinId::random()?;
+        let (s, c) = sealed_pin(&key, &pin, a.device, &format!("{i}"), "", true)?;
+        used += (s.len() + c.len()) as u64;
+        match a.pin_set(pin, 0, true, s, Some(c), vec![]).await? {
+            ServerMsg::PinAccepted { .. } => pins.push(pin),
+            other => anyhow::bail!("ждали PinAccepted, пришло {other:?}"),
+        }
+    }
+    let third = PinId::random()?;
+    let (s, c) = sealed_pin(&key, &third, a.device, "3", "", true)?;
+    match a
+        .pin_set(third, 0, true, s.clone(), Some(c.clone()), vec![])
+        .await?
+    {
+        ServerMsg::PinFailed { pin_id, reason } => {
+            assert_eq!(pin_id, third);
+            assert_eq!(reason, PinFail::TooMany { max: 2 });
+        }
+        other => anyhow::bail!("ждали PinFailed, пришло {other:?}"),
+    }
+    // Содержимое больше предела сервера (CLIPWIRE_MAX_ITEM_BYTES в тесте 4096).
+    let (s2, c2) = sealed_pin(&key, &pins[0], a.device, &"x".repeat(8000), "", true)?;
+    match a.pin_set(pins[0], 1, true, s2, Some(c2), vec![]).await? {
+        ServerMsg::PinFailed {
+            reason: PinFail::TooLarge { .. },
+            ..
+        } => {}
+        other => anyhow::bail!("ждали TooLarge, пришло {other:?}"),
+    }
+    // Объём: 2000 байт на группу, а такое содержимое их перерастёт.
+    let (s3, c3) = sealed_pin(&key, &pins[0], a.device, &"x".repeat(2500), "", true)?;
+    match a.pin_set(pins[0], 1, true, s3, Some(c3), vec![]).await? {
+        ServerMsg::PinFailed { reason, .. } => assert_eq!(reason, PinFail::NoSpace { max: 2000 }),
+        other => anyhow::bail!("ждали NoSpace, пришло {other:?}"),
+    }
+    // Нарушение формы: файлы у снятого закрепа.
+    let (s4, _) = sealed_pin(&key, &pins[0], a.device, "0", "", false)?;
+    match a
+        .pin_set(pins[0], 1, false, s4.clone(), None, vec![BlobId([1; 16])])
+        .await?
+    {
+        ServerMsg::PinFailed {
+            reason: PinFail::Invalid(_),
+            ..
+        } => {}
+        other => anyhow::bail!("ждали Invalid, пришло {other:?}"),
+    }
+    write_msg(&mut a.send, &ClientMsg::GetPinStats).await?;
+    match a.next_pin().await? {
+        ServerMsg::PinStats(st) => assert_eq!(
+            st,
+            PinStats {
+                pins: 2,
+                bytes: used,
+                max_pins: 2,
+                max_bytes: 2000
+            }
+        ),
+        other => anyhow::bail!("ждали PinStats, пришло {other:?}"),
+    }
+    // После снятия место под новый закреп есть; соединение всё это время живо.
+    match a.pin_set(pins[0], 1, false, s4, None, vec![]).await? {
+        ServerMsg::PinAccepted { .. } => {}
+        other => anyhow::bail!("ждали PinAccepted, пришло {other:?}"),
+    }
+    match a.pin_set(third, 0, true, s, Some(c), vec![]).await? {
+        ServerMsg::PinAccepted { .. } => {}
+        other => anyhow::bail!("ждали PinAccepted, пришло {other:?}"),
+    }
+    Ok(())
+}
+
+/// Файл закреплённой записи скачивается и после срока хранения, обычный —
+/// нет.
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_file_outlives_ttl() -> Result<()> {
+    use clipwire_core::PinId;
+    use clipwire_core::proto::ALPN_8;
+    let (server, relay) = start_server_with(|c| c.ttl = Duration::from_secs(1)).await?;
+    let info = server.info.clone();
+    let key = GroupKey::generate()?;
+    let mut a = Client::connect_alpn(&info, &relay, ALPN_8).await?;
+    a.join(&key).await?;
+
+    let data = sample(1000);
+    let (kept, gone) = (BlobId::random()?, BlobId::random()?);
+    upload(&a.conn, &key, kept, &data).await?;
+    upload(&a.conn, &key, gone, &data).await?;
+    let pin = PinId::random()?;
+    let (s, c) = sealed_pin(&key, &pin, a.device, "файл", "", true)?;
+    match a.pin_set(pin, 0, true, s, Some(c), vec![kept]).await? {
+        ServerMsg::PinAccepted { .. } => {}
+        other => anyhow::bail!("ждали PinAccepted, пришло {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(download(&a.conn, &key, kept).await?, data);
+    let mut s = BlobStream::open(
+        &a.conn,
+        BlobRequest::Get {
+            blob: gone,
+            from: 0,
+        },
+    )
+    .await?;
+    assert_eq!(expect_fail(&mut s).await?, BlobFail::NotFound);
+    Ok(())
+}

@@ -35,6 +35,8 @@ const en: Record<string, string> = {
   "Пробел": "Space",
   "предпросмотр (при пустом поиске)": "preview (when search is empty)",
   "закрепить": "pin",
+  "подписать закреплённую запись": "add a note to a pinned item",
+  "Закрепы на сервере": "Pins on the server",
   "удалить из истории (при пустом поиске)": "delete from history (when search is empty)",
   "удалить из истории": "delete from history",
   "удалить, когда в поиске есть текст": "delete when search has text",

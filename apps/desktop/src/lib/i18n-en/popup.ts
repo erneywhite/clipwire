@@ -96,6 +96,14 @@ const en: Record<string, string> = {
   'Без форматирования': 'Paste as plain text',
   'Просмотр': 'Preview',
   'Пробел': 'Space',
+  // Подписи и закрепы
+  'Подпись бывает только у закреплённых записей: сначала закрепите (Ctrl+P)': 'Only pinned items can have a note: pin it first (Ctrl+P)',
+  'подписать': 'note',
+  'Изменить подпись ({keys})': 'Edit note ({keys})',
+  '+ подпись': '+ note',
+  'Убрать закреплённую запись': 'Remove pinned item',
+  'Закреплённая запись': 'Pinned item',
+  'Подписать…': 'Edit note…',
 }
 
 export default en

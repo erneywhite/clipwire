@@ -12,7 +12,7 @@
   import { applyTheme } from '../lib/theme'
   import * as fmt from '../lib/format'
   import { bytesLabel } from '../lib/format'
-  import { devicesLabel, historyLabel, lastSyncLabel, linkLabel, quotaLabel, serverVersionLabel, serverFilesLabel, serverItemsLabel, storageLabel } from '../lib/overview'
+  import { devicesLabel, historyLabel, lastSyncLabel, linkLabel, pinsLabel, quotaLabel, serverVersionLabel, serverFilesLabel, serverItemsLabel, storageLabel } from '../lib/overview'
   import { fromEvent, label as hotkeyLabel } from '../lib/hotkey'
   import Toggle from './Toggle.svelte'
   import TitleBar from './TitleBar.svelte'
@@ -832,7 +832,7 @@
 
         <h2>{t('В окне вставки')}</h2>
         <div class="card">
-          {#each [['↑ ↓', t('выбрать')], [t('Enter, двойной клик'), t('вставить')], [keys('Ctrl + 1…9'), t('вставить элемент по номеру')], [t('Пробел'), t('предпросмотр (при пустом поиске)')], [keys('Ctrl + P'), t('закрепить')], ...(isMac ? [['⌘⌫', t('удалить из истории')]] : [['Delete', t('удалить из истории (при пустом поиске)')], ['Shift + Delete', t('удалить, когда в поиске есть текст')]]), [t('Правый клик, клавиша меню'), t('действия с записью')], ['Tab', t('История ↔ Закреплённое')], [keys('Alt + ← →'), t('фильтр: текст, ссылки, картинки, файлы')], ['Esc', t('закрыть')]] as [k, v] (k)}
+          {#each [['↑ ↓', t('выбрать')], [t('Enter, двойной клик'), t('вставить')], [keys('Ctrl + 1…9'), t('вставить элемент по номеру')], [t('Пробел'), t('предпросмотр (при пустом поиске)')], [keys('Ctrl + P'), t('закрепить')], [keys('Ctrl + R'), t('подписать закреплённую запись')], ...(isMac ? [['⌘⌫', t('удалить из истории')]] : [['Delete', t('удалить из истории (при пустом поиске)')], ['Shift + Delete', t('удалить, когда в поиске есть текст')]]), [t('Правый клик, клавиша меню'), t('действия с записью')], ['Tab', t('История ↔ Закреплённое')], [keys('Alt + ← →'), t('фильтр: текст, ссылки, картинки, файлы')], ['Esc', t('закрыть')]] as [k, v] (k)}
             <div class="kv"><span class="mono">{k}</span><span>{v}</span></div>
           {/each}
         </div>
@@ -927,6 +927,15 @@
                 <span class="tone" data-tone={q.tone}>{q.text}</span>
               </div>
             {/if}
+            <div class="kv">
+              <span>{t('Закрепы на сервере')}</span>
+              {#if stats?.pins}
+                {@const p = pinsLabel(stats.pins, fmt)}
+                <span class="tone" data-tone={p.tone}>{p.text}</span>
+              {:else}
+                <span class="tone" data-tone="muted">{stats?.pins_error ?? '—'}</span>
+              {/if}
+            </div>
             <div class="kv">
               <span>{t('Устройств в группе')}</span>
               {#if groupDevices}

@@ -170,8 +170,13 @@ async fn s3_store_against_real_server() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    assert_eq!(external::cleanup(&store, &g, 24).await.unwrap(), 0);
-    let removed = external::cleanup_at(&store, &g, 24, now + year)
+    assert_eq!(
+        external::cleanup(&store, &g, 24, &Default::default())
+            .await
+            .unwrap(),
+        0
+    );
+    let removed = external::cleanup_at(&store, &g, 24, now + year, &Default::default())
         .await
         .unwrap();
     println!("cleanup removed {removed}");

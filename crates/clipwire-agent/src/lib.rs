@@ -16,6 +16,7 @@ pub mod loopguard;
 pub mod p2p;
 #[cfg(target_os = "macos")]
 pub mod paste_import;
+pub mod pins;
 pub mod read_budget;
 pub mod secret;
 pub mod service;

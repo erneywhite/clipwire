@@ -71,3 +71,16 @@ const stale = serverVersionLabel({ server_version: '0.3.0', server_outdated: tru
 check(stale.text === '0.3.0 · обновите образ до 0.3.1' && stale.tone === 'warn', 'сервер старее приложения')
 const unknown = serverVersionLabel({ server_version: null, server_outdated: true, client_version: '0.3.1' })
 check(unknown.text === 'старше 0.3.1 · обновите образ до 0.3.1' && unknown.tone === 'warn', 'сервер без версии')
+
+// Закрепы на сервере: тон по ближайшему пределу, число с пределом — только когда упирается оно.
+const { pinsLabel } = (await import('./overview' + '.ts')) as typeof import('./overview')
+const MB = 1024 ** 2
+const pins = { pins: 12, bytes: 3.4 * MB, max_pins: 1000, max_bytes: 2 * GB }
+const pl = pinsLabel(pins, fmt)
+check(pl.text === '12 · 3,4 МБ из 2,0 ГБ' && pl.tone === 'ok', pl.text)
+check(pinsLabel({ ...pins, bytes: 1.7 * GB }, fmt).tone === 'warn', 'место под закрепы 85 %')
+const many = pinsLabel({ ...pins, pins: 960 }, fmt)
+check(many.text === '960 из 1000 · 3,4 МБ из 2,0 ГБ' && many.tone === 'error', many.text)
+check(pinsLabel({ ...pins, max_pins: 0, max_bytes: 0 }, fmt).text === '12 · 3,4 МБ', 'без пределов')
+check(pinsLabel({ ...pins, pins: 0, bytes: 0 }, fmt).text === '0 · 0 Б из 2,0 ГБ', 'пусто')
+console.log('overview pins: всё прошло')

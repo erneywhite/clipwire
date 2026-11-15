@@ -18,7 +18,10 @@ use uuid::Uuid;
 mod config;
 mod deletes;
 mod devices;
+mod pins;
 pub use devices::{RekeyLimits, RekeyOutcome, Rotation};
+use pins::KEPT_BY_PIN;
+pub use pins::{PinOutcome, PinQuota, PinWrite};
 
 // shortcut: синхронный rusqlite под std::Mutex прямо из async-кода. Запросы
 // короткие, а нагрузка — единицы устройств. Переделать на пул и spawn_blocking,
@@ -79,6 +82,7 @@ const IDLE_GROUP: &str = "NOT EXISTS (SELECT 1 FROM devices AS d
                              WHERE d.group_id = g.group_id AND d.last_seen_ms >= ?1)
      AND NOT EXISTS (SELECT 1 FROM items AS i WHERE i.group_id = g.group_id)
      AND NOT EXISTS (SELECT 1 FROM blobs AS b WHERE b.group_id = g.group_id)
+     AND NOT EXISTS (SELECT 1 FROM pins AS p WHERE p.group_id = g.group_id AND p.pinned = 1)
      AND g.rotated_ms IS NULL";
 
 /// У какой группы удалить самый старый элемент, когда история всех групп
@@ -182,6 +186,7 @@ impl Store {
         devices::migrate(&conn)?;
         config::migrate(&conn)?;
         deletes::migrate(&conn)?;
+        pins::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -413,8 +418,9 @@ impl Store {
         )?;
         let mut files = 0u64;
         let mut file_bytes = 0u64;
-        let mut stmt =
-            conn.prepare("SELECT size, have FROM blobs WHERE group_id = ?1 AND created_ms >= ?2")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT size, have FROM blobs WHERE group_id = ?1 AND (created_ms >= ?2 OR {KEPT_BY_PIN})"
+        ))?;
         let rows = stmt.query_map(params![&group.0[..], not_before_ms], |r| {
             Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
         })?;
@@ -428,8 +434,10 @@ impl Store {
         drop(stmt);
         // Та же формула sealed_size, что при проверке квоты в `blob_begin`.
         let quota_used: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(size + MAX(1, (size + ?3 - 1) / ?3) * ?4), 0)
-             FROM blobs WHERE group_id = ?1 AND created_ms >= ?2",
+            &format!(
+                "SELECT COALESCE(SUM(size + MAX(1, (size + ?3 - 1) / ?3) * ?4), 0)
+                 FROM blobs WHERE group_id = ?1 AND (created_ms >= ?2 OR {KEPT_BY_PIN})"
+            ),
             params![&group.0[..], not_before_ms, CHUNK as i64, OVERHEAD as i64],
             |r| r.get(0),
         )?;
@@ -477,15 +485,19 @@ impl Store {
         if is_rotated(&tx, group)? {
             return Ok(BlobBegin::Rotated);
         }
-        let existing: Option<(i64, i64, i64)> = tx
+        // Третье — истёк ли файл: файлы живых закрепов не истекают.
+        let existing: Option<(i64, i64, bool)> = tx
             .query_row(
-                "SELECT size, have, created_ms FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
-                params![&group.0[..], &blob.0[..]],
+                &format!(
+                    "SELECT size, have, created_ms < ?3 AND NOT {KEPT_BY_PIN}
+                     FROM blobs WHERE group_id = ?1 AND blob_id = ?2"
+                ),
+                params![&group.0[..], &blob.0[..], not_before_ms],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         match existing {
-            Some((_, _, created)) if created < not_before_ms => {
+            Some((_, _, true)) => {
                 tx.execute(
                     "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
                     params![&group.0[..], &blob.0[..]],
@@ -506,9 +518,11 @@ impl Store {
         // sealed_size(size) = size + max(1, ceil(size / CHUNK)) * OVERHEAD,
         // посчитано прямо в SQLite: так не надо тянуть все строки в память.
         let (group_used, total_used): (i64, i64) = tx.query_row(
-            "SELECT COALESCE(SUM(CASE WHEN group_id = ?1 THEN s END), 0), COALESCE(SUM(s), 0)
-             FROM (SELECT group_id, size + MAX(1, (size + ?3 - 1) / ?3) * ?4 AS s
-                   FROM blobs WHERE created_ms >= ?2)",
+            &format!(
+                "SELECT COALESCE(SUM(CASE WHEN group_id = ?1 THEN s END), 0), COALESCE(SUM(s), 0)
+                 FROM (SELECT group_id, size + MAX(1, (size + ?3 - 1) / ?3) * ?4 AS s
+                       FROM blobs WHERE created_ms >= ?2 OR {KEPT_BY_PIN})"
+            ),
             params![&group.0[..], not_before_ms, CHUNK as i64, OVERHEAD as i64],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -578,8 +592,10 @@ impl Store {
         Ok(self
             .conn()
             .query_row(
-                "SELECT size, have FROM blobs
-                 WHERE group_id = ?1 AND blob_id = ?2 AND created_ms >= ?3",
+                &format!(
+                    "SELECT size, have FROM blobs
+                     WHERE group_id = ?1 AND blob_id = ?2 AND (created_ms >= ?3 OR {KEPT_BY_PIN})"
+                ),
                 params![&group.0[..], &blob.0[..], not_before_ms],
                 |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
             )
@@ -601,8 +617,9 @@ impl Store {
         let tx = conn.transaction()?;
         let mut out = Vec::new();
         {
-            let mut stmt =
-                tx.prepare("SELECT group_id, blob_id FROM blobs WHERE created_ms < ?1")?;
+            let mut stmt = tx.prepare(&format!(
+                "SELECT group_id, blob_id FROM blobs WHERE created_ms < ?1 AND NOT {KEPT_BY_PIN}"
+            ))?;
             let rows = stmt.query_map(params![not_before_ms], |r| {
                 Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
             })?;
@@ -615,7 +632,7 @@ impl Store {
             }
         }
         tx.execute(
-            "DELETE FROM blobs WHERE created_ms < ?1",
+            &format!("DELETE FROM blobs WHERE created_ms < ?1 AND NOT {KEPT_BY_PIN}"),
             params![not_before_ms],
         )?;
         tx.commit()?;

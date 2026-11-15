@@ -33,6 +33,8 @@ services:
       # CLIPWIRE_MAX_DEVICES: 64
       # CLIPWIRE_HISTORY_TOTAL_BYTES: 1073741824
       # CLIPWIRE_MAX_DEVICE_CONNS: 4
+      # CLIPWIRE_PIN_MAX: 5000
+      # CLIPWIRE_PIN_BYTES: 2147483648
       # RUST_LOG: info
     ports:
       # relay по HTTP, только для локального прокси панели

@@ -16,6 +16,7 @@ use crate::blobs::{Blobs, Transfer};
 use crate::clipboard::{self, Watcher};
 use crate::history::{CardKind, Entry, History, local_entry, make_thumb, now_ms};
 use crate::loopguard::LoopGuard;
+use crate::pins::{PinSource, Pins};
 use crate::state::{AgentState, Paths};
 use crate::sync::{Engine, Event, Outgoing, Status};
 
@@ -61,6 +62,12 @@ pub enum UiEvent {
     /// Внешнее хранилище группы недоступно, файл ушёл через сервер Clipwire
     /// (текст для человека).
     StorageWarning(String),
+    /// Закрепы или подписи изменились с другого устройства (или запись
+    /// пришла закреплённой): список стоит перечитать.
+    PinsChanged,
+    /// Сервер не принял закреп (квота, размер): текст для человека. Запись
+    /// закреплена только на этом устройстве.
+    PinFailed(String),
 }
 
 pub type UiCallback = Arc<dyn Fn(UiEvent) + Send + Sync>;
@@ -89,6 +96,88 @@ pub struct Service {
     controller: Option<crate::devices::Controller>,
     /// Настройки хранилища файлов группы. Только в группе.
     storage: Option<crate::group_config::StorageController>,
+    /// Закрепы группы (книга с очередью правок). Только в группе.
+    pins: Option<Arc<Pins>>,
+}
+
+/// Записи истории для движка закрепов (`PinSource`).
+struct HistorySource {
+    history: Arc<Mutex<History>>,
+    limit_mb: Arc<AtomicU64>,
+    /// Это устройство: источник своих записей (у записей, скопированных
+    /// без группы, в истории нулевой id).
+    device: DeviceId,
+}
+
+impl HistorySource {
+    fn lock(&self) -> std::sync::MutexGuard<'_, History> {
+        self.history.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl PinSource for HistorySource {
+    fn item(&self, hash: &[u8; 32]) -> Option<Item> {
+        let h = self.lock();
+        let e = h.get(h.id_by_hash(hash)?)?;
+        drop(h);
+        let local = e.local;
+        let mut item = item_of(e);
+        if local {
+            item.origin = self.device;
+        }
+        Some(item)
+    }
+
+    fn has(&self, hash: &[u8; 32]) -> bool {
+        self.lock().id_by_hash(hash).is_some()
+    }
+
+    fn pinned(&self) -> Vec<([u8; 32], String)> {
+        self.lock()
+            .pinned_notes()
+            .into_iter()
+            .map(|(h, n, _)| (h, n))
+            .collect()
+    }
+
+    fn blobs(&self, hash: &[u8; 32]) -> Vec<BlobId> {
+        self.lock().blobs_of(hash)
+    }
+
+    fn upload_limit_mb(&self) -> u64 {
+        self.limit_mb.load(Ordering::Relaxed)
+    }
+}
+
+/// Запись истории как элемент группы (содержимое закрепа): без подписи,
+/// время — когда запись последний раз была в буфере.
+fn item_of(e: Entry) -> Item {
+    let mut ext = e.ext;
+    crate::history::strip_note(&mut ext);
+    Item {
+        id: e.id,
+        origin: e.origin,
+        device_name: e.device_name,
+        created_at_ms: e.seen_ms.max(0) as u64,
+        content: e.content,
+        ext,
+    }
+}
+
+/// Элемент из содержимого закрепа как запись истории.
+fn entry_of_pin(item: Item) -> Entry {
+    let mut ext = item.ext;
+    crate::history::strip_note(&mut ext);
+    Entry {
+        id: item.id,
+        origin: item.origin,
+        device_name: item.device_name,
+        local: false,
+        content: item.content,
+        seen_ms: item.created_at_ms as i64,
+        pinned: true,
+        ext,
+    }
 }
 
 /// Копирование на этом устройстве: решить, как передаются файлы, отправить
@@ -278,6 +367,7 @@ impl Service {
         });
         let mut controller = None;
         let mut storage = None;
+        let mut pins = None;
         if let Some(b) = &blobs {
             let on_event = on_event.clone();
             b.storage().set_sink(Arc::new(move |e| {
@@ -308,6 +398,19 @@ impl Service {
                 .with_blobs(blobs.clone().expect("в группе передача файлов есть"))
                 .with_control(ctl_rx);
                 let device = engine.device();
+                let book = Pins::open(&paths.dir, group_key.group_id());
+                let source = HistorySource {
+                    history: history.clone(),
+                    limit_mb: upload_limit_mb.clone(),
+                    device,
+                };
+                let engine = engine.with_pins(book.clone(), Arc::new(source));
+                if let Some(b) = &blobs {
+                    // Файлы закрепов по книге — сразу, до первой чистки
+                    // внешнего хранилища: связи с сервером может и не быть.
+                    b.storage().set_kept(book.kept_blobs());
+                }
+                pins = Some(book);
                 if let Some(b) = &blobs {
                     storage = Some(crate::group_config::StorageController::new(
                         ctl_tx.clone(),
@@ -350,12 +453,13 @@ impl Service {
 
         // События движка.
         {
-            let (paused, status, guard, on_event, history) = (
+            let (paused, status, guard, on_event, history, pins_for_events) = (
                 paused.clone(),
                 status.clone(),
                 guard.clone(),
                 on_event.clone(),
                 history.clone(),
+                pins.clone(),
             );
             rt.spawn(async move {
                 while let Some(ev) = event_rx.recv().await {
@@ -394,8 +498,9 @@ impl Service {
                                     seen_ms: now_ms(),
                                     pinned: false,
                                     // Приложение-источник и прочие сведения
-                                    // приходят внутри элемента.
-                                    ext: item.ext.clone(),
+                                    // приходят внутри элемента; подпись —
+                                    // только закрепом.
+                                    ext: without_note(&item.ext),
                                 },
                             );
                             on_event(UiEvent::Received(item));
@@ -414,7 +519,7 @@ impl Service {
                                     content: item.content,
                                     seen_ms: item.created_at_ms as i64,
                                     pinned: false,
-                                    ext: item.ext,
+                                    ext: without_note(&item.ext),
                                 })
                                 .collect();
                             // Миниатюры — без замка истории и только новым
@@ -467,6 +572,21 @@ impl Service {
                                 Err(e) => tracing::warn!("удаление с другого устройства: {e:#}"),
                             }
                         }
+                        Event::Pin(p) => {
+                            let res = tokio::task::spawn_blocking({
+                                let history = history.clone();
+                                let book = pins_for_events.clone();
+                                move || apply_pin_event(&history, book.as_deref(), p)
+                            })
+                            .await;
+                            match res {
+                                Ok(Ok(true)) => on_event(UiEvent::PinsChanged),
+                                Ok(Ok(false)) => {}
+                                Ok(Err(e)) => tracing::warn!("закреп не применился: {e:#}"),
+                                Err(e) => tracing::warn!("закреп не применился: {e}"),
+                            }
+                        }
+                        Event::PinFailed(why) => on_event(UiEvent::PinFailed(why)),
                         Event::KnownDevices(cards) => {
                             if let Some(g) = group
                                 && let Err(e) = crate::devices::save_known(&paths, g, &cards)
@@ -552,7 +672,14 @@ impl Service {
             watcher: Some(watcher),
             controller,
             storage,
+            pins,
         })
+    }
+
+    /// Закрепы группы: правки отсюда уходят на остальные устройства. `None`
+    /// в локальном режиме (закрепы только в истории).
+    pub fn pins(&self) -> Option<Arc<Pins>> {
+        self.pins.clone()
     }
 
     pub fn device(&self) -> DeviceId {
@@ -667,6 +794,35 @@ impl Service {
     }
 }
 
+/// Закреп группы — в историю (событие движка `Event::Pin`). Миниатюра
+/// новой записи считается до замка истории. Если своя правка этого хэша
+/// встала в очередь, пока событие шло, её закреп главнее: команды ставят
+/// правку в очередь до записи в историю, а проверка идёт под замком
+/// истории, поэтому только что поставленный закреп не снимется пришедшим
+/// раньше снятием. Возвращает, изменилась ли история.
+fn apply_pin_event(
+    history: &Mutex<History>,
+    pins: Option<&Pins>,
+    p: crate::pins::PinApply,
+) -> Result<bool> {
+    let entry = p.item.map(entry_of_pin).map(|e| {
+        let thumb = make_thumb(&e);
+        (e, thumb)
+    });
+    let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
+    if pins.is_some_and(|b| b.pending(&p.hash)) {
+        return Ok(false);
+    }
+    h.apply_pin(&p.hash, p.pinned, &p.note, entry)
+}
+
+/// Сведения элемента без подписи: подпись не ходит внутри элементов.
+fn without_note(ext: &[clipwire_core::Ext]) -> Vec<clipwire_core::Ext> {
+    let mut v = ext.to_vec();
+    crate::history::strip_note(&mut v);
+    v
+}
+
 /// Последние локальные элементы, от старых к новым, для отправки в группу.
 /// Отбор по карточкам, тела читаются только у отобранных.
 fn local_backfill(h: &History) -> Vec<(Outgoing, u64)> {
@@ -678,7 +834,7 @@ fn local_backfill(h: &History) -> Vec<(Outgoing, u64)> {
             let seen = e.seen_ms.max(0) as u64;
             let out = Outgoing {
                 content: e.content,
-                ext: e.ext,
+                ext: without_note(&e.ext),
             };
             (out, seen)
         })
@@ -885,6 +1041,39 @@ mod tests {
     use super::*;
     use crate::blobs::UploadJob;
     use clipwire_core::FileRef;
+
+    /// Снятие с сервера, пришедшее, пока здесь закрепляли заново (правка
+    /// уже в очереди книги), свежий закреп не снимает; без своей правки —
+    /// применяется.
+    #[test]
+    fn pin_event_yields_to_own_pending_edit() {
+        let history = Mutex::new(History::in_memory());
+        let content = Content::Text("закрепили только что".into());
+        let hash = content.hash();
+        let id = {
+            let mut h = history.lock().unwrap();
+            let e = local_entry(DeviceId([1; 32]), "ПК", content);
+            let id = e.id;
+            h.add(e).unwrap();
+            id
+        };
+        let pins = Pins::in_memory(clipwire_core::GroupId([1; 32]));
+        // Как `history_pin`: сначала очередь, потом история.
+        pins.pin(hash, "");
+        history.lock().unwrap().set_pinned(id, true).unwrap();
+        let unpin = crate::pins::PinApply {
+            hash,
+            pinned: false,
+            note: String::new(),
+            item: None,
+        };
+        assert!(!apply_pin_event(&history, Some(&pins), unpin.clone()).unwrap());
+        assert!(history.lock().unwrap().row(id).unwrap().pinned);
+        // Правка ушла — снятие применяется.
+        pins.update(|b| b.outbox.clear());
+        assert!(apply_pin_event(&history, Some(&pins), unpin).unwrap());
+        assert!(!history.lock().unwrap().row(id).unwrap().pinned);
+    }
 
     fn file(path: &str, size: u64, is_dir: bool) -> FileRef {
         FileRef {
