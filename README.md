@@ -320,6 +320,8 @@ Open **Sync → File storage** (the card appears only when the device is in a gr
   server, which never sees the credentials. The same ciphertext that would go to the server goes
   to the storage.
 - S3 works only over HTTPS; plain HTTP is allowed for `localhost` and local network addresses.
+  Link-local addresses (`169.254.x.x`, `fe80::`), where cloud servers keep their metadata
+  service, are refused in any case.
 - For SFTP the host key is checked against a fingerprint you confirm during the first test, and
   the password is never sent to an unknown host. A private key can be pasted or chosen as a file.
 - Saved secrets (secret key, password, private key) are never shown again. An empty field means
@@ -344,13 +346,19 @@ Full description: [docs/storage.md](docs/storage.md).
 - Content that password managers mark as private is never synced. Programs can also be excluded
   from syncing (password managers are on the list by default).
 - Files downloaded from other devices are marked as coming from the internet, so Windows (and
-  Gatekeeper on macOS) warns before running them.
+  Gatekeeper on macOS) warns before running them. Folders from other devices are unpacked
+  without the executable bit, and on macOS **Show in folder** only reveals the folder in Finder,
+  so a received `.app` does not start.
+- Clipwire presses Ctrl+V (Cmd+V) only after the window you came from is active again. If focus
+  went elsewhere, the entry just stays on the clipboard and is not pasted into a stranger window.
 - An item copied on another device more than 10 minutes ago (for example one that arrived late)
   goes to the history only and does not touch the clipboard.
 - Link cards do not execute the page and do not load single-use links (see
   [Link previews](#link-previews)).
 - Leaving a group also deletes the cache of downloaded files.
-- Settings and keys live in `%APPDATA%\Clipwire` on Windows and in `~/.config/clipwire` on Linux.
+- Settings and keys live in `%APPDATA%\Clipwire` on Windows, in
+  `~/Library/Application Support/Clipwire` on macOS and in `~/.config/clipwire` on Linux. On macOS
+  and Linux the folder is readable only by you (mode 0700).
 
 ## Updates
 
@@ -388,7 +396,7 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
 - Device name, invitation code (**Show code**), leaving the group.
 - Paste window size (one slider with a live preview next to it) and the hotkey.
 - Programs that must not be synced (password managers by default).
-- Hiding Clipwire windows during screen sharing.
+- Hiding Clipwire windows during screen sharing (Windows and macOS; Linux has no way to do it).
 - Link previews on or off, formatted text always plain, update settings.
 
 The **About** page shows the version and the update check, and below it a status block: the
@@ -408,7 +416,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.2.0`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.2.1`.
 
 **Through a Docker control panel or plain `docker compose`:**
 
@@ -483,7 +491,8 @@ for each one) and tells the removed device that it was excluded. See
 
 ## Building from source and tests
 
-You need Rust stable (tested on 1.100), Node.js 22+, and on Windows the MSVC Build Tools.
+You need Rust stable (tested on 1.100), Node.js 22+, on Windows the MSVC Build Tools, and on
+Linux the WebKitGTK and GTK development packages (the list is in [docs/linux.md](docs/linux.md)).
 
 ```
 cargo test --workspace
@@ -498,8 +507,10 @@ ulimit -n 10240 && cargo test --workspace
 ```
 
 A release is built by GitHub Actions on a `vX.Y.Z` tag ([release.yml](.github/workflows/release.yml)):
-the installer, signed update files and `latest.json`. The version comes from the workspace
-`Cargo.toml`.
+installers for Windows, macOS and Linux, signed update files and `latest.json`. The version comes
+from the workspace `Cargo.toml`. The signing keys live in the GitHub environment `release`, which
+accepts only `v*` tags and waits for the owner to approve each build, so a workflow from any other
+branch cannot read them.
 
 Icons, installer images and the logo in this README are generated from the sources in
 `docs/brand/` with `node apps/desktop/scripts/icons.mjs`, then
@@ -541,7 +552,8 @@ CLIPWIRE_SFTP_HOST=127.0.0.1 CLIPWIRE_SFTP_PORT=2222 CLIPWIRE_SFTP_USER=... CLIP
 **Frontend tests.** The pure logic of the settings window is tested without a build, in Node
 23.6+ (which strips types by itself). Run from `apps/desktop`:
 `node src/lib/storage.test.ts` (File storage card fields, saved secrets, host key reset),
-`node src/lib/i18n.test.ts`, `devices.test.ts`, `overview.test.ts` and `transfer.test.ts`.
+`node src/lib/i18n.test.ts`, `devices.test.ts`, `format.test.ts`, `overview.test.ts`,
+`platform.test.ts` and `transfer.test.ts`.
 
 The agent crate also has a console client for debugging: `create`, `join`, `run` (sync without a
 UI), `listen`, `send <text>`. The `CLIPWIRE_HOME` variable sets another settings directory, so
@@ -558,7 +570,8 @@ two clients can run on one machine.
 - `crates/clipwire-core`: item format, encryption, server codes and invitations.
 - `docs/`: [architecture](docs/architecture.md), [research of existing tools](docs/research.md),
   [files-transfer](docs/files-transfer.md), [devices](docs/devices.md),
-  [storage](docs/storage.md), [updates](docs/updates.md) and the brand sources (`docs/brand/`).
+  [storage](docs/storage.md), [updates](docs/updates.md), [macOS](docs/macos.md),
+  [Linux](docs/linux.md) and the brand sources (`docs/brand/`).
   These documents are in Russian.
 - `deploy/`: compose files and a reverse proxy example for the server.
 
