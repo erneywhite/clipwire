@@ -109,6 +109,7 @@ const en: Record<string, string> = {
   "Уже скачана и установится сама, когда вы закроете окна Clipwire и пару минут не будете им пользоваться.": "Already downloaded; it will install on its own once you close Clipwire's windows and don't use it for a couple of minutes.",
   "Обновления скачиваются с GitHub и проверяются по цифровой подписи.": "Updates are downloaded from GitHub and verified by digital signature.",
   "Связь": "Connection",
+  "Версия сервера": "Server version",
   "Хранилище файлов": "File storage",
   "История на этом устройстве": "History on this device",
   "Скачанные файлы": "Downloaded files",

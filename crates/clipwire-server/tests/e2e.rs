@@ -1390,3 +1390,32 @@ async fn devices_changed_reaches_v6_only() -> Result<()> {
     }
     Ok(())
 }
+
+/// `ServerInfo`: по `clipwire/7` сервер после входа сообщает свою версию,
+/// по `clipwire/6` и ниже — нет (старый клиент оборвал бы соединение).
+#[tokio::test]
+async fn server_info_reaches_v7_only() -> Result<()> {
+    use clipwire_core::proto::{ALPN_6, ALPN_7};
+    let (server, relay) = start_server().await?;
+    let info = server.info.clone();
+    let key = GroupKey::generate()?;
+
+    let mut new = Client::connect_alpn(&info, &relay, ALPN_7).await?;
+    new.join(&key).await?;
+    match new.next().await.context("версия")? {
+        ServerMsg::ServerInfo { version } => assert_eq!(version, env!("CARGO_PKG_VERSION")),
+        other => anyhow::bail!("ждали ServerInfo, пришло {other:?}"),
+    }
+
+    let mut old = Client::connect_alpn(&info, &relay, ALPN_6).await?;
+    old.join(&key).await?;
+    new.push_text(&key, "проверка").await?;
+    loop {
+        match old.next().await? {
+            ServerMsg::Deliver(_) => break,
+            ServerMsg::DevicesChanged | ServerMsg::Deleted(_) => {}
+            other => anyhow::bail!("клиент /6: пришло {other:?}"),
+        }
+    }
+    Ok(())
+}

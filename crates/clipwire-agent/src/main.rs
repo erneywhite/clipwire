@@ -171,6 +171,10 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
                 Event::RekeyLost(why) => eprintln!("{why}"),
                 Event::Deleted(n) => eprintln!("удалено на другом устройстве: {}", n.hashes.len()),
                 Event::DevicesChanged => tracing::debug!("устройства группы изменились"),
+                Event::ServerOutdated(v) => tracing::warn!(
+                    server = v.as_deref().unwrap_or("старше 0.3.1"),
+                    "сервер старше клиента, обновите образ сервера"
+                ),
             }
         }
         task.await??;
@@ -225,7 +229,7 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
             UiEvent::HistoryMerged(n) => eprintln!("в историю добавлено без записи в буфер: {n}"),
             UiEvent::NewEntry => {}
             UiEvent::Deleted(n) => eprintln!("удалено с другого устройства: {n}"),
-            UiEvent::DevicesChanged => {}
+            UiEvent::DevicesChanged | UiEvent::ServerOutdated(_) => {}
             UiEvent::Transfer(t) => match t.state {
                 TransferState::Active => {}
                 TransferState::Done => eprintln!("файл {} передан", t.blob),

@@ -34,6 +34,8 @@ pub enum UiEvent {
     Deleted(usize),
     /// Устройство группы подключилось, отключилось или обновило карточку.
     DevicesChanged,
+    /// Сервер старше клиента (`None` — версию не сообщает): обновить образ.
+    ServerOutdated(Option<String>),
     /// Прогресс загрузки или скачивания файла (не чаще раза в 200 мс на файл
     /// плюс финальное).
     Transfer(Transfer),
@@ -453,6 +455,7 @@ impl Service {
                         Event::Excluded { old } => on_event(UiEvent::Excluded { old }),
                         Event::RekeyLost(why) => on_event(UiEvent::RekeyLost(why)),
                         Event::DevicesChanged => on_event(UiEvent::DevicesChanged),
+                        Event::ServerOutdated(v) => on_event(UiEvent::ServerOutdated(v)),
                         Event::Deleted(note) => {
                             let removed = history
                                 .lock()

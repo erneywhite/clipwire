@@ -35,6 +35,19 @@ export function quotaLabel(s: GroupStats, { bytesLabel }: Fmt): { text: string; 
   return { text: t('{used} из {quota} ({pct} %)', { used: bytesLabel(s.quota_used), quota: bytesLabel(s.quota), pct }), tone }
 }
 
+/** Версия сервера: «0.3.1», «0.3.0 · обновите образ до 0.3.1». */
+export function serverVersionLabel(link: {
+  server_version: string | null
+  server_outdated: boolean
+  client_version: string
+}): { text: string; tone: Tone } {
+  if (!link.server_outdated) return { text: link.server_version ?? '—', tone: 'ok' }
+  const text = link.server_version
+    ? t('{server} · обновите образ до {client}', { server: link.server_version, client: link.client_version })
+    : t('старше 0.3.1 · обновите образ до {client}', { client: link.client_version })
+  return { text, tone: 'warn' }
+}
+
 /** «Напрямую · 12 мс», «Через relay · 48 мс». */
 export function linkLabel(link: { direct: boolean; rtt_ms: number }): string {
   const how = link.direct ? t('Напрямую') : t('Через relay')

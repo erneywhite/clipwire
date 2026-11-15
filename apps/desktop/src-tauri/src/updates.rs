@@ -395,6 +395,38 @@ fn announce(app: &AppHandle, dir: &Path) -> Startup {
     }
 }
 
+/// Сервер старше клиента: одно уведомление на пару «версия сервера — версия
+/// клиента», а не на каждое подключение. Что уже показано, помнит файл
+/// `server_notice` в папке данных.
+pub fn server_outdated(app: &AppHandle, server: Option<&str>) {
+    let dir = app.state::<crate::AppState>().paths.dir.clone();
+    let key = server_notice_key(server, clipwire_agent::sync::CLIENT_VERSION);
+    let path = dir.join("server_notice");
+    if std::fs::read_to_string(&path).is_ok_and(|k| k.trim() == key) {
+        return;
+    }
+    let text = match server {
+        Some(v) => trf(
+            "Сервер Clipwire {server} старше приложения {client}: обновите образ сервера",
+            &[
+                ("server", &v),
+                ("client", &clipwire_agent::sync::CLIENT_VERSION),
+            ],
+        ),
+        None => trf(
+            "Сервер Clipwire старше приложения {client}: обновите образ сервера",
+            &[("client", &clipwire_agent::sync::CLIENT_VERSION)],
+        ),
+    };
+    notify(app, &text);
+    let _ = std::fs::write(&path, key);
+}
+
+/// Ключ показанного уведомления: «сервер|клиент», «?|клиент» без версии.
+fn server_notice_key(server: Option<&str>, client: &str) -> String {
+    format!("{}|{client}", server.unwrap_or("?"))
+}
+
 fn notify(app: &AppHandle, text: &str) {
     use tauri_plugin_notification::NotificationExt;
     if let Err(e) = app.notification().builder().title(text).show() {
@@ -738,6 +770,18 @@ pub async fn install(app: AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn server_notice_once_per_pair() {
+        use super::server_notice_key;
+        assert_eq!(server_notice_key(Some("0.3.0"), "0.3.1"), "0.3.0|0.3.1");
+        assert_eq!(server_notice_key(None, "0.3.1"), "?|0.3.1");
+        // Новое приложение — новое уведомление.
+        assert_ne!(
+            server_notice_key(None, "0.3.1"),
+            server_notice_key(None, "0.3.2")
+        );
+    }
+
     use super::*;
 
     fn m(window_open: bool, busy: bool, idle_secs: u64) -> Moment {

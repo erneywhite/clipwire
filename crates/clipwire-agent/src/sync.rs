@@ -13,8 +13,8 @@ use clipwire_core::device::{DeviceCard, Rekey, open_rekey, rekey_public};
 use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{
-    ALPN, ALPN_4, ALPN_5, ALPN_6, ClientMsg, DeviceEntry, GroupStats, ServerMsg, knows_deletes,
-    knows_stats,
+    ALPNS, ClientMsg, DeviceEntry, GroupStats, ServerMsg, alpn_version, knows_deletes,
+    knows_server_info, knows_stats, version_older,
 };
 use clipwire_core::{Content, DeviceId, Ext, ExtList, GroupId, GroupKey, Item, ItemId, SourceApp};
 use iroh::endpoint::{Connection, presets};
@@ -172,6 +172,21 @@ pub enum Event {
     /// Устройство группы подключилось, отключилось или обновило карточку
     /// (сервер по `clipwire/6`): открытый список устройств стоит перечитать.
     DevicesChanged,
+    /// Сервер старше этого клиента: образ сервера пора обновить. `None` —
+    /// сервер не сообщает версию (до `clipwire/7`, то есть старше 0.3.1).
+    ServerOutdated(Option<String>),
+}
+
+/// Своя версия: сервер младше неё — подсказка обновить образ.
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// С сервером, чей протокол младше, клиент не синхронизируется: новые
+/// возможности ему нужны обязательно. Поднимается вместе с ними.
+pub const MIN_SERVER_PROTOCOL: u32 = 3;
+
+/// Сервер с этим протоколом слишком стар для синхронизации.
+pub fn server_too_old(protocol: u32) -> bool {
+    protocol < MIN_SERVER_PROTOCOL
 }
 
 /// Кто ждёт ответа `Devices`, по порядку запросов: команда интерфейса или
@@ -231,6 +246,10 @@ pub struct Engine {
     stats_waiters: VecDeque<tokio::sync::oneshot::Sender<Result<GroupStats, String>>>,
     /// Сервер выбрал [`ALPN_4`] или новее: знает `GetStats`.
     stats_supported: bool,
+    /// Версия протокола сервера (`clipwire/N`) и версия самого сервера, если
+    /// он её сообщил (`ServerInfo`). Для строки «Сервер» в «Состоянии».
+    server_protocol: u32,
+    server_version: Option<String>,
     /// Сервер выбрал [`ALPN_5`] или новее: знает `Delete`.
     deletes_supported: bool,
     /// Удаления, сделанные без связи: уйдут после входа.
@@ -307,6 +326,8 @@ impl Engine {
             devices_waiters: VecDeque::new(),
             stats_waiters: VecDeque::new(),
             stats_supported: false,
+            server_protocol: 0,
+            server_version: None,
             deletes_supported: false,
             pending_deletes: Vec::new(),
             times: Arc::default(),
@@ -670,6 +691,19 @@ impl Engine {
         let alpn = conn.alpn();
         self.stats_supported = knows_stats(alpn);
         self.deletes_supported = knows_deletes(alpn);
+        self.server_protocol = alpn_version(alpn);
+        self.server_version = None;
+        if server_too_old(self.server_protocol) {
+            self.emit(Event::ServerOutdated(None));
+            bail!(tr(
+                "Сервер Clipwire устарел и не поддерживает эту версию: обновите образ сервера"
+            ));
+        }
+        // Версию сообщает только сервер по `clipwire/7`; старее — сразу ясно,
+        // что он отстал.
+        if !knows_server_info(alpn) {
+            self.emit(Event::ServerOutdated(None));
+        }
         // Вошли в старую группу как обычно: `Rekey`, на который не пришёл
         // ответ, до сервера не дошёл, ключ не сменился.
         if self.pending_rekey.take().is_some() {
@@ -797,7 +831,10 @@ impl Engine {
                         self.devices_waiters.push_back(Some(reply));
                     }
                     Control::Link(reply) => {
-                        let _ = reply.send(Ok(link_info(&conn)));
+                        let mut info = link_info(&conn);
+                        info.server_protocol = self.server_protocol;
+                        info.server_version = self.server_version.clone();
+                        let _ = reply.send(Ok(info));
                     }
                     Control::Delete(note) => {
                         self.queue_delete(note);
@@ -890,6 +927,12 @@ impl Engine {
                 Err(e) => tracing::warn!("записка об удалении не открылась: {e}"),
             },
             ServerMsg::DevicesChanged => self.emit(Event::DevicesChanged),
+            ServerMsg::ServerInfo { version } => {
+                if version_older(&version, CLIENT_VERSION) {
+                    self.emit(Event::ServerOutdated(Some(version.clone())));
+                }
+                self.server_version = Some(version);
+            }
             ServerMsg::Stats(stats) => match self.stats_waiters.pop_front() {
                 Some(reply) => {
                     let _ = reply.send(Ok(stats));
@@ -1418,13 +1461,11 @@ fn is_fresh(item: &Item, now_ms: u64, window: Duration) -> bool {
 /// же токеном вечно.
 async fn connect(ep: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
     // Предлагаем все ALPN: сервер выберет новейший из известных ему
-    // (0.1.1 — `clipwire/3`, 0.1.2 — `/4`, 0.1.3 — `/5`).
-    let opts = iroh::endpoint::ConnectOptions::new().with_additional_alpns(vec![
-        ALPN_5.to_vec(),
-        ALPN_4.to_vec(),
-        ALPN.to_vec(),
-    ]);
-    let attempt = async { anyhow::Ok(ep.connect_with_opts(addr, ALPN_6, opts).await?.await?) };
+    // (0.1.1 — `clipwire/3`, 0.1.2 — `/4`, 0.1.3 — `/5`, 0.1.4 — `/6`,
+    // 0.3.1 — `/7`).
+    let opts = iroh::endpoint::ConnectOptions::new()
+        .with_additional_alpns(ALPNS[1..].iter().map(|a| a.to_vec()).collect());
+    let attempt = async { anyhow::Ok(ep.connect_with_opts(addr, ALPNS[0], opts).await?.await?) };
     tokio::select! {
         r = tokio::time::timeout(CONNECT_TIMEOUT, attempt) => {
             match r {
@@ -1529,6 +1570,8 @@ fn link_info(conn: &Connection) -> crate::devices::LinkInfo {
     crate::devices::LinkInfo {
         direct: selected.as_ref().is_some_and(|p| p.is_ip()),
         rtt_ms: selected.map_or(0, |p| p.rtt().as_millis() as u64),
+        server_protocol: 0,
+        server_version: None,
     }
 }
 

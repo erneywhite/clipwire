@@ -75,6 +75,17 @@ export interface GroupStats {
   quota: number
 }
 
+/** Связь с сервером и его версия (`stats_overview`). */
+export interface Link {
+  direct: boolean
+  rtt_ms: number
+  /** null — сервер не сообщает версию (старше 0.3.1). */
+  server_version: string | null
+  /** Сервер старше приложения: образ пора обновить. */
+  server_outdated: boolean
+  client_version: string
+}
+
 /** Счётчики раздела «О программе» (`stats_overview`). */
 export interface StatsOverview {
   history_total: number
@@ -83,7 +94,7 @@ export interface StatsOverview {
   server: GroupStats | null
   server_error: string | null
   /** Путь до сервера, null — нет связи. */
-  link: { direct: boolean; rtt_ms: number } | null
+  link: Link | null
   /** Мс Unix, 0 — с запуска не было. */
   last_sent_ms: number
   last_received_ms: number

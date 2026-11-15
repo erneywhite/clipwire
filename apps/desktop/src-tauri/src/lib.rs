@@ -213,6 +213,7 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
             UiEvent::DevicesChanged => {
                 let _ = handle.emit("clipwire://devices-changed", ());
             }
+            UiEvent::ServerOutdated(v) => updates::server_outdated(&handle, v.as_deref()),
             // Настройки хранилища группы (без секретов) и предупреждение,
             // что файл ушёл через сервер: для карточки «Хранилище файлов».
             UiEvent::GroupConfig(view) => {
