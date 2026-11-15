@@ -109,7 +109,10 @@ history is merged into the local one. The clipboard itself is not touched.
 prints a server code that looks like `cwserver2-…`. That is the administrator's code: groups are
 created with it (see [Administrator code](#administrator-code)).
 
-1. On the first device open **Sync**, enter the server code and create a group.
+1. On the first device open **Sync**, enter the server code `cwserver2-…` and create a group.
+   The device becomes the group admin and the server administrator: a **Server** section appears
+   in settings. An old `cwserver1-…` code cannot create a group; the app tells you where to get
+   the new one.
 2. Clipwire shows an invitation code, `clipwire1-…`. Enter it on your other devices.
 
 The invitation code contains the group's encryption key. Share it only with yourself.
@@ -374,7 +377,8 @@ issued by a device that this computer has already seen in the list; after the ch
 say which device changed it. The removed device keeps the relay token from the invitation code:
 it can no longer create groups (that needs the administrator code since server 0.5.0), but it
 can still reach the relay. If the computer may have fallen into the wrong hands, the server
-administrator changes the relay token, and every device enters a new invitation code.
+administrator changes the relay token (the app calls it the **access token**, in the **Server**
+section), and every device enters a new invitation code.
 
 **Changing the group key** does the same without removing anyone, which is useful if the
 invitation code ended up in the wrong place. The group's history on the server is erased, local
@@ -382,8 +386,9 @@ history is untouched and the invitation code changes. Devices without a card do 
 new key, and Clipwire warns about it before you confirm.
 
 **Group admin.** The device that created the group is its admin and is marked in the device
-list. Only the admin removes devices and changes the group key, and the role can be handed over
-to another device of the group. Groups created before server 0.5.0 have no admin: there any
+list. Only the admin removes devices and changes the group key: other devices do not get these
+buttons, and a note under the list says who the admin is. The role is handed over with **Make
+admin** next to another device of the group. Groups created before server 0.5.0 have no admin: there any
 device can still change the key, and the first device that connects with the administrator
 code becomes the admin. After a key change the admin stays the same.
 
@@ -476,7 +481,13 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
 - Copy sound: a short click when something new enters the history. Pasting from the history and
   copying the same thing again are silent. On Linux it plays through `pw-play`, `paplay` or `aplay`.
 - History retention, from a day to forever (pinned entries are kept forever).
-- Device name, invitation code (**Show code**), leaving the group.
+- Device name, invitation code (**Show code**), leaving the group (it also removes the server
+  administrator key from the device).
+- **I am the server administrator** in Sync: the `cwserver2-…` code for a device that is already
+  in a group.
+- The **Server** section, for the server administrator only: a summary (groups, devices, space
+  used by history, files and pins, version), server limits and secret changes (see
+  [Administrator code](#administrator-code)).
 - Paste window size (one slider with a live preview next to it) and the hotkey.
 - Programs that must not be synced (password managers by default).
 - Hiding Clipwire windows during screen sharing (Windows and macOS; Linux has no way to do it).
@@ -546,11 +557,21 @@ an invitation code. Where to find the code:
 With the administrator code a device can create groups and sees the **Server** section in
 settings: limits (the same as the variables below), a server summary, changing the relay token
 and changing the administrator key. Limits set there are stored in the server database and apply
-at once, without a restart; the environment variables become the defaults, and **Reset** returns
-a limit to its default.
+at once, without a restart; the environment variables become the defaults. Each field shows its
+default, and **Reset** returns a limit set from the app to it. Sizes are entered in MB or GB,
+durations in hours; the app does not send a value outside the allowed range.
+
+On a device that is already in a group, enter the code in **Sync → I am the server
+administrator**. The app checks that the code belongs to the same server and that the key works.
+The key is stored encrypted on the device, like the group key; it can be forgotten in the
+**Server** section, and leaving the group removes it too.
 
 Changing the relay token disconnects every device, and old invitation codes stop working: hand
-out a new one. A token set with `CLIPWIRE_RELAY_TOKEN` can only be changed in the container
+out a new one. The device that changed the token saves the new server code and reconnects on its
+own, and the app shows the new server code and the new invitation code for its group. Other
+devices leave the group and join again with the new invitation code. An administrator device in
+another group comes back online once you enter the new server code on it under **I am the server
+administrator**; it then shows the new invitation code of its group. A token set with `CLIPWIRE_RELAY_TOKEN` can only be changed in the container
 settings. After changing the administrator key, the old server code stops working, enter the new
 one on your administrator device.
 
@@ -683,7 +704,8 @@ CLIPWIRE_SFTP_HOST=127.0.0.1 CLIPWIRE_SFTP_PORT=2222 CLIPWIRE_SFTP_USER=... CLIP
 `node src/lib/i18n.test.ts`, `devices.test.ts`, `format.test.ts`, `overview.test.ts`,
 `platform.test.ts` and `transfer.test.ts`.
 
-The agent crate also has a console client for debugging: `create`, `join`, `run` (sync without a
+The agent crate also has a console client for debugging: `create <cwserver2-…>`, `join <invite
+code> [<cwserver2-…>]`, `admin <cwserver2-…>` (store the administrator key), `run` (sync without a
 UI), `listen`, `send <text>`. The `CLIPWIRE_HOME` variable sets another settings directory, so
 two clients can run on one machine.
 
