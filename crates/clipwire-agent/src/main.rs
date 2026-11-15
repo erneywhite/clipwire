@@ -172,7 +172,7 @@ fn headless(state: AgentState, send: Option<String>) -> Result<()> {
                 Event::Deleted(n) => eprintln!("удалено на другом устройстве: {}", n.hashes.len()),
                 Event::DevicesChanged => tracing::debug!("устройства группы изменились"),
                 Event::ServerOutdated(v) => tracing::warn!(
-                    server = v.as_deref().unwrap_or("старше 0.3.1"),
+                    server = v.as_deref().unwrap_or("старше 0.4.0"),
                     "сервер старше клиента, обновите образ сервера"
                 ),
                 // Без книги закрепов движок их не синхронизирует.

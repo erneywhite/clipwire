@@ -99,7 +99,7 @@ export type PinnedDelete =
 export interface Link {
   direct: boolean
   rtt_ms: number
-  /** null — сервер не сообщает версию (старше 0.3.1). */
+  /** null — сервер не сообщает версию (старше 0.4.0). */
   server_version: string | null
   /** Сервер старше приложения: образ пора обновить. */
   server_outdated: boolean

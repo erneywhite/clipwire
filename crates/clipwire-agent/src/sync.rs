@@ -176,7 +176,7 @@ pub enum Event {
     /// (сервер по `clipwire/6`): открытый список устройств стоит перечитать.
     DevicesChanged,
     /// Сервер старше этого клиента: образ сервера пора обновить. `None` —
-    /// сервер не сообщает версию (до `clipwire/7`, то есть старше 0.3.1).
+    /// сервер не сообщает версию (до `clipwire/7`, то есть старше 0.4.0).
     ServerOutdated(Option<String>),
     /// Закреп группы изменился (с другого устройства, при входе или после
     /// разбора дублей): поставить в истории закреп и подпись, добавить запись
@@ -1569,7 +1569,7 @@ fn is_fresh(item: &Item, now_ms: u64, window: Duration) -> bool {
 async fn connect(ep: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
     // Предлагаем все ALPN: сервер выберет новейший из известных ему
     // (0.1.1 — `clipwire/3`, 0.1.2 — `/4`, 0.1.3 — `/5`, 0.1.4 — `/6`,
-    // 0.3.1 — `/7`).
+    // 0.4.0 — `/7` и `/8`).
     let opts = iroh::endpoint::ConnectOptions::new()
         .with_additional_alpns(ALPNS[1..].iter().map(|a| a.to_vec()).collect());
     let attempt = async { anyhow::Ok(ep.connect_with_opts(addr, ALPNS[0], opts).await?.await?) };

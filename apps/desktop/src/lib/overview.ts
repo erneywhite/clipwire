@@ -64,7 +64,7 @@ export function serverVersionLabel(link: {
   if (!link.server_outdated) return { text: link.server_version ?? '—', tone: 'ok' }
   const text = link.server_version
     ? t('{server} · обновите образ до {client}', { server: link.server_version, client: link.client_version })
-    : t('старше 0.3.1 · обновите образ до {client}', { client: link.client_version })
+    : t('старше 0.4.0 · обновите образ до {client}', { client: link.client_version })
   return { text, tone: 'warn' }
 }
 

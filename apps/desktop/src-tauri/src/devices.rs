@@ -90,7 +90,7 @@ pub struct LinkDto {
     /// Напрямую по UDP; иначе через relay.
     pub direct: bool,
     pub rtt_ms: u64,
-    /// Версия сервера; `None` — не сообщает (старше 0.3.1).
+    /// Версия сервера; `None` — не сообщает (старше 0.4.0).
     pub server_version: Option<String>,
     /// Сервер старше этого приложения: образ пора обновить.
     pub server_outdated: bool,

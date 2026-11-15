@@ -493,7 +493,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.3.0`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.4.0`.
 
 **Through a Docker control panel or plain `docker compose`:**
 

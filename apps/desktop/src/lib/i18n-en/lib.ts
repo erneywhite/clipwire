@@ -84,7 +84,7 @@ const en: Record<string, string> = {
   '{used} из {quota} ({pct} %)': '{used} of {quota} ({pct}%)',
   'Напрямую': 'Direct',
   '{server} · обновите образ до {client}': '{server} · update the image to {client}',
-  'старше 0.3.1 · обновите образ до {client}': 'older than 0.3.1 · update the image to {client}',
+  'старше 0.4.0 · обновите образ до {client}': 'older than 0.4.0 · update the image to {client}',
   'Через relay': 'Via relay',
   '{ms} мс': '{ms} ms',
   'только что': 'just now',

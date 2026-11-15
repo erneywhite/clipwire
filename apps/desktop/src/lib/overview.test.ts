@@ -70,7 +70,7 @@ check(fresh.text === '0.3.1' && fresh.tone === 'ok', 'актуальный се�
 const stale = serverVersionLabel({ server_version: '0.3.0', server_outdated: true, client_version: '0.3.1' })
 check(stale.text === '0.3.0 · обновите образ до 0.3.1' && stale.tone === 'warn', 'сервер старее приложения')
 const unknown = serverVersionLabel({ server_version: null, server_outdated: true, client_version: '0.3.1' })
-check(unknown.text === 'старше 0.3.1 · обновите образ до 0.3.1' && unknown.tone === 'warn', 'сервер без версии')
+check(unknown.text === 'старше 0.4.0 · обновите образ до 0.3.1' && unknown.tone === 'warn', 'сервер без версии')
 
 // Закрепы на сервере: тон по ближайшему пределу, число с пределом — только когда упирается оно.
 const { pinsLabel } = (await import('./overview' + '.ts')) as typeof import('./overview')
