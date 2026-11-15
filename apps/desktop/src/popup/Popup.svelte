@@ -5,7 +5,7 @@
   import { api, type Entry, type FileInfo, type KindFilter, type Settings, type Transfer } from '../lib/api'
   import { applyTheme } from '../lib/theme'
   import { ago, bytesLabel, filesMeta, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
-  import { canDownload, canDrop, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
+  import { canDownload, canDrop, entriesByBlob, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import EntryRow from '../lib/EntryRow.svelte'
   import { anchored, anchoredById, disjoint, HeightCache, keptInDom, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange, type Range, type RowShape } from '../lib/vlist'
@@ -165,6 +165,12 @@
     }
   }
 
+  // Файлы записей на виду (список и предпросмотр) по blob — для dropTransfer.
+  // Считается при первом чтении после смены списка, а не на каждую передачу.
+  const blobEntries = $derived(
+    entriesByBlob((preview ? [...items, preview.entry] : items).filter((e) => e.files.length > 0).map((e) => e.files.map((f) => f.blob))),
+  )
+
   /** Убрать законченную передачу из карты. */
   function dropTransfer(blob: string) {
     dropTimers.delete(blob)
@@ -172,8 +178,7 @@
     if (!x || x.state === 'active') return
     // Другой файл той же записи ещё идёт: без готового прогресс записи поедет
     // назад. Ждём ещё, до конца всей записи.
-    const shownEntries = (preview ? [...items, preview.entry] : items).map((e) => e.files.map((f) => f.blob))
-    if (!canDrop(blob, transfers, shownEntries)) {
+    if (!canDrop(blob, transfers, blobEntries.get(blob) ?? [])) {
       dropTimers.set(blob, setTimeout(() => dropTransfer(blob), DONE_KEEP_MS))
       return
     }

@@ -73,6 +73,24 @@ export function canDrop(blob: string, transfers: TransferMap, entries: Iterable<
 }
 
 /**
+ * Указатель для canDrop: для каждого blob — файлы (blob'ы) записей на виду,
+ * где он есть. Строится один раз на смену списка, а не перебором всех
+ * подгруженных записей (их тысячи) на каждую законченную передачу.
+ */
+export function entriesByBlob(entries: Iterable<readonly (string | null)[]>): Map<string, (readonly (string | null)[])[]> {
+  const index = new Map<string, (readonly (string | null)[])[]>()
+  for (const blobs of entries) {
+    for (const b of new Set(blobs)) {
+      if (b === null) continue
+      const list = index.get(b)
+      if (list) list.push(blobs)
+      else index.set(b, [blobs])
+    }
+  }
+  return index
+}
+
+/**
  * Все файлы записи, которые отправлялись, уже на сервере. Полоса прогресса
  * видна только пока файл идёт, а это секунды: без этой пометки открывший окно
  * позже не узнает, ушёл ли файл. Сведения двух видов: события передач этого
