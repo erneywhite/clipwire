@@ -23,6 +23,9 @@ jobs:
     # Ручной запуск с ветки не должен публиковать релиз: нужен тег vX.Y.Z.
     # macos и linux ждут это задание и без него тоже пропускаются.
     if: startsWith(github.ref, 'refs/tags/v')
+    # Секреты подписи лежат в окружении release: оно пускает только теги v*
+    # и ждёт подтверждения выпуска на странице запуска.
+    environment: release
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -57,6 +60,7 @@ jobs:
   # latest.json релиза, и два задания разом затёрли бы запись друг друга.
   macos:
     needs: windows
+    environment: release
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -124,6 +128,7 @@ jobs:
   # Ubuntu 22.04 — старый glibc: пакеты запускаются и на более старых системах.
   linux:
     needs: macos
+    environment: release
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
