@@ -6,7 +6,7 @@
   import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart'
   import { check, type Update } from '@tauri-apps/plugin-updater'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { api, type DeviceInfo, type GroupDevice, type GroupRekeyed, type Retention, type Settings, type StatsOverview, type Status, type StorageState, type Theme } from '../lib/api'
+  import { api, type DeviceInfo, type DevicesIncoming, type GroupDevice, type GroupNotices, type Retention, type Settings, type StatsOverview, type Status, type StorageState, type Theme } from '../lib/api'
   import { rekeyedBy } from '../lib/devices'
   import { applyTheme } from '../lib/theme'
   import * as fmt from '../lib/format'
@@ -117,6 +117,32 @@
     }
     el.value = String(v)
     if (v !== s.file_upload_limit_mb) save({ file_upload_limit_mb: v })
+  }
+
+  /** Итог смены ключа для списка устройств: его может не быть на экране. */
+  let devicesIncoming = $state<DevicesIncoming | null>(null)
+
+  async function pullGroupNotices() {
+    let n: GroupNotices
+    try {
+      n = await api.groupNoticesTake()
+    } catch {
+      return
+    }
+    if (n.excluded) {
+      invite = ''
+      createdInvite = ''
+      section = 'sync'
+    }
+    // Смена ключа группы: старый код приглашения больше не действует.
+    if (n.rekeyed) {
+      invite = ''
+      createdInvite = ''
+      if (!n.rekeyed.by_me) notice = t('{who}. Старый код приглашения больше не действует.', { who: rekeyedBy(n.rekeyed.by) })
+    }
+    const result = n.rekeyed?.by_me ? n.rekeyed.result : null
+    if (result || n.rekey_failed) devicesIncoming = { result, error: n.rekey_failed }
+    if (n.excluded || n.rekeyed) refresh()
   }
 
   async function refresh() {
@@ -400,26 +426,21 @@
         s = e.payload
         applyTheme(e.payload.theme, e.payload.mode)
       }),
-      // Смена ключа группы: старый код приглашения больше не действует.
-      listen<GroupRekeyed>('clipwire://group-rekeyed', (e) => {
-        invite = ''
-        createdInvite = ''
-        if (!e.payload.by_me) notice = t('{who}. Старый код приглашения больше не действует.', { who: rekeyedBy(e.payload.by) })
-        refresh()
-      }),
-      listen('clipwire://group-excluded', () => {
-        invite = ''
-        createdInvite = ''
-        section = 'sync'
-        refresh()
-      }),
+      // События группы Rust хранит, пока окно их не заберёт: событие —
+      // только повод забрать.
+      listen('clipwire://group-rekeyed', pullGroupNotices),
+      listen('clipwire://group-rekey-failed', pullGroupNotices),
+      listen('clipwire://group-excluded', pullGroupNotices),
     ]
-    Promise.all(unlisten).then(refresh)
-    // Окно настроек создаётся при каждом открытии и событие фоновой проверки
-    // могло прийти, пока его не было. Скачанное обновление ждёт — показать
-    // его в «О программе» сразу.
+    // Окно настроек создаётся при каждом открытии: события группы и фоновой
+    // проверки обновлений могли прийти, пока его не было.
+    Promise.all(unlisten).then(() => {
+      refresh()
+      pullGroupNotices()
+    })
+    // Найденное (или уже скачанное) обновление — показать в «О программе» сразу.
     api
-      .updateReady()
+      .updateFound()
       .then((v) => {
         if (v) checkUpdates()
       })
@@ -646,7 +667,11 @@
             {/if}
           </div>
 
-          <Devices onRekeyed={() => ((invite = ''), (createdInvite = ''))} />
+          <Devices
+            onRekeyed={() => ((invite = ''), (createdInvite = ''))}
+            incoming={devicesIncoming}
+            onIncomingTaken={() => (devicesIncoming = null)}
+          />
 
           <h2>{t('Отключить')}</h2>
           <div class="card pad">

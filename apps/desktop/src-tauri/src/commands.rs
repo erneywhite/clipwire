@@ -588,3 +588,10 @@ pub async fn update_install(app: AppHandle) -> CmdResult<()> {
 pub fn update_ready(app: AppHandle) -> Option<String> {
     crate::updates::ready_version(&app)
 }
+
+/// Версия, которую нашла фоновая проверка (или скачанная), или `null`. Окно
+/// настроек на старте по ней решает, проверять ли обновление заново.
+#[tauri::command]
+pub fn update_found(app: AppHandle) -> Option<String> {
+    crate::updates::found_version(&app)
+}

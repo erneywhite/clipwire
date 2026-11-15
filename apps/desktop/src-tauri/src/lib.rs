@@ -43,6 +43,8 @@ pub struct AppState {
     /// Сервер сообщил, что устройство исключено (`devices::mark_excluded`):
     /// сервис работает локально, ключ группы на месте.
     pub excluded: std::sync::atomic::AtomicBool,
+    /// События группы для окна настроек, пока оно их не забрало.
+    pub group_notices: Mutex<devices::GroupNotices>,
 }
 
 /// Статус для интерфейса.
@@ -206,9 +208,7 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
             }
             UiEvent::Rekeyed(n) => devices::on_rekeyed(&handle, n),
             UiEvent::Excluded { old } => devices::on_excluded(&handle, old),
-            UiEvent::RekeyLost(why) => {
-                let _ = handle.emit("clipwire://group-rekey-failed", why);
-            }
+            UiEvent::RekeyLost(why) => devices::on_rekey_lost(&handle, why),
             // Открытый список устройств перечитывается сам.
             UiEvent::DevicesChanged => {
                 let _ = handle.emit("clipwire://devices-changed", ());
@@ -275,6 +275,7 @@ fn load_state() -> anyhow::Result<AppState> {
         service: Mutex::new(None),
         service_attempted: Default::default(),
         excluded: Default::default(),
+        group_notices: Default::default(),
         paths,
     })
 }
@@ -563,6 +564,8 @@ pub fn run() {
             storage::storage_probe,
             commands::update_install,
             commands::update_ready,
+            commands::update_found,
+            devices::group_notices_take,
         ])
         .setup(|app| {
             #[cfg(target_os = "linux")]

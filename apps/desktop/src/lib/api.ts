@@ -203,6 +203,21 @@ export type Status =
   /** Сервер сообщил, что устройство исключено: синхронизация остановлена, ключ на месте. */
   | { kind: 'excluded' }
 
+/** События группы, которые окно настроек забирает у Rust (`group_notices_take`). */
+export interface GroupNotices {
+  rekeyed: GroupRekeyed | null
+  /** Новый ключ не дошёл: текст ошибки. */
+  rekey_failed: string | null
+  /** Сервер исключил устройство. */
+  excluded: boolean
+}
+
+/** Для списка устройств: итог смены ключа, пришедший событием. */
+export interface DevicesIncoming {
+  result: RekeyResult | null
+  error: string | null
+}
+
 /** Событие `clipwire://group-rekeyed`. */
 export interface GroupRekeyed {
   /** Ключ сменили на этом устройстве. */
@@ -315,6 +330,10 @@ export const api = {
   updateInstall: () => invoke<void>('update_install'),
   /** Версия, которая уже скачана и поставится сама, или null. */
   updateReady: () => invoke<string | null>('update_ready'),
+  /** Версия, которую нашла фоновая проверка (или скачанная), или null. */
+  updateFound: () => invoke<string | null>('update_found'),
+  /** Забрать события группы, пришедшие с прошлого раза (в том числе пока настроек не было). */
+  groupNoticesTake: () => invoke<GroupNotices>('group_notices_take'),
   devicesList: () => invoke<GroupDevice[]>('devices_list'),
   statsOverview: () => invoke<StatsOverview>('stats_overview'),
   deviceRemove: (deviceId: string) => invoke<RekeyResult>('device_remove', { deviceId }),

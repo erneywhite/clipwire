@@ -169,6 +169,11 @@ pub struct Updates {
     last_activity: AtomicI64,
     /// Скачанное и проверенное обновление ждёт удобного момента.
     ready: Mutex<Option<Ready>>,
+    /// Последняя версия, которую нашла фоновая проверка (и при выключенном
+    /// автообновлении, когда ничего не скачивается). Окно настроек создаётся
+    /// при открытии и событие `update-available` могло пропустить: на старте
+    /// оно спрашивает эту версию.
+    found: Mutex<Option<String>>,
     /// Идёт скачивание или установка: второй раз не начинать.
     busy: AtomicBool,
 }
@@ -194,9 +199,11 @@ impl Payload {
     fn load(&self) -> Result<std::borrow::Cow<'_, [u8]>, String> {
         match self {
             Payload::Memory(b) => Ok(std::borrow::Cow::Borrowed(b)),
-            Payload::Disk(p) => std::fs::read(p)
-                .map(std::borrow::Cow::Owned)
-                .map_err(|e| format!("скачанное обновление не прочиталось ({}): {e}", p.display())),
+            Payload::Disk(p) => std::fs::read(p).map(std::borrow::Cow::Owned).map_err(|e| {
+                // Путь — в журнал: человеку в «О программе» он ничего не скажет.
+                tracing::warn!("скачанное обновление не прочиталось ({}): {e}", p.display());
+                trf("Скачанное обновление не прочиталось: {e}", &[("e", &e)])
+            }),
         }
     }
 }
@@ -276,6 +283,17 @@ pub fn touch(app: &AppHandle) {
     if let Some(u) = app.try_state::<Updates>() {
         u.last_activity.store(now_ms(), Ordering::Relaxed);
     }
+}
+
+/// Версия, которую нашла последняя фоновая проверка, или скачанная.
+pub fn found_version(app: &AppHandle) -> Option<String> {
+    let found = app
+        .state::<Updates>()
+        .found
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    found.or_else(|| ready_version(app))
 }
 
 /// Версия, которая скачана и ждёт установки.
@@ -535,6 +553,10 @@ async fn check_once(app: &AppHandle) {
     let v = update.version.clone();
     tracing::info!("доступно обновление {v}");
     crate::tray::show_update(app, &v);
+    *app.state::<Updates>()
+        .found
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(v.clone());
     let _ = app.emit("clipwire://update-available", &v);
     if !auto_enabled(app) || ready_version(app).as_deref() == Some(v.as_str()) {
         return;
