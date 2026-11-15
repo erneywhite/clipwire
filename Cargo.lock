@@ -981,6 +981,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64 0.22.1",
  "chacha20poly1305",
  "clipboard-win",
  "clipwire-core",
@@ -995,6 +996,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-foundation",
  "percent-encoding",
+ "plist",
  "postcard",
  "reqwest",
  "resvg",

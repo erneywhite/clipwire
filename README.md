@@ -113,6 +113,21 @@ prints a server code that looks like `cwserver1-…`.
 
 The invitation code contains the group's encryption key. Share it only with yourself.
 
+**Moving from Paste (macOS).** The history of [Paste](https://pasteapp.io) can be moved with a
+command-line tool for now; a button in Settings is planned. Text and formatted text are moved with
+their dates and source apps, pinboard entries become pinned. Files are skipped (Paste keeps only
+links to them), images too, until Clipwire stops keeping the whole history in memory. Quit
+Clipwire, set history retention to "forever", keep your other devices online if you add `--send`,
+then run from the repository:
+
+```
+cargo run --release -p clipwire-agent -- import-paste --dry-run   # only count
+cargo run --release -p clipwire-agent -- import-paste --send      # move and send to the group
+```
+
+macOS asks once for access to the Clipwire key in the Keychain. Running it again skips what was
+already moved.
+
 ## Paste window
 
 Press Ctrl+Shift+V on Windows, Cmd+Shift+V on macOS or Ctrl+Alt+V on Linux (configurable; on Linux

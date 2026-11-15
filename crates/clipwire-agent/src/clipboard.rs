@@ -350,7 +350,7 @@ pub(crate) fn local_file_ref(p: &std::path::Path) -> clipwire_core::FileRef {
 pub use win::Watcher;
 
 #[cfg(target_os = "macos")]
-mod mac;
+pub(crate) mod mac;
 #[cfg(target_os = "macos")]
 pub use mac::{Watcher, front_pid};
 
