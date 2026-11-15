@@ -30,6 +30,9 @@ pub struct AppState {
     pub paths: Paths,
     pub settings: Mutex<Settings>,
     pub history: Arc<Mutex<History>>,
+    /// Второе соединение с историей для долгих чтений (списки с поиском,
+    /// проверки файлов): без замка `history`.
+    pub reader: Option<clipwire_agent::history::HistoryReader>,
     /// Список игнорируемых программ, общий с сервисом: меняется без перезапуска.
     pub ignored_apps: Arc<Mutex<Vec<String>>>,
     /// Настройка `file_upload_limit_mb`, общая с сервисом.
@@ -40,6 +43,8 @@ pub struct AppState {
     /// Сервер сообщил, что устройство исключено (`devices::mark_excluded`):
     /// сервис работает локально, ключ группы на месте.
     pub excluded: std::sync::atomic::AtomicBool,
+    /// События группы для окна настроек, пока оно их не забрало.
+    pub group_notices: Mutex<devices::GroupNotices>,
 }
 
 /// Статус для интерфейса.
@@ -189,7 +194,9 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
                 if updates::is_activity(&e) {
                     updates::touch(&handle);
                 }
-                let _ = handle.emit("clipwire://history-changed", ());
+                // Через ту же склейку: серия копирований подряд или пачка
+                // пришедших записей перечитывает список один раз.
+                history_changed_soon(&handle);
             }
             UiEvent::Deleted(_) => {
                 // Скачанные копии удалённых записей больше не нужны.
@@ -201,9 +208,7 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
             }
             UiEvent::Rekeyed(n) => devices::on_rekeyed(&handle, n),
             UiEvent::Excluded { old } => devices::on_excluded(&handle, old),
-            UiEvent::RekeyLost(why) => {
-                let _ = handle.emit("clipwire://group-rekey-failed", why);
-            }
+            UiEvent::RekeyLost(why) => devices::on_rekey_lost(&handle, why),
             // Открытый список устройств перечитывается сам.
             UiEvent::DevicesChanged => {
                 let _ = handle.emit("clipwire://devices-changed", ());
@@ -265,10 +270,12 @@ fn load_state() -> anyhow::Result<AppState> {
         ignored_apps: Arc::new(Mutex::new(settings.ignored_apps.clone())),
         upload_limit_mb: Arc::new(settings.file_upload_limit_mb.into()),
         settings: Mutex::new(settings),
+        reader: history.reader(),
         history: Arc::new(Mutex::new(history)),
         service: Mutex::new(None),
         service_attempted: Default::default(),
         excluded: Default::default(),
+        group_notices: Default::default(),
         paths,
     })
 }
@@ -353,6 +360,8 @@ pub fn apply_window_background(app: &AppHandle, hex: &str) {
         return;
     }
     let color = tauri::window::Color((v >> 16) as u8, (v >> 8) as u8, v as u8, 255);
+    // Окна, которых сейчас нет, возьмут цвет при создании (`ensure_window`).
+    *WINDOW_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some(color);
     for label in ["settings", "popup", "preview", "editor"] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.set_background_color(Some(color));
@@ -360,12 +369,124 @@ pub fn apply_window_background(app: &AppHandle, hex: &str) {
     }
 }
 
+/// Последний цвет фона из темы, для окон, созданных после его выбора.
+static WINDOW_BACKGROUND: Mutex<Option<tauri::window::Color>> = Mutex::new(None);
+
+/// Замок над созданием и закрытием окон по требованию (`ensure_window`,
+/// `destroy_window_if`). Внутри — метки окон, которым уже сказали закрыться,
+/// но Tauri их ещё не убрал.
+static WINDOWS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Сколько `ensure_window` ждёт, пока закрываемое окно исчезнет.
+const DYING_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Закрыть окно насовсем, если `ok` согласен. Решение принимается под тем
+/// же замком, что и `ensure_window`: окно, которое как раз открывают снова,
+/// либо уже отдано открывающему (и `ok` это увидит), либо будет создано
+/// заново после закрытия. Звать не из главного потока: замок может ждать
+/// создания окна.
+pub fn destroy_window_if(
+    app: &AppHandle,
+    label: &str,
+    ok: impl FnOnce(&tauri::WebviewWindow) -> bool,
+) {
+    let mut dying = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(w) = app.get_webview_window(label) else {
+        return;
+    };
+    if !ok(&w) {
+        return;
+    }
+    match w.destroy() {
+        Ok(()) => {
+            if !dying.iter().any(|l| l == label) {
+                dying.push(label.to_string());
+            }
+        }
+        Err(e) => tracing::warn!("окно {label} не закрылось: {e}"),
+    }
+}
+
+/// Взять окно по метке или создать его по описанию из `tauri.conf.json`.
+/// Второе значение — окно только что создано (страница ещё грузится).
+///
+/// Окно вставки создаётся вместе с приложением и живёт всегда: его показ по
+/// горячей клавише должен быть мгновенным. Настройки, превью размера и
+/// редактор помечены в конфиге `"create": false`: их WebView (на Windows —
+/// отдельный процесс рендера) появляется только по требованию и закрывается
+/// насовсем, а не прячется.
+///
+/// На Windows создание окна из главного потока (синхронная команда,
+/// обработчик событий окна, меню трея) зависает намертво: WebView2 ждёт тот
+/// же поток. Поэтому звать только из фонового потока или async-команды.
+pub fn ensure_window(app: &AppHandle, label: &str) -> Result<(tauri::WebviewWindow, bool), String> {
+    // Два одновременных вызова не должны создавать окно дважды: вторая
+    // попытка с той же меткой упала бы. Тот же замок держит и
+    // `destroy_window_if`: окно, которое закрывают, не отдаётся как живое.
+    let mut dying = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = dying.iter().position(|l| l == label) {
+        // Tauri убирает окно из списка, только когда главный поток обработал
+        // закрытие; до тех пор `get_webview_window` отдаёт умирающее окно.
+        let deadline = std::time::Instant::now() + DYING_WAIT;
+        while app.get_webview_window(label).is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        dying.swap_remove(i);
+    }
+    if let Some(w) = app.get_webview_window(label) {
+        return Ok((w, false));
+    }
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|c| c.label == label)
+        .cloned()
+        .ok_or_else(|| format!("в конфиге нет окна {label}"))?;
+    let mut builder =
+        tauri::WebviewWindowBuilder::from_config(app, &config).map_err(|e| e.to_string())?;
+    let background = *WINDOW_BACKGROUND.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(color) = background {
+        builder = builder.background_color(color);
+    }
+    let w = builder.build().map_err(|e| e.to_string())?;
+    tracing::debug!("создано окно {label}");
+    Ok((w, true))
+}
+
+/// Включена ли «Скрывать окна при демонстрации экрана».
+fn hide_from_capture(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .hide_from_capture
+}
+
+/// Показать окно настроек, создав его при необходимости. Можно звать из
+/// любого потока: окно создаётся в фоновом.
 pub fn show_settings(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("settings") {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (w, created) = match ensure_window(&app, "settings") {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("окно настроек не открылось: {e}");
+                return;
+            }
+        };
+        if created {
+            settings_window::restore_geometry(&w);
+        }
+        let _ = w.set_content_protected(hide_from_capture(&app));
         let _ = w.show();
         let _ = w.unminimize();
+        // Уже открытое окно человек мог вернуть из развёрнутого: не трогать.
+        if created {
+            settings_window::maximize_if_was(&w);
+        }
         let _ = w.set_focus();
-    }
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -471,9 +592,13 @@ pub fn run() {
             settings_window::size_preview,
             settings_window::size_preview_hide,
             settings_window::settings_toggle_maximize,
+            settings_window::settings_section_get,
+            settings_window::settings_section_set,
+            settings_window::settings_close_guard,
             commands::history_update,
             editor::editor_open,
             editor::editor_save,
+            editor::editor_pending,
             link::link_preview,
             files::file_preview,
             files::files_download,
@@ -486,6 +611,8 @@ pub fn run() {
             storage::storage_probe,
             commands::update_install,
             commands::update_ready,
+            commands::update_found,
+            devices::group_notices_take,
         ])
         .setup(|app| {
             #[cfg(target_os = "linux")]
@@ -501,23 +628,16 @@ pub fn run() {
             // Первым делом: обновление, скачанное в прошлый раз, ставится до
             // запуска движка, а после автоматической установки окно не нужно.
             let after_update = updates::on_startup(app.handle());
-            let hide_from_capture = app
-                .state::<AppState>()
-                .settings
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .hide_from_capture;
             // Окно вставки создаётся вместе с приложением, но показываться должно
             // только по горячей клавише. Прячем явно: на некоторых сборках WebView2
             // скрытое окно без рамки всплывало пустым белым прямоугольником.
-            for label in ["popup", "preview", "editor"] {
-                if let Some(p) = app.get_webview_window(label) {
-                    let _ = p.hide();
-                }
+            // Остальные окна на старте не создаются (`ensure_window`).
+            if let Some(p) = app.get_webview_window("popup") {
+                let _ = p.hide();
             }
             // Защиту от захвата трогаем, только если она включена: вызов на
             // скрытом окне может его показать.
-            if hide_from_capture {
+            if hide_from_capture(app.handle()) {
                 apply_capture_protection(app.handle(), true);
             }
             spawn_pruner(app.handle().clone());
@@ -561,14 +681,24 @@ pub fn run() {
             // Любое событие окна — признак, что программой пользуются.
             updates::touch(window.app_handle());
             match event {
-                // Закрытие окна прячет его: приложение живёт в трее до «Выход».
-                WindowEvent::CloseRequested { api, .. } => {
+                // Окно вставки при закрытии только прячется: оно нужно мгновенно
+                // по горячей клавише. Настройки, превью и редактор закрываются
+                // насовсем и освобождают свой WebView; приложение живёт в трее
+                // до «Выход» (см. `RunEvent::ExitRequested` ниже).
+                WindowEvent::CloseRequested { api, .. } if window.label() == "popup" => {
                     api.prevent_close();
                     let _ = window.hide();
-                    // Вместе с настройками прячется и пример окна вставки.
-                    if window.label() == "settings" {
-                        settings_window::size_preview_hide(window.app_handle().clone());
+                }
+                // Несохранённая форма хранилища: окно спросит человека само.
+                // Иначе запомнить, как стояло окно, и вместе с настройками
+                // закрыть пример окна вставки.
+                WindowEvent::CloseRequested { api, .. } if window.label() == "settings" => {
+                    if !settings_window::may_close(window.app_handle()) {
+                        api.prevent_close();
+                        return;
                     }
+                    settings_window::remember_geometry(window);
+                    settings_window::size_preview_close(window.app_handle());
                 }
                 // Окно вставки исчезает, как только уходит фокус: как меню.
                 WindowEvent::Focused(true) if window.label() == "popup" => {
@@ -584,6 +714,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("приложение не собралось")
         .run(|app, event| {
+            // Закрылось последнее окно (`code` пустой): программа остаётся в
+            // трее. Выход из меню (`app.exit`) и перезапуск после обновления
+            // приходят с кодом и проходят.
+            if let tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } = &event
+            {
+                api.prevent_exit();
+                return;
+            }
             if let tauri::RunEvent::Exit = event {
                 // Дать движку дослать очередь перед выходом.
                 let state = app.state::<AppState>();
@@ -647,6 +787,19 @@ mod coalesce_tests {
 
 #[cfg(test)]
 mod config_tests {
+    /// На старте создаётся только окно вставки (быстрый первый показ),
+    /// остальные — по требованию через `ensure_window`.
+    #[test]
+    fn only_popup_is_created_at_startup() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
+        let conf: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for w in conf["app"]["windows"].as_array().unwrap() {
+            let created = w["create"].as_bool().unwrap_or(true);
+            assert_eq!(created, w["label"] == "popup", "окно {}", w["label"]);
+        }
+    }
+
     /// `tauri.macos.conf.json` при слиянии заменяет массив окон целиком, поэтому
     /// там копия окон из `tauri.conf.json`. Отличаться она может только
     /// заголовком macOS, иначе правка основного конфига потеряется на маке.

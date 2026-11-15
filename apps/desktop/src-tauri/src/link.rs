@@ -4,7 +4,7 @@
 //! трогаем (переход по ним может сжечь код входа или сброса пароля).
 
 use clipwire_agent::i18n::{tr, trf};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -39,9 +39,63 @@ pub struct LinkCard {
     pub error: Option<String>,
 }
 
+/// Сколько карточек держать. В карточке бывает картинка до [`MAX_IMAGE`]
+/// (data URL — ещё на треть больше), поэтому кэш маленький: 32 карточки —
+/// это худший случай около 90 МБ, обычный — сотни килобайт.
+const CACHE_CARDS: usize = 32;
+
 /// Кэш на время работы программы: повторный пробел не ходит в сеть.
 #[derive(Default)]
-pub struct LinkCache(Mutex<HashMap<String, LinkCard>>);
+pub struct LinkCache(Mutex<Lru<LinkCard>>);
+
+/// Маленький LRU по строковому ключу: свежие спереди, лишние уходят с конца.
+/// Поиск линейный — при паре десятков записей это дешевле хэш-таблицы
+/// со списком порядка.
+pub struct Lru<V> {
+    cap: usize,
+    items: VecDeque<(String, V)>,
+}
+
+impl<V> Default for Lru<V> {
+    fn default() -> Self {
+        Self::new(CACHE_CARDS)
+    }
+}
+
+impl<V> Lru<V> {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            items: VecDeque::new(),
+        }
+    }
+
+    /// Найти и сделать самой свежей.
+    pub fn get(&mut self, key: &str) -> Option<V>
+    where
+        V: Clone,
+    {
+        let i = self.items.iter().position(|(k, _)| k == key)?;
+        let item = self.items.remove(i)?;
+        let v = item.1.clone();
+        self.items.push_front(item);
+        Some(v)
+    }
+
+    /// Положить (заменив старое значение), вытеснив самую давнюю при переполнении.
+    pub fn put(&mut self, key: String, v: V) {
+        if let Some(i) = self.items.iter().position(|(k, _)| *k == key) {
+            self.items.remove(i);
+        }
+        self.items.push_front((key, v));
+        self.items.truncate(self.cap);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+}
 
 #[tauri::command]
 pub async fn link_preview(app: AppHandle, url: String) -> LinkCard {
@@ -116,7 +170,7 @@ pub async fn link_preview(app: AppHandle, url: String) -> LinkCard {
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, card.clone());
+            .put(key, card.clone());
     }
     card
 }
@@ -127,7 +181,6 @@ fn cached(app: &AppHandle, key: &str) -> Option<LinkCard> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(key)
-        .cloned()
 }
 
 fn failed(url: &str, e: String) -> LinkCard {
@@ -612,6 +665,33 @@ mod tests {
 
     fn u(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn link_cache_is_bounded_lru() {
+        let mut c = Lru::new(2);
+        c.put("a".into(), 1);
+        c.put("b".into(), 2);
+        // Чтение освежает «a»: вытесняется давняя «b».
+        assert_eq!(c.get("a"), Some(1));
+        c.put("c".into(), 3);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.get("b"), None);
+        assert_eq!(c.get("a"), Some(1));
+        assert_eq!(c.get("c"), Some(3));
+        // Повторная запись заменяет значение, а не плодит дубль.
+        c.put("a".into(), 10);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.get("a"), Some(10));
+        assert_eq!(c.get("missing"), None);
+        // Предел по умолчанию.
+        let mut d: Lru<u32> = Lru::default();
+        for i in 0..100 {
+            d.put(i.to_string(), i);
+        }
+        assert_eq!(d.len(), CACHE_CARDS);
+        assert_eq!(d.get("99"), Some(99));
+        assert_eq!(d.get("0"), None);
     }
 
     #[test]

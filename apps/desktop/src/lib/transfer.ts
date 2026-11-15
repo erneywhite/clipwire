@@ -54,6 +54,43 @@ export function entryProgress(files: Pick<FileInfo, 'blob'>[], transfers: Transf
 }
 
 /**
+ * Можно ли убрать законченную передачу из карты. Нельзя, пока она сама идёт
+ * или пока идёт другой файл той же записи: entryProgress считает только файлы
+ * с передачей в карте, и без готового файла сумма уменьшится, процент и полоса
+ * поедут назад. `entries` — blob'ы файлов каждой записи, которая сейчас на
+ * виду (список и предпросмотр). Файл, которого нет ни в одной из них, никто
+ * не показывает: его можно убирать.
+ */
+export function canDrop(blob: string, transfers: TransferMap, entries: Iterable<readonly (string | null)[]>): boolean {
+  const x = transfers[blob]
+  if (!x) return false
+  if (x.state === 'active') return false
+  for (const blobs of entries) {
+    if (!blobs.includes(blob)) continue
+    if (blobs.some((b) => b !== null && b !== blob && transfers[b]?.state === 'active')) return false
+  }
+  return true
+}
+
+/**
+ * Указатель для canDrop: для каждого blob — файлы (blob'ы) записей на виду,
+ * где он есть. Строится один раз на смену списка, а не перебором всех
+ * подгруженных записей (их тысячи) на каждую законченную передачу.
+ */
+export function entriesByBlob(entries: Iterable<readonly (string | null)[]>): Map<string, (readonly (string | null)[])[]> {
+  const index = new Map<string, (readonly (string | null)[])[]>()
+  for (const blobs of entries) {
+    for (const b of new Set(blobs)) {
+      if (b === null) continue
+      const list = index.get(b)
+      if (list) list.push(blobs)
+      else index.set(b, [blobs])
+    }
+  }
+  return index
+}
+
+/**
  * Все файлы записи, которые отправлялись, уже на сервере. Полоса прогресса
  * видна только пока файл идёт, а это секунды: без этой пометки открывший окно
  * позже не узнает, ушёл ли файл. Сведения двух видов: события передач этого

@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::blobs::{Blobs, Transfer};
 use crate::clipboard::{self, Watcher};
-use crate::history::{Entry, History, local_entry, now_ms};
+use crate::history::{CardKind, Entry, History, local_entry, make_thumb, now_ms};
 use crate::loopguard::LoopGuard;
 use crate::state::{AgentState, Paths};
 use crate::sync::{Engine, Event, Outgoing, Status};
@@ -157,15 +157,17 @@ impl Copier {
         if let Some(app) = &source {
             entry.set_source_app(app);
         }
+        let thumb = thumb_if_new(&self.history, &entry);
         let added = self
             .history
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .merge(entry)
+            .merge_many([(entry, thumb)])
             .unwrap_or_else(|e| {
                 tracing::warn!("не записалось в историю: {e:#}");
-                false
-            });
+                0
+            })
+            > 0;
         if added {
             (self.on_event)(UiEvent::HistoryMerged(1));
         }
@@ -324,12 +326,12 @@ impl Service {
         let local_tx = synced.then_some(local_tx);
         // Другие устройства просят напрямую только то, что есть в своей
         // истории с `p2p`.
+        // Поиск — обход карточек: вторым соединением, без замка истории.
         if let Some(b) = &blobs {
             let h = history.clone();
+            let reader = h.lock().unwrap_or_else(|e| e.into_inner()).reader();
             b.set_p2p_sources(Arc::new(move |blob| {
-                h.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .local_p2p_file(blob)
+                crate::history::read(&h, reader.as_ref(), |h| h.local_p2p_file(blob))
             }));
         }
         let copier = Copier {
@@ -400,10 +402,9 @@ impl Service {
                             }
                         }
                         Event::History(items) => {
-                            let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
-                            let mut added = 0;
-                            for item in items {
-                                let entry = Entry {
+                            let entries: Vec<Entry> = items
+                                .into_iter()
+                                .map(|item| Entry {
                                     id: item.id,
                                     origin: item.origin,
                                     device_name: item.device_name,
@@ -412,14 +413,38 @@ impl Service {
                                     seen_ms: item.created_at_ms as i64,
                                     pinned: false,
                                     ext: item.ext,
-                                };
-                                match h.merge(entry) {
-                                    Ok(true) => added += 1,
-                                    Ok(false) => {}
-                                    Err(e) => tracing::warn!("не записалось в историю: {e:#}"),
-                                }
-                            }
-                            drop(h);
+                                })
+                                .collect();
+                            // Миниатюры — без замка истории и только новым
+                            // записям: в пачке до тысячи элементов, часть
+                            // картинки, и большинство обычно уже знакомо.
+                            let fresh: Vec<bool> = {
+                                let h = history.lock().unwrap_or_else(|e| e.into_inner());
+                                entries.iter().map(|e| !h.knows(e)).collect()
+                            };
+                            let batch = tokio::task::spawn_blocking(move || {
+                                entries
+                                    .into_iter()
+                                    .zip(fresh)
+                                    .map(|(e, fresh)| {
+                                        let thumb = if fresh { make_thumb(&e) } else { None };
+                                        (e, thumb)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .await;
+                            let Ok(batch) = batch else {
+                                tracing::warn!("история группы не записалась: сбой задачи");
+                                continue;
+                            };
+                            let added = history
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .merge_many(batch)
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!("не записалось в историю: {e:#}");
+                                    0
+                                });
                             if added > 0 {
                                 on_event(UiEvent::HistoryMerged(added));
                             }
@@ -640,18 +665,19 @@ impl Service {
 }
 
 /// Последние локальные элементы, от старых к новым, для отправки в группу.
+/// Отбор по карточкам, тела читаются только у отобранных.
 fn local_backfill(h: &History) -> Vec<(Outgoing, u64)> {
     let mut out: Vec<(Outgoing, u64)> = h
-        .list("", false, usize::MAX)
+        .ids_where(BACKFILL_MAX, |c| c.local && sendable_backfill(c.kind))
         .into_iter()
-        .filter(|e| e.local && sendable_backfill(&e.content))
-        .take(BACKFILL_MAX)
+        .filter_map(|id| h.get(id))
         .map(|e| {
+            let seen = e.seen_ms.max(0) as u64;
             let out = Outgoing {
-                content: e.content.clone(),
-                ext: e.ext.clone(),
+                content: e.content,
+                ext: e.ext,
             };
-            (out, e.seen_ms.max(0) as u64)
+            (out, seen)
         })
         .collect();
     out.reverse();
@@ -662,8 +688,8 @@ fn local_backfill(h: &History) -> Vec<(Outgoing, u64)> {
 // shortcut: файлы из локального режима в группу не отправляются — у них нет
 // `blob`, а грузить на сервер всю старую историю файлов при входе неожиданно.
 // Пересмотреть, если попросят «отправить и старые файлы».
-fn sendable_backfill(c: &Content) -> bool {
-    !matches!(c, Content::Files(_))
+fn sendable_backfill(kind: CardKind) -> bool {
+    kind != CardKind::Files
 }
 
 /// Как передаётся файл или папка (таблица в `docs/files-transfer.md`).
@@ -819,10 +845,21 @@ fn discard_outbox(blobs: Option<&Blobs>, content: &Content) {
     }
 }
 
+/// Миниатюра для записи, которой ещё нет в истории. Делается без замка
+/// истории: декодирование картинки не должно держать окно и движок.
+fn thumb_if_new(history: &Mutex<History>, e: &Entry) -> Option<Vec<u8>> {
+    if !matches!(e.content, Content::Image { .. } | Content::Files(_)) {
+        return None;
+    }
+    let known = history.lock().unwrap_or_else(|e| e.into_inner()).knows(e);
+    if known { None } else { make_thumb(e) }
+}
+
 /// Записать в историю. `true` — появилась новая запись.
 fn record(history: &Mutex<History>, entry: Entry) -> bool {
+    let thumb = thumb_if_new(history, &entry);
     let mut h = history.lock().unwrap_or_else(|e| e.into_inner());
-    h.add(entry).unwrap_or_else(|e| {
+    h.add_with_thumb(entry, thumb).unwrap_or_else(|e| {
         tracing::warn!("не записалось в историю: {e:#}");
         false
     })
@@ -1138,11 +1175,11 @@ mod tests {
         let list = h.list("", false, 10);
         assert_eq!(list.len(), 2);
         assert_eq!(
-            list[0].content,
+            h.get(list[0].id).unwrap().content,
             Content::Text("позже".into()),
             "наверху — новое"
         );
-        assert_eq!(list[1].content, late);
+        assert_eq!(h.get(list[1].id).unwrap().content, late);
         assert_eq!(list[1].seen_ms, started);
         drop(h);
         // В группу ничего не ушло.

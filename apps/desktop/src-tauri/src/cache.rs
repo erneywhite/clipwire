@@ -25,33 +25,50 @@ fn busy(state: &AppState) -> HashSet<BlobId> {
         .unwrap_or_default()
 }
 
+/// Чистка кэша: одна за раз, просьбы во время чистки — один повтор после неё.
+static PRUNE: clipwire_agent::cache::Rerun = clipwire_agent::cache::Rerun::new();
+
 /// Удалить в фоне копии и забранные виртуальные файлы, на которые не
 /// ссылается ни одна запись истории.
 /// Зовётся после удаления записи, очистки истории, чистки по сроку и на старте.
+/// Сразу возвращается: и обход карточек истории, и удаление идут отдельным
+/// потоком (зовут и из обработчика событий сервиса). Частые просьбы (удаляют
+/// записи одну за другой) не запускают обход на каждую.
 pub fn prune_later(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    let busy = busy(&state);
-    let (keep, paths) = {
-        let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        (h.blobs(), h.file_paths())
-    };
-    let dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
-    let virtual_dir = clipwire_agent::clipboard::virtual_dir(&state.paths.dir);
+    if !PRUNE.request() {
+        return;
+    }
+    let app = app.clone();
     std::thread::spawn(move || {
-        let r = clipwire_agent::cache::prune(&dir, &keep, &busy);
-        if r.removed > 0 {
-            tracing::info!(removed = r.removed, "из кэша удалены ненужные копии");
-        }
-        // Забранные вложения Outlook: держатся, пока на них ссылается запись.
-        let r = clipwire_agent::cache::prune_virtual(
-            &virtual_dir,
-            &paths,
-            clipwire_agent::cache::VIRTUAL_GRACE,
-        );
-        if r.removed > 0 {
-            tracing::info!(removed = r.removed, "удалены ненужные виртуальные файлы");
+        while PRUNE.next() {
+            prune_now(&app);
         }
     });
+}
+
+fn prune_now(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
+    let virtual_dir = clipwire_agent::clipboard::virtual_dir(&state.paths.dir);
+    // Обход всех карточек: вторым соединением, без замка истории.
+    let (keep, paths) =
+        clipwire_agent::history::read(&state.history, state.reader.as_ref(), |h| h.file_refs());
+    // Что качается — после обхода: запись, пришедшая во время обхода, уже
+    // качается и попадёт сюда, хотя в снимок истории не попала.
+    let busy = busy(&state);
+    let r = clipwire_agent::cache::prune(&dir, &keep, &busy);
+    if r.removed > 0 {
+        tracing::info!(removed = r.removed, "из кэша удалены ненужные копии");
+    }
+    // Забранные вложения Outlook: держатся, пока на них ссылается запись.
+    let r = clipwire_agent::cache::prune_virtual(
+        &virtual_dir,
+        &paths,
+        clipwire_agent::cache::VIRTUAL_GRACE,
+    );
+    if r.removed > 0 {
+        tracing::info!(removed = r.removed, "удалены ненужные виртуальные файлы");
+    }
 }
 
 /// Сколько места занимает кэш скачанного, байт.

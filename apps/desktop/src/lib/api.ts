@@ -203,6 +203,21 @@ export type Status =
   /** Сервер сообщил, что устройство исключено: синхронизация остановлена, ключ на месте. */
   | { kind: 'excluded' }
 
+/** События группы, которые окно настроек забирает у Rust (`group_notices_take`). */
+export interface GroupNotices {
+  rekeyed: GroupRekeyed | null
+  /** Новый ключ не дошёл: текст ошибки. */
+  rekey_failed: string | null
+  /** Сервер исключил устройство. */
+  excluded: boolean
+}
+
+/** Для списка устройств: итог смены ключа, пришедший событием. */
+export interface DevicesIncoming {
+  result: RekeyResult | null
+  error: string | null
+}
+
 /** Событие `clipwire://group-rekeyed`. */
 export interface GroupRekeyed {
   /** Ключ сменили на этом устройстве. */
@@ -309,12 +324,21 @@ export const api = {
   hidePopup: () => invoke<void>('popup_hide'),
   sizePreview: (width: number, height: number) => invoke<void>('size_preview', { width, height }),
   sizePreviewHide: () => invoke<void>('size_preview_hide'),
+  /** Раздел настроек, открытый в прошлый раз: окно закрывается насовсем. */
+  settingsSectionGet: () => invoke<string | null>('settings_section_get'),
+  settingsSectionSet: (section: string) => invoke<void>('settings_section_set', { section }),
+  /** Спрашивать ли перед закрытием окна настроек (несохранённая форма хранилища). */
+  settingsCloseGuard: (on: boolean) => invoke<void>('settings_close_guard', { on }),
   leaveGroup: () => invoke<void>('leave_group'),
   deviceInfo: () => invoke<DeviceInfo>('device_info'),
   /** Поставить обновление сейчас; на Windows программа закроется и запустится заново. */
   updateInstall: () => invoke<void>('update_install'),
   /** Версия, которая уже скачана и поставится сама, или null. */
   updateReady: () => invoke<string | null>('update_ready'),
+  /** Версия, которую нашла фоновая проверка (или скачанная), или null. */
+  updateFound: () => invoke<string | null>('update_found'),
+  /** Забрать события группы, пришедшие с прошлого раза (в том числе пока настроек не было). */
+  groupNoticesTake: () => invoke<GroupNotices>('group_notices_take'),
   devicesList: () => invoke<GroupDevice[]>('devices_list'),
   statsOverview: () => invoke<StatsOverview>('stats_overview'),
   deviceRemove: (deviceId: string) => invoke<RekeyResult>('device_remove', { deviceId }),
@@ -327,6 +351,8 @@ export const api = {
   /** Удалить скачанные копии, кроме тех, что качаются сейчас. */
   cacheClear: () => invoke<CacheCleared>('cache_clear'),
   editImage: (id: string) => invoke<void>('editor_open', { id }),
+  /** Какую картинку показывать редактору: последний запрошенный id. */
+  editorPending: () => invoke<string | null>('editor_pending'),
   linkPreview: (url: string) => invoke<LinkCard>('link_preview', { url }),
   filePreview: (path: string) => invoke<FilePreview>('file_preview', { path }),
   /** Скачать файлы записи с другого устройства без вставки. Прогресс идёт событиями. */

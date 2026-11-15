@@ -1,13 +1,23 @@
 <script lang="ts">
   // Устройства группы: список, удаление устройства и смена ключа группы.
-  import { onMount } from 'svelte'
+  import { onMount, untrack } from 'svelte'
   import { t } from '../lib/i18n'
   import { listen } from '@tauri-apps/api/event'
-  import { api, type GroupDevice, type GroupRekeyed, type RekeyResult, type Status, type StorageKind } from '../lib/api'
+  import { api, type DevicesIncoming, type GroupDevice, type RekeyResult, type Status, type StorageKind } from '../lib/api'
   import { ago, plural } from '../lib/format'
   import { CHECKING, checking as checkingText, confirmText, deviceTitle, seenLabel } from '../lib/devices'
 
-  let { onRekeyed }: { onRekeyed?: (invite: string) => void } = $props()
+  // `incoming` — итог смены ключа, пришедший событием (его забирает окно
+  // настроек: раздел мог быть закрыт). Принятый сообщается `onIncomingTaken`.
+  let {
+    onRekeyed,
+    incoming = null,
+    onIncomingTaken,
+  }: {
+    onRekeyed?: (invite: string) => void
+    incoming?: DevicesIncoming | null
+    onIncomingTaken?: () => void
+  } = $props()
 
   const fmt = { ago, plural }
 
@@ -95,21 +105,27 @@
     reloadTimer = setTimeout(load, 300)
   }
 
+  // Ключ сменили здесь, а ответ сервера потерялся: успех приходит событием,
+  // когда устройство снова вошло в старую группу. Или новый ключ не дошёл.
+  $effect(() => {
+    const inc = incoming
+    if (!inc) return
+    untrack(() => {
+      if (inc.result) done(inc.result)
+      if (inc.error) {
+        checking = false
+        error = inc.error
+      }
+      onIncomingTaken?.()
+    })
+  })
+
   onMount(() => {
     // Список обновляется, когда сервис снова на связи (в том числе после
     // смены ключа): раньше движок ответить не может.
     const unlisten = [
       listen<Status>('clipwire://status', (e) => {
         if (e.payload.kind === 'online') load()
-      }),
-      // Ключ сменили здесь, а ответ сервера потерялся: успех приходит
-      // событием, когда устройство снова вошло в старую группу.
-      listen<GroupRekeyed>('clipwire://group-rekeyed', (e) => {
-        if (e.payload.by_me && e.payload.result) done(e.payload.result)
-      }),
-      listen<string>('clipwire://group-rekey-failed', (e) => {
-        checking = false
-        error = e.payload
       }),
       // Сервер сообщил, что устройство подключилось, ушло или переименовалось.
       listen('clipwire://devices-changed', loadSoon),

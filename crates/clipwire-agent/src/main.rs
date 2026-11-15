@@ -193,14 +193,15 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
     let mut history = History::open(&paths.dir)?;
     history.prune(settings.retention, clipwire_agent::history::now_ms())?;
     // Копии скачанного, на которые больше не ссылается ни одна запись.
+    let (blobs, file_paths) = history.file_refs();
     clipwire_agent::cache::prune(
         &clipwire_agent::blobs::files_dir(&paths.dir),
-        &history.blobs(),
+        &blobs,
         &Default::default(),
     );
     clipwire_agent::cache::prune_virtual(
         &clipwire_agent::clipboard::virtual_dir(&paths.dir),
-        &history.file_paths(),
+        &file_paths,
         clipwire_agent::cache::VIRTUAL_GRACE,
     );
     let rt = tokio::runtime::Runtime::new()?;
@@ -289,29 +290,35 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(clipwire_agent::paste_import::default_dir);
 
+    let report = |sum: &clipwire_agent::paste_import::Summary| {
+        eprintln!(
+            "в Paste записей: {}. Переносится: текст {}, с форматированием {}, картинки {} \
+             (закреплённых {}). Пропущено: файлы {}, приватное {}, картинки {}, пустое {}, \
+             не прочиталось {}.",
+            sum.total,
+            sum.text,
+            sum.rich,
+            sum.images,
+            sum.pinned,
+            sum.skipped_files,
+            sum.skipped_private,
+            sum.skipped_images,
+            sum.skipped_empty,
+            sum.unreadable
+        )
+    };
     eprintln!("читаю Paste: {}", dir.display());
-    let (items, sum) = clipwire_agent::paste_import::read(&dir, images)?;
-    eprintln!(
-        "в Paste записей: {}. Переносится: текст {}, с форматированием {}, картинки {} \
-         (закреплённых {}). Пропущено: файлы {}, приватное {}, картинки {}, пустое {}, \
-         не прочиталось {}.",
-        sum.total,
-        sum.text,
-        sum.rich,
-        sum.images,
-        sum.pinned,
-        sum.skipped_files,
-        sum.skipped_private,
-        sum.skipped_images,
-        sum.skipped_empty,
-        sum.unreadable
-    );
     if dry_run {
+        report(&clipwire_agent::paste_import::read(&dir, images, |_| {
+            Ok(())
+        })?);
         return Ok(());
     }
 
-    // Приложение держит историю в памяти и перезаписало бы её поверх. С
-    // отдельной папкой (`CLIPWIRE_HOME`, проверки) рабочее приложение не мешает.
+    // Приложение и импорт пишут в одну базу истории; перенос тысяч записей
+    // под работающим приложением шёл бы вперемешку с его записями и долго
+    // держал бы базу. С отдельной папкой (`CLIPWIRE_HOME`, проверки) рабочее
+    // приложение не мешает.
     let running = std::env::var_os("CLIPWIRE_HOME").is_none()
         && std::process::Command::new("pgrep")
             .args(["-f", "Clipwire.app/Contents/MacOS/clipwire-desktop"])
@@ -342,8 +349,11 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
     let mut history = History::open(&paths.dir)?;
     let mut apps: HashMap<(Option<String>, Option<String>), Option<clipwire_core::SourceApp>> =
         HashMap::new();
+    // shortcut: с --send отправляемое копится в памяти целиком (движку нужен
+    // список); с картинками это много. Переделать на чтение тел из истории
+    // по мере отправки, если --send --images понадобится на больших архивах.
     let (mut added, mut outgoing) = (0usize, Vec::new());
-    for it in items {
+    let sum = clipwire_agent::paste_import::read(&dir, images, |it| {
         let app = it.app.and_then(|a| {
             apps.entry((a.bundle_id.clone(), a.name.clone()))
                 .or_insert_with(|| {
@@ -354,12 +364,13 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
                 })
                 .clone()
         });
+        let sent = send.then(|| it.content.clone());
         let mut entry = Entry {
             id: ItemId::at_ms(it.seen_ms.max(0) as u64),
             origin: device,
             device_name: settings.device_name.clone(),
             local: true,
-            content: it.content.clone(),
+            content: it.content,
             seen_ms: it.seen_ms,
             pinned: it.pinned,
             ext: Vec::new(),
@@ -367,16 +378,20 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
         if let Some(app) = &app {
             entry.set_source_app(app);
         }
+        // Записи идут по одной, каждая своей транзакцией: тела картинок не
+        // копятся в памяти, а `merge` сам отбрасывает уже перенесённое.
         if history.merge(entry)? {
             added += 1;
-            if send {
+            if let Some(content) = sent {
                 outgoing.push((
-                    Outgoing::new(it.content, app.as_ref()),
+                    Outgoing::new(content, app.as_ref()),
                     it.seen_ms.max(0) as u64,
                 ));
             }
         }
-    }
+        Ok(())
+    })?;
+    report(&sum);
     eprintln!(
         "в историю Clipwire добавлено: {added} (уже были: {})",
         sum.text + sum.rich + sum.images - added

@@ -5,11 +5,14 @@
   import { api, type Entry, type FileInfo, type KindFilter, type Settings, type Transfer } from '../lib/api'
   import { applyTheme } from '../lib/theme'
   import { ago, bytesLabel, filesMeta, isUrl, looksLikeCode, richDoc, sizeLabel } from '../lib/format'
-  import { canDownload, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
+  import { canDownload, canDrop, entriesByBlob, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import EntryRow from '../lib/EntryRow.svelte'
+  import { anchored, anchoredById, disjoint, HeightCache, keptInDom, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange, type Range, type RowShape } from '../lib/vlist'
   import AppTag from '../lib/AppTag.svelte'
   import { t } from '../lib/i18n'
+  import { debounce } from '../lib/debounce'
+  import { inFlight } from '../lib/inflight'
   import LinkCard from './LinkCard.svelte'
   import FilePreview from './FilePreview.svelte'
   import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -34,7 +37,9 @@
     kind = order[(order.indexOf(kind) + d + order.length) % order.length]
     reload()
   }
-  let items = $state<Entry[]>([])
+  // Записи не меняются по месту, только заменяются целиком: без глубокого
+  // прокси Svelte на каждую из тысяч подгруженных.
+  let items = $state.raw<Entry[]>([])
   let sel = $state(0)
   let preview = $state<{ entry: Entry; side: 'left' | 'right' } | null>(null)
   // Текст в предпросмотре можно поправить перед вставкой.
@@ -51,7 +56,9 @@
   let portalPaste = $state(false)
   const canPaste = $derived(canX11Paste || portalPaste)
   let input: HTMLInputElement | undefined = $state()
-  let listEl: HTMLUListElement | undefined = $state()
+  // Прокручиваемая обёртка списка и сам список внутри неё.
+  let listEl: HTMLDivElement | undefined = $state()
+  let rowsEl: HTMLUListElement | undefined = $state()
 
   const current = $derived(items[sel])
 
@@ -132,14 +139,60 @@
     }
   }
 
+  // Законченные передачи убираются из карты через несколько секунд, иначе она
+  // растёт с каждым переданным файлом. Неудачные живут дольше: ошибку в строке
+  // должны успеть увидеть.
+  const DONE_KEEP_MS = 5_000
+  const FAILED_KEEP_MS = 30_000
+  const dropTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+  /** Новое состояние передачи: законченную запланировать к удалению из карты. */
+  function scheduleDrop(t: Transfer) {
+    clearTimeout(dropTimers.get(t.blob))
+    dropTimers.delete(t.blob)
+    if (t.state === 'active') return
+    dropTimers.set(t.blob, setTimeout(() => dropTransfer(t.blob), t.state === 'done' ? DONE_KEEP_MS : FAILED_KEEP_MS))
+  }
+
   function onTransfer(t: Transfer) {
     transfers[t.blob] = t
+    scheduleDrop(t)
     // Скачивание по кнопке ждёт download(); здесь — чужие скачивания, например
     // начатые из другого окна, чтобы предпросмотр не остался на карточке.
     if (t.direction === 'down' && t.state === 'done' && !fetching) {
-      load()
-      refreshPreview()
+      historyChanged()
+      if (visible) refreshPreview()
     }
+  }
+
+  // Файлы записей на виду (список и предпросмотр) по blob — для dropTransfer.
+  // Считается при первом чтении после смены списка, а не на каждую передачу.
+  const blobEntries = $derived(
+    entriesByBlob((preview ? [...items, preview.entry] : items).filter((e) => e.files.length > 0).map((e) => e.files.map((f) => f.blob))),
+  )
+
+  /** Убрать законченную передачу из карты. */
+  function dropTransfer(blob: string) {
+    dropTimers.delete(blob)
+    const x = transfers[blob]
+    if (!x || x.state === 'active') return
+    // Другой файл той же записи ещё идёт: без готового прогресс записи поедет
+    // назад. Ждём ещё, до конца всей записи.
+    if (!canDrop(blob, transfers, blobEntries.get(blob) ?? [])) {
+      dropTimers.set(blob, setTimeout(() => dropTransfer(blob), DONE_KEEP_MS))
+      return
+    }
+    // Пометку «↑ на сервере» строка берёт из события передачи, пока оно есть,
+    // а потом из поля uploaded (журнал загрузок). У строк, прочитанных до
+    // конца загрузки, поле ещё старое: выставляем его сами, иначе пометка
+    // пропадёт до следующего чтения списка.
+    if (x.direction === 'up' && x.state === 'done') {
+      const has = (e: Entry) => e.files.some((f) => f.blob === blob && !f.uploaded)
+      const mark = (e: Entry): Entry => ({ ...e, files: e.files.map((f) => (f.blob === blob ? { ...f, uploaded: true } : f)) })
+      if (items.some(has)) items = items.map((e) => (has(e) ? mark(e) : e))
+      if (preview && has(preview.entry)) preview = { ...preview, entry: mark(preview.entry) }
+    }
+    delete transfers[blob]
   }
 
   // Лента: записи подгружаются страницами по мере прокрутки. Следующая
@@ -149,35 +202,53 @@
   // Больше этого история за один запрос не отдаёт (commands.rs).
   const MAX_CALL = 1000
   // Записей дальше нет: история кончилась.
-  let exhausted = false
+  let exhausted = $state(false)
   let loadingMore = false
   // Номер списка: смена запроса, вкладки или фильтра его меняет, и ответы
   // на старые запросы отбрасываются.
   let gen = 0
+  // Запрос, по которому построен текущий список. Строка поиска (query) уходит
+  // вперёд на паузу перед запросом; до неё перечитывание по событию и
+  // подгрузка следующей страницы должны читать тот же список, что на экране.
+  // Меняется вместе с gen: в reload() и при показе окна.
+  let applied = ''
 
   /** `count` записей подряд начиная с `offset` (несколькими запросами, если много). */
   async function fetchRange(offset: number, count: number): Promise<Entry[]> {
     const out: Entry[] = []
     while (out.length < count) {
       const n = Math.min(MAX_CALL, count - out.length)
-      const page = await api.list(query, tab === 'pinned', kind, n, offset + out.length)
+      const page = await api.list(applied, tab === 'pinned', kind, n, offset + out.length)
       out.push(...page)
       if (page.length < n) break
     }
     return out
   }
 
+  // Окно на экране. Пока оно спрятано, изменения истории список не
+  // перечитывают: показ (popup://opened) всё равно перечитает первую страницу.
+  let visible = false
+  // Перечитывание по событию уже идёт: событие, пришедшее за это время, ждёт его конца.
+  let refreshing = false
+  let refreshAgain = false
+
   // Чужую ошибку (скачивания, вставки) load() не стирает: её сбрасывают явные
   // действия — новый запрос, смена вкладки, новое открытие окна, новая вставка.
-  // Перечитывает столько записей, сколько уже подгружено: новая запись не
-  // сбрасывает ленту и место прокрутки.
-  async function load(want = Math.max(PAGE, items.length)) {
+  // Перечитывает записи до видимого конца с запасом: новая запись не сбрасывает
+  // ленту и место прокрутки, а подгруженное ниже не читается заново.
+  async function load(want = neededCount()) {
     const g = gen
     try {
       const list = await fetchRange(0, want)
       if (g !== gen) return
+      const before = offs
+      const idsBefore = items.map((e) => e.id)
       items = list
       exhausted = list.length < want
+      // Сверху пришла запись, пока список прокручен вниз: видимое не уезжает.
+      const top = listEl?.scrollTop ?? 0
+      const y = anchoredById(before, idsBefore, offs, items.map((e) => e.id), top)
+      if (y !== top) tick().then(() => setScroll(y))
       if (sel >= items.length) sel = Math.max(0, items.length - 1)
       if (loadFailed) {
         loadFailed = false
@@ -189,9 +260,33 @@
     }
   }
 
+  /** Сколько записей перечитывать, чтобы не сдвинуть видимое и выбранное. */
+  function neededCount(): number {
+    return reloadCount(items.length, Math.max(range.end, sel + 1), PAGE, AHEAD)
+  }
+
+  /** История изменилась: перечитать список, если окно на экране. */
+  function historyChanged() {
+    if (!visible) return
+    if (refreshing) {
+      refreshAgain = true
+      return
+    }
+    refreshing = true
+    load().finally(() => {
+      refreshing = false
+      if (refreshAgain) {
+        refreshAgain = false
+        historyChanged()
+      }
+    })
+  }
+
   /** Следующая страница ленты, если она есть и ещё не грузится. */
   async function loadMore() {
-    if (exhausted || loadingMore || !items.length) return
+    // Пока новый список (другой запрос, вкладка или фильтр) не пришёл, на экране
+    // старый: смещение по его длине дало бы дыру в новой ленте.
+    if (exhausted || loadingMore || listing.busy || !items.length) return
     loadingMore = true
     const g = gen
     try {
@@ -212,30 +307,212 @@
   /** Подгрузить, если до конца ленты осталось меньше AHEAD записей. */
   function maybeMore() {
     if (exhausted || !items.length) return
-    let left = items.length - 1 - sel
-    if (listEl && listEl.scrollHeight > 0) {
-      // Строки разной высоты: считаем по средней.
-      const row = listEl.scrollHeight / items.length
-      const below = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight
-      left = Math.min(left, below / row)
-    }
-    if (left < AHEAD) loadMore()
+    const last = rowAt(offs, scrollTop + (listEl?.clientHeight ?? 0))
+    if (rowsLeft(items.length, sel, last) < AHEAD) loadMore()
   }
 
   /** Явная смена списка: новый запрос или вкладка. Старая ошибка уже ни к чему. */
-  function reload() {
+  function reload(): Promise<void> {
+    search.cancel()
     gen++
+    applied = query
     sel = 0
     error = ''
     loadFailed = false
     exhausted = false
-    load(PAGE)
-    if (listEl) listEl.scrollTop = 0
+    const done = listing.track(load(PAGE))
+    setScroll(0)
+    return done
   }
 
-  async function scrollToSel() {
-    await tick()
+  // Поиск — через SEARCH_MS после последней нажатой клавиши: редкое слово ищется
+  // полным проходом по истории, и запрос на каждую букву только нагружает базу.
+  // Ответы на старые запросы и так отбрасываются по gen.
+  const SEARCH_MS = 150
+  const search = debounce(reload, SEARCH_MS)
+  // Новый список (запрос, вкладка, фильтр, показ окна) ещё читается.
+  const listing = inFlight()
+
+  /**
+   * Запрос набран, но ещё не отправлен, или новый список ещё читается:
+   * отправить и дождаться его. Само чтение редкого слова может идти дольше
+   * паузы перед запросом.
+   */
+  async function flushSearch() {
+    if (search.pending) reload()
+    await listing.settled()
+  }
+
+  /**
+   * Клавиша работает со списком (выбор, вставка, удаление, меню): если поиск
+   * ещё ждёт паузы, она должна сработать по новому списку, а не по старому.
+   */
+  function listKey(e: KeyboardEvent): boolean {
+    const mod = e.ctrlKey || e.metaKey
+    return (
+      e.key === 'ArrowDown' ||
+      e.key === 'ArrowUp' ||
+      e.key === 'Enter' ||
+      e.key === 'ContextMenu' ||
+      (e.shiftKey && e.key === 'F10') ||
+      (e.key === 'Delete' && (e.shiftKey || query === '')) ||
+      (e.key === ' ' && query === '') ||
+      (mod && /^(KeyE|KeyP|Digit[1-9])$/.test(e.code)) ||
+      (isMac && e.metaKey && e.key === 'Backspace')
+    )
+  }
+
+  // Виртуальная прокрутка: в DOM только видимые строки и OVERSCAN строк
+  // сверху и снизу, сколько бы записей ни было подгружено. Место остальных
+  // занимают поля списка сверху и снизу. Высоты отрисованных строк меряет
+  // ResizeObserver, незамеренные оцениваются (lib/vlist.ts).
+  const OVERSCAN = 10
+  // Пока окно ещё не измерено.
+  const FALLBACK_VIEW = 600
+  const heights = new HeightCache()
+  // Меняется при каждом новом замере: по нему пересчитываются отступы строк.
+  let hver = $state(0)
+  let scrollTop = $state(0)
+  let viewH = $state(0)
+
+  function shapeOf(e: Entry): RowShape {
+    return e.thumb || e.kind === 'image' ? 'thumb' : 'row'
+  }
+
+  const offs = $derived.by(() => {
+    void hver
+    const list = items
+    return offsets(list.length, (i) => heights.get(list[i].id, shapeOf(list[i])))
+  })
+  // Тот же отрезок — тот же объект, чтобы прокрутка внутри него не перерисовывала строки.
+  let lastRange: Range = { start: 0, end: 0 }
+  const range = $derived.by(() => {
+    const r = visibleRange(offs, scrollTop, viewH || FALLBACK_VIEW, OVERSCAN)
+    if (r.start === lastRange.start && r.end === lastRange.end) return lastRange
+    return (lastRange = r)
+  })
+  const rows = $derived(items.slice(range.start, range.end))
+
+  function setScroll(y: number) {
+    if (listEl) {
+      listEl.scrollTop = y
+      scrollTop = listEl.scrollTop
+    } else {
+      scrollTop = 0
+    }
+  }
+
+  function onScroll() {
+    const prev = lastRange
+    if (listEl) scrollTop = listEl.scrollTop
+    // Прыжок (перетащили ползунок, щёлкнули по полосе прокрутки): отрисованы только новые строки,
+    // прежних в DOM не осталось.
+    if (disjoint(prev, range)) markJump(false)
+    maybeMore()
+  }
+
+  // Положение только что выставлено по настоящим строкам в DOM (прыжок к
+  // выбранной строке или к далёкому месту): поправку высот считаем по полю
+  // сверху (keptInDom), а не по оценкам строк над верхом окна (anchored).
+  // Флаг живёт два кадра: ResizeObserver сообщает о новых строках в том же
+  // кадре, где они разложены.
+  let jumped = false
+  // Выбранную строку после поправки снова показать целиком.
+  let revealSel = false
+  let jumpFrame = 0
+
+  function markJump(reveal: boolean) {
+    jumped = true
+    if (reveal) revealSel = true
+    if (typeof requestAnimationFrame === 'undefined') return
+    cancelAnimationFrame(jumpFrame)
+    jumpFrame = requestAnimationFrame(() => {
+      jumpFrame = requestAnimationFrame(() => {
+        jumped = false
+        revealSel = false
+      })
+    })
+  }
+
+  function revealSelected() {
     listEl?.querySelector<HTMLElement>(`[data-i="${sel}"]`)?.scrollIntoView({ block: 'nearest' })
+  }
+
+  // Другой список (пустой ↔ непустой): новый элемент прокрутки начинает с
+  // нуля, прокрутка от старого не годится, иначе строки нарисуются за полем
+  // сверху, а на виду будет пусто.
+  $effect(() => {
+    scrollTop = listEl ? listEl.scrollTop : 0
+  })
+
+  const observed = new Set<Element>()
+  const resizes = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(onResize)
+
+  /** Новые высоты строк: запомнить и удержать видимое на месте. */
+  function onResize(entries: ResizeObserverEntry[]) {
+    const list = items
+    let changed = false
+    // Строки стали другой ширины — замеры под старую ширину забываются. Новые
+    // высоты всех отрисованных строк приходят здесь же: смена ширины — тоже
+    // смена размера, ResizeObserver о ней сообщает.
+    if (rowsEl && heights.setWidth(rowsEl.clientWidth)) changed = true
+    for (const en of entries) {
+      const el = en.target as HTMLElement
+      if (!el.isConnected) continue
+      const e = list[Number(el.dataset.i)]
+      const h = en.borderBoxSize?.[0]?.blockSize ?? el.getBoundingClientRect().height
+      // Нулевая высота — окно спрятано или строка ещё не разложена: это не замер.
+      if (!e || !(h > 0)) continue
+      if (Math.abs(heights.set(e.id, shapeOf(e), h)) > 0.01) changed = true
+    }
+    if (!changed) return
+    // Строки выше окна поменяли высоту (или их оценку): та строка, что была
+    // вверху окна, должна там и остаться. Встроенную привязку прокрутки
+    // браузера (overflow-anchor) не берём: в WebKit её нет.
+    const before = offs
+    const top = listEl?.scrollTop ?? 0
+    const first = Number((rowsEl?.firstElementChild as HTMLElement | null)?.dataset.i ?? 0)
+    hver++
+    const y = jumped ? keptInDom(before, offs, first, top) : anchored(before, offs, top)
+    const reveal = revealSel
+    if (y === top && !reveal) return
+    tick().then(() => {
+      if (y !== top) setScroll(y)
+      if (reveal) revealSelected()
+    })
+  }
+
+  // Следить за размером строк, которые сейчас в DOM; ушедшие отпускать.
+  $effect(() => {
+    void rows
+    if (!resizes) return
+    for (const el of observed) {
+      if (el.isConnected) continue
+      resizes.unobserve(el)
+      observed.delete(el)
+    }
+    if (!rowsEl) return
+    for (const el of rowsEl.children) {
+      if (observed.has(el)) continue
+      resizes.observe(el)
+      observed.add(el)
+    }
+  })
+
+  async function scrollToSel() {
+    // Выбранной строки может не быть в DOM: сначала прокрутка по расчёту,
+    // потом, когда строка отрисована, точно по ней.
+    const prev = lastRange
+    if (listEl) setScroll(scrollFor(offs, sel, listEl.scrollTop, listEl.clientHeight))
+    await tick()
+    revealSelected()
+    // Прыжок (по кругу с первой записи на последнюю): в DOM только новые
+    // строки, их сейчас замерят, и поле сверху сдвинется. Поправка — по полю
+    // сверху, а строку надо будет показать снова (onResize). Обычный шаг
+    // стрелкой оставляет в DOM прежние строки, ему подходит привязка к строке
+    // вверху окна (anchored): с keptInDom незамеренная строка над окном сдвигала
+    // бы всё видимое на разницу с оценкой.
+    if (disjoint(prev, range)) markJump(true)
   }
 
   function move(d: number) {
@@ -406,8 +683,10 @@
   }
 
   /** Меню для выбранной строки с клавиатуры (клавиша меню или Shift+F10). */
-  function menuForCurrent() {
+  async function menuForCurrent() {
     if (!current) return
+    // Строка могла уйти из DOM при прокрутке: сначала вернуть её в окно.
+    await scrollToSel()
     const row = listEl?.querySelector<HTMLElement>(`[data-i="${sel}"]`)
     const r = row?.getBoundingClientRect()
     openMenu(current, r ? r.left + 24 : 24, r ? r.bottom - 6 : 60, true)
@@ -421,6 +700,16 @@
         closeMenu()
       }
       return
+    }
+    if ((search.pending || listing.busy) && e.target !== editor && listKey(e)) {
+      // Отменить действие браузера надо сразу, до ожидания; ниже клавиша
+      // обрабатывается как обычно, уже по новому списку.
+      e.preventDefault()
+      const session = shown
+      await flushSearch()
+      // Пока ждали, окно спрятали или открыли заново: клавиша относилась к
+      // списку, которого уже нет, вставлять или удалять по ней нельзя.
+      if (session !== shown || !visible) return
     }
     if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
       e.preventDefault()
@@ -505,6 +794,9 @@
   }
 
   function applySettings(s: Settings) {
+    // Замеры высот под другую ширину забывает onResize, когда строки правда
+    // стали другой ширины: ширина окна зажата в пределы (popup.rs), и разные
+    // настройки дают одинаковые строки.
     portalPaste = s.portal_paste && s.paste_into_active
     applyTheme(s.theme, s.mode)
     // При открытом предпросмотре окно шире, а список сохраняет свою ширину.
@@ -517,11 +809,13 @@
     load()
     const unlisten = [
       listen<Transfer>('clipwire://transfer', (e) => onTransfer(e.payload)),
-      listen('clipwire://history-changed', () => load()),
+      listen('clipwire://history-changed', historyChanged),
       listen('clipwire://need-accessibility', () => (needAccess = true)),
       listen<Settings>('clipwire://settings-changed', (e) => applySettings(e.payload)),
       // Живое превью размера из настроек: ширина списка меняется вместе с окном.
       listen('popup://opened', async () => {
+        visible = true
+        search.cancel()
         // Новый показ: начатые в прошлый раз скачивание и вставка сюда уже не
         // относятся (скачивание дойдёт в фоне, но вставлять не станет).
         shown++
@@ -537,24 +831,66 @@
         needAccess = false
         loadFailed = false
         gen++
+        applied = ''
         exhausted = false
-        await load(PAGE)
+        // Показ перечитывает первую страницу всегда, даже без изменений истории:
+        // фильтры сброшены, а файлы на диске могли пропасть или появиться.
+        await listing.track(load(PAGE))
         await tick()
         // Окно не пересоздаётся, а прокрутка остаётся с прошлого раза: без этого
         // список мог открыться в середине, и свежие элементы были не видны.
-        if (listEl) listEl.scrollTop = 0
+        setScroll(0)
         input?.focus()
+      }),
+      // Окно вставки прячется, как только теряет фокус (lib.rs, Focused(false)),
+      // поэтому потеря фокуса и есть скрытие.
+      getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        if (focused) visible = true
+        else onHidden()
       }),
     ]
     // Начальные передачи — после подписки, и событие новее не затирается.
     unlisten[0]
       .then(() => api.transfers())
       .then((list) => {
-        for (const t of list) if (!transfers[t.blob]) transfers[t.blob] = t
+        for (const t of list) {
+          if (transfers[t.blob]) continue
+          transfers[t.blob] = t
+          scheduleDrop(t)
+        }
       })
       .catch(() => {})
-    return () => unlisten.forEach((p) => p.then((f) => f()))
+    return () => {
+      unlisten.forEach((p) => p.then((f) => f()))
+      resizes?.disconnect()
+      search.cancel()
+      for (const id of dropTimers.values()) clearTimeout(id)
+    }
   })
+
+  /**
+   * Окно спрятали: отпустить то, что набралось за показ. Лента сокращается до
+   * первой страницы, предпросмотр с полной картинкой закрывается, кэш высот
+   * чистится от ушедших строк. Изменения истории до следующего показа список
+   * не перечитывают (historyChanged).
+   */
+  function onHidden() {
+    visible = false
+    search.cancel()
+    // Ответы на запросы, начатые до скрытия, уже не к месту: следующий показ
+    // перечитает список заново.
+    gen++
+    if (items.length > PAGE) {
+      items = items.slice(0, PAGE)
+      exhausted = false
+    }
+    if (sel >= items.length) sel = 0
+    preview = null
+    draft = ''
+    menu = null
+    heights.keepOnly(new Set(items.map((e) => e.id)))
+    setScroll(0)
+  }
 </script>
 
 <svelte:window onkeydown={onKey} />
@@ -566,7 +902,7 @@
       <input
         bind:this={input}
         bind:value={query}
-        oninput={reload}
+        oninput={search}
         placeholder={t('Найти в буфере')}
         spellcheck="false"
         aria-label={t('Поиск по истории')}
@@ -614,11 +950,34 @@
         {/if}
       </div>
     {:else}
-      <ul class="list" bind:this={listEl} onscroll={maybeMore} role="listbox" aria-label={t('История буфера')}>
-        {#each items as item, i (item.id)}
-          <EntryRow {item} {transfers} index={i} selected={i === sel} onselect={() => (sel = i)} onpaste={() => paste(item)} onpin={() => togglePin(item)} onremove={() => remove(item)} onmenu={(x, y) => openMenu(item, x, y)} />
+      <!-- Виртуальная прокрутка: строки вне окна заменены полями списка сверху
+           и снизу. Прокручивается обёртка: поля на самом прокручиваемом
+           элементе не дали бы ему сжаться меньше их суммы. -->
+      <div class="list" bind:this={listEl} bind:clientHeight={viewH} onscroll={onScroll}>
+      <ul
+        bind:this={rowsEl}
+        style:padding-top="{offs[range.start]}px"
+        style:padding-bottom="{offs[items.length] - offs[range.end]}px"
+        role="listbox"
+        aria-label={t('История буфера')}
+      >
+        {#each rows as item, k (item.id)}
+          {@const i = range.start + k}
+          <EntryRow
+            {item}
+            {transfers}
+            index={i}
+            setsize={exhausted ? items.length : -1}
+            selected={i === sel}
+            onselect={() => (sel = i)}
+            onpaste={() => paste(item)}
+            onpin={() => togglePin(item)}
+            onremove={() => remove(item)}
+            onmenu={(x, y) => openMenu(item, x, y)}
+          />
         {/each}
       </ul>
+      </div>
     {/if}
 
     <footer class="hints">
@@ -961,11 +1320,16 @@
     stroke-linejoin: round;
   }
   .list {
+    overflow-y: auto;
+    /* Место прокрутки держит сам список (anchored в lib/vlist.ts). */
+    overflow-anchor: none;
+    flex: 1;
+    min-height: 0;
+  }
+  .list ul {
     list-style: none;
     margin: 0;
     padding: 0;
-    overflow-y: auto;
-    flex: 1;
   }
   .preview-meta {
     font-family: var(--font-mono);

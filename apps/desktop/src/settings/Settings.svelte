@@ -3,10 +3,11 @@
   import { onMount } from 'svelte'
   import { t } from '../lib/i18n'
   import { listen } from '@tauri-apps/api/event'
+  import { getCurrentWindow } from '@tauri-apps/api/window'
   import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart'
   import { check, type Update } from '@tauri-apps/plugin-updater'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { api, type DeviceInfo, type GroupDevice, type GroupRekeyed, type Retention, type Settings, type StatsOverview, type Status, type StorageState, type Theme } from '../lib/api'
+  import { api, type DeviceInfo, type DevicesIncoming, type GroupDevice, type GroupNotices, type Retention, type Settings, type StatsOverview, type Status, type StorageState, type Theme } from '../lib/api'
   import { rekeyedBy } from '../lib/devices'
   import { applyTheme } from '../lib/theme'
   import * as fmt from '../lib/format'
@@ -40,6 +41,12 @@
   ]
 
   let section = $state<Section>('general')
+  /** Раздел из прошлого открытия уже вернули: только после этого его запоминать. */
+  let sectionRestored = $state(false)
+  /** Окно просят закрыть, а форма хранилища не сохранена. */
+  let confirmClose = $state(false)
+  /** Кнопка «Остаться»: получает фокус, когда вопрос появляется. */
+  let stayButton = $state<HTMLButtonElement | null>(null)
   let s = $state<Settings | null>(null)
   let status = $state<Status>({ kind: 'connecting' })
   let info = $state<DeviceInfo | null>(null)
@@ -117,6 +124,32 @@
     }
     el.value = String(v)
     if (v !== s.file_upload_limit_mb) save({ file_upload_limit_mb: v })
+  }
+
+  /** Итог смены ключа для списка устройств: его может не быть на экране. */
+  let devicesIncoming = $state<DevicesIncoming | null>(null)
+
+  async function pullGroupNotices() {
+    let n: GroupNotices
+    try {
+      n = await api.groupNoticesTake()
+    } catch {
+      return
+    }
+    if (n.excluded) {
+      invite = ''
+      createdInvite = ''
+      section = 'sync'
+    }
+    // Смена ключа группы: старый код приглашения больше не действует.
+    if (n.rekeyed) {
+      invite = ''
+      createdInvite = ''
+      if (!n.rekeyed.by_me) notice = t('{who}. Старый код приглашения больше не действует.', { who: rekeyedBy(n.rekeyed.by) })
+    }
+    const result = n.rekeyed?.by_me ? n.rekeyed.result : null
+    if (result || n.rekey_failed) devicesIncoming = { result, error: n.rekey_failed }
+    if (n.excluded || n.rekeyed) refresh()
   }
 
   async function refresh() {
@@ -380,7 +413,28 @@
     return 'error'
   }
 
+  // Окно настроек закрывается насовсем: открытый раздел запоминает Rust.
+  $effect(() => {
+    if (sectionRestored) api.settingsSectionSet(section).catch(() => {})
+  })
+
+  // Форма хранилища стоит внизу «Синхронизации», вопрос — вверху `<main>`, а
+  // он прокручивается. Вопрос прилипает к верху (`.close-confirm`, sticky), а
+  // фокус на «Остаться» показывает его и клавиатуре, и экранному диктору.
+  $effect(() => {
+    if (confirmClose && stayButton) stayButton.focus()
+  })
+
+  async function closeAnyway() {
+    confirmClose = false
+    await api.settingsCloseGuard(false)
+    await getCurrentWindow().close()
+  }
+
   onMount(() => {
+    // Свежая страница: несохранённой формы нет (могла остаться от
+    // перезагрузки при смене языка).
+    api.settingsCloseGuard(false).catch(() => {})
     api.settings().then((v) => {
       s = v
       demoSize = { w: v.popup_width, h: v.popup_height }
@@ -400,21 +454,35 @@
         s = e.payload
         applyTheme(e.payload.theme, e.payload.mode)
       }),
-      // Смена ключа группы: старый код приглашения больше не действует.
-      listen<GroupRekeyed>('clipwire://group-rekeyed', (e) => {
-        invite = ''
-        createdInvite = ''
-        if (!e.payload.by_me) notice = t('{who}. Старый код приглашения больше не действует.', { who: rekeyedBy(e.payload.by) })
-        refresh()
-      }),
-      listen('clipwire://group-excluded', () => {
-        invite = ''
-        createdInvite = ''
+      // События группы Rust хранит, пока окно их не заберёт: событие —
+      // только повод забрать.
+      listen('clipwire://group-rekeyed', pullGroupNotices),
+      listen('clipwire://group-rekey-failed', pullGroupNotices),
+      listen('clipwire://group-excluded', pullGroupNotices),
+      listen('settings://close-blocked', () => {
         section = 'sync'
-        refresh()
+        confirmClose = true
       }),
     ]
-    Promise.all(unlisten).then(refresh)
+    // Окно настроек создаётся при каждом открытии: события группы и фоновой
+    // проверки обновлений могли прийти, пока его не было. Сначала вернуть
+    // прошлый раздел: исключение из группы потом переключит на «Синхронизацию».
+    Promise.all(unlisten)
+      .then(() => api.settingsSectionGet())
+      .catch(() => null)
+      .then((prev) => {
+        if (prev && sections.some((x) => x.id === prev)) section = prev as Section
+        sectionRestored = true
+        refresh()
+        pullGroupNotices()
+      })
+    // Найденное (или уже скачанное) обновление — показать в «О программе» сразу.
+    api
+      .updateFound()
+      .then((v) => {
+        if (v) checkUpdates()
+      })
+      .catch(() => {})
     return () => unlisten.forEach((p) => p.then((f) => f()))
   })
 </script>
@@ -441,6 +509,15 @@
     <main>
       {#if error}<p class="error" role="alert">{error}</p>{/if}
       {#if notice}<p class="notice" role="status">{notice}</p>{/if}
+      {#if confirmClose}
+        <div class="card pad close-confirm" role="alertdialog">
+          <div class="confirm">
+            <span>{t('Настройки хранилища не сохранены. Закрыть окно без них?')}</span>
+            <button class="danger" onclick={closeAnyway}>{t('Закрыть без сохранения')}</button>
+            <button bind:this={stayButton} onclick={() => (confirmClose = false)}>{t('Остаться')}</button>
+          </div>
+        </div>
+      {/if}
 
       {#if section === 'general'}
         <h1>{t('Основные')}</h1>
@@ -637,7 +714,11 @@
             {/if}
           </div>
 
-          <Devices onRekeyed={() => ((invite = ''), (createdInvite = ''))} />
+          <Devices
+            onRekeyed={() => ((invite = ''), (createdInvite = ''))}
+            incoming={devicesIncoming}
+            onIncomingTaken={() => (devicesIncoming = null)}
+          />
 
           <h2>{t('Отключить')}</h2>
           <div class="card pad">
@@ -1344,6 +1425,13 @@
   .notice {
     color: var(--c-accent);
     margin: 0 0 var(--space-3);
+  }
+  .close-confirm {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    margin-bottom: var(--space-3);
+    border-color: var(--c-danger);
   }
   button.link {
     border: 0;

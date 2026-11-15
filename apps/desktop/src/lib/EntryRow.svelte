@@ -18,9 +18,16 @@
     onremove,
     onmenu,
     transfers = {},
+    setsize,
   }: {
     item: Entry
     index: number
+    /**
+     * Сколько всего строк в списке, -1 — пока неизвестно. Нужен, когда в DOM
+     * только часть строк (виртуальная прокрутка): иначе экранный диктор считает
+     * по отрисованным.
+     */
+    setsize?: number
     selected?: boolean
     /** Передачи файлов по blob — для полосы прогресса. */
     transfers?: TransferMap
@@ -72,6 +79,8 @@
   data-i={index}
   role="option"
   aria-selected={selected}
+  aria-posinset={setsize === undefined ? undefined : index + 1}
+  aria-setsize={setsize}
   class:sel={selected}
   onclick={onselect}
   ondblclick={onpaste}
@@ -105,6 +114,8 @@
           class="thumb"
           src={item.thumb}
           alt={item.files[0]?.name}
+          loading="lazy"
+          decoding="async"
           draggable="false"
           style:--ratio={item.width && item.height ? item.width / item.height : 16 / 9}
         />
@@ -117,6 +128,8 @@
           class="thumb"
           src={item.thumb}
           alt={t('Картинка {w}×{h}', { w: item.width, h: item.height })}
+          loading="lazy"
+          decoding="async"
           draggable="false"
           style:--ratio={item.width && item.height ? item.width / item.height : 16 / 9}
         />

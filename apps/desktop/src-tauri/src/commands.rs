@@ -3,7 +3,7 @@
 //! Ошибки возвращаются строкой: интерфейс показывает их как есть, поэтому
 //! текст должен быть понятен человеку.
 
-use clipwire_agent::history::Entry;
+use clipwire_agent::history::{CardKind, Entry, RichFormat, Row};
 use clipwire_agent::i18n::tr;
 use clipwire_agent::settings::Settings;
 use clipwire_agent::state::{AgentState, random_key};
@@ -220,9 +220,6 @@ fn file_image_url(f: &clipwire_core::FileRef, path: &std::path::Path) -> Option<
     ))
 }
 
-/// Сколько символов текста отдавать в список: хватает на две строки превью.
-const LIST_PREVIEW_CHARS: usize = 400;
-
 fn png_url(png: &[u8]) -> String {
     format!(
         "data:image/png;base64,{}",
@@ -230,78 +227,64 @@ fn png_url(png: &[u8]) -> String {
     )
 }
 
-fn to_dto(
-    e: &Entry,
-    thumb: Option<&[u8]>,
-    full: bool,
-    files_dir: &std::path::Path,
-    uploaded: UploadedFn<'_>,
-) -> EntryDto {
-    let (kind, text, width, height, image) = match &e.content {
-        Content::Text(t) | Content::Rich { text: t, .. } => ("text", t.as_str(), 0, 0, None),
-        Content::Image { width, height, png } => ("image", "", *width, *height, Some(png)),
-        Content::Files(f) => {
-            let (w, h) = if f.len() == 1 {
-                (f[0].width, f[0].height)
-            } else {
-                (0, 0)
-            };
-            ("files", "", w, h, None)
-        }
-        #[allow(unreachable_patterns)]
-        _ => ("other", "", 0, 0, None),
-    };
-    let files: Vec<FileDto> = match &e.content {
-        Content::Files(f) => f
-            .iter()
-            .map(|f| file_dto(e.local, f, files_dir, uploaded))
-            .collect(),
-        _ => Vec::new(),
-    };
-    let (rich, html) = match &e.content {
-        Content::Rich { html, .. } => (
-            Some(if html.is_some() { "HTML" } else { "RTF" }),
-            html.as_ref().filter(|_| full).cloned(),
-        ),
-        _ => (None, None),
-    };
-    let shown: String = if full {
-        text.to_string()
-    } else {
-        text.chars().take(LIST_PREVIEW_CHARS).collect()
-    };
+/// Строка списка из карточки: текст обрезан до начала (`HEAD_CHARS`, хватает
+/// на две строки превью), счётчики — по полному тексту, тела нет.
+fn row_dto(r: &Row, files_dir: &std::path::Path, uploaded: UploadedFn<'_>) -> EntryDto {
+    let c = &r.card;
     EntryDto {
-        id: e.id.0.to_string(),
-        kind,
-        text: shown,
-        chars: text.chars().count(),
-        lines: text.lines().count().max(1),
-        device_name: e.device_name.clone(),
-        local: e.local,
-        pinned: e.pinned,
-        seen_ms: e.seen_ms,
-        width,
-        height,
-        bytes: match &e.content {
-            Content::Files(f) => f.iter().map(|f| f.size as usize).sum(),
-            c => c.len(),
+        id: r.id.0.to_string(),
+        kind: match c.kind {
+            CardKind::Text | CardKind::Rich => "text",
+            CardKind::Image => "image",
+            CardKind::Files => "files",
+            CardKind::Other => "other",
         },
-        thumb: thumb.map(png_url),
-        image: match (&e.content, full) {
-            (_, false) => None,
-            (Content::Files(f), true) if f.len() == 1 && f[0].width > 0 => {
-                local_file(e.local, &f[0], files_dir).and_then(|p| file_image_url(&f[0], &p))
-            }
-            (_, true) => image.map(|p| png_url(p)),
-        },
-        rich,
-        html,
-        files,
-        source_app: e.source_app().map(|a| SourceAppDto {
+        text: c.head.clone(),
+        chars: c.chars as usize,
+        lines: c.lines as usize,
+        device_name: c.device_name.clone(),
+        local: c.local,
+        pinned: r.pinned,
+        seen_ms: r.seen_ms,
+        width: c.width,
+        height: c.height,
+        bytes: c.bytes as usize,
+        thumb: r.thumb.as_deref().map(png_url),
+        image: None,
+        rich: c.rich.map(|f| match f {
+            RichFormat::Html => "HTML",
+            RichFormat::Rtf => "RTF",
+        }),
+        html: None,
+        files: c
+            .files
+            .iter()
+            .map(|f| file_dto(c.local, f, files_dir, uploaded))
+            .collect(),
+        source_app: r.source_app().map(|a| SourceAppDto {
             icon: (!a.icon_png.is_empty()).then(|| png_url(&a.icon_png)),
             name: a.name,
         }),
     }
+}
+
+/// Запись целиком для предпросмотра: строка списка плюс полный текст, HTML и
+/// картинка из тела.
+fn full_dto(r: &Row, e: &Entry, files_dir: &std::path::Path, uploaded: UploadedFn<'_>) -> EntryDto {
+    let mut d = row_dto(r, files_dir, uploaded);
+    match &e.content {
+        Content::Text(t) => d.text = t.clone(),
+        Content::Rich { text, html, .. } => {
+            d.text = text.clone();
+            d.html = html.clone();
+        }
+        Content::Image { png, .. } => d.image = Some(png_url(png)),
+        Content::Files(f) if f.len() == 1 && f[0].width > 0 => {
+            d.image = local_file(e.local, &f[0], files_dir).and_then(|p| file_image_url(&f[0], &p));
+        }
+        _ => {}
+    }
+    d
 }
 
 pub fn parse_id(id: &str) -> CmdResult<ItemId> {
@@ -310,29 +293,56 @@ pub fn parse_id(id: &str) -> CmdResult<ItemId> {
         .map_err(|_| tr("Неверный id элемента").to_string())
 }
 
+/// Обходы ленты окна вставки: новый запрос останавливает устаревшие.
+static LIST_SCANS: clipwire_agent::history::Supersede = clipwire_agent::history::Supersede::new();
+
 #[tauri::command]
-pub fn history_list(
-    state: State<'_, AppState>,
+pub async fn history_list(
+    app: AppHandle,
     query: String,
     pinned_only: bool,
     kind: Option<clipwire_agent::history::Kind>,
     offset: Option<usize>,
     limit: usize,
 ) -> Vec<EntryDto> {
-    let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
-    let uploaded = uploaded_check(&state);
-    let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-    // Окно вставки берёт ленту страницами; одна страница не больше 1000.
-    h.list_page(
-        &query,
-        pinned_only,
-        kind.unwrap_or_default(),
-        offset.unwrap_or(0),
-        limit.min(1000),
-    )
-    .into_iter()
-    .map(|e| to_dto(e, h.thumb(e.id), false, &files_dir, &uploaded))
-    .collect()
+    // Поиск редкого слова или вкладка с редким типом читают все карточки:
+    // отдельным потоком и вторым соединением, чтобы не ждали ни окно, ни
+    // запись новых копирований. Запрос с другим текстом или вкладкой
+    // останавливает старые обходы: окно их ответы всё равно отбрасывает.
+    let kind = kind.unwrap_or_default();
+    let ticket = LIST_SCANS.start(&format!("{query}\0{pinned_only}\0{kind:?}"));
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
+        let uploaded = uploaded_check(&state);
+        // Окно вставки берёт ленту страницами; одна страница не больше 1000.
+        // Проверки файлов на диске — после чтения карточек.
+        let rows = clipwire_agent::history::read(&state.history, state.reader.as_ref(), |h| {
+            h.list_page_until(
+                &query,
+                pinned_only,
+                kind,
+                offset.unwrap_or(0),
+                limit.min(1000),
+                &|| LIST_SCANS.stale(ticket),
+            )
+        });
+        // shortcut: брошенный обход отдаёт пустую страницу, а не ошибку:
+        // окно отбрасывает ответы на старый запрос по своему номеру списка.
+        // Если история понадобится второму окну со своим запросом, ключ
+        // надо дополнить окном, иначе окна будут останавливать друг друга.
+        let Some(rows) = rows else {
+            return Vec::new();
+        };
+        rows.iter()
+            .map(|r| row_dto(r, &files_dir, &uploaded))
+            .collect()
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("список истории не прочитался: {e}");
+        Vec::new()
+    })
 }
 
 #[tauri::command]
@@ -340,9 +350,12 @@ pub fn history_get(state: State<'_, AppState>, id: String) -> CmdResult<EntryDto
     let id = parse_id(&id)?;
     let files_dir = clipwire_agent::blobs::files_dir(&state.paths.dir);
     let uploaded = uploaded_check(&state);
-    let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-    h.get(id)
-        .map(|e| to_dto(e, h.thumb(e.id), true, &files_dir, &uploaded))
+    let found = {
+        let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        h.row(id).zip(h.get(id))
+    };
+    found
+        .map(|(r, e)| full_dto(&r, &e, &files_dir, &uploaded))
         .ok_or_else(|| tr("Элемента уже нет в истории").into())
 }
 
@@ -369,7 +382,7 @@ pub fn history_delete(app: AppHandle, state: State<'_, AppState>, id: String) ->
     let id = parse_id(&id)?;
     let hash = {
         let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        let hash = h.get(id).map(|e| e.content.hash());
+        let hash = h.hash_of(id);
         h.delete(id).map_err(err)?;
         hash
     };
@@ -588,4 +601,11 @@ pub async fn update_install(app: AppHandle) -> CmdResult<()> {
 #[tauri::command]
 pub fn update_ready(app: AppHandle) -> Option<String> {
     crate::updates::ready_version(&app)
+}
+
+/// Версия, которую нашла фоновая проверка (или скачанная), или `null`. Окно
+/// настроек на старте по ней решает, проверять ли обновление заново.
+#[tauri::command]
+pub fn update_found(app: AppHandle) -> Option<String> {
+    crate::updates::found_version(&app)
 }

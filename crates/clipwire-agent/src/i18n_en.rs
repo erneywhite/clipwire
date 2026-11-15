@@ -177,6 +177,10 @@ pub static EN: &[(&str, &str)] = &[
         "An update is already being installed",
     ),
     (
+        "Скачанное обновление не прочиталось: {e}",
+        "Could not read the downloaded update: {e}",
+    ),
+    (
         "файл изменился после копирования",
         "the file changed after it was copied",
     ),

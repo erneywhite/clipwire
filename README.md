@@ -116,7 +116,8 @@ The invitation code contains the group's encryption key. Share it only with your
 **Moving from Paste (macOS).** The history of [Paste](https://pasteapp.io) can be moved with a
 command-line tool for now; a button in Settings is planned. Text and formatted text are moved with
 their dates and source apps, pinboard entries become pinned. Files are skipped (Paste keeps only
-links to them), images too, until Clipwire stops keeping the whole history in memory. Quit
+links to them). Images are moved with `--images`; with `--send` everything being sent is held in
+memory until it is sent, so a large image archive is better moved without `--send`. Quit
 Clipwire, set history retention to "forever", keep your other devices online if you add `--send`,
 then run from the repository:
 
@@ -177,6 +178,10 @@ Ctrl+S saves it to the history.
 The list scrolls through the whole history, with search and filters too: older entries load in
 advance, about 50 entries before you reach the end. A new entry arriving at the top does not
 reset what is already loaded or where you are.
+
+Search looks at the first 8 KB of each text, at file names, the device and the source app; a
+match further into a very long text is not found. The history is read from disk page by page, so
+memory use does not grow with it (details in `docs/history-storage.md`).
 
 **Deleting.** By default a deleted entry disappears only on this device. Turn on
 **Delete on all devices** under Sync and the deletion is sent to the rest of the group as well.
@@ -524,6 +529,10 @@ network tests start dozens of iroh endpoints and fail with "Too many open files"
 ```
 ulimit -n 10240 && cargo test --workspace
 ```
+
+How much memory and CPU the app uses while idle, and how to measure it (Windows and macOS
+commands that count Clipwire together with its WebView processes), is described in
+[docs/architecture.md](docs/architecture.md#память-и-процессор-в-простое) (in Russian).
 
 A release is built by GitHub Actions on a `vX.Y.Z` tag ([release.yml](.github/workflows/release.yml)):
 installers for Windows, macOS and Linux, signed update files and `latest.json`. The version comes

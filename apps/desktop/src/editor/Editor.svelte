@@ -512,15 +512,32 @@
 
   // ---- Открыть, сохранить, закрыть ----
 
+  /** Номер последнего открытия: картинка, догрузившаяся позже новой, отбрасывается. */
+  let openSeq = 0
+  /** Что сейчас открыто или открывается: тот же id второй раз не грузится. */
+  let openId: string | null = null
+
   async function open(id: string) {
+    // Тот же id приходит дважды при каждом открытии нового окна (из
+    // `editor_pending` и событием `editor://open`). Поэтому и повторное
+    // «Изменить» на картинке, которая уже открыта, не перезагружает её:
+    // несохранённые правки остаются. Раньше картинка грузилась заново и правки
+    // пропадали; новое поведение оставлено намеренно. Начать с чистого листа —
+    // закрыть редактор и открыть снова: закрытое окно уничтожается вместе со
+    // страницей, а после сохранения и ошибки загрузки `openId` сбрасывается.
+    if (id === openId) return
+    openId = id
+    const seq = ++openSeq
     error = ''
     busy = false
     try {
       const entry = await api.get(id)
+      if (seq !== openSeq) return
       if (!entry.image) throw new Error(t('У элемента нет картинки'))
       const img = new Image()
       img.src = entry.image
       await img.decode()
+      if (seq !== openSeq) return
       image = img
       W = img.naturalWidth
       H = img.naturalHeight
@@ -541,6 +558,9 @@
       pickTool(tool)
       render()
     } catch (e) {
+      if (seq !== openSeq) return
+      // Не открылась: повторное «Изменить» той же картинки пробует снова.
+      openId = null
       error = String(e)
     }
   }
@@ -565,6 +585,9 @@
       await invoke('editor_save', { png: out.toDataURL('image/png'), paste })
       undoStack = []
       redoStack = []
+      // Редактор спрятан и скоро закроется; если его успеют открыть снова,
+      // та же картинка загрузится заново, без прошлых правок.
+      openId = null
     } catch (e) {
       error = String(e)
     } finally {
@@ -572,10 +595,33 @@
     }
   }
 
-  function close() {
+  /** Отпустить картинку, холст и историю правок: полноразмерный кадр 4K —
+   *  это десятки мегабайт в процессе WebView. */
+  function release() {
+    image = null
+    W = 0
+    H = 0
+    shapes = []
+    crop = null
+    selected = null
+    undoStack = []
+    redoStack = []
+    draft = null
+    cropDraft = null
+    drag = null
     editing = null
     escArmed = false
-    win.hide()
+    if (canvas) {
+      canvas.width = 0
+      canvas.height = 0
+    }
+  }
+
+  function close() {
+    release()
+    // Окно закрывается насовсем (Rust не прячет его, а уничтожает), следующее
+    // «Изменить» создаст его заново.
+    win.close()
   }
 
   function onKey(e: KeyboardEvent) {
@@ -641,6 +687,12 @@
       listen<string>('editor://open', (e) => open(e.payload)),
       listen<Settings>('clipwire://settings-changed', (e) => applySettings(e.payload)),
     ]
+    // Какую картинку показывать, страница спрашивает сама, когда подписалась:
+    // только что созданное окно событие `editor://open` пропустило бы, а после
+    // перезагрузки (смена языка) нужна последняя запрошенная картинка.
+    unlisten[0].then(() => api.editorPending()).then((id) => {
+      if (id) open(id)
+    })
     return () => {
       ro.disconnect()
       unlisten.forEach((p) => p.then((f) => f()))

@@ -219,20 +219,78 @@ async fn switch_to(app: &AppHandle, old: GroupId, key: GroupKey) -> CmdResult<St
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct RekeyedEvent<'a> {
+pub struct RekeyedEvent {
     /// Ключ сменили на этом устройстве.
     by_me: bool,
     /// Имя устройства, которое сменило ключ (если не это).
-    by: &'a str,
+    by: String,
     /// Новый код приглашения и кому ключ не достался — если сменили здесь.
-    result: Option<&'a RekeyDto>,
+    result: Option<RekeyDto>,
+}
+
+/// События группы, которые окно настроек должно увидеть, даже если в момент
+/// события его не было: оно создаётся при открытии и закрывается насовсем.
+/// Хранится последнее событие каждого вида; окно забирает их на старте и
+/// по каждому событию (`group_notices_take`), так что показанное не
+/// повторяется при следующем открытии.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GroupNotices {
+    /// Ключ группы сменили (`clipwire://group-rekeyed`).
+    pub rekeyed: Option<RekeyedEvent>,
+    /// Новый ключ не дошёл (`clipwire://group-rekey-failed`).
+    pub rekey_failed: Option<String>,
+    /// Сервер исключил устройство (`clipwire://group-excluded`).
+    pub excluded: bool,
+}
+
+impl GroupNotices {
+    pub fn rekeyed(&mut self, e: RekeyedEvent) {
+        // Ключ всё-таки сменился: прошлая неудача уже не важна.
+        self.rekey_failed = None;
+        self.rekeyed = Some(e);
+    }
+
+    pub fn rekey_failed(&mut self, why: String) {
+        self.rekey_failed = Some(why);
+    }
+
+    pub fn excluded(&mut self) {
+        self.excluded = true;
+    }
+
+    pub fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
+fn notices(app: &AppHandle) -> std::sync::MutexGuard<'_, GroupNotices> {
+    app.state::<AppState>()
+        .inner()
+        .group_notices
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Забрать накопленные события группы для окна настроек и очистить их.
+#[tauri::command]
+pub fn group_notices_take(app: AppHandle) -> GroupNotices {
+    notices(&app).take()
+}
+
+/// Новый ключ группы не дошёл: запомнить для окна настроек и сообщить.
+pub fn on_rekey_lost(app: &AppHandle, why: String) {
+    notices(app).rekey_failed(why.clone());
+    let _ = app.emit("clipwire://group-rekey-failed", why);
 }
 
 fn emit_rekeyed(app: &AppHandle, by_me: bool, by: &str, result: Option<&RekeyDto>) {
-    let _ = app.emit(
-        "clipwire://group-rekeyed",
-        RekeyedEvent { by_me, by, result },
-    );
+    let e = RekeyedEvent {
+        by_me,
+        by: by.to_string(),
+        result: result.cloned(),
+    };
+    notices(app).rekeyed(e.clone());
+    let _ = app.emit("clipwire://group-rekeyed", e);
 }
 
 /// Ключ группы сменили: сохранить новый и перезапустить. Если ключ сменило
@@ -274,6 +332,7 @@ pub fn on_excluded(app: &AppHandle, old: GroupId) {
             tracing::error!("локальный режим не запустился: {e:#}");
         }
         crate::publish_status(&app);
+        notices(&app).excluded();
         let _ = app.emit("clipwire://group-excluded", ());
     });
 }
@@ -320,5 +379,29 @@ mod tests {
         assert_eq!(d.fingerprint, "0202020202");
         let mine = to_dto(&DeviceView { device: me, ..v }, me);
         assert!(mine.me && mine.online);
+    }
+
+    /// События группы копятся до того, как окно настроек их заберёт, и
+    /// забираются один раз. Смена ключа гасит прошлую неудачу.
+    #[test]
+    fn group_notices_are_taken_once() {
+        let mut n = GroupNotices::default();
+        n.rekey_failed("нет связи".into());
+        n.excluded();
+        let got = n.take();
+        assert_eq!(got.rekey_failed.as_deref(), Some("нет связи"));
+        assert!(got.excluded && got.rekeyed.is_none());
+        let empty = n.take();
+        assert!(empty.rekey_failed.is_none() && !empty.excluded && empty.rekeyed.is_none());
+
+        n.rekey_failed("нет связи".into());
+        n.rekeyed(RekeyedEvent {
+            by_me: false,
+            by: "Ноутбук".into(),
+            result: None,
+        });
+        let got = n.take();
+        assert!(got.rekey_failed.is_none());
+        assert_eq!(got.rekeyed.map(|e| e.by).as_deref(), Some("Ноутбук"));
     }
 }
