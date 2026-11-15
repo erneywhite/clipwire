@@ -11,6 +11,7 @@
 
 use super::formats::{self, Offer};
 use crate::i18n::tr;
+use crate::read_budget::{ReadBudget, TOTAL_TIMEOUT};
 use anyhow::{Context, Result};
 use clipwire_core::Content;
 use std::collections::HashMap;
