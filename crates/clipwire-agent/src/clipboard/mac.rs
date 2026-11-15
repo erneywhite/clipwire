@@ -48,7 +48,7 @@ const URL: &str = "public.url";
 
 /// Что брать из буфера по набору типов в нём.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Kind {
+pub(crate) enum Kind {
     /// Помечено как приватное.
     Excluded,
     /// Файлы и папки (Finder).
@@ -67,7 +67,7 @@ pub(super) enum Kind {
 /// - иначе текст: таблицы и редакторы кладут к тексту ещё и картинку, но
 ///   копировали текст;
 /// - картинка без текста.
-pub(super) fn classify<S: AsRef<str>>(types: &[S]) -> Kind {
+pub(crate) fn classify<S: AsRef<str>>(types: &[S]) -> Kind {
     let has = |t: &str| types.iter().any(|s| s.as_ref() == t);
     if PRIVATE_TYPES.iter().any(|t| has(t)) {
         return Kind::Excluded;
@@ -221,6 +221,11 @@ fn read_image(pb: &NSPasteboard) -> Option<Content> {
             None
         }
     }
+}
+
+/// TIFF (байты) → PNG.
+pub(crate) fn tiff_bytes_to_png(tiff: &[u8]) -> Option<Vec<u8>> {
+    autoreleasepool(|_| tiff_to_png(&NSData::with_bytes(tiff)))
 }
 
 fn tiff_to_png(tiff: &NSData) -> Option<Vec<u8>> {

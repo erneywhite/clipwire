@@ -25,6 +25,18 @@ use crate::blobs::Blobs;
 use crate::devices::{Control, RekeyNotice, Rekeyed};
 use crate::state::AgentState;
 
+/// Сколько элементов истории отправлять подряд без паузы: половина очереди
+/// получателя на сервере (`hub::QUEUE` = 64).
+const BACKFILL_BATCH: usize = 32;
+
+/// Пауза после пачки истории: не меньше 0,4 с и не быстрее 1 МБ/с, чтобы
+/// получатель успел расшифровать и записать (32 элемента за 0,4 с — ~80/с).
+fn backfill_pause(batch_bytes: usize) -> Duration {
+    Duration::from_millis(400).max(Duration::from_secs_f64(
+        batch_bytes as f64 / (1 << 20) as f64,
+    ))
+}
+
 /// Больше этого не отправляем: сервер по умолчанию принимает до 8 МиБ
 /// шифротекста, а postcard и AEAD добавляют немного сверху. Картинки в PNG
 /// обычно сотни килобайт — пара мегабайт.
@@ -200,7 +212,7 @@ pub struct Engine {
     went_online: bool,
     /// Локальная история, которую надо отправить в группу (устройство только
     /// что подключилось): содержимое и когда скопировано, от старых к новым.
-    backfill: Vec<(Outgoing, u64)>,
+    backfill: std::collections::VecDeque<(Outgoing, u64)>,
     /// Передача файлов: загрузчик живёт здесь, соединение отдаётся ему на
     /// время сессии.
     blobs: Option<Arc<Blobs>>,
@@ -286,7 +298,7 @@ impl Engine {
             events,
             notify,
             went_online: false,
-            backfill: Vec::new(),
+            backfill: std::collections::VecDeque::new(),
             blobs: None,
             pending: None,
             pending_reserved: false,
@@ -333,7 +345,7 @@ impl Engine {
 
     /// Отправить в группу эту локальную историю после входа.
     pub fn with_backfill(mut self, items: Vec<(Outgoing, u64)>) -> Self {
-        self.backfill = items;
+        self.backfill = items.into();
         self
     }
 
@@ -1154,20 +1166,34 @@ impl Engine {
         if self.backfill.is_empty() {
             return Ok(());
         }
-        tracing::info!(
-            n = self.backfill.len(),
-            "отправляю локальную историю в группу"
-        );
-        while let Some((out, ms)) = self.backfill.first().cloned() {
+        let total = self.backfill.len();
+        tracing::info!(n = total, "отправляю локальную историю в группу");
+        // Сервер пересылает элементы устройствам на связи через короткую
+        // очередь (64) и при переполнении теряет: большую историю (импорт)
+        // отправляем пачками с паузой, чтобы получатели успевали.
+        let (mut in_batch, mut batch_bytes, mut sent) = (0usize, 0usize, 0usize);
+        while let Some((out, ms)) = self.backfill.front().cloned() {
+            if in_batch == BACKFILL_BATCH {
+                tokio::time::sleep(backfill_pause(batch_bytes)).await;
+                (in_batch, batch_bytes) = (0, 0);
+                if sent % (BACKFILL_BATCH * 32) == 0 {
+                    tracing::info!(sent, total, "история отправляется");
+                }
+            }
             let content = out.content.fit(MAX_ITEM_BYTES);
             if content.len() <= MAX_ITEM_BYTES {
                 let mut item = Item::backdated(self.device, content, ms)
                     .with_device_name(self.device_name.clone());
                 item.ext = out.ext;
                 let sealed = self.state.invite.group_key.seal(&item)?;
+                batch_bytes += sealed.ciphertext.len();
                 write_msg(send, &ClientMsg::Backfill(sealed)).await?;
             }
-            self.backfill.remove(0);
+            self.backfill.pop_front();
+            (in_batch, sent) = (in_batch + 1, sent + 1);
+        }
+        if total > BACKFILL_BATCH {
+            tracing::info!(sent, "история отправлена");
         }
         Ok(())
     }
@@ -1558,6 +1584,14 @@ fn relay_hint(ep: &Endpoint) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backfill_pause_by_size() {
+        use std::time::Duration;
+        // Мелкие элементы — минимальная пауза, крупные — по 1 МБ/с.
+        assert_eq!(super::backfill_pause(1000), Duration::from_millis(400));
+        assert_eq!(super::backfill_pause(3 << 20), Duration::from_secs(3));
+    }
+
     #[test]
     fn join_history_budget_stops_runaway_server() {
         use super::*;

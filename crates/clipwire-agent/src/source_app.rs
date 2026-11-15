@@ -63,6 +63,24 @@ pub fn ignore_keys(exe_path: &str) -> Vec<String> {
     keys
 }
 
+/// Программа по bundle id, как её запомнил другой менеджер буфера (macOS):
+/// установленная — с именем и иконкой пакета, иначе только с именем.
+#[cfg(target_os = "macos")]
+pub fn by_bundle_id(bundle_id: Option<&str>, name: Option<&str>) -> Option<SourceApp> {
+    if let Some(app) = bundle_id
+        .and_then(platform::exe_for_bundle_id)
+        .and_then(|exe| lookup(&exe))
+    {
+        return Some(app);
+    }
+    let name = name.or(bundle_id)?.trim();
+    (!name.is_empty()).then(|| SourceApp {
+        name: name.to_string(),
+        exe: name.to_string(),
+        icon_png: Vec::new(),
+    })
+}
+
 /// Имя файла из пути: «C:\Program Files\App\App.exe» → «App.exe».
 pub fn file_name(path: &str) -> Option<String> {
     path.rsplit(['\\', '/'])
@@ -296,6 +314,18 @@ mod platform {
                 .to_string();
             let name = name.strip_suffix(".app").unwrap_or(&name).to_string();
             (Some(name).filter(|n| !n.trim().is_empty()), icon_png(&ns))
+        })
+    }
+
+    /// Исполняемый файл установленной программы по bundle id (для записей,
+    /// где известен только он, — импорт из Paste).
+    pub fn exe_for_bundle_id(id: &str) -> Option<String> {
+        autoreleasepool(|_| {
+            let url = NSWorkspace::sharedWorkspace()
+                .URLForApplicationWithBundleIdentifier(&NSString::from_str(id))?;
+            NSBundle::bundleWithURL(&url)?
+                .executablePath()
+                .map(|p| p.to_string())
         })
     }
 

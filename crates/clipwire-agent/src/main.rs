@@ -20,6 +20,12 @@ clipwire-agent — общий буфер обмена Clipwire
   listen                      печатать всё, что приходит в группу
   send <текст>                отправить текст в группу и выйти
 
+Перенос (macOS):
+  import-paste [--dry-run] [--send] [--images] [--from <папка Paste>]
+                              перенести историю из Paste: --dry-run — только
+                              посчитать, --send — отправить и в группу,
+                              --images — с картинками. Clipwire должен быть закрыт
+
 Код сервера (cwserver1-…) печатает сервер при запуске.
 Код приглашения (clipwire1-…) содержит ключ группы — передавайте его только себе.";
 
@@ -104,6 +110,8 @@ fn main() -> Result<()> {
             let state = paths.load()?.context("устройство ещё не в группе")?;
             headless(state, Some(text))?;
         }
+        #[cfg(target_os = "macos")]
+        "import-paste" => import_paste(&paths, &args[1..])?,
         "-h" | "--help" | "help" => println!("{USAGE}"),
         other => bail!("неизвестная команда {other}\n\n{USAGE}"),
     }
@@ -259,4 +267,148 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
         service.shutdown().await;
     });
     Ok(())
+}
+
+/// Импорт истории из Paste (`paste_import.rs`): в локальную историю и, с
+/// `--send`, в группу. Повторный запуск пропускает уже перенесённое.
+#[cfg(target_os = "macos")]
+fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
+    use clipwire_agent::history::{Entry, History};
+    use clipwire_agent::settings::{Retention, Settings};
+    use clipwire_agent::sync::{Engine, Event, Outgoing, Status};
+    use clipwire_core::{DeviceId, ItemId};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    let (dry_run, send, images) = (flag("--dry-run"), flag("--send"), flag("--images"));
+    let dir = args
+        .iter()
+        .position(|a| a == "--from")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(clipwire_agent::paste_import::default_dir);
+
+    eprintln!("читаю Paste: {}", dir.display());
+    let (items, sum) = clipwire_agent::paste_import::read(&dir, images)?;
+    eprintln!(
+        "в Paste записей: {}. Переносится: текст {}, с форматированием {}, картинки {} \
+         (закреплённых {}). Пропущено: файлы {}, приватное {}, картинки {}, пустое {}, \
+         не прочиталось {}.",
+        sum.total,
+        sum.text,
+        sum.rich,
+        sum.images,
+        sum.pinned,
+        sum.skipped_files,
+        sum.skipped_private,
+        sum.skipped_images,
+        sum.skipped_empty,
+        sum.unreadable
+    );
+    if dry_run {
+        return Ok(());
+    }
+
+    // Приложение держит историю в памяти и перезаписало бы её поверх. С
+    // отдельной папкой (`CLIPWIRE_HOME`, проверки) рабочее приложение не мешает.
+    let running = std::env::var_os("CLIPWIRE_HOME").is_none()
+        && std::process::Command::new("pgrep")
+            .args(["-f", "Clipwire.app/Contents/MacOS/clipwire-desktop"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+    if running {
+        bail!("Clipwire запущен: закройте его (значок в строке меню → «Выход») и повторите");
+    }
+    let settings = Settings::load(&paths.dir);
+    if settings.retention != Retention::Forever {
+        bail!(
+            "срок хранения истории не «всегда»: старые записи удалятся при запуске. \
+             Поставьте «всегда» в настройках Clipwire и повторите"
+        );
+    }
+    let state = paths.load()?;
+    if send && state.is_none() {
+        bail!("--send: устройство не в группе");
+    }
+    let device = state.as_ref().map_or(DeviceId([0; 32]), |s| {
+        DeviceId(
+            *iroh::SecretKey::from_bytes(&s.device_key)
+                .public()
+                .as_bytes(),
+        )
+    });
+
+    let mut history = History::open(&paths.dir)?;
+    let mut apps: HashMap<(Option<String>, Option<String>), Option<clipwire_core::SourceApp>> =
+        HashMap::new();
+    let (mut added, mut outgoing) = (0usize, Vec::new());
+    for it in items {
+        let app = it.app.and_then(|a| {
+            apps.entry((a.bundle_id.clone(), a.name.clone()))
+                .or_insert_with(|| {
+                    clipwire_agent::source_app::by_bundle_id(
+                        a.bundle_id.as_deref(),
+                        a.name.as_deref(),
+                    )
+                })
+                .clone()
+        });
+        let mut entry = Entry {
+            id: ItemId::at_ms(it.seen_ms.max(0) as u64),
+            origin: device,
+            device_name: settings.device_name.clone(),
+            local: true,
+            content: it.content.clone(),
+            seen_ms: it.seen_ms,
+            pinned: it.pinned,
+            ext: Vec::new(),
+        };
+        if let Some(app) = &app {
+            entry.set_source_app(app);
+        }
+        if history.merge(entry)? {
+            added += 1;
+            if send {
+                outgoing.push((
+                    Outgoing::new(it.content, app.as_ref()),
+                    it.seen_ms.max(0) as u64,
+                ));
+            }
+        }
+    }
+    eprintln!(
+        "в историю Clipwire добавлено: {added} (уже были: {})",
+        sum.text + sum.rich + sum.images - added
+    );
+    drop(history);
+    let Some(state) = state.filter(|_| send && !outgoing.is_empty()) else {
+        return Ok(());
+    };
+
+    eprintln!(
+        "отправляю в группу: {} записей. Другие устройства должны быть на связи",
+        outgoing.len()
+    );
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+        let (ltx, lrx) = tokio::sync::mpsc::channel(4);
+        let engine = Engine::new(state, settings.device_name, None, etx, Arc::new(|| {}))
+            .with_backfill(outgoing);
+        let task = tokio::spawn(engine.run(lrx));
+        // Движок шлёт историю сразу после входа; закрытый канал — сигнал
+        // завершиться, когда отправит.
+        let mut ltx = Some(ltx);
+        while let Some(ev) = erx.recv().await {
+            match ev {
+                Event::Status(Status::Online) => drop(ltx.take()),
+                Event::Status(Status::Offline(e)) => eprintln!("нет связи: {e}"),
+                _ => {}
+            }
+        }
+        task.await??;
+        eprintln!("готово");
+        anyhow::Ok(())
+    })
 }
