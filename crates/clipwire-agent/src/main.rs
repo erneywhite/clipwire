@@ -398,8 +398,14 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
         entry.set_note(&note);
         // Записи идут по одной, каждая своей транзакцией: тела картинок не
         // копятся в памяти, а `merge` сам отбрасывает уже перенесённое.
-        // Уже перенесённой записи с доски ставятся закреп и подпись.
+        // Уже перенесённой записи с доски ставится закреп, а подпись —
+        // только если у записи её ещё нет: поправленную в Clipwire повторный
+        // импорт не затирает.
         let new = history.merge(entry)?;
+        let note = match history.id_by_hash(&hash).and_then(|id| history.row(id)) {
+            Some(r) if !new => r.note().unwrap_or(note),
+            _ => note,
+        };
         if !new && it.pinned && history.apply_pin(&hash, true, &note, None)? {
             repinned += 1;
         }
@@ -427,19 +433,20 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
     }
     // Закрепы с доски уходят в группу закрепами: книга закрепов (одной
     // записью на диск) отправит их при следующем запуске Clipwire.
+    // Закрепление подпись живого закрепа группы не меняет (`Op::Pin`):
+    // название из Paste встаёт, только если подписи там ещё нет.
     if let Some(p) = &pins
         && !to_pin.is_empty()
     {
         let at_ms = clipwire_agent::history::now_ms();
         p.update(|b| {
             for (hash, note) in to_pin {
-                b.queue(clipwire_agent::pins::Edit {
+                b.queue(clipwire_agent::pins::Edit::new(
                     hash,
-                    op: clipwire_agent::pins::Op::Pin,
-                    note: clipwire_agent::history::clean_note(&note),
+                    clipwire_agent::pins::Op::Pin,
+                    &clipwire_agent::history::clean_note(&note),
                     at_ms,
-                    pin: None,
-                });
+                ));
             }
         });
         eprintln!("закрепы уйдут в группу при следующем запуске Clipwire");
