@@ -45,6 +45,8 @@
   let sectionRestored = $state(false)
   /** Окно просят закрыть, а форма хранилища не сохранена. */
   let confirmClose = $state(false)
+  /** Кнопка «Остаться»: получает фокус, когда вопрос появляется. */
+  let stayButton = $state<HTMLButtonElement | null>(null)
   let s = $state<Settings | null>(null)
   let status = $state<Status>({ kind: 'connecting' })
   let info = $state<DeviceInfo | null>(null)
@@ -416,6 +418,13 @@
     if (sectionRestored) api.settingsSectionSet(section).catch(() => {})
   })
 
+  // Форма хранилища стоит внизу «Синхронизации», вопрос — вверху `<main>`, а
+  // он прокручивается. Вопрос прилипает к верху (`.close-confirm`, sticky), а
+  // фокус на «Остаться» показывает его и клавиатуре, и экранному диктору.
+  $effect(() => {
+    if (confirmClose && stayButton) stayButton.focus()
+  })
+
   async function closeAnyway() {
     confirmClose = false
     await api.settingsCloseGuard(false)
@@ -505,7 +514,7 @@
           <div class="confirm">
             <span>{t('Настройки хранилища не сохранены. Закрыть окно без них?')}</span>
             <button class="danger" onclick={closeAnyway}>{t('Закрыть без сохранения')}</button>
-            <button onclick={() => (confirmClose = false)}>{t('Остаться')}</button>
+            <button bind:this={stayButton} onclick={() => (confirmClose = false)}>{t('Остаться')}</button>
           </div>
         </div>
       {/if}
@@ -1418,7 +1427,11 @@
     margin: 0 0 var(--space-3);
   }
   .close-confirm {
+    position: sticky;
+    top: 0;
+    z-index: 2;
     margin-bottom: var(--space-3);
+    border-color: var(--c-danger);
   }
   button.link {
     border: 0;
