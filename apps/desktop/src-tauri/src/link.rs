@@ -26,7 +26,12 @@ pub struct LinkCard {
     /// `ok`, `off` (выключено в настройках), `one_time` (не грузим), `failed`.
     pub status: &'static str,
     pub url: String,
+    /// Домен ссылки из записи (без `www.`, IDN в punycode). Подписи страницы
+    /// (`og:site_name`) вместо него не показываем: любая страница может
+    /// назваться «github.com».
     pub site: String,
+    /// Домен, на котором ссылка оказалась после редиректов, если он другой.
+    pub final_site: Option<String>,
     pub title: Option<String>,
     pub description: Option<String>,
     /// Картинка data URL: окно ничего не грузит из сети само.
@@ -89,7 +94,7 @@ pub async fn link_preview(app: AppHandle, url: String) -> LinkCard {
             };
             LinkCard {
                 status: "ok",
-                site: meta.site.unwrap_or(base.site.clone()),
+                final_site: redirected_host(&parsed, &final_url),
                 title: meta.title,
                 description: meta.description,
                 image,
@@ -139,6 +144,14 @@ fn host_label(u: &Url) -> String {
         .unwrap_or_default()
         .trim_start_matches("www.")
         .to_string()
+}
+
+/// Конечный домен, если после редиректов он другой, чем у исходной ссылки
+/// (`www.` не в счёт). `Url::host_str` отдаёт IDN в punycode, так что
+/// подмена буквами другого алфавита видна.
+fn redirected_host(source: &Url, last: &Url) -> Option<String> {
+    let (a, b) = (host_label(source), host_label(last));
+    (a != b).then_some(b)
 }
 
 /// Сколько редиректов проходить.
@@ -599,6 +612,31 @@ mod tests {
 
     fn u(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn displayed_host_is_the_source_one() {
+        assert_eq!(host_label(&u("https://www.github.com/a")), "github.com");
+        // IDN показываем в punycode: кириллическая «а» не прячется.
+        assert_eq!(host_label(&u("https://gіthub.com/")), "xn--gthub-8ve.com");
+        // og:site_name в выбор не входит: поля для него нет, `Meta.site`
+        // только разбирается и в карточку не попадает.
+        let site_name = parse_meta(r#"<meta property="og:site_name" content="github.com">"#).site;
+        assert_eq!(site_name.as_deref(), Some("github.com"));
+    }
+
+    #[test]
+    fn redirect_to_other_host_is_shown() {
+        let src = u("https://evil.example/x");
+        assert_eq!(
+            redirected_host(&src, &u("https://other.example/y")).as_deref(),
+            Some("other.example")
+        );
+        assert_eq!(
+            redirected_host(&src, &u("https://www.evil.example/y")),
+            None
+        );
+        assert_eq!(redirected_host(&src, &src), None);
     }
 
     #[test]

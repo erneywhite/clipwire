@@ -182,7 +182,10 @@ export interface FilePreview {
 export interface LinkCard {
   status: 'ok' | 'off' | 'one_time' | 'failed'
   url: string
+  /** Домен ссылки из записи, не og:site_name. */
   site: string
+  /** Конечный домен после редиректов, если он другой. */
+  final_site: string | null
   title: string | null
   description: string | null
   /** data URL — окно само в сеть не ходит. */

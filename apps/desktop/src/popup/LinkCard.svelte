@@ -15,6 +15,11 @@
     }
   })
 
+  /** Домен из записи; если после редиректов он другой — «исходный → конечный». */
+  function siteLine(c: LinkCard): string {
+    return c.final_site ? `${c.site} → ${c.final_site}` : c.site
+  }
+
   $effect(() => {
     const u = url
     card = null
@@ -33,11 +38,11 @@
     {#if card.image}
       <img class="shot" src={card.image} alt="" draggable="false" />
     {/if}
-    <p class="site">{card.site}</p>
+    <p class="site">{siteLine(card)}</p>
     {#if card.title}<p class="title">{card.title}</p>{/if}
     {#if card.description}<p class="desc">{card.description}</p>{/if}
   {:else}
-    <p class="site">{card.site}</p>
+    <p class="site">{siteLine(card)}</p>
     <p class="muted">
       {#if card.status === 'one_time'}
         {t('Похоже на одноразовую ссылку: вход, сброс пароля или подтверждение. Карточку не загружаю, чтобы переход не сжёг её.')}
