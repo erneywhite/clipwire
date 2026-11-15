@@ -202,13 +202,18 @@
   // Номер списка: смена запроса, вкладки или фильтра его меняет, и ответы
   // на старые запросы отбрасываются.
   let gen = 0
+  // Запрос, по которому построен текущий список. Строка поиска (query) уходит
+  // вперёд на паузу перед запросом; до неё перечитывание по событию и
+  // подгрузка следующей страницы должны читать тот же список, что на экране.
+  // Меняется вместе с gen: в reload() и при показе окна.
+  let applied = ''
 
   /** `count` записей подряд начиная с `offset` (несколькими запросами, если много). */
   async function fetchRange(offset: number, count: number): Promise<Entry[]> {
     const out: Entry[] = []
     while (out.length < count) {
       const n = Math.min(MAX_CALL, count - out.length)
-      const page = await api.list(query, tab === 'pinned', kind, n, offset + out.length)
+      const page = await api.list(applied, tab === 'pinned', kind, n, offset + out.length)
       out.push(...page)
       if (page.length < n) break
     }
@@ -303,6 +308,7 @@
   function reload(): Promise<void> {
     search.cancel()
     gen++
+    applied = query
     sel = 0
     error = ''
     loadFailed = false
@@ -818,6 +824,7 @@
         needAccess = false
         loadFailed = false
         gen++
+        applied = ''
         exhausted = false
         // Показ перечитывает первую страницу всегда, даже без изменений истории:
         // фильтры сброшены, а файлы на диске могли пропасть или появиться.
