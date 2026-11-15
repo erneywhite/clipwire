@@ -8,7 +8,7 @@
   import { canDownload, canDrop, entryProgress, fetchLabel, isGone, isHere, onlyThere, progressLabel, type TransferMap } from '../lib/transfer'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import EntryRow from '../lib/EntryRow.svelte'
-  import { anchored, anchoredById, HeightCache, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange, type Range, type RowShape } from '../lib/vlist'
+  import { anchored, anchoredById, HeightCache, keptInDom, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange, type Range, type RowShape } from '../lib/vlist'
   import AppTag from '../lib/AppTag.svelte'
   import { t } from '../lib/i18n'
   import LinkCard from './LinkCard.svelte'
@@ -349,9 +349,48 @@
   }
 
   function onScroll() {
+    const prev = lastRange
     if (listEl) scrollTop = listEl.scrollTop
+    // Прыжок (перетащили ползунок, щёлкнули по полосе прокрутки): отрисованы только новые строки,
+    // прежних в DOM не осталось.
+    const r = range
+    if (r.start >= prev.end || r.end <= prev.start) markJump(false)
     maybeMore()
   }
+
+  // Положение только что выставлено по настоящим строкам в DOM (прыжок к
+  // выбранной строке или к далёкому месту): поправку высот считаем по полю
+  // сверху (keptInDom), а не по оценкам строк над верхом окна (anchored).
+  // Флаг живёт два кадра: ResizeObserver сообщает о новых строках в том же
+  // кадре, где они разложены.
+  let jumped = false
+  // Выбранную строку после поправки снова показать целиком.
+  let revealSel = false
+  let jumpFrame = 0
+
+  function markJump(reveal: boolean) {
+    jumped = true
+    if (reveal) revealSel = true
+    if (typeof requestAnimationFrame === 'undefined') return
+    cancelAnimationFrame(jumpFrame)
+    jumpFrame = requestAnimationFrame(() => {
+      jumpFrame = requestAnimationFrame(() => {
+        jumped = false
+        revealSel = false
+      })
+    })
+  }
+
+  function revealSelected() {
+    listEl?.querySelector<HTMLElement>(`[data-i="${sel}"]`)?.scrollIntoView({ block: 'nearest' })
+  }
+
+  // Другой список (пустой ↔ непустой): новый элемент прокрутки начинает с
+  // нуля, прокрутка от старого не годится, иначе строки нарисуются за полем
+  // сверху, а на виду будет пусто.
+  $effect(() => {
+    scrollTop = listEl ? listEl.scrollTop : 0
+  })
 
   const observed = new Set<Element>()
   const resizes = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(onResize)
@@ -360,6 +399,10 @@
   function onResize(entries: ResizeObserverEntry[]) {
     const list = items
     let changed = false
+    // Строки стали другой ширины — замеры под старую ширину забываются. Новые
+    // высоты всех отрисованных строк приходят здесь же: смена ширины — тоже
+    // смена размера, ResizeObserver о ней сообщает.
+    if (rowsEl && heights.setWidth(rowsEl.clientWidth)) changed = true
     for (const en of entries) {
       const el = en.target as HTMLElement
       if (!el.isConnected) continue
@@ -375,9 +418,15 @@
     // браузера (overflow-anchor) не берём: в WebKit её нет.
     const before = offs
     const top = listEl?.scrollTop ?? 0
+    const first = Number((rowsEl?.firstElementChild as HTMLElement | null)?.dataset.i ?? 0)
     hver++
-    const y = anchored(before, offs, top)
-    if (y !== top) tick().then(() => setScroll(y))
+    const y = jumped ? keptInDom(before, offs, first, top) : anchored(before, offs, top)
+    const reveal = revealSel
+    if (y === top && !reveal) return
+    tick().then(() => {
+      if (y !== top) setScroll(y)
+      if (reveal) revealSelected()
+    })
   }
 
   // Следить за размером строк, которые сейчас в DOM; ушедшие отпускать.
@@ -402,7 +451,10 @@
     // потом, когда строка отрисована, точно по ней.
     if (listEl) setScroll(scrollFor(offs, sel, listEl.scrollTop, listEl.clientHeight))
     await tick()
-    listEl?.querySelector<HTMLElement>(`[data-i="${sel}"]`)?.scrollIntoView({ block: 'nearest' })
+    revealSelected()
+    // Новые строки сейчас замерят, и поле сверху сдвинется: строку надо
+    // будет показать снова (onResize).
+    markJump(true)
   }
 
   function move(d: number) {
@@ -673,16 +725,10 @@
     }
   }
 
-  // Ширина списка, под которую замерены высоты строк.
-  let measuredWidth = 0
-
   function applySettings(s: Settings) {
-    // Другая ширина — текст переносится иначе, старые замеры не годятся.
-    if (s.popup_width !== measuredWidth) {
-      measuredWidth = s.popup_width
-      heights.clear()
-      hver++
-    }
+    // Замеры высот под другую ширину забывает onResize, когда строки правда
+    // стали другой ширины: ширина окна зажата в пределы (popup.rs), и разные
+    // настройки дают одинаковые строки.
     portalPaste = s.portal_paste && s.paste_into_active
     applyTheme(s.theme, s.mode)
     // При открытом предпросмотре окно шире, а список сохраняет свою ширину.

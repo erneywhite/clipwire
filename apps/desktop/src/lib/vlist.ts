@@ -24,6 +24,8 @@ export class HeightCache {
   private known = new Map<string, { h: number; shape: RowShape }>()
   private sum: Record<RowShape, number> = { row: 0, thumb: 0 }
   private count: Record<RowShape, number> = { row: 0, thumb: 0 }
+  // Ширина строк при замерах; 0 — ещё не мерили.
+  private width = 0
 
   /** Высота строки: замер или оценка. */
   get(id: string, shape: RowShape): number {
@@ -59,6 +61,22 @@ export class HeightCache {
       this.sum[k.shape] -= k.h
       this.count[k.shape]--
     }
+  }
+
+  /**
+   * Ширина строк, под которую сделаны замеры. Строки стали другой ширины —
+   * текст переносится иначе, старые замеры не годятся: кэш очищается, и
+   * возвращается true. Нулевая ширина (окно спрятано, строки не разложены)
+   * за замер не считается. Сравнивается настоящая ширина строк, а не
+   * настройка: ширина окна зажата в пределы, и разные настройки дают одну ширину.
+   */
+  setWidth(w: number): boolean {
+    if (!(w > 0) || Math.abs(w - this.width) < 0.5) return false
+    const had = this.width > 0
+    this.width = w
+    if (!had) return false
+    this.clear()
+    return true
   }
 
   clear() {
@@ -128,6 +146,19 @@ export function anchored(before: Float64Array, after: Float64Array, scrollTop: n
   if (before.length !== after.length || before.length < 2) return scrollTop
   const i = rowAt(before, scrollTop)
   return Math.max(0, after[i] + (scrollTop - before[i]))
+}
+
+/**
+ * Прокрутка после смены высот, когда положение уже выставлено по настоящим
+ * строкам в DOM: прыжок к выбранной строке (scrollIntoView) или к далёкому
+ * месту списка. Отрисованные строки уже стоят на своих настоящих высотах,
+ * сдвинется только поле сверху (offs[start]: оценки строк выше первой
+ * отрисованной). На него и поправляется прокрутка, чтобы видимое не уехало.
+ * `start` — первая строка в DOM.
+ */
+export function keptInDom(before: Float64Array, after: Float64Array, start: number, scrollTop: number): number {
+  if (before.length !== after.length || start < 0 || start >= before.length) return scrollTop
+  return Math.max(0, scrollTop + after[start] - before[start])
 }
 
 /**

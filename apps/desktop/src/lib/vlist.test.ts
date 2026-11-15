@@ -1,7 +1,7 @@
 // Проверка расчёта виртуальной прокрутки. Запуск: node src/lib/vlist.test.ts
 // (Node 23.6+ сам убирает типы), как transfer.test.ts.
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
-const { anchored, anchoredById, DEFAULT_HEIGHT, HeightCache, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange } = (await import(
+const { anchored, anchoredById, keptInDom, DEFAULT_HEIGHT, HeightCache, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange } = (await import(
   './vlist' + '.ts'
 )) as typeof import('./vlist')
 
@@ -113,6 +113,36 @@ function check(cond: boolean, msg: string) {
   const gone = ['a', 'c', 'd', 'e']
   check(anchoredById(before, ids, offsets(4, () => 50), gone, 160) === 110, 'выше удалили запись — прокрутка выше')
   check(anchoredById(before, ids, offsets(2, () => 50), ['x', 'y'], 160) === 160, 'верхней записи больше нет — не трогаем')
+}
+
+// Прыжок к строке: положение выставлено по DOM, сдвигается только поле сверху.
+{
+  // Строки 0..99 по оценке 56 px, отрисованы 80..99 (первая в DOM — 80).
+  const before = offsets(100, () => 56)
+  // Замеры строк 80..99 по 40 px сдвинули и среднее для незамеренных: 40.
+  const after = offsets(100, () => 40)
+  const top = 80 * 56 + 300
+  const y = keptInDom(before, after, 80, top)
+  check(y === top - 80 * 16, `сдвиг ровно на изменение поля сверху: ${y}`)
+  // anchored поправил бы ещё и на ошибку оценки отрисованных строк выше верха окна.
+  check(anchored(before, after, top) !== y, 'старый расчёт двигает больше, чем поле сверху')
+  check(keptInDom(before, offsets(100, (i) => (i < 80 ? 56 : 40)), 80, top) === top, 'поле сверху то же — прокрутка не меняется')
+  check(keptInDom(before, offsets(5, () => 40), 80, top) === top, 'другое число строк — не трогаем')
+  check(keptInDom(before, after, 0, 10) === 10, 'с первой строки поля нет')
+}
+
+// Ширина строк: кэш чистится, только когда она правда изменилась.
+{
+  const c = new HeightCache()
+  check(!c.setWidth(0), 'нулевая ширина — не замер')
+  check(!c.setWidth(400), 'первая ширина — чистить нечего')
+  c.set('a', 'row', 30)
+  check(!c.setWidth(400.2), 'та же ширина с дробью — кэш на месте')
+  check(c.has('a'), 'замер остался')
+  check(!c.setWidth(0), 'окно спрятали — замеры не трогаем')
+  check(c.has('a'), 'после скрытия замер на месте')
+  check(c.setWidth(500), 'другая ширина — кэш очищен')
+  check(!c.has('a') && c.get('a', 'row') === DEFAULT_HEIGHT.row, 'после очистки снова оценка')
 }
 
 check(rowsLeft(100, 10, 20) === 79, 'осталось — от нижней видимой')
