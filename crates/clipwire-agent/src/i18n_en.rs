@@ -745,8 +745,30 @@ pub static EN: &[(&str, &str)] = &[
         "The server prints it on startup (container log) and via clipwire-server info; it starts with cwserver2-.",
     ),
     (
-        "С кодом cwserver1- группу не создать: создавать группы может только администратор сервера, нужен код сервера администратора.",
-        "A cwserver1- code cannot create a group: only the server administrator can create groups, so you need the server admin code.",
+        "С кодом cwserver1- группу не создать: эта версия Clipwire создаёт группы только на сервере 0.5.0 или новее и только с его кодом администратора cwserver2-. Если сервер старее, обновите его образ, и он напечатает новый код.",
+        "A cwserver1- code cannot create a group: this version of Clipwire creates groups only on server 0.5.0 or newer and only with its administrator code cwserver2-. If the server is older, update its image, and it will print the new code.",
+    ),
+    ("Код не сохранился: {e}", "The code was not saved: {e}"),
+    (
+        "Код приглашения не разобрался ({e}). Он начинается с clipwire1-.",
+        "Could not read the invite code ({e}). It starts with clipwire1-.",
+    ),
+    ("сервер не ответил", "the server did not reply"),
+    (
+        "сервер не принял ключ администратора",
+        "the server did not accept the administrator key",
+    ),
+    (
+        "Это доступно только в окне настроек",
+        "This is available only in the settings window",
+    ),
+    (
+        "Это приглашение в другую группу. Чтобы перейти в неё, выйдите из этой группы и войдите по коду.",
+        "This invite is for another group. To move to it, leave this group and join with the code.",
+    ),
+    (
+        "Это приглашение на другой сервер. Чтобы перейти на него, выйдите из группы и войдите по коду.",
+        "This invite is for another server. To move to it, leave the group and join with the code.",
     ),
     (
         "В коде cwserver1- нет ключа администратора.",

@@ -17,6 +17,8 @@ clipwire-agent — общий буфер обмена Clipwire
   admin <код сервера>         сохранить ключ администратора сервера на
                               устройстве, которое уже в группе
   invite                      снова напечатать код приглашения
+  reinvite <код приглашения>  новый код приглашения в ту же группу (после смены
+                              токена relay): группа и ключи остаются
   run                         синхронизировать буфер без интерфейса (до Ctrl+C)
   reset                       забыть группу и ключи на этом устройстве
   retry                       снять отметку «исключено» и снова пробовать
@@ -104,6 +106,15 @@ fn main() -> Result<()> {
             println!(
                 "Ключ администратора сервера сохранён. Он действует со следующего запуска run."
             );
+        }
+        // Новый код приглашения в ту же группу (сменили токен relay): ключ
+        // группы и устройства остаются, меняется только сервер.
+        "reinvite" => {
+            let code = args
+                .get(1)
+                .context("нужен новый код приглашения: reinvite clipwire1-…")?;
+            clipwire_agent::admin::adopt_invite(&paths, code).map_err(anyhow::Error::msg)?;
+            println!("Код приглашения обновлён. Он действует со следующего запуска run.");
         }
         "invite" => {
             let state = paths.load()?.context("устройство ещё не в группе")?;
@@ -210,6 +221,9 @@ fn headless(state: AgentState, paths: &Paths, send: Option<String>) -> Result<()
                 // Без книги закрепов движок их не синхронизирует.
                 Event::Pin(_) => {}
                 Event::PinFailed(why) => eprintln!("{why}"),
+                Event::AdminKeyStale => eprintln!(
+                    "ключ администратора сервера устарел: нужен новый код (clipwire-agent admin cwserver2-…)"
+                ),
             }
         }
         task.await??;
@@ -265,6 +279,9 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
             UiEvent::NewEntry => {}
             UiEvent::Deleted(n) => eprintln!("удалено с другого устройства: {n}"),
             UiEvent::DevicesChanged | UiEvent::ServerOutdated(_) => {}
+            UiEvent::AdminKeyStale => eprintln!(
+                "ключ администратора сервера устарел и забыт: новый код — clipwire-agent admin cwserver2-…"
+            ),
             UiEvent::Transfer(t) => match t.state {
                 TransferState::Active => {}
                 TransferState::Done => eprintln!("файл {} передан", t.blob),

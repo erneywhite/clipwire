@@ -103,18 +103,119 @@ pub fn parse_server_code(code: &str) -> Result<ServerCode, String> {
 }
 
 /// Код сервера, с которым можно создать группу: только `cwserver2-…` с ключом
-/// администратора. Старый `cwserver1-…` — понятная ошибка, где взять новый.
+/// администратора. Старый `cwserver1-…` — понятная ошибка: какой нужен
+/// сервер и где взять новый код.
 pub fn creation_code(code: &str) -> Result<AdminServerInfo, String> {
     match parse_server_code(code)? {
         ServerCode::Admin(a) => Ok(a),
         ServerCode::Plain(_) => Err(format!(
             "{} {}",
             tr(
-                "С кодом cwserver1- группу не создать: создавать группы может только администратор сервера, нужен код сервера администратора."
+                "С кодом cwserver1- группу не создать: эта версия Clipwire создаёт группы только на сервере 0.5.0 или новее и только с его кодом администратора cwserver2-. Если сервер старее, обновите его образ, и он напечатает новый код."
             ),
             where_to_get()
         )),
     }
+}
+
+/// Новый код приглашения на месте, без выхода из группы: после смены токена
+/// relay у устройств группы ключ группы прежний, меняется только сервер
+/// (токен, адрес relay). Если ключ группы в коде тот же, в состоянии
+/// меняется только `invite.server`, ключ устройства остаётся. Возвращает
+/// новое состояние; ошибка — текст для человека.
+pub fn adopt_invite(paths: &Paths, code: &str) -> Result<AgentState, String> {
+    let invite = clipwire_core::Invite::decode(code.trim()).map_err(|e| {
+        trf(
+            "Код приглашения не разобрался ({e}). Он начинается с clipwire1-.",
+            &[("e", &e)],
+        )
+    })?;
+    let mut state = paths
+        .load()
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or_else(|| tr("Устройство не в группе").to_string())?;
+    if invite.group_key != state.invite.group_key {
+        return Err(tr(
+            "Это приглашение в другую группу. Чтобы перейти в неё, выйдите из этой группы и войдите по коду.",
+        )
+        .into());
+    }
+    if invite.server.server_id != state.invite.server.server_id {
+        return Err(tr(
+            "Это приглашение на другой сервер. Чтобы перейти на него, выйдите из группы и войдите по коду.",
+        )
+        .into());
+    }
+    if state.invite.server != invite.server {
+        state.invite.server = invite.server;
+        paths
+            .save(&state)
+            .map_err(|e| trf("Код не сохранился: {e}", &[("e", &format!("{e:#}"))]))?;
+    }
+    Ok(state)
+}
+
+/// Проверить код сервера администратора отдельным соединением: relay и
+/// токен — из кода, `AdminAuth` — с ключом из кода. Нужно, когда токен в
+/// коде новее сохранённого: со старым движок к серверу не подключится, и
+/// проверить ключ через него нельзя. Эндпоинт со случайным ключом: это
+/// соединение только для администрирования, без группы.
+pub async fn check_admin_code(info: &AdminServerInfo) -> Result<(), String> {
+    use clipwire_core::proto::io::{read_msg, write_msg};
+    use iroh::endpoint::presets;
+    use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
+
+    let url: RelayUrl = info.server.relay_url.parse().map_err(|_| {
+        trf(
+            "кривой адрес relay {url}",
+            &[("url", &info.server.relay_url)],
+        )
+    })?;
+    let ep = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::generate())
+        .relay_mode(RelayMode::Custom(
+            RelayMap::from_iter([url.clone()]).with_auth_token(info.server.relay_token.clone()),
+        ))
+        .bind()
+        .await
+        .map_err(|e| format!("{}: {e}", tr("не поднялся iroh-эндпоинт")))?;
+    let res = async {
+        let id = PublicKey::from_bytes(&info.server.server_id).map_err(|e| e.to_string())?;
+        let conn = crate::sync::connect(&ep, EndpointAddr::new(id).with_relay_url(url))
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        if !clipwire_core::proto::knows_admin(conn.alpn()) {
+            return Err(old_server().to_string());
+        }
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+        write_msg(
+            &mut send,
+            &ClientMsg::AdminAuth {
+                key: info.admin_key.clone(),
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            read_msg::<_, ServerMsg>(&mut recv),
+        )
+        .await
+        .map_err(|_| tr("сервер не ответил").to_string())?
+        .map_err(|e| e.to_string())?;
+        let _ = send.finish();
+        conn.close(0u32.into(), b"bye");
+        match reply {
+            Some(ServerMsg::AdminOk) => Ok(()),
+            Some(ServerMsg::AdminFailed(f)) => Err(fail_text(&f)),
+            Some(ServerMsg::Error(e)) => Err(trf("сервер отказал: {e}", &[("e", &e)])),
+            Some(m) => Err(unexpected(&m)),
+            None => Err(tr("сервер закрыл соединение").into()),
+        }
+    }
+    .await;
+    ep.close().await;
+    res
 }
 
 /// Код сервера администратора для устройства, уже состоящего в группе
@@ -199,6 +300,9 @@ pub enum AdminRequest {
     RotateAdminKey,
     GroupAdmin,
     TransferGroupAdmin(DeviceId),
+    /// Забрать роль админа группы себе (администратор сервера, прежний админ
+    /// потерян).
+    ClaimGroupAdmin,
 }
 
 impl AdminRequest {
@@ -214,6 +318,7 @@ impl AdminRequest {
             Self::RotateAdminKey => ClientMsg::RotateAdminKey,
             Self::GroupAdmin => ClientMsg::GetGroupAdmin,
             Self::TransferGroupAdmin(device) => ClientMsg::TransferGroupAdmin { device: *device },
+            Self::ClaimGroupAdmin => ClientMsg::ClaimGroupAdmin,
         }
     }
 
@@ -312,7 +417,7 @@ impl Controller {
     /// закрывает все соединения, и это тоже.
     pub async fn rotate_relay_token(&self) -> Result<String, String> {
         match self.admin(AdminRequest::RotateRelayToken).await? {
-            ServerMsg::RelayTokenRotated { server_code } => Ok(server_code),
+            ServerMsg::RelayTokenRotated { server_code } => Ok(server_code.0),
             m => Err(unexpected(&m)),
         }
     }
@@ -321,7 +426,17 @@ impl Controller {
     /// входит с новым ключом.
     pub async fn rotate_admin_key(&self) -> Result<String, String> {
         match self.admin(AdminRequest::RotateAdminKey).await? {
-            ServerMsg::AdminKeyRotated { server_code } => Ok(server_code),
+            ServerMsg::AdminKeyRotated { server_code } => Ok(server_code.0),
+            m => Err(unexpected(&m)),
+        }
+    }
+
+    /// Стать админом группы самому (нужны права администратора сервера):
+    /// прежний админ потерян, а без него ключ группы не сменить и устройства
+    /// не удалить.
+    pub async fn claim_group_admin(&self) -> Result<(), String> {
+        match self.admin(AdminRequest::ClaimGroupAdmin).await? {
+            ServerMsg::GroupAdmin { .. } => Ok(()),
             m => Err(unexpected(&m)),
         }
     }
@@ -411,7 +526,9 @@ mod tests {
         assert_eq!(a.admin_key, AdminKey([7; 32]));
         let old = creation_code(&server(1, "t").encode()).unwrap_err();
         assert!(
-            old.contains("cwserver2-") && old.contains("clipwire-server info"),
+            old.contains("cwserver2-")
+                && old.contains("clipwire-server info")
+                && old.contains("0.5.0"),
             "{old}"
         );
         let bad = creation_code("cwserver2-!!!").unwrap_err();

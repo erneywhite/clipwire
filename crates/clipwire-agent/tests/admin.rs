@@ -251,3 +251,155 @@ async fn relay_token_rotation_gives_new_code() -> Result<()> {
     drop(again);
     server.shutdown().await
 }
+
+/// Ждать «на связи», собирая по дороге, было ли `AdminKeyStale`.
+async fn online_noting_stale(a: &mut Agent) -> Result<bool> {
+    tokio::time::timeout(T, async {
+        let mut stale = false;
+        loop {
+            match a.events.recv().await.context("движок остановился")? {
+                Event::Status(Status::Online) => return Ok(stale),
+                Event::AdminKeyStale => stale = true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("не дождались связи")?
+}
+
+/// Ревью безопасности, находка 3: ключ администратора сменили, а у
+/// устройства старый. Раньше вход падал на голый `Join`, который после смены
+/// токена relay сервер не принимает, и устройство не подключалось никогда.
+/// Теперь движок забывает ключ, сообщает об этом и входит с токеном.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_admin_key_falls_back_to_token() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key, Some(ADMIN))?;
+    a.status().await?.expect("на связи");
+    // Сначала ключ администратора, потом токен relay.
+    a.ctl.rotate_admin_key().await.map_err(anyhow::Error::msg)?;
+    let code = a
+        .ctl
+        .rotate_relay_token()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let fresh = AdminServerInfo::decode(&code)?;
+    drop(a);
+
+    // B с новым токеном (новый код приглашения), но со старым ключом.
+    let mut server_info = fresh.server.clone();
+    server_info.relay_url = info.relay_url.clone();
+    let mut b = Agent::spawn(&server_info, &key, Some(ADMIN))?;
+    assert!(online_noting_stale(&mut b).await?, "ждали AdminKeyStale");
+    // Без ключа запросы администратора — понятный отказ, синхронизация идёт.
+    let err = b.ctl.server_settings().await.unwrap_err();
+    assert!(err.contains("код сервера администратора"), "{err}");
+    drop(b);
+
+    server.shutdown().await
+}
+
+/// Админ группы с ключом администратора меняет ключ группы: новая группа
+/// создаётся без ключа администратора (иначе сервер не принял бы её в
+/// `Rekey`), админ переходит в новую группу.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_rekeys_through_pending_group() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key, Some(ADMIN))?;
+    a.status().await?.expect("на связи");
+    let a_dev = a.ctl.device();
+    let done = a.ctl.rekey(None).await.map_err(anyhow::Error::msg)?;
+    drop(a);
+    // Другое устройство с ключом администратора входит в новую группу: админ
+    // у неё уже есть (перешёл из старой), и он не меняется.
+    let mut a2 = Agent::spawn(&info, &done.key, Some(ADMIN))?;
+    a2.status().await?.expect("в новой группе на связи");
+    assert_eq!(
+        a2.ctl.group_admin().await.map_err(anyhow::Error::msg)?,
+        Some(a_dev)
+    );
+    drop(a2);
+    server.shutdown().await
+}
+
+/// Ревью безопасности, находка 4: администратор сервера из группы забирает
+/// роль админа группы, когда прежний админ потерян.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_admin_takes_group_admin() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key, Some(ADMIN))?;
+    a.status().await?.expect("на связи");
+    let mut b = Agent::spawn(&info, &key, None)?;
+    b.status().await?.expect("на связи");
+    // Без ключа администратора — нельзя.
+    let err = b.ctl.claim_group_admin().await.unwrap_err();
+    assert!(err.contains("код сервера администратора"), "{err}");
+    b.ctl.admin_auth(ADMIN).await.map_err(anyhow::Error::msg)?;
+    b.ctl
+        .claim_group_admin()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        a.ctl.group_admin().await.map_err(anyhow::Error::msg)?,
+        Some(b.ctl.device())
+    );
+    drop((a, b));
+    server.shutdown().await
+}
+
+/// Находка 7: после смены токена relay устройство вводит новый код
+/// приглашения на месте: группа и ключ устройства те же, меняется сервер.
+#[tokio::test(flavor = "multi_thread")]
+async fn new_invite_in_place_after_token_rotation() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key, Some(ADMIN))?;
+    a.status().await?.expect("на связи");
+    let code = a
+        .ctl
+        .rotate_relay_token()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let fresh = AdminServerInfo::decode(&code)?;
+
+    let paths = Paths {
+        dir: std::env::temp_dir().join(format!("clipwire-reinvite-{}", uuid::Uuid::now_v7())),
+    };
+    let device_key = random_key()?;
+    paths.save(&AgentState {
+        invite: Invite {
+            server: info.clone(),
+            group_key: key.clone(),
+        },
+        device_key,
+    })?;
+    // Приглашение в другую группу — отказ, состояние не меняется.
+    let other = Invite {
+        server: fresh.server.clone(),
+        group_key: GroupKey::generate()?,
+    };
+    let err = clipwire_agent::admin::adopt_invite(&paths, &other.encode()).unwrap_err();
+    assert!(err.contains("другую группу"), "{err}");
+    assert_eq!(paths.load()?.context("нет состояния")?.invite.server, info);
+    // Своё — сервер обновлён, ключ устройства прежний.
+    let invite = Invite {
+        server: fresh.server.clone(),
+        group_key: key.clone(),
+    };
+    let st = clipwire_agent::admin::adopt_invite(&paths, &invite.encode())
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(st.invite.server, fresh.server);
+    assert_eq!(st.device_key, device_key);
+    // С ним — на связи в той же группе.
+    let mut server_info = st.invite.server.clone();
+    server_info.relay_url = info.relay_url.clone();
+    let mut b = Agent::spawn(&server_info, &key, None)?;
+    b.status().await?.expect("с новым кодом на связи");
+    let _ = std::fs::remove_dir_all(&paths.dir);
+    drop((a, b));
+    server.shutdown().await
+}

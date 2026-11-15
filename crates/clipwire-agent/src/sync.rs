@@ -186,6 +186,11 @@ pub enum Event {
     /// Сервер не принял закреп (квота, размер): текст для человека. Запись
     /// остаётся закреплённой только на этом устройстве.
     PinFailed(String),
+    /// Сервер не принял ключ администратора (его сменили): движок забыл ключ
+    /// и вошёл с токеном relay. Ключ на диске больше не нужен
+    /// (`Paths::forget_admin_key`), интерфейс просит ввести новый код
+    /// сервера администратора.
+    AdminKeyStale,
 }
 
 /// Своя версия: сервер младше неё — подсказка обновить образ.
@@ -722,11 +727,27 @@ impl Engine {
         let server_addr = addr.clone();
         let conn = connect(ep, addr.clone()).await?;
         let key = self.state.invite.group_key.clone();
-        let admin = self.admin_key.as_ref();
-        let (conn, mut send, mut recv) = match join(&conn, &key, Some(&self.token()), admin).await {
+        let admin = self.admin_key.clone();
+        let first = join(&conn, &key, Some(&self.token()), admin.as_ref()).await;
+        // Ключ администратора сменили (на другом устройстве или в разделе
+        // «Сервер»): с ним вход не пройдёт никогда. Забыть ключ и войти с
+        // токеном relay, как устройство без ключа. Падать на голый `Join`
+        // нельзя: после смены токена relay сервер его не принимает.
+        let (conn, first) = match first {
+            Err(JoinFail::BadAdminKey) => {
+                tracing::warn!("сервер не принял ключ администратора, вхожу без него");
+                self.forget_admin_key();
+                let conn = connect(ep, addr.clone()).await?;
+                let again = join(&conn, &key, Some(&self.token()), None).await;
+                (conn, again)
+            }
+            other => (conn, other),
+        };
+        let (conn, mut send, mut recv) = match first {
             Ok((send, recv)) => (conn, send, recv),
             Err(JoinFail::Other(e)) => return Err(e),
             Err(JoinFail::Rotated(env)) => return Err(self.rotated(env)),
+            Err(JoinFail::BadAdminKey) => bail!(tr("сервер не принял ключ администратора")),
             Err(first) => {
                 // Старый сервер не знает `JoinWithToken`: кадр не разбирается,
                 // и сервер просто рвёт соединение. Повторяем один раз обычным
@@ -1111,7 +1132,7 @@ impl Engine {
                 }
             }
             ServerMsg::AdminKeyRotated { server_code } => {
-                match clipwire_core::AdminServerInfo::decode(server_code) {
+                match clipwire_core::AdminServerInfo::decode(server_code.as_str()) {
                     Ok(info) => {
                         // Права этого соединения пропали вместе со старым
                         // ключом: войти с новым.
@@ -1123,11 +1144,30 @@ impl Engine {
             }
             ServerMsg::AdminFailed(f) if w.reply.is_none() => {
                 tracing::warn!("повторный вход администратора не прошёл: {f}");
+                if *f == clipwire_core::admin::AdminFail::BadKey {
+                    self.forget_admin_key();
+                }
+            }
+            // Вошли с ключом, а прав уже нет: ключ, скорее всего, сменили с
+            // другого устройства. Проверить своим `AdminAuth`: не подойдёт —
+            // ключ забывается (ветка выше).
+            ServerMsg::AdminFailed(clipwire_core::admin::AdminFail::NotAuthorized)
+                if w.auth.is_none() && self.admin_key.is_some() =>
+            {
+                self.admin_reauth = true;
             }
             _ => {}
         }
         if let Some(reply) = w.reply {
             let _ = reply.send(Ok(msg));
+        }
+    }
+
+    /// Ключ администратора устарел: забыть его в движке и сообщить
+    /// (`Event::AdminKeyStale`), чтобы его забыли и на диске.
+    fn forget_admin_key(&mut self) {
+        if self.admin_key.take().is_some() {
+            self.emit(Event::AdminKeyStale);
         }
     }
 
@@ -1199,9 +1239,12 @@ impl Engine {
         let new_key = GroupKey::generate()?;
 
         // Новая группа: вход отдельным соединением и своя карточка в ней.
+        // Всегда с токеном relay, без ключа администратора, даже если он
+        // есть: так сервер создаёт незавершённую группу смены ключа
+        // (`Create::ForRekey`), и только такую он принимает новой группой в
+        // `Rekey`. Устаревший ключ администратора здесь поэтому не мешает.
         let conn2 = connect(ep, addr).await?;
-        let admin = self.admin_key.as_ref();
-        let (mut send2, mut recv2) = join(&conn2, &new_key, Some(&self.token()), admin)
+        let (mut send2, mut recv2) = join(&conn2, &new_key, Some(&self.token()), None)
             .await
             .map_err(|e| anyhow!(trf("не удалось создать новую группу: {e}", &[("e", &e)])))?;
         let card = crate::devices::sealed_card(
@@ -1650,7 +1693,7 @@ fn is_fresh(item: &Item, now_ms: u64, window: Duration) -> bool {
 /// Подключиться к серверу. Пока идёт подключение, следим за relay: если он
 /// отказал по токену, ждать таймаута бессмысленно, iroh будет повторять с тем
 /// же токеном вечно.
-async fn connect(ep: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
+pub(crate) async fn connect(ep: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
     // Предлагаем все ALPN: сервер выберет новейший из известных ему
     // (0.1.1 — `clipwire/3`, 0.1.2 — `/4`, 0.1.3 — `/5`, 0.1.4 — `/6`,
     // 0.4.0 — `/7` и `/8`).
@@ -1688,6 +1731,9 @@ enum JoinFail {
     /// Ключ группы сменён: пакет нового ключа для этого устройства
     /// (`Rekeyed`) или `None` (`Excluded`).
     Rotated(Option<Vec<u8>>),
+    /// `JoinAsAdmin` с ключом, которого сервер не знает (его сменили):
+    /// повторить вход с токеном relay.
+    BadAdminKey,
 }
 
 impl std::fmt::Display for JoinFail {
@@ -1697,6 +1743,7 @@ impl std::fmt::Display for JoinFail {
             JoinFail::Closed(e) => f.write_str(&trf("сервер закрыл соединение: {e}", &[("e", e)])),
             JoinFail::Other(e) => write!(f, "{e:#}"),
             JoinFail::Rotated(_) => f.write_str(tr("ключ группы сменён")),
+            JoinFail::BadAdminKey => f.write_str(tr("сервер не принял ключ администратора")),
         }
     }
 }
@@ -1742,6 +1789,9 @@ async fn join(
         Ok(Some(ServerMsg::Error(e))) => Err(JoinFail::Refused(e)),
         Ok(Some(ServerMsg::Rekeyed { envelope })) => Err(JoinFail::Rotated(Some(envelope))),
         Ok(Some(ServerMsg::Excluded)) => Err(JoinFail::Rotated(None)),
+        Ok(Some(ServerMsg::AdminFailed(clipwire_core::admin::AdminFail::BadKey))) => {
+            Err(JoinFail::BadAdminKey)
+        }
         Ok(Some(other)) => Err(JoinFail::Other(anyhow::anyhow!(
             "неожиданный ответ сервера: {other:?}"
         ))),

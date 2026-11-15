@@ -68,6 +68,10 @@ pub enum UiEvent {
     /// Сервер не принял закреп (квота, размер): текст для человека. Запись
     /// закреплена только на этом устройстве.
     PinFailed(String),
+    /// Ключ администратора сервера устарел (его сменили): сервис уже забыл
+    /// его на диске, синхронизация идёт без него. Интерфейс просит ввести
+    /// новый код сервера администратора.
+    AdminKeyStale,
 }
 
 pub type UiCallback = Arc<dyn Fn(UiEvent) + Send + Sync>;
@@ -591,6 +595,14 @@ impl Service {
                             }
                         }
                         Event::PinFailed(why) => on_event(UiEvent::PinFailed(why)),
+                        // Ключ уже не подходит серверу: на диске он только
+                        // заставлял бы каждый запуск сначала пробовать его.
+                        Event::AdminKeyStale => {
+                            if let Err(e) = paths.forget_admin_key() {
+                                tracing::warn!("устаревший ключ администратора не удалился: {e:#}");
+                            }
+                            on_event(UiEvent::AdminKeyStale);
+                        }
                         Event::KnownDevices(cards) => {
                             if let Some(g) = group
                                 && let Err(e) = crate::devices::save_known(&paths, g, &cards)
