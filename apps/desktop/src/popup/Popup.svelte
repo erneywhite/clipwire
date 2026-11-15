@@ -12,6 +12,7 @@
   import AppTag from '../lib/AppTag.svelte'
   import { t } from '../lib/i18n'
   import { debounce } from '../lib/debounce'
+  import { inFlight } from '../lib/inflight'
   import LinkCard from './LinkCard.svelte'
   import FilePreview from './FilePreview.svelte'
   import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -306,7 +307,7 @@
     error = ''
     loadFailed = false
     exhausted = false
-    const done = load(PAGE)
+    const done = listing.track(load(PAGE))
     setScroll(0)
     return done
   }
@@ -316,10 +317,17 @@
   // Ответы на старые запросы и так отбрасываются по gen.
   const SEARCH_MS = 150
   const search = debounce(reload, SEARCH_MS)
+  // Новый список (запрос, вкладка, фильтр, показ окна) ещё читается.
+  const listing = inFlight()
 
-  /** Запрос набран, но ещё не отправлен: отправить и дождаться списка. */
+  /**
+   * Запрос набран, но ещё не отправлен, или новый список ещё читается:
+   * отправить и дождаться его. Само чтение редкого слова может идти дольше
+   * паузы перед запросом.
+   */
   async function flushSearch() {
-    if (search.pending) await reload()
+    if (search.pending) reload()
+    await listing.settled()
   }
 
   /**
@@ -680,11 +688,15 @@
       }
       return
     }
-    if (search.pending && e.target !== editor && listKey(e)) {
+    if ((search.pending || listing.busy) && e.target !== editor && listKey(e)) {
       // Отменить действие браузера надо сразу, до ожидания; ниже клавиша
       // обрабатывается как обычно, уже по новому списку.
       e.preventDefault()
+      const session = shown
       await flushSearch()
+      // Пока ждали, окно спрятали или открыли заново: клавиша относилась к
+      // списку, которого уже нет, вставлять или удалять по ней нельзя.
+      if (session !== shown || !visible) return
     }
     if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
       e.preventDefault()
@@ -809,7 +821,7 @@
         exhausted = false
         // Показ перечитывает первую страницу всегда, даже без изменений истории:
         // фильтры сброшены, а файлы на диске могли пропасть или появиться.
-        await load(PAGE)
+        await listing.track(load(PAGE))
         await tick()
         // Окно не пересоздаётся, а прокрутка остаётся с прошлого раза: без этого
         // список мог открыться в середине, и свежие элементы были не видны.
