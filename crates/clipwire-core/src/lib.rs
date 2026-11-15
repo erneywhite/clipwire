@@ -11,6 +11,7 @@ pub mod device;
 pub mod invite;
 pub mod item;
 pub mod p2p;
+pub mod pin;
 pub mod proto;
 pub mod storage;
 
@@ -18,4 +19,5 @@ pub use blob::BlobId;
 pub use crypto::{GroupId, GroupKey, JoinSecret, SealedItem};
 pub use invite::{Invite, ServerInfo};
 pub use item::{Content, DeviceId, Ext, ExtList, FileRef, Item, ItemId, SourceApp};
+pub use pin::{PinId, PinState};
 pub use storage::{GroupConfig, StorageConfig};
