@@ -372,8 +372,20 @@ fn group_pins(state: &AppState) -> Option<std::sync::Arc<clipwire_agent::pins::P
         .and_then(|s| s.pins())
 }
 
+/// Хэш, закреплена ли и подпись записи (`None` — записи нет).
+fn pin_info(state: &AppState, id: ItemId) -> Option<([u8; 32], bool, String)> {
+    let h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+    let row = h.row(id)?;
+    Some((row.card.hash, row.pinned, row.note().unwrap_or_default()))
+}
+
 /// Закрепить или открепить. В группе правка уходит на все устройства (без
-/// связи — после входа); открепление стирает подпись.
+/// связи — после входа); открепление стирает подпись. Повторное
+/// закрепление подпись группы не меняет.
+///
+/// Правка встаёт в очередь закрепов до записи в историю: закреп с сервера,
+/// который пришёл в это время, сервис применяет под замком истории и только
+/// без своей правки в очереди, поэтому свежее закрепление он не снимет.
 #[tauri::command]
 pub fn history_pin(
     app: AppHandle,
@@ -382,23 +394,21 @@ pub fn history_pin(
     pinned: bool,
 ) -> CmdResult<()> {
     let id = parse_id(&id)?;
-    let pins = group_pins(&state);
-    let (hash, note) = {
-        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        h.set_pinned(id, pinned).map_err(err)?;
-        let row = h.row(id);
-        (
-            h.hash_of(id),
-            row.and_then(|r| r.note()).unwrap_or_default(),
-        )
-    };
-    if let (Some(pins), Some(hash)) = (pins, hash) {
+    let (hash, _, note) =
+        pin_info(&state, id).ok_or_else(|| tr("Элемента уже нет в истории").to_string())?;
+    if let Some(pins) = group_pins(&state) {
         if pinned {
             pins.pin(hash, &note);
         } else {
             pins.unpin(hash);
         }
     }
+    state
+        .history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_pinned(id, pinned)
+        .map_err(err)?;
     let _ = app.emit("clipwire://history-changed", ());
     Ok(())
 }
@@ -413,15 +423,21 @@ pub fn history_note(
     note: String,
 ) -> CmdResult<String> {
     let id = parse_id(&id)?;
-    let pins = group_pins(&state);
-    let (saved, hash) = {
-        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = h.set_note(id, &note).map_err(err)?;
-        (saved, h.hash_of(id))
-    };
-    if let (Some(pins), Some(hash)) = (pins, hash) {
-        pins.set_note(hash, &saved);
+    let (hash, pinned, _) =
+        pin_info(&state, id).ok_or_else(|| tr("Элемента уже нет в истории").to_string())?;
+    if !pinned {
+        return Err(tr("Подписать можно только закреплённую запись").into());
     }
+    // В очередь — до истории, как в `history_pin`.
+    if let Some(pins) = group_pins(&state) {
+        pins.set_note(hash, &clipwire_agent::history::clean_note(&note));
+    }
+    let saved = state
+        .history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_note(id, &note)
+        .map_err(err)?;
     let _ = app.emit("clipwire://history-changed", ());
     Ok(saved)
 }
@@ -447,18 +463,9 @@ pub fn history_delete_pinned(
     mode: PinnedDelete,
 ) -> CmdResult<()> {
     let id = parse_id(&id)?;
-    let pins = group_pins(&state);
-    let hash = {
-        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        let hash = h.hash_of(id);
-        match mode {
-            PinnedDelete::Here | PinnedDelete::Everywhere => h.set_pinned(id, false),
-            PinnedDelete::Delete => h.delete(id),
-        }
-        .map_err(err)?;
-        hash
-    };
-    if let (Some(pins), Some(hash)) = (pins, hash) {
+    let hash = pin_info(&state, id).map(|(h, _, _)| h);
+    // Книга — до истории, как в `history_pin`.
+    if let (Some(pins), Some(hash)) = (group_pins(&state), hash) {
         match mode {
             PinnedDelete::Here => pins.unpin_here(hash),
             PinnedDelete::Everywhere => pins.unpin(hash),
@@ -467,6 +474,14 @@ pub fn history_delete_pinned(
             PinnedDelete::Delete => pins.delete(hash),
         }
     }
+    {
+        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        match mode {
+            PinnedDelete::Here | PinnedDelete::Everywhere => h.set_pinned(id, false),
+            PinnedDelete::Delete => h.delete(id),
+        }
+        .map_err(err)?;
+    }
     if matches!(mode, PinnedDelete::Delete) {
         crate::cache::prune_later(&app);
     }
@@ -474,15 +489,24 @@ pub fn history_delete_pinned(
     Ok(())
 }
 
+/// Удалить запись. Закреплённая в группе сначала снимается только здесь
+/// (`PinnedDelete::Here`): иначе закреп группы вернул бы её при следующей
+/// правке с другого устройства. Выбор «снять везде / удалить везде» —
+/// `history_delete_pinned`.
 #[tauri::command]
 pub fn history_delete(app: AppHandle, state: State<'_, AppState>, id: String) -> CmdResult<()> {
     let id = parse_id(&id)?;
-    let hash = {
-        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        let hash = h.hash_of(id);
-        h.delete(id).map_err(err)?;
-        hash
-    };
+    let info = pin_info(&state, id);
+    if let (Some(pins), Some((hash, true, _))) = (group_pins(&state), &info) {
+        pins.unpin_here(*hash);
+    }
+    state
+        .history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .delete(id)
+        .map_err(err)?;
+    let hash = info.map(|(h, _, _)| h);
     // Удаление уходит на остальные устройства группы, если это включено в
     // настройках (там закреплённое не трогается). Без группы — только здесь.
     let everywhere = state
@@ -506,12 +530,24 @@ pub fn history_delete(app: AppHandle, state: State<'_, AppState>, id: String) ->
     Ok(())
 }
 
+/// Очистить историю. Без `keep_pinned` закрепы группы снимаются только
+/// здесь, как при удалении закреплённой записи: иначе они вернулись бы.
 #[tauri::command]
 pub fn history_clear(
     app: AppHandle,
     state: State<'_, AppState>,
     keep_pinned: bool,
 ) -> CmdResult<()> {
+    if !keep_pinned && let Some(pins) = group_pins(&state) {
+        let pinned = state
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pinned_notes();
+        for (hash, _, _) in pinned {
+            pins.unpin_here(hash);
+        }
+    }
     state
         .history
         .lock()
