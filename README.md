@@ -202,9 +202,30 @@ while offline, one pin is kept with the note of the newer change. A pin can be r
 device only: the other devices keep it, and it does not come back here unless you pin it here
 again. The server keeps pins with no expiry, encrypted with the group key, and refuses new ones
 over its limits (`CLIPWIRE_PIN_MAX`, `CLIPWIRE_PIN_BYTES`): such an entry stays pinned on this
-device only, and the app says so. On a group key change the device that changes the key moves the
-pins to the new group. This needs a server with protocol `clipwire/8`: the app does not sync with
-an older server and asks you to update the image.
+device only, and the app says so. The order of changes is decided by the server, not by device
+clocks: an unpin or a note made offline reaches every device even if this device's clock is
+behind. Simply deleting a pinned entry removes the pin on this device only; the other devices keep it
+pinned. Pinning again and importing from Paste again do not change an existing note: only
+editing the note does.
+
+Files in pinned entries. Files under the upload limit are kept in the group storage (the server
+or external S3/SFTP) and are not deleted after the retention period while the pin exists.
+Folders and files over the limit are not uploaded: other devices see the file card and can fetch
+the file directly only while the source device is online. External storage is cleaned by the
+devices themselves, using the list of pinned files the server provides. Devices with an older
+Clipwire (before pins) do not know this list and may delete pinned files from S3/SFTP after the
+retention period, so update the app on every device of the group.
+
+On a group key change the device that changes the key moves the pins to the new group and tells
+you if the server refused some of them (the pin limit). Files of pinned entries are not moved:
+the server and external storage delete the files of the old group, so in the new group such a
+pin keeps the file card, and the file itself is only where it lies on disk. A device that was off
+during the key change does not upload pins that other devices removed in the meantime. If the
+server database was lost or restored from an old backup, devices notice it, fetch the pins from
+the start and upload their live pins again.
+
+This needs a server with protocol `clipwire/8`: the app does not sync with an older server and
+asks you to update the image.
 
 ## What gets synced
 
