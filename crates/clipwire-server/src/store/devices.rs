@@ -178,6 +178,14 @@ impl Store {
             Some(Some(_)) => return Ok(Refused("ключ этой группы уже сменён")),
             Some(None) => {}
         }
+        // Ключ меняет и устройства удаляет только админ группы. У группы без
+        // админа (создана до 0.5.0) — любой участник, как раньше.
+        let old_admin = super::admin::admin_of(&tx, group)?;
+        if old_admin.is_some_and(|a| a != *sender) {
+            return Ok(Refused(
+                "сменить ключ группы и удалить устройство может только админ группы",
+            ));
+        }
         let new: Option<Option<i64>> = tx
             .query_row(
                 "SELECT rotated_ms FROM groups WHERE group_id = ?1",
@@ -213,6 +221,7 @@ impl Store {
             "UPDATE groups SET rotated_to = ?2, rotated_ms = ?3 WHERE group_id = ?1",
             params![&group.0[..], &new_group.0[..], now_ms],
         )?;
+        super::admin::inherit_admin(&tx, new_group, old_admin.as_ref())?;
         for (device, envelope) in envelopes {
             tx.execute(
                 "INSERT INTO rekeys (group_id, device_id, envelope) VALUES (?1, ?2, ?3)",

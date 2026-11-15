@@ -7,12 +7,16 @@ use anyhow::{Context, Result};
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{ALPN, ClientMsg, ServerMsg};
 use clipwire_core::storage::MAX_CONFIG_BYTES;
-use clipwire_core::{GroupKey, ServerInfo};
+use clipwire_core::{AdminKey, GroupKey, ServerInfo};
 use clipwire_server::{Config, Guards};
 use iroh::endpoint::{RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
 
 const T: Duration = Duration::from_secs(20);
+
+/// Ключ администратора тестового сервера: тест кладёт его в каталог данных
+/// до запуска (`admin.key`), и сервер берёт его вместо случайного.
+const ADMIN: AdminKey = AdminKey([42; 32]);
 
 struct Client {
     _ep: Endpoint,
@@ -42,10 +46,10 @@ impl Client {
             send,
             recv,
         };
-        c.send(&ClientMsg::JoinWithToken {
+        c.send(&ClientMsg::JoinAsAdmin {
             group_id: key.group_id(),
             join_secret: key.join_secret(),
-            token: "test-token".into(),
+            admin_key: ADMIN,
         })
         .await?;
         anyhow::ensure!(matches!(c.next().await?, ServerMsg::Joined));
@@ -104,6 +108,8 @@ async fn start_server() -> Result<(clipwire_server::Running, String)> {
         blob_total_quota: u64::MAX,
         blob_stall: Duration::from_secs(10),
     };
+    std::fs::create_dir_all(&config.data_dir)?;
+    std::fs::write(config.data_dir.join("admin.key"), ADMIN.0)?;
     let server = clipwire_server::start_with(&config, &Guards::default()).await?;
     tokio::time::timeout(T, server.endpoint().online())
         .await

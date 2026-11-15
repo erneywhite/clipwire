@@ -15,10 +15,12 @@ use clipwire_core::{BlobId, DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+mod admin;
 mod config;
 mod deletes;
 mod devices;
 mod pins;
+pub use admin::{Create, PENDING_KEEP};
 pub use devices::{RekeyLimits, RekeyOutcome, Rotation};
 use pins::KEPT_BY_PIN;
 pub use pins::{PinOutcome, PinQuota, PinWrite};
@@ -64,7 +66,8 @@ pub enum JoinOutcome {
     Joined,
     /// Группа есть, но секрет другой.
     Denied,
-    /// Группы нет, а создавать её этому входу нельзя (вход без токена сервера).
+    /// Группы нет, а создавать её этому входу нельзя: нет ключа
+    /// администратора сервера и это не новая группа для смены ключа.
     NoGroup,
     /// Группы нет, и на сервере уже предельное число групп.
     TooManyGroups,
@@ -184,6 +187,7 @@ impl Store {
             conn.execute_batch("ALTER TABLE blobs ADD COLUMN origin BLOB;")?;
         }
         devices::migrate(&conn)?;
+        admin::migrate(&conn)?;
         config::migrate(&conn)?;
         deletes::migrate(&conn)?;
         pins::migrate(&conn)?;
@@ -198,8 +202,8 @@ impl Store {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Вход устройства в группу. Новая группа создаётся, только если
-    /// `may_create` (вход с токеном сервера) и групп меньше `max_groups`.
+    /// Вход устройства в группу. Новая группа создаётся, только если это
+    /// разрешает `create` ([`Create`]) и групп меньше `max_groups`.
     /// Проверка числа групп и вставка идут в одной транзакции, поэтому два
     /// одновременных входа предел не проскочат.
     ///
@@ -213,7 +217,7 @@ impl Store {
         secret: &JoinSecret,
         device: &DeviceId,
         now_ms: i64,
-        may_create: bool,
+        create: Create,
         limits: JoinLimits,
     ) -> Result<JoinOutcome> {
         let JoinLimits {
@@ -231,8 +235,16 @@ impl Store {
             )
             .optional()?;
         let outcome = match existing {
-            None if !may_create => return Ok(JoinOutcome::NoGroup),
+            None if create == Create::No => return Ok(JoinOutcome::NoGroup),
+            None if create == Create::ForRekey && !admin::may_rekey_any(&tx, device)? => {
+                return Ok(JoinOutcome::NoGroup);
+            }
             None => {
+                if create == Create::ForRekey {
+                    // Одна незавершённая новая группа на устройство: прошлая
+                    // (смена ключа не дошла до `Rekey`) больше не нужна.
+                    admin::drop_pending_of(&tx, device)?;
+                }
                 // Надгробия сменённых групп (`store/devices.rs`) места не занимают.
                 let groups: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM groups WHERE tombstone_ms IS NULL",
@@ -246,6 +258,7 @@ impl Store {
                     "INSERT INTO groups (group_id, join_digest, created_ms) VALUES (?1, ?2, ?3)",
                     params![&group.0[..], &digest[..], now_ms],
                 )?;
+                admin::mark_created(&tx, group, device, create, now_ms)?;
                 JoinOutcome::Created
             }
             Some(d) if constant_time_eq(&d, &digest) => {
@@ -291,7 +304,12 @@ impl Store {
             max_groups,
             max_devices: usize::MAX,
         };
-        self.join_limited(group, secret, device, now_ms, may_create, limits)
+        let create = if may_create {
+            Create::Admin
+        } else {
+            Create::No
+        };
+        self.join_limited(group, secret, device, now_ms, create, limits)
     }
 
     /// Сохраняет элемент и обрезает историю группы до `keep` последних.
@@ -1104,7 +1122,7 @@ mod tests {
                 &k.join_secret(),
                 &DeviceId([n; 32]),
                 0,
-                true,
+                Create::Admin,
                 JoinLimits {
                     max_groups: 10,
                     max_devices: 2,

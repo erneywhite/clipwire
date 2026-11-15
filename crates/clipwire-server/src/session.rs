@@ -1,15 +1,17 @@
-//! Обработка одного подключения агента по ALPN от `clipwire/3` до `clipwire/8`:
+//! Обработка одного подключения агента по ALPN от `clipwire/3` до `clipwire/9`:
 //! формат кадров один, новые версии только добавляют сообщения (`proto.rs`).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use clipwire_core::admin::AdminFail;
 use clipwire_core::delete::MAX_DELETE_BYTES;
 use clipwire_core::proto::io::{IoError, read_msg, read_msg_limited, write_msg};
 use clipwire_core::proto::{
-    ClientMsg, ServerMsg, knows_deletes, knows_devices_changed, knows_pins, knows_server_info,
+    ClientMsg, ServerMsg, knows_admin, knows_deletes, knows_devices_changed, knows_pins,
+    knows_server_info,
 };
 use clipwire_core::storage::MAX_CONFIG_BYTES;
 use clipwire_core::{DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
@@ -18,16 +20,18 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
+use crate::admin::{AdminReply, AdminSession, AdminState};
 use crate::blobs::Blobs;
 use crate::config::Guards;
 use crate::hub::{Hub, QUEUE};
-use crate::store::{JoinOutcome, Store, constant_time_eq};
+use crate::store::{Create, JoinOutcome, Store};
 
 /// Сколько ждать первого сообщения `Join` после подключения.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Предел первого кадра до входа в группу. В `Join` два значения по 32 байта,
 /// в `JoinWithToken` ещё токен сервера (32 символа у сгенерированного, не
-/// больше [`crate::config::MAX_RELAY_TOKEN_BYTES`] у заданного вручную).
+/// больше [`crate::config::MAX_RELAY_TOKEN_BYTES`] у заданного вручную), в
+/// `JoinAsAdmin` — 32 байта ключа администратора.
 /// Клиент, который ещё никуда не вошёл, не должен заставлять сервер выделять
 /// под кадр 16 МиБ.
 pub const MAX_JOIN_FRAME: usize = 512;
@@ -38,6 +42,10 @@ pub const MAX_JOIN_FRAME: usize = 512;
 /// место самого свежего в истории он занимает не дольше суток.
 pub const MAX_CLOCK_SKEW_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// Пределы сервера. Действующие лежат в [`Shared::limits`] и меняются на
+/// ходу настройками из клиента (`SetServerSettings`), поэтому их читают
+/// заново на каждый запрос, а не запоминают.
+#[derive(Debug, Clone)]
 pub struct Limits {
     pub max_item_bytes: usize,
     pub history_len: usize,
@@ -87,19 +95,46 @@ pub struct Shared {
     pub store: Store,
     pub hub: Hub,
     pub blobs: Blobs,
-    pub limits: Limits,
+    /// Действующие пределы: [`Shared::base_limits`] с настройками из базы
+    /// поверх. Читать через [`Shared::limits`].
+    pub limits: RwLock<Arc<Limits>>,
+    /// Пределы из переменных окружения и встроенные: значения по умолчанию
+    /// для настроек сервера.
+    pub base_limits: Limits,
     /// Пределы одновременных `Put` и `Get` на сервер и на группу (сверх
     /// предела на соединение).
     pub streams: crate::transfer::StreamLimits,
-    /// Токен сервера (тот же, что у relay). С ним можно создать новую группу.
-    pub token: String,
+    /// Токен relay, ключ администратора и закрытие всех соединений.
+    pub admin: AdminState,
     /// Сколько соединений сейчас открыто с каждого устройства.
     pub devices: DeviceSlots,
 }
 
 impl Shared {
+    /// Действующие пределы. Снимок: настройка, поменянная посреди запроса,
+    /// подействует со следующего.
+    pub fn limits(&self) -> Arc<Limits> {
+        self.limits
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Перечитать настройки из базы и поставить новые пределы.
+    pub fn reload_limits(&self) -> Result<()> {
+        let stored = self.store.settings()?;
+        let next = Arc::new(crate::admin::effective(&self.base_limits, &stored));
+        *self.limits.write().unwrap_or_else(|e| e.into_inner()) = next;
+        Ok(())
+    }
+
+    /// Закрыть все соединения сервера (сменён токен relay).
+    pub fn close_all(&self) {
+        self.admin.closing.send_modify(|n| *n += 1);
+    }
+
     pub fn not_before_ms(&self) -> i64 {
-        now_ms() - self.limits.ttl.as_millis() as i64
+        now_ms() - self.limits().ttl.as_millis() as i64
     }
 }
 
@@ -173,19 +208,37 @@ impl ProtocolHandler for ClipwireProtocol {
     }
 }
 
+/// Чем подтверждён вход в группу.
+enum Credential {
+    /// `Join`: только секрет группы.
+    Plain,
+    /// `JoinWithToken`: токен relay.
+    Token(String),
+    /// `JoinAsAdmin`: ключ администратора сервера.
+    Admin(clipwire_core::AdminKey),
+}
+
 /// Что прислал клиент первым кадром.
 struct JoinRequest {
     group: GroupId,
     secret: JoinSecret,
-    /// Токен сервера, если вход `JoinWithToken`.
-    token: Option<String>,
+    cred: Credential,
 }
+
+/// Текст отказа, когда токен relay сменили, а устройство пришло со старым
+/// кодом приглашения.
+const RELAY_ROTATED: &str = "токен сервера сменён: нужен новый код приглашения";
 
 async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
     let device = DeviceId(*conn.remote_id().as_bytes());
+    // Подписка раньше входа: смена токена relay во время входа тоже закроет
+    // соединение.
+    let mut closing = shared.admin.closing.subscribe();
     // Место берём сразу, до потока: соединения, которые так и не открыли
     // поток, тоже считаются.
-    let slot = shared.devices.enter(device, shared.limits.max_device_conns);
+    let slot = shared
+        .devices
+        .enter(device, shared.limits().max_device_conns);
     let (mut send, mut recv) = tokio::time::timeout(JOIN_TIMEOUT, conn.accept_bi())
         .await
         .context("клиент не открыл поток")??;
@@ -207,7 +260,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         })) => JoinRequest {
             group: group_id,
             secret: join_secret,
-            token: None,
+            cred: Credential::Plain,
         },
         Ok(Some(ClientMsg::JoinWithToken {
             group_id,
@@ -216,8 +269,21 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         })) => JoinRequest {
             group: group_id,
             secret: join_secret,
-            token: Some(token),
+            cred: Credential::Token(token),
         },
+        Ok(Some(ClientMsg::JoinAsAdmin {
+            group_id,
+            join_secret,
+            admin_key,
+        })) => JoinRequest {
+            group: group_id,
+            secret: join_secret,
+            cred: Credential::Admin(admin_key),
+        },
+        // Соединение только для администрирования сервера, без группы.
+        Ok(Some(ClientMsg::AdminAuth { key })) if knows_admin(conn.alpn()) => {
+            return serve_admin(shared, send, recv, key, closing).await;
+        }
         Ok(Some(_)) => {
             refuse(&mut send, "первым сообщением должен быть Join").await;
             bail!("первое сообщение не Join");
@@ -231,26 +297,40 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
     };
     let group = req.group;
 
-    let may_create = match &req.token {
-        None => false,
-        Some(t) if constant_time_eq(t.as_bytes(), shared.token.as_bytes()) => true,
-        Some(_) => {
+    let mut admin = AdminSession::default();
+    let create = match &req.cred {
+        // Обычный `Join` агент шлёт, если вход с токеном не прошёл. После
+        // смены токена relay так входил бы старый код приглашения.
+        Credential::Plain if shared.store.relay_rotated()? => {
+            refuse(&mut send, RELAY_ROTATED).await;
+            bail!("вход без токена после смены токена relay");
+        }
+        Credential::Plain => Create::No,
+        Credential::Token(t) if shared.admin.token_matches(t) => Create::ForRekey,
+        Credential::Token(_) => {
             refuse(&mut send, "неверный код сервера").await;
             bail!("неверный токен сервера");
         }
+        Credential::Admin(key) if admin.auth(shared, key) => Create::Admin,
+        Credential::Admin(_) => {
+            refuse(&mut send, "неверный ключ администратора сервера").await;
+            bail!("неверный ключ администратора");
+        }
     };
 
+    let limits = shared.limits();
     let outcome = shared.store.join_limited(
         &group,
         &req.secret,
         &device,
         now_ms(),
-        may_create,
+        create,
         crate::store::JoinLimits {
-            max_groups: shared.limits.max_groups,
-            max_devices: shared.limits.max_devices,
+            max_groups: limits.max_groups,
+            max_devices: limits.max_devices,
         },
     )?;
+    drop(limits);
     let reason = match &outcome {
         JoinOutcome::Rotated(r) => {
             // Ключ сменён: ни истории, ни входа, только пакет этого устройства.
@@ -262,7 +342,9 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         }
         JoinOutcome::Created | JoinOutcome::Joined => None,
         JoinOutcome::Denied => Some("неверный секрет группы"),
-        JoinOutcome::NoGroup => Some("группы нет; создать группу можно только с кодом сервера"),
+        JoinOutcome::NoGroup => {
+            Some("группы нет; создать группу можно только с кодом сервера администратора")
+        }
         JoinOutcome::TooManyGroups => Some("на сервере уже предельное число групп"),
         JoinOutcome::TooManyDevices => Some("в группе уже предельное число устройств"),
     };
@@ -271,6 +353,11 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         bail!("вход отклонён: {reason}");
     }
     tracing::info!(group = %short(&group), ?outcome, "вход в группу");
+    // Группа без админа (до 0.5.0) получает админом первое устройство,
+    // вошедшее с ключом администратора сервера.
+    if create == Create::Admin && shared.store.claim_group_admin(&group, &device)? {
+        tracing::info!(group = %short(&group), "у группы появился админ");
+    }
 
     // История по одному элементу и прямо из базы: картинки вместе не влезут
     // в один кадр, а держать всю историю в памяти на каждый вход незачем.
@@ -337,8 +424,63 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     None => return Ok(()),
                     Some(ClientMsg::Push(item)) => accept(shared, &group, device, reg.id, item, false)?,
                     Some(ClientMsg::Backfill(item)) => accept(shared, &group, device, reg.id, item, true)?,
-                    Some(ClientMsg::Join { .. } | ClientMsg::JoinWithToken { .. }) => {
+                    Some(
+                        ClientMsg::Join { .. }
+                        | ClientMsg::JoinWithToken { .. }
+                        | ClientMsg::JoinAsAdmin { .. },
+                    ) => {
                         bail!("повторный Join")
+                    }
+                    Some(ClientMsg::AdminAuth { key }) => {
+                        need_admin_alpn(conn)?;
+                        let reply = if admin.auth(shared, &key) {
+                            if shared.store.claim_group_admin(&group, &device)? {
+                                tracing::info!(group = %short(&group), "у группы появился админ");
+                                shared.hub.devices_changed(&group, reg.id);
+                            }
+                            ServerMsg::AdminOk
+                        } else {
+                            tracing::info!("неверный ключ администратора");
+                            ServerMsg::AdminFailed(AdminFail::BadKey)
+                        };
+                        write_msg(&mut send, &reply).await?;
+                    }
+                    Some(ClientMsg::TransferGroupAdmin { device: to }) => {
+                        need_admin_alpn(conn)?;
+                        let reply = match shared.store.transfer_group_admin(&group, &device, &to)? {
+                            Ok(()) => {
+                                tracing::info!(group = %short(&group), "админ группы передан");
+                                shared.hub.devices_changed(&group, reg.id);
+                                ServerMsg::GroupAdmin { admin: Some(to) }
+                            }
+                            Err(f) => ServerMsg::AdminFailed(f),
+                        };
+                        write_msg(&mut send, &reply).await?;
+                    }
+                    Some(ClientMsg::GetGroupAdmin) => {
+                        need_admin_alpn(conn)?;
+                        let admin = shared.store.group_admin(&group)?;
+                        write_msg(&mut send, &ServerMsg::GroupAdmin { admin }).await?;
+                    }
+                    Some(
+                        msg @ (ClientMsg::GetServerSettings
+                        | ClientMsg::SetServerSettings { .. }
+                        | ClientMsg::GetServerSummary
+                        | ClientMsg::RotateRelayToken
+                        | ClientMsg::RotateAdminKey),
+                    ) => {
+                        need_admin_alpn(conn)?;
+                        match crate::admin::handle(shared, &admin, &msg)? {
+                            Some(AdminReply::Send(reply)) => write_msg(&mut send, &reply).await?,
+                            Some(AdminReply::SendAndCloseAll(reply)) => {
+                                write_msg(&mut send, &reply).await?;
+                                shared.close_all();
+                                streams.shutdown().await;
+                                crate::devices::close_with(&mut send, None).await;
+                                return Ok(());
+                            }
+                            None => unreachable!("запрос администратора"),
+                        }
                     }
                     Some(ClientMsg::PublishCard(card)) => {
                         match crate::devices::publish_card(shared, &group, &device, &card)? {
@@ -402,7 +544,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     }
                     Some(ClientMsg::GetPinStats) => {
                         let (pins, bytes) = shared.store.pin_stats(&group)?;
-                        let q = shared.limits.pin_quota;
+                        let q = shared.limits().pin_quota;
                         let stats = clipwire_core::proto::PinStats {
                             pins,
                             bytes,
@@ -413,7 +555,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     }
                     Some(ClientMsg::GetStats) => {
                         let mut stats = shared.store.group_stats(&group, shared.not_before_ms())?;
-                        stats.quota = shared.limits.blob_quota;
+                        stats.quota = shared.limits().blob_quota;
                         write_msg(&mut send, &ServerMsg::Stats(stats)).await?;
                     }
                     Some(ClientMsg::ListDevices) => {
@@ -435,6 +577,14 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     }
                 }
             }
+            _ = closing.changed() => {
+                // Токен relay сменили: старые коды приглашения больше не
+                // действуют, устройство должно войти с новым.
+                streams.shutdown().await;
+                refuse(&mut send, RELAY_ROTATED).await;
+                conn.close(0u32.into(), b"relay token rotated");
+                return Ok(());
+            }
             () = reg.kick.notified() => {
                 // Ключ группы сменили с другого устройства.
                 streams.shutdown().await;
@@ -446,6 +596,67 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                 // Отправитель живёт в hub, пока жива регистрация, поэтому None не придёт.
                 let Some(out) = out else { return Ok(()) };
                 write_msg(&mut send, &out).await?;
+            }
+        }
+    }
+}
+
+/// Сообщения `clipwire/9` по старому ALPN: клиент нарушает протокол.
+fn need_admin_alpn(conn: &Connection) -> Result<()> {
+    if !knows_admin(conn.alpn()) {
+        bail!("сообщение clipwire/9 по старому протоколу");
+    }
+    Ok(())
+}
+
+/// Соединение только для администрирования (первым сообщением `AdminAuth`):
+/// без группы, только запросы администратора сервера.
+async fn serve_admin(
+    shared: &Arc<Shared>,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    key: clipwire_core::AdminKey,
+    mut closing: tokio::sync::watch::Receiver<u64>,
+) -> Result<()> {
+    let mut admin = AdminSession::default();
+    if !admin.auth(shared, &key) {
+        // Без группы с неверным ключом соединению делать нечего.
+        let _ = write_msg(&mut send, &ServerMsg::AdminFailed(AdminFail::BadKey)).await;
+        crate::devices::close_with(&mut send, None).await;
+        bail!("неверный ключ администратора");
+    }
+    tracing::info!("вход администратора сервера");
+    write_msg(&mut send, &ServerMsg::AdminOk).await?;
+    loop {
+        tokio::select! {
+            msg = read_msg::<_, ClientMsg>(&mut recv) => {
+                let Some(msg) = msg? else { return Ok(()) };
+                if let ClientMsg::AdminAuth { key } = &msg {
+                    let reply = if admin.auth(shared, key) {
+                        ServerMsg::AdminOk
+                    } else {
+                        ServerMsg::AdminFailed(AdminFail::BadKey)
+                    };
+                    write_msg(&mut send, &reply).await?;
+                    continue;
+                }
+                match crate::admin::handle(shared, &admin, &msg)? {
+                    Some(AdminReply::Send(reply)) => write_msg(&mut send, &reply).await?,
+                    Some(AdminReply::SendAndCloseAll(reply)) => {
+                        write_msg(&mut send, &reply).await?;
+                        shared.close_all();
+                        crate::devices::close_with(&mut send, None).await;
+                        return Ok(());
+                    }
+                    None => {
+                        refuse(&mut send, "сначала нужен вход в группу").await;
+                        bail!("сообщение группы в соединении администратора");
+                    }
+                }
+            }
+            _ = closing.changed() => {
+                refuse(&mut send, RELAY_ROTATED).await;
+                return Ok(());
             }
         }
     }
@@ -477,7 +688,8 @@ fn accept(
     if item.origin != device {
         bail!("origin элемента не совпадает с устройством");
     }
-    if item.ciphertext.len() > shared.limits.max_item_bytes {
+    let limits = shared.limits();
+    if item.ciphertext.len() > limits.max_item_bytes {
         // Не рвём соединение: агент мог просто скопировать большой текст.
         tracing::warn!(
             len = item.ciphertext.len(),
@@ -500,9 +712,9 @@ fn accept(
         group,
         &item,
         now,
-        shared.limits.history_len,
+        limits.history_len,
         backfill,
-        shared.limits.history_total_bytes,
+        limits.history_total_bytes,
     )?;
     if fresh {
         let msg = if backfill {

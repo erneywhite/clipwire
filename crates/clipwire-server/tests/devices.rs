@@ -12,12 +12,16 @@ use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{
     ALPN, BlobChunk, BlobReply, BlobRequest, ClientMsg, DeviceEntry, ServerMsg,
 };
-use clipwire_core::{BlobId, Content, DeviceId, GroupKey, Item, ServerInfo};
+use clipwire_core::{AdminKey, BlobId, Content, DeviceId, GroupKey, Item, ServerInfo};
 use clipwire_server::{Config, Guards};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
 
 const T: Duration = Duration::from_secs(20);
+
+/// Ключ администратора тестового сервера: тест кладёт его в каталог данных
+/// до запуска (`admin.key`), и сервер берёт его вместо случайного.
+const ADMIN: AdminKey = AdminKey([42; 32]);
 
 /// Устройство: ключ и эндпоинт с этим ключом.
 struct Dev {
@@ -96,12 +100,13 @@ impl Client {
         }
     }
 
-    /// Войти с токеном сервера и дочитать историю. Возвращает её длину.
+    /// Войти с ключом администратора (группа создастся, если её нет) и
+    /// дочитать историю. Возвращает её длину.
     async fn join(&mut self, key: &GroupKey) -> Result<usize> {
-        self.send(&ClientMsg::JoinWithToken {
+        self.send(&ClientMsg::JoinAsAdmin {
             group_id: key.group_id(),
             join_secret: key.join_secret(),
-            token: "test-token".into(),
+            admin_key: ADMIN,
         })
         .await?;
         match self.next().await? {
@@ -118,7 +123,7 @@ impl Client {
         }
     }
 
-    /// `JoinWithToken` (с правом создать группу) и первый ответ сервера.
+    /// `JoinWithToken` и первый ответ сервера.
     async fn join_first(&mut self, key: &GroupKey) -> Result<ServerMsg> {
         self.send(&ClientMsg::JoinWithToken {
             group_id: key.group_id(),
@@ -227,6 +232,8 @@ async fn start_server_with(guards: Guards) -> Result<(clipwire_server::Running, 
         blob_total_quota: u64::MAX,
         blob_stall: Duration::from_secs(10),
     };
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("admin.key"), ADMIN.0)?;
     let server = clipwire_server::start_with(&config, &guards).await?;
     tokio::time::timeout(T, server.endpoint().online())
         .await

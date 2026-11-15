@@ -2,6 +2,7 @@
 //! элементов буфера. Содержимое сервер не видит, ключ группы есть только на
 //! устройствах.
 
+mod admin;
 mod blobs;
 pub mod config;
 mod devices;
@@ -17,8 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clipwire_core::ServerInfo;
 use clipwire_core::proto::ALPNS;
+use clipwire_core::{AdminKey, AdminServerInfo, ServerInfo};
 use data_encoding::BASE32_NOPAD;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -35,13 +36,26 @@ const PURGE_EVERY: Duration = Duration::from_secs(600);
 
 /// Запущенный сервер. Работает, пока жив объект или до `shutdown`.
 pub struct Running {
+    /// Код сервера на момент запуска. После смены токена relay из клиента
+    /// устаревает: текущий — [`Running::server_code`].
     pub info: ServerInfo,
+    shared: Arc<Shared>,
     router: Router,
     relay: iroh_relay::server::Server,
     purge: tokio::task::JoinHandle<()>,
 }
 
 impl Running {
+    /// Текущий код сервера `cwserver2-…` (с ключом администратора).
+    pub fn server_code(&self) -> String {
+        self.shared.admin.server_code()
+    }
+
+    /// Текущий ключ администратора сервера.
+    pub fn admin_key(&self) -> AdminKey {
+        self.shared.admin.admin_key()
+    }
+
     pub fn endpoint(&self) -> &Endpoint {
         self.router.endpoint()
     }
@@ -65,11 +79,33 @@ impl Running {
     }
 }
 
-/// Ключ сервера, токен relay и публичный адрес. Создаются при первом запуске
-/// и дальше не меняются: от них зависит код сервера, выданный пользователям.
+/// Файл токена relay в каталоге данных.
+pub const RELAY_TOKEN_FILE: &str = "relay.token";
+/// Файл ключа администратора в каталоге данных: 32 байта.
+pub const ADMIN_KEY_FILE: &str = "admin.key";
+
+/// Ключ сервера, токен relay и ключ администратора. Создаются при первом
+/// запуске. Ключ сервера не меняется никогда (по нему устройства узнают свой
+/// сервер), токен relay и ключ администратора администратор может сменить из
+/// клиента (`clipwire/9`).
 pub struct Identity {
     pub secret_key: SecretKey,
     pub relay_token: String,
+    pub admin_key: AdminKey,
+}
+
+/// Новый случайный токен relay.
+pub(crate) fn new_relay_token() -> Result<String> {
+    let mut raw = [0u8; 20];
+    getrandom::fill(&mut raw).context("нет случайных байтов")?;
+    Ok(BASE32_NOPAD.encode(&raw).to_lowercase())
+}
+
+/// Новый случайный ключ администратора.
+pub(crate) fn new_admin_key() -> Result<AdminKey> {
+    let mut raw = [0u8; 32];
+    getrandom::fill(&mut raw).context("нет случайных байтов")?;
+    Ok(AdminKey(raw))
 }
 
 impl Identity {
@@ -97,13 +133,11 @@ impl Identity {
         let relay_token = match token_override {
             Some(t) => t.trim().to_string(),
             None => {
-                let token_path = data_dir.join("relay.token");
+                let token_path = data_dir.join(RELAY_TOKEN_FILE);
                 match std::fs::read_to_string(&token_path) {
                     Ok(t) => t.trim().to_string(),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        let mut raw = [0u8; 20];
-                        getrandom::fill(&mut raw).context("нет случайных байтов")?;
-                        let t = BASE32_NOPAD.encode(&raw).to_lowercase();
+                        let t = new_relay_token()?;
                         write_private(&token_path, t.as_bytes())?;
                         t
                     }
@@ -113,10 +147,38 @@ impl Identity {
         };
 
         config::check_relay_token(&relay_token)?;
+
+        // Ключ администратора появился в 0.5.0: у сервера, обновлённого со
+        // старой версии, файла ещё нет, и он создаётся при первом запуске.
+        let admin_path = data_dir.join(ADMIN_KEY_FILE);
+        let admin_key = match std::fs::read(&admin_path) {
+            Ok(bytes) => AdminKey(
+                bytes
+                    .try_into()
+                    .ok()
+                    .with_context(|| format!("{} повреждён", admin_path.display()))?,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let key = new_admin_key()?;
+                write_private(&admin_path, &key.0)?;
+                key
+            }
+            Err(e) => return Err(e).context("не читается ключ администратора"),
+        };
         Ok(Self {
             secret_key,
             relay_token,
+            admin_key,
         })
+    }
+
+    /// Код сервера администратора `cwserver2-…`: его печатают
+    /// `clipwire-server info` и лог при запуске.
+    pub fn admin_info(&self, public_url: &str) -> AdminServerInfo {
+        AdminServerInfo {
+            server: self.server_info(public_url),
+            admin_key: self.admin_key.clone(),
+        }
     }
 
     pub fn server_info(&self, public_url: &str) -> ServerInfo {
@@ -128,13 +190,18 @@ impl Identity {
     }
 }
 
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
-    std::fs::write(path, data).with_context(|| format!("не записался {}", path.display()))?;
+/// Записать секрет с правами 0600. Через временный файл и переименование:
+/// при смене токена или ключа из клиента обрыв посередине не оставит
+/// полузаписанный файл, с которым сервер не запустится.
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, data).with_context(|| format!("не записался {}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
+    std::fs::rename(&tmp, path).with_context(|| format!("не записался {}", path.display()))?;
     Ok(())
 }
 
@@ -148,7 +215,13 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
     let identity = Identity::load_or_create(&config.data_dir, config.relay_token.as_deref())?;
     let info = identity.server_info(&config.public_url);
 
-    let relay = relay::spawn(config.relay_bind, identity.relay_token.clone()).await?;
+    let admin = admin::AdminState::new(&identity, config);
+    let relay = relay::spawn(
+        config.relay_bind,
+        admin.relay_token.clone(),
+        identity.secret_key.public(),
+    )
+    .await?;
     let relay_port = relay
         .http_addr()
         .map(|a| a.port())
@@ -173,15 +246,19 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
         .context("не поднялся iroh-эндпоинт")?;
 
     let store = Store::open(&config.data_dir.join("clipwire.db"))?;
+    let base_limits = Limits::new(config, guards);
     let shared = Arc::new(Shared {
+        limits: std::sync::RwLock::new(Arc::new(base_limits.clone())),
+        base_limits,
         store,
         hub: Default::default(),
         blobs: Blobs::new(config.data_dir.join("blobs")),
-        limits: Limits::new(config, guards),
         streams: Default::default(),
-        token: identity.relay_token.clone(),
+        admin,
         devices: DeviceSlots::default(),
     });
+    // Настройки, заданные из клиента, поверх переменных окружения.
+    shared.reload_limits()?;
     let purge_every = PURGE_EVERY
         .min(guards.reserve_ttl)
         .min(guards.group_idle)
@@ -212,6 +289,12 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
                     Ok(n) => tracing::info!("удалено брошенных резервов: {n}"),
                     Err(e) => tracing::warn!("очистка резервов не удалась: {e:#}"),
                 }
+                let pending_before = session::now_ms() - store::PENDING_KEEP.as_millis() as i64;
+                match shared.store.purge_pending(pending_before) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("удалено брошенных групп смены ключа: {n}"),
+                    Err(e) => tracing::warn!("очистка групп смены ключа не удалась: {e:#}"),
+                }
                 match devices::purge_rotated(&shared) {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("групп со сменённым ключом стало надгробиями: {n}"),
@@ -238,6 +321,7 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
 
     Ok(Running {
         info,
+        shared,
         router,
         relay,
         purge,

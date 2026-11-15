@@ -62,7 +62,7 @@ pub fn set(
     w: &PinWrite<'_>,
 ) -> Result<Option<ServerMsg>> {
     let pin_id = w.pin_id;
-    let limits = &shared.limits;
+    let limits = shared.limits();
     if let Some(reason) = check(w, max_content(limits.max_item_bytes)) {
         return Ok(Some(ServerMsg::PinFailed { pin_id, reason }));
     }

@@ -151,7 +151,7 @@ async fn remove_files(shared: Arc<Shared>, group: GroupId, blobs: Vec<BlobId>) {
 /// стало надгробиями.
 pub fn purge_rotated(shared: &Shared) -> Result<usize> {
     let now = now_ms();
-    let before = now - shared.limits.rotated_keep.as_millis() as i64;
+    let before = now - shared.limits().rotated_keep.as_millis() as i64;
     shared.store.purge_rotated(before, now)
 }
 

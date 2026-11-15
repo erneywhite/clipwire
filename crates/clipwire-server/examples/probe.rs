@@ -1,7 +1,7 @@
 //! Проверка живого сервера снаружи: подключиться через relay по коду сервера,
 //! создать одноразовую группу и прогнать элемент между двумя клиентами.
 //!
-//!     cargo run -p clipwire-server --example probe -- cwserver1-...
+//!     cargo run -p clipwire-server --example probe -- cwserver2-...
 //!
 //! Одноразовая группа остаётся в базе сервера, но без ключа она бесполезна,
 //! а её история исчезнет по TTL.
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{ALPN, ClientMsg, ServerMsg};
-use clipwire_core::{Content, DeviceId, GroupKey, Item, ServerInfo};
+use clipwire_core::{Content, DeviceId, GroupKey, Item, ServerCode, ServerInfo};
 use iroh::endpoint::{RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
 
@@ -56,16 +56,25 @@ async fn next(c: &mut Client) -> Result<ServerMsg> {
 async fn main() -> Result<()> {
     let code = std::env::args()
         .nth(1)
-        .context("передай код сервера: probe cwserver1-...")?;
-    let info = ServerInfo::decode(&code)?;
+        .context("передай код сервера: probe cwserver2-...")?;
+    let code = ServerCode::decode(&code)?;
+    let info = code.server().clone();
     println!("relay: {}", info.relay_url);
 
     let key = GroupKey::generate()?;
-    // Новую группу сервер создаёт только по коду сервера (токен relay).
-    let join = ClientMsg::JoinWithToken {
-        group_id: key.group_id(),
-        join_secret: key.join_secret(),
-        token: info.relay_token.clone(),
+    // Новую группу сервер создаёт только с ключом администратора (код
+    // cwserver2). Со старым кодом cwserver1 сервер 0.5.0 группу не создаст.
+    let join = match code.admin_key() {
+        Some(k) => ClientMsg::JoinAsAdmin {
+            group_id: key.group_id(),
+            join_secret: key.join_secret(),
+            admin_key: k.clone(),
+        },
+        None => ClientMsg::JoinWithToken {
+            group_id: key.group_id(),
+            join_secret: key.join_secret(),
+            token: info.relay_token.clone(),
+        },
     };
 
     let t0 = Instant::now();
