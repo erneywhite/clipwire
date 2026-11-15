@@ -167,9 +167,10 @@ portal (the desktop may ask to confirm once). On Sway, which has none of these, 
 | Ctrl+1…9 | paste the entry with that number |
 | Space | preview (when the search field is empty) |
 | Ctrl+P, click the pin on the right of a row | pin or unpin |
+| Ctrl+R | add or edit the note of a pinned entry (Enter saves, Esc cancels) |
 | Ctrl+E | edit an image |
-| Delete (with an empty search), Shift+Delete, the bin icon in a row | delete from history |
-| Right click, Menu key, Shift+F10 | entry menu: paste, preview, edit, pin, delete |
+| Delete (with an empty search), Shift+Delete, the bin icon in a row | delete from history; on a pinned entry, first a choice of what to do |
+| Right click, Menu key, Shift+F10 | entry menu: paste, preview, edit, pin, note, delete |
 | Tab | switch between History and Pinned |
 | Alt+Left, Alt+Right, the icons next to the tabs | filter: text, links, images, files |
 | Typing | search |
@@ -226,6 +227,18 @@ the start and upload their live pins again.
 
 This needs a server with protocol `clipwire/8`: the app does not sync with an older server and
 asks you to update the image.
+
+A note is shown as the row's title in the theme's accent colour, with the usual content under it:
+the text, the image or the file name. Pasting pastes the entry, never the note. To add or change a
+note press Ctrl+R (Cmd+R on macOS) or pick **Edit note…** in the entry menu: a field opens in place
+of the title, Enter saves, Esc cancels, and an empty field removes the note. In the preview the
+note sits at the top, and clicking it opens the same field.
+
+Delete, the bin icon or **Delete** on a pinned entry first asks what to do: **Unpin on this device
+only**, **Unpin everywhere** (the entry stays in the history) or **Delete everywhere**. Pick with
+the arrow keys and Enter or with the mouse; Esc closes the choice. Ordinary entries are deleted
+right away, as before. How many pins the server holds and how much space they take is shown in
+About → Status, in the **Pins on the server** row.
 
 ## What gets synced
 
