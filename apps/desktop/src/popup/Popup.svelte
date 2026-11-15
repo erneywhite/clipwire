@@ -11,6 +11,7 @@
   import { anchored, anchoredById, HeightCache, keptInDom, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange, type Range, type RowShape } from '../lib/vlist'
   import AppTag from '../lib/AppTag.svelte'
   import { t } from '../lib/i18n'
+  import { debounce } from '../lib/debounce'
   import LinkCard from './LinkCard.svelte'
   import FilePreview from './FilePreview.svelte'
   import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -298,14 +299,46 @@
   }
 
   /** Явная смена списка: новый запрос или вкладка. Старая ошибка уже ни к чему. */
-  function reload() {
+  function reload(): Promise<void> {
+    search.cancel()
     gen++
     sel = 0
     error = ''
     loadFailed = false
     exhausted = false
-    load(PAGE)
+    const done = load(PAGE)
     setScroll(0)
+    return done
+  }
+
+  // Поиск — через SEARCH_MS после последней нажатой клавиши: редкое слово ищется
+  // полным проходом по истории, и запрос на каждую букву только нагружает базу.
+  // Ответы на старые запросы и так отбрасываются по gen.
+  const SEARCH_MS = 150
+  const search = debounce(reload, SEARCH_MS)
+
+  /** Запрос набран, но ещё не отправлен: отправить и дождаться списка. */
+  async function flushSearch() {
+    if (search.pending) await reload()
+  }
+
+  /**
+   * Клавиша работает со списком (выбор, вставка, удаление, меню): если поиск
+   * ещё ждёт паузы, она должна сработать по новому списку, а не по старому.
+   */
+  function listKey(e: KeyboardEvent): boolean {
+    const mod = e.ctrlKey || e.metaKey
+    return (
+      e.key === 'ArrowDown' ||
+      e.key === 'ArrowUp' ||
+      e.key === 'Enter' ||
+      e.key === 'ContextMenu' ||
+      (e.shiftKey && e.key === 'F10') ||
+      (e.key === 'Delete' && (e.shiftKey || query === '')) ||
+      (e.key === ' ' && query === '') ||
+      (mod && /^(KeyE|KeyP|Digit[1-9])$/.test(e.code)) ||
+      (isMac && e.metaKey && e.key === 'Backspace')
+    )
   }
 
   // Виртуальная прокрутка: в DOM только видимые строки и OVERSCAN строк
@@ -643,6 +676,12 @@
       }
       return
     }
+    if (search.pending && e.target !== editor && listKey(e)) {
+      // Отменить действие браузера надо сразу, до ожидания; ниже клавиша
+      // обрабатывается как обычно, уже по новому списку.
+      e.preventDefault()
+      await flushSearch()
+    }
     if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
       e.preventDefault()
       menuForCurrent()
@@ -747,6 +786,7 @@
       // Живое превью размера из настроек: ширина списка меняется вместе с окном.
       listen('popup://opened', async () => {
         visible = true
+        search.cancel()
         // Новый показ: начатые в прошлый раз скачивание и вставка сюда уже не
         // относятся (скачивание дойдёт в фоне, но вставлять не станет).
         shown++
@@ -793,6 +833,7 @@
     return () => {
       unlisten.forEach((p) => p.then((f) => f()))
       resizes?.disconnect()
+      search.cancel()
       for (const id of dropTimers.values()) clearTimeout(id)
     }
   })
@@ -805,6 +846,7 @@
    */
   function onHidden() {
     visible = false
+    search.cancel()
     // Ответы на запросы, начатые до скрытия, уже не к месту: следующий показ
     // перечитает список заново.
     gen++
@@ -830,7 +872,7 @@
       <input
         bind:this={input}
         bind:value={query}
-        oninput={reload}
+        oninput={search}
         placeholder={t('Найти в буфере')}
         spellcheck="false"
         aria-label={t('Поиск по истории')}
