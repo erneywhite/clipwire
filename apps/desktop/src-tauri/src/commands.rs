@@ -62,39 +62,52 @@ fn ensure_unconfigured(app: &AppHandle) -> CmdResult<()> {
 /// Ключ администратора сохраняется: с ним движок создаёт группу, а
 /// устройство видит раздел «Сервер». По одноразовому коду группа создаётся
 /// сразу, до сохранения состояния: если код не подошёл, устройство остаётся
-/// без группы, а человек видит причину. Возвращает код приглашения.
+/// без группы, а человек видит причину. Ключи до ответа сервера лежат в
+/// черновике: повтор после обрыва входит в ту же группу, и код не сгорает.
+/// Возвращает код приглашения.
 #[tauri::command]
 pub async fn create_group(app: AppHandle, server_code: String) -> CmdResult<String> {
     use clipwire_agent::admin::Creation;
     let creation = clipwire_agent::admin::creation_code(server_code.trim())?;
+    // Двойной клик или вход параллельно с созданием: второй ждёт первого и
+    // видит, что устройство уже в группе.
+    let _busy = SETUP.lock().await;
     ensure_unconfigured(&app)?;
     let paths = &app.state::<AppState>().paths;
-    let agent = AgentState {
-        invite: Invite {
-            server: creation.server().clone(),
-            group_key: GroupKey::generate().map_err(err)?,
-        },
-        device_key: random_key().map_err(err)?,
-    };
-    match &creation {
+    let agent = match &creation {
         // Ключ раньше состояния: сервис, который запустится по состоянию,
         // должен уже найти ключ, иначе группа не создастся.
-        Creation::Admin(admin) => paths
-            .save_admin_key(admin.server.server_id, &admin.admin_key)
-            .map_err(err)?,
-        Creation::Invite(code) => {
-            clipwire_agent::admin::create_group_with_invite(&agent, code).await?
+        Creation::Admin(admin) => {
+            let agent = AgentState {
+                invite: Invite {
+                    server: creation.server().clone(),
+                    group_key: GroupKey::generate().map_err(err)?,
+                },
+                device_key: random_key().map_err(err)?,
+            };
+            paths
+                .save_admin_key(admin.server.server_id, &admin.admin_key)
+                .map_err(err)?;
+            paths.save(&agent).map_err(err)?;
+            agent
         }
-    }
-    app.state::<AppState>().paths.save(&agent).map_err(err)?;
+        Creation::Invite(code) => {
+            clipwire_agent::admin::create_group_by_invite(paths, code).await?
+        }
+    };
     crate::restart_service_joined(&app).await.map_err(err)?;
     Ok(agent.invite.encode())
 }
+
+/// Создание группы и вход по коду — по одному за раз: оба проверяют, что
+/// устройство ещё не в группе, и только потом сохраняют состояние.
+static SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Остальные устройства: войти по коду приглашения.
 #[tauri::command]
 pub async fn join_group(app: AppHandle, invite_code: String) -> CmdResult<()> {
     let invite = Invite::decode(&invite_code).map_err(err)?;
+    let _busy = SETUP.lock().await;
     ensure_unconfigured(&app)?;
     let agent = AgentState {
         invite,

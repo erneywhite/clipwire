@@ -73,27 +73,30 @@ fn main() -> Result<()> {
             let creation =
                 clipwire_agent::admin::creation_code(code).map_err(anyhow::Error::msg)?;
             ensure_empty(&paths)?;
-            let state = AgentState {
-                invite: Invite {
-                    server: creation.server().clone(),
-                    group_key: GroupKey::generate()?,
-                },
-                device_key: random_key()?,
-            };
-            match &creation {
+            let state = match &creation {
                 // Группу создаст движок при первом входе с ключом администратора.
                 Creation::Admin(admin) => {
-                    paths.save_admin_key(admin.server.server_id, &admin.admin_key)?
+                    let state = AgentState {
+                        invite: Invite {
+                            server: creation.server().clone(),
+                            group_key: GroupKey::generate()?,
+                        },
+                        device_key: random_key()?,
+                    };
+                    paths.save_admin_key(admin.server.server_id, &admin.admin_key)?;
+                    paths.save(&state)?;
+                    state
                 }
                 // Код одноразовый: группа создаётся сразу, и только потом
-                // сохраняется состояние. Секрет на диск не попадает.
+                // сохраняется состояние. Секрет на диск не попадает; ключи
+                // до ответа сервера лежат в черновике, и повтор после обрыва
+                // входит в ту же группу.
                 Creation::Invite(invite) => tokio::runtime::Runtime::new()?
-                    .block_on(clipwire_agent::admin::create_group_with_invite(
-                        &state, invite,
+                    .block_on(clipwire_agent::admin::create_group_by_invite(
+                        &paths, invite,
                     ))
                     .map_err(anyhow::Error::msg)?,
-            }
-            paths.save(&state)?;
+            };
             println!("Группа создана. Код приглашения для остальных устройств:\n");
             println!("{}\n", state.invite.encode());
             println!("В нём ключ группы: передавайте его только по надёжному каналу.");

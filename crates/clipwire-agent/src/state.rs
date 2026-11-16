@@ -9,7 +9,9 @@
 //! - `group_config.bin` — настройки группы (хранилище файлов и доступы к
 //!   нему), защищены как `state.bin` (`crate::group_config`);
 //! - `pins.bin` — книга закрепов группы (`crate::pins`), защищена так же;
-//! - `admin.bin` — ключ администратора сервера (`crate::admin`), защищён так же.
+//! - `admin.bin` — ключ администратора сервера (`crate::admin`), защищён так же;
+//! - `invite-draft.bin` — ключи незавершённого создания группы по одноразовому
+//!   коду (`crate::admin`), защищены так же, после создания удаляются.
 
 use std::path::{Path, PathBuf};
 
@@ -104,6 +106,7 @@ impl Paths {
         let cleaned = self.dir.join(crate::group_config::CLEANED_FILE);
         let pins = self.dir.join(crate::pins::PINS_FILE);
         let admin = self.dir.join(crate::admin::ADMIN_FILE);
+        let draft = self.dir.join(crate::admin::INVITE_DRAFT_FILE);
         for p in [
             self.state(),
             self.cursor(),
@@ -115,6 +118,7 @@ impl Paths {
             cleaned,
             pins,
             admin,
+            draft,
         ] {
             match std::fs::remove_file(&p) {
                 Ok(()) => {}

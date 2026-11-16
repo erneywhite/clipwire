@@ -597,3 +597,72 @@ async fn group_invite_creates_group_without_server_admin() -> Result<()> {
     drop(a);
     server.shutdown().await
 }
+
+/// Обрыв после того, как сервер создал группу (ответ потерялся, состояние не
+/// сохранилось): повтор с тем же кодом берёт ключи из черновика и входит в
+/// ту же группу. Код не сгорает, группа одна, черновик после сохранения
+/// удаляется.
+#[tokio::test(flavor = "multi_thread")]
+async fn group_invite_retry_after_lost_reply_reuses_draft() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let mut a = Agent::spawn(&info, &GroupKey::generate()?, Some(ADMIN))?;
+    a.status().await?.expect("на связи");
+    let (code, _) = a
+        .ctl
+        .create_group_invite(String::new(), 1)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let inv = invite_code(&code, &info)?;
+    let paths = Paths {
+        dir: std::env::temp_dir().join(format!("clipwire-agent-draft-{}", uuid::Uuid::now_v7())),
+    };
+
+    // Первая попытка: черновик записан, сервер группу создал, а дальше
+    // обрыв — состояние не сохранено.
+    let first = paths.invite_draft(&inv)?;
+    clipwire_agent::admin::create_group_with_invite(&first, &inv)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(paths.load()?.is_none());
+
+    // Повтор: те же ключи, сервер пускает как вход в созданную группу.
+    let state = clipwire_agent::admin::create_group_by_invite(&paths, &inv)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(state.invite.group_key, first.invite.group_key);
+    assert_eq!(state.device_key, first.device_key);
+    let saved = paths.load()?.context("состояние не сохранилось")?;
+    assert_eq!(saved.invite.group_key, first.invite.group_key);
+    assert!(
+        !paths
+            .dir
+            .join(clipwire_agent::admin::INVITE_DRAFT_FILE)
+            .exists()
+    );
+
+    // На сервере группа одна: своя администратора и созданная по коду.
+    let groups = a.ctl.server_groups().await.map_err(anyhow::Error::msg)?;
+    assert_eq!(groups.len(), 2, "{groups:?}");
+    assert!(
+        groups
+            .iter()
+            .any(|g| g.group == first.invite.group_key.group_id())
+    );
+    let list = a.ctl.group_invites().await.map_err(anyhow::Error::msg)?;
+    assert_eq!(list[0].used_group, Some(first.invite.group_key.group_id()));
+
+    // Без черновика (другие ключи) тем же кодом уже не войти.
+    let err = clipwire_agent::admin::create_group_by_invite(
+        &Paths {
+            dir: paths.dir.join("other"),
+        },
+        &inv,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("уже создали"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&paths.dir);
+    drop(a);
+    server.shutdown().await
+}

@@ -657,13 +657,16 @@ Your friend pastes the code in **Sync → Create group** on their first device (
 `clipwire-agent create cwgroup1-…`). One group is created, and their device becomes its admin: it
 can remove devices and change the group key, but it has no **Server** section. Their other
 devices join with the usual invitation code of their group. If the code has been used, has
-expired or was revoked, the app says so, and the device stays without a group.
+expired or was revoked, the app says so, and the device stays without a group. If the connection
+dropped after the server had already created the group, enter the same code again: the app keeps
+the keys of the unfinished attempt and joins that same group.
 
 The code list shows who each code is for, when it was issued and its state: active, used (when,
 and the fingerprint of the created group, the same as in the **Groups** card), expired or revoked.
 An unused code can be revoked. There can be at most 100 active codes; finished ones disappear from
 the list after 30 days. Groups created with codes count towards the server's group limit.
-Changing the access token revokes all unused codes. This needs a server with protocol
+Changing the access token (from the app, in `CLIPWIRE_RELAY_TOKEN` or in the file with a restart)
+or the administrator key revokes all unused codes. This needs a server with protocol
 `clipwire/11`; on an older server the card asks you to update the image.
 
 On a device that is already in a group, enter the code in **Sync → I am the server

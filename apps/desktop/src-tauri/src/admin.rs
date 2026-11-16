@@ -510,12 +510,22 @@ pub async fn server_invites(window: WebviewWindow, app: AppHandle) -> CmdResult<
 }
 
 /// Выпущенный код: весь `cwgroup1-…` (больше его не узнать) и список после
-/// выпуска.
-#[derive(Debug, Clone, Serialize)]
+/// выпуска. В отладочном выводе кода нет: в нём секрет.
+#[derive(Clone, Serialize)]
 pub struct InviteCreatedDto {
     pub code: String,
     pub id: u64,
     pub invites: Vec<GroupInviteDto>,
+}
+
+impl std::fmt::Debug for InviteCreatedDto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteCreatedDto")
+            .field("code", &"..")
+            .field("id", &self.id)
+            .field("invites", &self.invites)
+            .finish()
+    }
 }
 
 #[tauri::command]
@@ -558,6 +568,17 @@ pub async fn server_invite_revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invite_created_debug_hides_code() {
+        let dto = InviteCreatedDto {
+            code: "cwgroup1-секрет".into(),
+            id: 7,
+            invites: Vec::new(),
+        };
+        let s = format!("{dto:?}");
+        assert!(!s.contains("секрет") && s.contains('7'), "{s}");
+    }
 
     #[test]
     fn group_dto_marks_mine_and_state() {

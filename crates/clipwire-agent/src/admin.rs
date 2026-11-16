@@ -190,17 +190,115 @@ pub fn adopt_invite(paths: &Paths, code: &str) -> Result<AgentState, String> {
     Ok(state)
 }
 
+/// Черновик создания группы по одноразовому коду: ключ группы и ключ
+/// устройства, с которыми устройство пошло создавать группу.
+pub const INVITE_DRAFT_FILE: &str = "invite-draft.bin";
+
+#[derive(Serialize, Deserialize)]
+struct InviteDraft {
+    /// SHA-256 секрета кода (то же, что хранит сервер): по нему черновик
+    /// узнаёт свой код. Самого секрета на диске нет.
+    code: [u8; 32],
+    server_id: [u8; 32],
+    group_key: clipwire_core::GroupKey,
+    device_key: [u8; 32],
+}
+
+impl Paths {
+    fn invite_draft_path(&self) -> std::path::PathBuf {
+        self.dir.join(INVITE_DRAFT_FILE)
+    }
+
+    /// Состояние для создания группы по коду `code`. Если черновик с этим
+    /// кодом уже есть (прошлая попытка оборвалась: потерялся ответ, таймаут,
+    /// не сохранилось состояние), ключи берутся из него, и сервер узнаёт
+    /// повтор: группа та же, код не сгорает. Иначе ключи новые, и черновик
+    /// записывается до отправки на сервер.
+    pub fn invite_draft(&self, code: &GroupInviteCode) -> Result<AgentState> {
+        let digest = code.secret.digest();
+        let state = |group_key, device_key| AgentState {
+            invite: clipwire_core::Invite {
+                server: code.server.clone(),
+                group_key,
+            },
+            device_key,
+        };
+        if let Some(d) = self.load_invite_draft()
+            && d.code == digest
+            && d.server_id == code.server.server_id
+        {
+            return Ok(state(d.group_key, d.device_key));
+        }
+        let draft = InviteDraft {
+            code: digest,
+            server_id: code.server.server_id,
+            group_key: clipwire_core::GroupKey::generate()?,
+            device_key: crate::state::random_key()?,
+        };
+        crate::state::ensure_private_dir(&self.dir)?;
+        let plain = postcard::to_stdvec(&draft)?;
+        crate::state::write_atomic(&self.invite_draft_path(), &crate::secret::protect(&plain)?)?;
+        Ok(state(draft.group_key, draft.device_key))
+    }
+
+    /// Черновик, если он есть и читается. Битый — как нет: тогда ключи будут
+    /// новые.
+    fn load_invite_draft(&self) -> Option<InviteDraft> {
+        let path = self.invite_draft_path();
+        let raw = std::fs::read(&path).ok()?;
+        let plain = crate::secret::unprotect_file(&path, &raw)
+            .map_err(|e| tracing::warn!("{INVITE_DRAFT_FILE} не расшифровался: {e:#}"))
+            .ok()?;
+        postcard::from_bytes(&plain)
+            .map_err(|e| tracing::warn!("{INVITE_DRAFT_FILE} повреждён: {e}"))
+            .ok()
+    }
+
+    /// Удалить черновик: группа создана и состояние сохранено.
+    pub fn forget_invite_draft(&self) -> Result<()> {
+        match std::fs::remove_file(self.invite_draft_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context("не удалился черновик создания группы"),
+        }
+    }
+}
+
+/// Создать группу по одноразовому коду и сохранить состояние. Ключи — из
+/// черновика ([`Paths::invite_draft`]): если прошлая попытка с этим кодом
+/// оборвалась после того, как сервер создал группу, повтор входит в неё же.
+/// Черновик удаляется только после `paths.save`. Ошибка — текст для
+/// человека.
+pub async fn create_group_by_invite(
+    paths: &Paths,
+    code: &GroupInviteCode,
+) -> Result<AgentState, String> {
+    let state = paths.invite_draft(code).map_err(|e| {
+        trf(
+            "Не записался черновик группы: {e}",
+            &[("e", &format!("{e:#}"))],
+        )
+    })?;
+    create_group_with_invite(&state, code).await?;
+    paths
+        .save(&state)
+        .map_err(|e| trf("Код не сохранился: {e}", &[("e", &format!("{e:#}"))]))?;
+    if let Err(e) = paths.forget_invite_draft() {
+        // Не беда: при следующем создании с другим кодом черновик
+        // перезапишется.
+        tracing::warn!("{e:#}");
+    }
+    Ok(state)
+}
+
 /// Создать группу `state` по одноразовому коду отдельным соединением с ключом
 /// этого устройства (`JoinWithInvite`): сервер гасит код и делает устройство
 /// админом новой группы. Вызывать до сохранения состояния: при отказе (код
 /// использован, истёк, отозван, сервер старый) устройство остаётся без группы,
 /// и человек сразу видит причину. Секрет нигде не сохраняется: после
 /// создания движок входит в уже существующую группу обычным входом с токеном.
-///
-/// shortcut: если сервер создал группу, а ответ потерялся, ключ группы здесь
-/// не сохранится, и код окажется потрачен на пустую группу. Администратор
-/// увидит это в списке кодов и выпустит новый; хранить состояние до ответа,
-/// если такое начнёт случаться.
+/// Повтор с теми же ключами (ответ потерялся) сервер пускает как вход в уже
+/// созданную группу; ключи между попытками хранит [`create_group_by_invite`].
 pub async fn create_group_with_invite(
     state: &AgentState,
     code: &GroupInviteCode,
@@ -796,6 +894,41 @@ mod tests {
             junk.contains("cwserver2-") && junk.contains("cwgroup1-"),
             "{junk}"
         );
+    }
+
+    /// Черновик создания группы: тот же код — те же ключи, другой код или
+    /// другой сервер — новые. Секрета кода в файле нет.
+    #[test]
+    fn invite_draft_keeps_keys_per_code() {
+        let paths = tmp();
+        let code = |s: u8, srv: u8| GroupInviteCode {
+            server: server(srv, "t"),
+            secret: clipwire_core::admin::GroupInviteSecret([s; 32]),
+        };
+        let a = paths.invite_draft(&code(4, 1)).unwrap();
+        let again = paths.invite_draft(&code(4, 1)).unwrap();
+        assert_eq!(a.invite.group_key, again.invite.group_key);
+        assert_eq!(a.device_key, again.device_key);
+        assert_eq!(again.invite.server, server(1, "t"));
+        let raw = std::fs::read(paths.dir.join(INVITE_DRAFT_FILE)).unwrap();
+        assert!(!raw.windows(32).any(|w| w == [4; 32]));
+
+        let other = paths.invite_draft(&code(5, 1)).unwrap();
+        assert_ne!(other.invite.group_key, a.invite.group_key);
+        assert_ne!(other.device_key, a.device_key);
+        // Черновик теперь от второго кода: первый получает новые ключи.
+        let first = paths.invite_draft(&code(4, 1)).unwrap();
+        assert_ne!(first.invite.group_key, a.invite.group_key);
+        let srv = paths.invite_draft(&code(4, 2)).unwrap();
+        assert_ne!(srv.invite.group_key, first.invite.group_key);
+
+        // Битый файл — как нет.
+        std::fs::write(paths.dir.join(INVITE_DRAFT_FILE), b"junk").unwrap();
+        assert!(paths.invite_draft(&code(4, 1)).is_ok());
+        paths.forget_invite_draft().unwrap();
+        paths.forget_invite_draft().unwrap();
+        assert!(!paths.dir.join(INVITE_DRAFT_FILE).exists());
+        let _ = std::fs::remove_dir_all(&paths.dir);
     }
 
     #[test]

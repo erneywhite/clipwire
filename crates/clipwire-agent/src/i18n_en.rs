@@ -762,6 +762,10 @@ pub static EN: &[(&str, &str)] = &[
     ),
     ("Код не сохранился: {e}", "The code was not saved: {e}"),
     (
+        "Не записался черновик группы: {e}",
+        "Could not save the group draft: {e}",
+    ),
+    (
         "Код приглашения не разобрался ({e}). Он начинается с clipwire1-.",
         "Could not read the invite code ({e}). It starts with clipwire1-.",
     ),
