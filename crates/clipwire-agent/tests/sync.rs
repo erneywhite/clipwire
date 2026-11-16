@@ -365,11 +365,37 @@ async fn long_history_arrives_in_batches() -> Result<()> {
             .send(Content::Text(format!("пропущено {i}")).into())
             .await?;
     }
-    // Закрытие канала ждёт, пока сервер дочитает всё отправленное.
     drop(a.local);
     tokio::time::timeout(Duration::from_secs(120), a.task).await???;
 
-    let mut b = Agent::spawn(&info, &key, Some(before))?;
+    // Сервер мог ещё не сохранить хвост отправленного (на медленных машинах
+    // CI): входим заново, пока устройство не получит всё. Так проверяется сам
+    // вход пачками, а не то, как быстро сервер дочитывает чужую отправку.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let (hist, batches, clip) = loop {
+        let got = join_and_count(&info, &key, before).await?;
+        if got.0 + got.2.len() >= MISSED || tokio::time::Instant::now() >= deadline {
+            break got;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert_eq!(
+        clip,
+        vec![Content::Text(format!("пропущено {}", MISSED - 1))]
+    );
+    assert_eq!(hist + clip.len(), MISSED, "пришло не всё");
+    assert!(batches > 1, "история пришла одной пачкой");
+    server.shutdown().await
+}
+
+/// Войти в группу с курсором `before` и посчитать пришедшее: элементов в
+/// истории, пачек, что легло в буфер. Пачки не длиннее 200.
+async fn join_and_count(
+    info: &ServerInfo,
+    key: &GroupKey,
+    before: ItemId,
+) -> Result<(usize, usize, Vec<Content>)> {
+    let mut b = Agent::spawn(info, key, Some(before))?;
     let (mut hist, mut batches, mut clip) = (0usize, 0usize, Vec::new());
     tokio::time::timeout(Duration::from_secs(120), async {
         loop {
@@ -384,7 +410,7 @@ async fn long_history_arrives_in_batches() -> Result<()> {
                 Event::Flush(done) => {
                     let _ = done.send(());
                 }
-                Event::Status(Status::Online) => return Ok(()),
+                Event::Status(Status::Online) => return anyhow::Ok(()),
                 Event::Status(Status::Offline(e)) => anyhow::bail!("вход сорвался: {e}"),
                 _ => {}
             }
@@ -392,11 +418,7 @@ async fn long_history_arrives_in_batches() -> Result<()> {
     })
     .await
     .context("история не дошла")??;
-    assert_eq!(
-        clip,
-        vec![Content::Text(format!("пропущено {}", MISSED - 1))]
-    );
-    assert_eq!(hist + clip.len(), MISSED, "пришло не всё");
-    assert!(batches > 1, "история пришла одной пачкой");
-    server.shutdown().await
+    drop(b.local);
+    let _ = tokio::time::timeout(Duration::from_secs(10), b.task).await;
+    Ok((hist, batches, clip))
 }
