@@ -83,6 +83,10 @@ pub(super) struct Accepted {
 pub(super) struct Repairs {
     /// Принятые правки, чьи файлы ещё не зарезервированы (обрыв связи —
     /// дождутся следующей сессии).
+    // shortcut: только в памяти. Выход из программы между `PinAccepted` и
+    // резервом оставит в закрепе `blob`, которого на сервере нет; закреп
+    // починят, когда скачивание ответит `NotFound` на устройстве с байтами.
+    // Хранить на диске, если такое будет встречаться.
     accepted: Vec<Accepted>,
     /// Попытки починки по хэшу; [`pin_files::MAX_REPAIRS`] — больше не браться.
     tries: HashMap<[u8; 32], u32>,
@@ -896,7 +900,12 @@ impl Engine {
                 return Ok(());
             }
         };
-        let sent = content.as_ref().map(|(item, _)| item.clone());
+        // Ушедшее содержимое нужно только записям с файлами (`PinFiles`,
+        // резерв после ответа): тексты и картинки до 8 МиБ не копируем.
+        let sent = content
+            .as_ref()
+            .filter(|(item, _)| matches!(item.content, Content::Files(_)))
+            .map(|(item, _)| item.clone());
         let (content, blobs) = match content {
             Some((item, blobs)) => match key.seal_pin_content(&w.pin_id, &item) {
                 Ok(c) => (Some(c), blobs),
