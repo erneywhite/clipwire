@@ -231,18 +231,26 @@ behind. Simply deleting a pinned entry removes the pin on this device only; the 
 pinned. Pinning again and importing from Paste again do not change an existing note: only
 editing the note does.
 
-Files in pinned entries. Files under the upload limit are kept in the group storage (the server
-or external S3/SFTP) and are not deleted after the retention period while the pin exists.
-Folders and files over the limit are not uploaded: other devices see the file card and can fetch
-the file directly only while the source device is online. External storage is cleaned by the
-devices themselves, using the list of pinned files the server provides. Devices with an older
+Files in pinned entries. A pin uploads the entry's files to the group storage (the server or
+external S3/SFTP) whatever the "upload right away" limit is: a folder as an archive, large files
+too. If the files are over that limit, the paste window asks first: "Pin and upload 1.2 GB to
+storage?". The only limit is the server's (`CLIPWIRE_MAX_FILE_BYTES`); a file over it, or over the
+pins' space, is not uploaded, the app says so, and the file stays available directly while the
+source device is online. A file that is neither on disk nor in the cache cannot be uploaded: the
+pin stays and the file is marked unavailable. Uploaded pinned files are not deleted after the
+retention period while the pin exists; once unpinned they are ordinary files again and expire as
+usual. External storage is cleaned by the devices themselves, using the list of pinned files the
+server provides. Devices with an older
 Clipwire (before pins) do not know this list and may delete pinned files from S3/SFTP after the
 retention period, so update the app on every device of the group.
 
 On a group key change the device that changes the key moves the pins to the new group and tells
-you if the server refused some of them (the pin limit). Files of pinned entries are not moved:
-the server and external storage delete the files of the old group, so in the new group such a
-pin keeps the file card, and the file itself is only where it lies on disk. A device that was off
+you if the server refused some of them (the pin limit). The server and external storage delete
+the old group's files, so pinned files are uploaded again in the new group. The device that
+changed the key does it as soon as it connects with the new key; files it does not have are
+uploaded a few minutes later by the devices that have them on disk or in the cache. If a pin
+ends up without its file for another reason (the server lost it, an upload failed), a device that
+has the file repairs it the same way. A device that was off
 during the key change does not upload pins that other devices removed in the meantime. If the
 server database was lost or restored from an old backup, devices notice it, fetch the pins from
 the start and upload their live pins again.
@@ -259,7 +267,8 @@ note sits at the top, and clicking it opens the same field.
 Delete, the bin icon or **Delete** on a pinned entry first asks what to do: **Unpin on this device
 only**, **Unpin everywhere** (the entry stays in the history) or **Delete everywhere**. Pick with
 the arrow keys and Enter or with the mouse; Esc closes the choice. Ordinary entries are deleted
-right away, as before. How many pins the server holds and how much space they take is shown in
+right away, as before. How many pins the server holds and how much space they take, their files
+included, is shown in
 About → Status, in the **Pins on the server** row.
 
 ## What gets synced
@@ -564,7 +573,7 @@ not ask for that),
 when an item last went out and came in, the group's file storage, how many entries the history
 has on this device and how much space downloaded files take, how many items and files of the
 group sit on the server, how much of the server's quota for files is used
-(`CLIPWIRE_BLOB_QUOTA`), and how many devices are in the group and how many are online. Server
+(`CLIPWIRE_BLOB_QUOTA`; pinned files are counted in the pins row), and how many devices are in the group and how many are online. Server
 numbers need server 0.1.2 or newer. The Ko-fi button is there too.
 
 ## Self-hosted server
@@ -710,8 +719,8 @@ app without restarting the container.
 | `CLIPWIRE_TTL_HOURS`\* | `24` | how long to keep an item |
 | `CLIPWIRE_SELF_RELAY_URL` | `http://127.0.0.1:<relay port>` | how the server connects to its own relay |
 | `CLIPWIRE_MAX_FILE_BYTES`\* | `104857600` | limit for one file (100 MiB) |
-| `CLIPWIRE_BLOB_QUOTA`\* | `2147483648` | file space per group (2 GiB) |
-| `CLIPWIRE_BLOB_TOTAL_QUOTA`\* | `21474836480` | file space for the whole server (20 GiB) |
+| `CLIPWIRE_BLOB_QUOTA`\* | `2147483648` | file space per group (2 GiB), not counting files of pinned entries |
+| `CLIPWIRE_BLOB_TOTAL_QUOTA`\* | `21474836480` | file space for the whole server (20 GiB), not counting files of pinned entries |
 | `CLIPWIRE_BLOB_STALL_SECS` | `120` | how long to wait for the next part of a file before an upload counts as abandoned |
 | `CLIPWIRE_RESERVE_TTL_SECS` | `600` | after how long space reserved for a file is released if the upload never started |
 | `CLIPWIRE_MAX_RESERVES`\* | `512` | how many files one device may keep reserved without a single uploaded part |
@@ -720,7 +729,7 @@ app without restarting the container.
 | `CLIPWIRE_HISTORY_TOTAL_BYTES`\* | `1073741824` | total limit of item history per server (1 GiB); the excess is evicted from the largest group |
 | `CLIPWIRE_MAX_DEVICE_CONNS`\* | `4` | simultaneous connections from one device |
 | `CLIPWIRE_PIN_MAX`\* | `5000` | how many pinned entries one group can keep on the server; a new pin over the limit is refused |
-| `CLIPWIRE_PIN_BYTES`\* | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries and the records of removed pins. Files of pinned entries count toward `CLIPWIRE_BLOB_QUOTA` |
+| `CLIPWIRE_PIN_BYTES`\* | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries, the records of removed pins and the files of pinned entries. Those files don't count toward `CLIPWIRE_BLOB_QUOTA`; after unpinning they count there again |
 
 ### What the server stores
 
