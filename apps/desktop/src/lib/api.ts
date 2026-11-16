@@ -396,12 +396,14 @@ export interface RelayRotated {
   invite: string
 }
 
-/** Группа сервера (`server_groups`, `clipwire/10`). Имён у групп нет: только отпечаток id. */
+/** Группа сервера (`server_groups`, `clipwire/10`). Имя — с `clipwire/12`. */
 export interface ServerGroup {
   /** Id группы, 64 hex. */
   id: string
   /** Короткий отпечаток id (10 hex). */
   fingerprint: string
+  /** Имя — заметка администратора сервера; пусто — имени нет. */
+  name: string
   /** Группа этого устройства: её удалить нельзя. */
   mine: boolean
   created_ms: number
@@ -425,6 +427,8 @@ export interface ServerGroup {
 export interface ServerGroups {
   /** Сервер знает группы сервера; нет — список пустой, нужно обновить сервер. */
   supported: boolean
+  /** Сервер хранит имена групп (clipwire/12): их можно задавать. */
+  names: boolean
   groups: ServerGroup[]
 }
 
@@ -559,6 +563,8 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   serverGroups: () => invoke<ServerGroups>('server_groups'),
   /** Удалить группу сервера целиком: возвращает список после удаления. */
   serverGroupDelete: (groupId: string) => invoke<ServerGroup[]>('server_group_delete', { groupId }),
+  /** Задать имя группы сервера (пустое — снять): возвращает список после правки. */
+  setServerGroupName: (groupId: string, name: string) => invoke<ServerGroup[]>('set_server_group_name', { groupId, name }),
   /** Коды создания группы (clipwire/11). */
   serverInvites: () => invoke<GroupInvites>('server_invites'),
   /** Выпустить код создания группы: код возвращается один раз. */

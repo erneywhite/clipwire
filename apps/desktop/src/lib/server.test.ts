@@ -91,7 +91,7 @@ check(!tokenRefused('таймаут подключения'), 'таймаут �
 // Карточка «Группы».
 function group(over: Partial<ServerGroup>): ServerGroup {
   return {
-    id: 'ab'.repeat(32), fingerprint: 'ababababab', mine: false, created_ms: 1, last_seen_ms: 0, devices: 0, online: 0,
+    id: 'ab'.repeat(32), fingerprint: 'ababababab', name: '', mine: false, created_ms: 1, last_seen_ms: 0, devices: 0, online: 0,
     items: 0, item_bytes: 0, files: 0, file_bytes: 0, pins: 0, pin_bytes: 0, has_admin: true, state: 'live', days_left: null, ...over,
   }
 }
@@ -120,6 +120,20 @@ check(confirm[0].includes('5 элементов') && confirm[0].includes('1 фа
 check(confirm[1].startsWith('3 устройства группы отключатся'), confirm[1])
 check(confirm[2].includes('необратимо'), 'необратимо')
 check(deleteGroupText(group({})).length === 2, 'без устройств — без абзаца об отключении')
+
+// Имена групп.
+const { GROUP_NAME_MAX, groupLabel, groupNameError } = (await import('./server' + '.ts')) as typeof import('./server')
+check(groupLabel(group({})) === 'ababababab', 'без имени — отпечаток')
+check(groupLabel(group({ name: 'Семья' })) === '«Семья» (ababababab)', 'с именем — имя и отпечаток')
+check(deleteGroupText(group({ name: 'Семья' }))[0].includes('«Семья» (ababababab)'), 'имя в подтверждении удаления')
+check(groupNameError('  Семья ') === '', 'пробелы по краям можно')
+check(groupNameError('') === '' && groupNameError('   ') === '', 'пустое — снять имя')
+check(groupNameError('я'.repeat(GROUP_NAME_MAX)) === '', 'ровно предел')
+check([0x200b, 0x200e, 0x2028, 0xfeff, 0xad].every((c) => groupNameError('а' + String.fromCharCode(c) + 'б') !== ''), 'невидимые символы — ошибка')
+check(groupNameError('я'.repeat(GROUP_NAME_MAX + 1)) !== '', 'длиннее предела')
+check(groupNameError('😀'.repeat(GROUP_NAME_MAX)) === '', 'эмодзи считаются символами, а не половинками')
+check(groupNameError('а\nб') !== '' && groupNameError('а\u0007б') !== '', 'управляющие символы')
+check(groupNameError('‮анам') !== '', 'символы направления текста')
 
 // Коды создания группы.
 const { creationKind, inviteIssuedText, inviteLabel, inviteState, inviteStateText, inviteTtlText, sortInvites, timeLeftText, DEFAULT_INVITE_TTL, INVITE_TTLS } =

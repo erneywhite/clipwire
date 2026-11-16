@@ -1,7 +1,7 @@
 <script lang="ts">
   // Раздел «Сервер» (только у администратора сервера): сводка, группы
-  // сервера с удалением, одноразовые коды создания группы, пределы сервера, смена токена доступа и ключа
-  // администратора.
+  // сервера с именами и удалением, одноразовые коды создания группы, пределы
+  // сервера, смена токена доступа и ключа администратора.
   import { onMount } from 'svelte'
   import { t } from '../lib/i18n'
   import { api, type GroupInvites, type RelayRotated, type ServerGroups, type ServerSetting, type ServerSummary } from '../lib/api'
@@ -18,6 +18,8 @@
     collectChanges,
     deleteGroupText,
     groupActivity,
+    groupLabel,
+    groupNameError,
     groupDevicesText,
     groupMuted,
     groupSizeText,
@@ -64,6 +66,12 @@
   let deletingGroup = $state(false)
   let groupError = $state('')
   const groupList = $derived(groupsInfo ? sortGroups(groupsInfo.groups) : [])
+  /** Группа, имя которой правим (id). */
+  let renaming = $state<string | null>(null)
+  let nameDraft = $state('')
+  let savingName = $state(false)
+  let nameError = $state('')
+  const nameDraftError = $derived(renaming ? groupNameError(nameDraft) : '')
 
   let invitesInfo = $state<GroupInvites | null>(null)
   let invitesError = $state('')
@@ -148,12 +156,52 @@
     groupError = ''
   }
 
+  function startRename(id: string, name: string) {
+    renaming = id
+    nameDraft = name
+    nameError = ''
+    confirmGroup = null
+  }
+
+  function cancelRename() {
+    renaming = null
+    nameError = ''
+  }
+
+  async function saveName(id: string) {
+    if (savingName || nameDraftError) return
+    savingName = true
+    nameError = ''
+    try {
+      const groups = await api.setServerGroupName(id, nameDraft.trim())
+      if (groupsInfo) groupsInfo = { ...groupsInfo, groups }
+      renaming = null
+    } catch (e) {
+      nameError = String(e)
+    } finally {
+      savingName = false
+    }
+  }
+
+  function nameKey(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      cancelRename()
+    }
+  }
+
+  /** Поле имени получает фокус сразу, с выделенным текстом. */
+  function focusInput(node: HTMLInputElement) {
+    node.focus()
+    node.select()
+  }
+
   async function deleteGroup(id: string) {
     deletingGroup = true
     groupError = ''
     try {
       const groups = await api.serverGroupDelete(id)
-      groupsInfo = { supported: true, groups }
+      groupsInfo = { supported: true, names: groupsInfo?.names ?? false, groups }
       confirmGroup = null
       loadSummary()
     } catch (e) {
@@ -275,29 +323,73 @@
   <div class="card pad"><p class="hint">{t('Групп на сервере нет.')}</p></div>
 {:else}
   <p class="hint outside">
-    {t('Имён у групп нет: сервер знает только их id и ничего не может расшифровать. Группа узнаётся по отпечатку id, группу этого устройства отмечает «ваша группа».')}
+    {#if groupsInfo.names}
+      {t('Имена групп — ваши заметки: их знают только вы и сервер, устройства групп их не видят. Содержимое групп зашифровано, сервер его не читает. Группу этого устройства отмечает «ваша группа».')}
+    {:else}
+      {t('Имён у групп нет: сервер знает только их id и ничего не может расшифровать. Группа узнаётся по отпечатку id, группу этого устройства отмечает «ваша группа».')}
+    {/if}
   </p>
   <div class="card list">
     {#each groupList as g (g.id)}
       <div class="group">
         <div class="group-row" class:muted={groupMuted(g)}>
           <div class="group-main">
-            <div class="group-title">
-              <span class="mono">{g.fingerprint}</span>
-              {#if g.mine}<span class="tag accent">{t('ваша группа')}</span>{/if}
-              {#if !g.has_admin && g.state === 'live'}<span class="tag">{t('без админа')}</span>{/if}
-              {#if groupStateText(g)}<span class="tag">{groupStateText(g)}</span>{/if}
-            </div>
+            {#if renaming === g.id}
+              <form
+                class="rename"
+                onsubmit={(e) => {
+                  e.preventDefault()
+                  saveName(g.id)
+                }}
+              >
+                <input
+                  class="wide"
+                  class:invalid={!!nameDraftError}
+                  bind:value={nameDraft}
+                  placeholder={g.fingerprint}
+                  aria-label={t('Имя группы')}
+                  aria-invalid={!!nameDraftError}
+                  disabled={savingName}
+                  onkeydown={nameKey}
+                  use:focusInput
+                />
+                <button class="small primary" type="submit" disabled={savingName || !!nameDraftError}>{savingName ? t('Сохраняю…') : t('Сохранить')}</button>
+                <button class="small" type="button" disabled={savingName} onclick={cancelRename}>{t('Отмена')}</button>
+              </form>
+              {#if nameDraftError || nameError}<p class="error small-error" role="alert">{nameDraftError || nameError}</p>{/if}
+            {:else}
+              <div class="group-title">
+                {#if g.name}
+                  <span class="group-name">{g.name}</span>
+                  <span class="mono group-id">{g.fingerprint}</span>
+                {:else}
+                  <span class="mono">{g.fingerprint}</span>
+                {/if}
+                {#if groupsInfo.names}
+                  <button
+                    class="icon"
+                    title={g.name ? t('Переименовать') : t('Задать имя')}
+                    aria-label={g.name ? t('Переименовать') : t('Задать имя')}
+                    onclick={() => startRename(g.id, g.name)}
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4" /></svg>
+                  </button>
+                {/if}
+                {#if g.mine}<span class="tag accent">{t('ваша группа')}</span>{/if}
+                {#if !g.has_admin && g.state === 'live'}<span class="tag">{t('без админа')}</span>{/if}
+                {#if groupStateText(g)}<span class="tag">{groupStateText(g)}</span>{/if}
+              </div>
+            {/if}
             <div class="group-meta">{groupDevicesText(g)} · {groupActivity(g.last_seen_ms)}</div>
             <div class="group-meta mono">{groupSizeText(g)}</div>
           </div>
-          {#if !g.mine && confirmGroup !== g.id}
+          {#if !g.mine && confirmGroup !== g.id && renaming !== g.id}
             <button class="small danger" disabled={deletingGroup} onclick={() => askDelete(g.id)}>{t('Удалить')}</button>
           {/if}
         </div>
         {#if confirmGroup === g.id}
           <div class="confirm group-confirm" role="alertdialog">
-            <strong>{t('Удалить группу {fp}?', { fp: g.fingerprint })}</strong>
+            <strong>{t('Удалить группу {fp}?', { fp: groupLabel(g) })}</strong>
             {#each deleteGroupText(g) as p, i (i)}
               <p class="hint" class:warn={i > 0}>{p}</p>
             {/each}
@@ -656,12 +748,55 @@
     flex-direction: column;
     gap: 2px;
     min-width: 0;
+    /* Поле имени при правке — во всю ширину строки. */
+    flex: 1 1 auto;
   }
   .group-title {
     display: flex;
     flex-wrap: wrap;
     align-items: baseline;
     gap: var(--space-2);
+  }
+  .group-name {
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+  .group-id {
+    color: var(--c-muted);
+  }
+  /* Карандаш у названия: без рамки, чтобы не спорить с кнопкой «Удалить». */
+  button.icon {
+    align-self: center;
+    border: 0;
+    padding: 2px;
+    line-height: 0;
+    color: var(--c-muted);
+    border-radius: var(--radius-m);
+  }
+  button.icon:hover:not(:disabled) {
+    color: var(--c-text);
+  }
+  button.icon svg {
+    width: 15px;
+    height: 15px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .rename {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .rename input {
+    flex: 1 1 18ch;
+    min-width: 0;
+  }
+  .small-error {
+    font-size: var(--text-s);
   }
   .group-meta {
     font-size: var(--text-s);
@@ -679,7 +814,7 @@
     color: var(--c-accent);
     border-color: var(--c-accent);
   }
-  .group-row button {
+  .group-row > button {
     align-self: center;
     flex-shrink: 0;
   }

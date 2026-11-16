@@ -2,7 +2,7 @@
 //! сервера, которые можно сменить из клиента, настройки сервера поверх
 //! переменных окружения и обработка запросов администратора. С
 //! `clipwire/10` — список групп сервера и удаление группы, с `clipwire/11` —
-//! одноразовые коды создания группы.
+//! одноразовые коды создания группы, с `clipwire/12` — имена групп.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Context, Result};
 use clipwire_core::admin::{
     AdminFail, AdminKey, GroupInviteSecret, MAX_INVITE_LABEL, MAX_INVITE_TTL_HOURS, SETTINGS,
-    SecretCode, ServerSettings, check_setting,
+    SecretCode, ServerSettings, check_setting, is_bidi_control, normalize_group_name,
 };
 use clipwire_core::proto::{ClientMsg, ServerMsg};
 use clipwire_core::{AdminServerInfo, DeviceId, GroupId, GroupInviteCode, ServerInfo};
@@ -273,6 +273,7 @@ pub fn is_admin_msg(msg: &ClientMsg) -> bool {
             | ClientMsg::CreateGroupInvite { .. }
             | ClientMsg::ListGroupInvites
             | ClientMsg::RevokeGroupInvite { .. }
+            | ClientMsg::SetGroupName { .. }
     )
 }
 
@@ -284,6 +285,8 @@ pub struct AdminCtx {
     pub groups: bool,
     /// Соединение по `clipwire/11`: знает коды создания группы.
     pub invites: bool,
+    /// Соединение по `clipwire/12`: знает имена групп (`GroupList`).
+    pub names: bool,
 }
 
 impl AdminCtx {
@@ -292,18 +295,25 @@ impl AdminCtx {
             device,
             groups: clipwire_core::proto::knows_server_groups(alpn),
             invites: clipwire_core::proto::knows_group_invites(alpn),
+            names: clipwire_core::proto::knows_group_names(alpn),
         }
     }
 }
 
-/// Группы сервера для `Groups`: из базы, кто на связи — из hub.
-pub fn groups_msg(shared: &Shared) -> Result<ServerMsg> {
+/// Группы сервера: из базы, кто на связи — из hub. Соединению `clipwire/12`
+/// — `GroupList` с именами, старым — `Groups` без них: `GroupList` они бы не
+/// разобрали.
+pub fn groups_msg(shared: &Shared, ctx: &AdminCtx) -> Result<ServerMsg> {
     let keep = shared.limits().rotated_keep.as_millis() as i64;
     let mut list = shared.store.list_groups(now_ms(), keep)?;
     for g in &mut list {
-        g.online = shared.hub.online_devices(&g.group).len() as u64;
+        g.info.online = shared.hub.online_devices(&g.info.group).len() as u64;
     }
-    Ok(ServerMsg::Groups(list))
+    Ok(if ctx.names {
+        ServerMsg::GroupList(list)
+    } else {
+        ServerMsg::Groups(list.into_iter().map(|g| g.info).collect())
+    })
 }
 
 /// `DeleteGroup`: удалить группу, разбудить её соединения (они отдадут
@@ -325,16 +335,34 @@ fn delete_group(shared: &Arc<Shared>, ctx: &AdminCtx, group: &GroupId) -> Result
     if !blobs.is_empty() {
         tokio::spawn(crate::devices::remove_files(shared.clone(), *group, blobs));
     }
-    groups_msg(shared)
+    groups_msg(shared, ctx)
 }
 
-/// Символы управления направлением текста (U+202A–U+202E, U+2066–U+2069):
-/// ими подпись в списке можно развернуть задом наперёд и выдать за другую.
-fn is_bidi_control(c: char) -> bool {
-    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+/// `SetGroupName`: проверить имя и записать. Имя в лог не пишется: это
+/// заметка администратора, а лог контейнера видят и другие.
+fn set_group_name(
+    shared: &Shared,
+    ctx: &AdminCtx,
+    group: &GroupId,
+    name: &str,
+) -> Result<Result<ServerMsg, AdminFail>> {
+    let name = match normalize_group_name(name) {
+        Ok(n) => n,
+        Err(f) => return Ok(Err(f)),
+    };
+    if !shared.store.set_group_name(group, &name)? {
+        return Ok(Err(AdminFail::NoSuchGroup));
+    }
+    tracing::info!(
+        group = %crate::session::short(group),
+        cleared = name.is_empty(),
+        "имя группы изменено администратором сервера"
+    );
+    Ok(Ok(groups_msg(shared, ctx)?))
 }
 
-/// Подпись кода: без управляющих символов (и символов направления текста),
+/// Подпись кода: без управляющих символов (и символов направления текста,
+/// [`is_bidi_control`]),
 /// по краям без пробелов, не длиннее [`MAX_INVITE_LABEL`] символов.
 fn clean_label(label: &str) -> String {
     label
@@ -392,7 +420,7 @@ fn create_invite(
 }
 
 /// Запрос администратора сервера (`GetServerSettings` … `RotateAdminKey`,
-/// `ListGroups`, `DeleteGroup`). `None` — это не запрос администратора.
+/// группы сервера, коды создания группы, `SetGroupName`). `None` — это не запрос администратора.
 /// Ошибка — сбой сервера или нарушение протокола (сообщение `clipwire/10`
 /// по старому ALPN): соединение закрывается.
 pub fn handle(
@@ -415,6 +443,9 @@ pub fn handle(
     ) && !ctx.invites
     {
         anyhow::bail!("сообщение clipwire/11 по старому протоколу");
+    }
+    if matches!(msg, ClientMsg::SetGroupName { .. }) && !ctx.names {
+        anyhow::bail!("сообщение clipwire/12 по старому протоколу");
     }
     let fail = |f| Ok(Some(AdminReply::Send(ServerMsg::AdminFailed(f))));
     if !session.authorized(shared) {
@@ -498,7 +529,7 @@ pub fn handle(
                 server_code: SecretCode(server_code),
             }
         }
-        ClientMsg::ListGroups => groups_msg(shared)?,
+        ClientMsg::ListGroups => groups_msg(shared, ctx)?,
         ClientMsg::DeleteGroup { group } => delete_group(shared, ctx, group)?,
         ClientMsg::CreateGroupInvite { label, ttl_hours } => {
             match create_invite(shared, label, *ttl_hours)? {
@@ -513,6 +544,12 @@ pub fn handle(
             }
             tracing::info!(id, "код создания группы отозван");
             ServerMsg::GroupInvites(shared.store.list_invites()?)
+        }
+        ClientMsg::SetGroupName { group, name } => {
+            match set_group_name(shared, ctx, group, name)? {
+                Ok(reply) => reply,
+                Err(f) => return fail(f),
+            }
         }
         _ => unreachable!("проверено выше"),
     };

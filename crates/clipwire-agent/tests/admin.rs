@@ -468,9 +468,35 @@ async fn admin_lists_and_deletes_groups() -> Result<()> {
     assert_eq!(list.len(), 2);
     let g = list
         .iter()
-        .find(|g| g.group == theirs.group_id())
+        .find(|g| g.info.group == theirs.group_id())
         .context("чужая группа в списке")?;
-    assert_eq!((g.devices, g.online), (2, 2));
+    assert_eq!((g.info.devices, g.info.online), (2, 2));
+    assert_eq!(g.name, "");
+
+    // Имя группы (`clipwire/12`): задаётся, плохое — понятный отказ,
+    // участнику без ключа — тоже отказ.
+    let named = a
+        .ctl
+        .set_server_group_name(theirs.group_id(), " Семья ".into())
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let g = named
+        .iter()
+        .find(|g| g.info.group == theirs.group_id())
+        .context("чужая группа в списке")?;
+    assert_eq!(g.name, "Семья");
+    let err = a
+        .ctl
+        .set_server_group_name(theirs.group_id(), "а\nб".into())
+        .await
+        .unwrap_err();
+    assert!(err.contains("64"), "{err}");
+    let err = c
+        .ctl
+        .set_server_group_name(theirs.group_id(), "x".into())
+        .await
+        .unwrap_err();
+    assert!(err.contains("код сервера администратора"), "{err}");
 
     let err = a
         .ctl
@@ -484,7 +510,7 @@ async fn admin_lists_and_deletes_groups() -> Result<()> {
         .await
         .map_err(anyhow::Error::msg)?;
     assert_eq!(after.len(), 1);
-    assert_eq!(after[0].group, mine.group_id());
+    assert_eq!(after[0].info.group, mine.group_id());
     deleted_and_quiet(&mut b).await?;
     deleted_and_quiet(&mut c).await?;
     // Новый движок с ключом администратора группу заново не создаёт: тоже «удалена».
@@ -574,6 +600,13 @@ async fn group_invite_creates_group_without_server_admin() -> Result<()> {
     let list = a.ctl.group_invites().await.map_err(anyhow::Error::msg)?;
     assert!(list[0].used_ms.is_some());
     assert_eq!(list[0].used_group, Some(state.invite.group_key.group_id()));
+    // Имя созданной группы — подпись кода.
+    let groups = a.ctl.server_groups().await.map_err(anyhow::Error::msg)?;
+    let g = groups
+        .iter()
+        .find(|g| g.info.group == state.invite.group_key.group_id())
+        .context("группа по коду в списке")?;
+    assert_eq!(g.name, "Маше");
 
     // Отозванный код не создаёт группу.
     let (code2, id2) = a
@@ -646,7 +679,7 @@ async fn group_invite_retry_after_lost_reply_reuses_draft() -> Result<()> {
     assert!(
         groups
             .iter()
-            .any(|g| g.group == first.invite.group_key.group_id())
+            .any(|g| g.info.group == first.invite.group_key.group_id())
     );
     let list = a.ctl.group_invites().await.map_err(anyhow::Error::msg)?;
     assert_eq!(list[0].used_group, Some(first.invite.group_key.group_id()));

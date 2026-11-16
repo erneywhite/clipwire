@@ -1,7 +1,8 @@
 //! Администратор сервера и админ группы (`clipwire/9`): команды раздела
 //! «Сервер» в настройках (с `clipwire/10` — и список групп сервера с
-//! удалением, с `clipwire/11` — одноразовые коды создания группы), «Я администратор сервера» в «Синхронизации» и роли в списке
-//! устройств. Запросы идут через движок (`clipwire_agent::admin`),
+//! удалением, с `clipwire/11` — одноразовые коды создания группы, с
+//! `clipwire/12` — имена групп), «Я администратор сервера» в «Синхронизации»
+//! и роли в списке устройств. Запросы идут через движок (`clipwire_agent::admin`),
 //! ключ администратора лежит в `admin.bin`.
 
 use std::sync::atomic::Ordering;
@@ -10,8 +11,8 @@ use clipwire_agent::admin::{adopt_server_code, check_admin_code, claim_code, fai
 use clipwire_agent::i18n::{tr, trf};
 use clipwire_core::GroupId;
 use clipwire_core::admin::{
-    GroupInfo, GroupInviteInfo, GroupState, MAX_INVITE_TTL_HOURS, SETTINGS, ServerSettings,
-    ServerSummary, SettingUnit, check_setting,
+    GroupEntry, GroupInviteInfo, GroupState, MAX_INVITE_TTL_HOURS, SETTINGS, ServerSettings,
+    ServerSummary, SettingUnit, check_setting, normalize_group_name,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
@@ -347,8 +348,11 @@ pub async fn group_admin_claim(window: WebviewWindow, app: AppHandle) -> CmdResu
 pub struct ServerGroupDto {
     /// Id группы (64 hex): им карточка просит удалить.
     pub id: String,
-    /// Короткий отпечаток id (10 hex), как у устройств: имён у групп нет.
+    /// Короткий отпечаток id (10 hex), как у устройств.
     pub fingerprint: String,
+    /// Имя группы — заметка администратора сервера (`clipwire/12`); пусто —
+    /// имени нет, заголовком идёт отпечаток.
+    pub name: String,
     /// Группа этого устройства.
     pub mine: bool,
     pub created_ms: i64,
@@ -369,7 +373,8 @@ pub struct ServerGroupDto {
     pub days_left: Option<u32>,
 }
 
-fn group_dto(g: &GroupInfo, mine: Option<GroupId>) -> ServerGroupDto {
+fn group_dto(e: &GroupEntry, mine: Option<GroupId>) -> ServerGroupDto {
+    let g = &e.info;
     let (state, days_left) = match g.state {
         GroupState::Live => ("live", None),
         GroupState::Pending => ("pending", None),
@@ -379,6 +384,7 @@ fn group_dto(g: &GroupInfo, mine: Option<GroupId>) -> ServerGroupDto {
     ServerGroupDto {
         id: data_encoding::HEXLOWER.encode(&g.group.0),
         fingerprint: data_encoding::HEXLOWER.encode(&g.group.0[..5]),
+        name: e.name.clone(),
         mine: mine == Some(g.group),
         created_ms: g.created_ms,
         last_seen_ms: g.last_seen_ms,
@@ -396,7 +402,7 @@ fn group_dto(g: &GroupInfo, mine: Option<GroupId>) -> ServerGroupDto {
     }
 }
 
-fn groups_dto(list: &[GroupInfo], app: &AppHandle) -> Vec<ServerGroupDto> {
+fn groups_dto(list: &[GroupEntry], app: &AppHandle) -> Vec<ServerGroupDto> {
     let mine = app
         .state::<AppState>()
         .paths
@@ -413,6 +419,8 @@ pub struct ServerGroupsDto {
     /// Сервер знает группы сервера (`clipwire/10`). Нет — список пустой, в
     /// карточке пояснение «обновите сервер».
     pub supported: bool,
+    /// Сервер хранит имена групп (`clipwire/12`): можно переименовывать.
+    pub names: bool,
     pub groups: Vec<ServerGroupDto>,
 }
 
@@ -422,17 +430,30 @@ pub async fn server_groups(window: WebviewWindow, app: AppHandle) -> CmdResult<S
     let ctl = controller(&app)?;
     // Группы сервера появились в `clipwire/10`; старому серверу запрос не
     // шлём совсем (он оборвал бы соединение).
-    if ctl.link().await?.server_protocol < 10 {
+    let protocol = ctl.link().await?.server_protocol;
+    if protocol < 10 {
         return Ok(ServerGroupsDto {
             supported: false,
+            names: false,
             groups: Vec::new(),
         });
     }
     let list = ctl.server_groups().await?;
     Ok(ServerGroupsDto {
         supported: true,
+        names: protocol >= 12,
         groups: groups_dto(&list, &app),
     })
+}
+
+/// Id группы из 64 hex.
+fn parse_group(group_id: &str) -> CmdResult<GroupId> {
+    data_encoding::HEXLOWER
+        .decode(group_id.as_bytes())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .map(GroupId)
+        .ok_or_else(|| tr("Неверный id группы").to_string())
 }
 
 /// Удалить группу сервера целиком. Возвращает список после удаления.
@@ -443,14 +464,25 @@ pub async fn server_group_delete(
     group_id: String,
 ) -> CmdResult<Vec<ServerGroupDto>> {
     only_settings(&window)?;
-    let bytes: [u8; 32] = data_encoding::HEXLOWER
-        .decode(group_id.as_bytes())
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| tr("Неверный id группы").to_string())?;
-    let list = controller(&app)?
-        .delete_server_group(GroupId(bytes))
-        .await?;
+    let group = parse_group(&group_id)?;
+    let list = controller(&app)?.delete_server_group(group).await?;
+    Ok(groups_dto(&list, &app))
+}
+
+/// Задать имя группы сервера (пустое — снять). Имя проверяется здесь теми
+/// же правилами, что на сервере, чтобы отказ пришёл сразу. Возвращает список
+/// после правки.
+#[tauri::command]
+pub async fn set_server_group_name(
+    window: WebviewWindow,
+    app: AppHandle,
+    group_id: String,
+    name: String,
+) -> CmdResult<Vec<ServerGroupDto>> {
+    only_settings(&window)?;
+    let group = parse_group(&group_id)?;
+    let name = normalize_group_name(&name).map_err(|f| fail_text(&f))?;
+    let list = controller(&app)?.set_server_group_name(group, name).await?;
     Ok(groups_dto(&list, &app))
 }
 
@@ -582,6 +614,7 @@ mod tests {
 
     #[test]
     fn group_dto_marks_mine_and_state() {
+        use clipwire_core::admin::GroupInfo;
         let g = GroupInfo {
             group: GroupId([0xab; 32]),
             created_ms: 1,
@@ -597,20 +630,37 @@ mod tests {
             has_admin: true,
             state: GroupState::Rotated { days_left: 12 },
         };
-        let d = group_dto(&g, Some(GroupId([0xab; 32])));
+        let named = GroupEntry {
+            info: g.clone(),
+            name: "Семья".into(),
+        };
+        let d = group_dto(&named, Some(GroupId([0xab; 32])));
+        assert_eq!(d.name, "Семья");
         assert!(d.mine);
         assert_eq!(d.fingerprint, "ababababab");
         assert_eq!(d.id.len(), 64);
         assert_eq!((d.state, d.days_left), ("rotated", Some(12)));
         let other = group_dto(
-            &GroupInfo {
-                state: GroupState::Idle,
-                ..g
+            &GroupEntry {
+                info: GroupInfo {
+                    state: GroupState::Idle,
+                    ..g
+                },
+                name: String::new(),
             },
             None,
         );
         assert!(!other.mine);
+        assert_eq!(other.name, "");
         assert_eq!((other.state, other.days_left), ("idle", None));
+    }
+
+    #[test]
+    fn group_id_is_parsed_strictly() {
+        let id = "ab".repeat(32);
+        assert_eq!(parse_group(&id).unwrap(), GroupId([0xab; 32]));
+        assert!(parse_group("ab").is_err());
+        assert!(parse_group(&"zz".repeat(32)).is_err());
     }
 
     #[test]

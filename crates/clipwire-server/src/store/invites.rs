@@ -153,6 +153,18 @@ pub(super) fn consume(
     Ok(Ok(()))
 }
 
+/// Подпись кода по хэшу: из неё берётся имя группы, созданной по коду.
+pub(super) fn label_of(conn: &Connection, hash: &[u8; 32]) -> Result<String> {
+    Ok(conn
+        .query_row(
+            "SELECT label FROM group_invites WHERE secret_hash = ?1",
+            params![&hash[..]],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_default())
+}
+
 /// Вход с кодом в группу, которая уже есть. Пускать только повтор: этим
 /// кодом создали именно эту группу (ответ на создание потерялся), код
 /// выпущен при текущем токене relay и использован не раньше последней смены
@@ -396,6 +408,10 @@ mod tests {
         assert_eq!(list[0].label, "Маше");
         assert_eq!(list[0].used_ms, Some(20));
         assert_eq!(list[0].used_group, Some(k1.group_id()));
+        // Имя группы — подпись кода.
+        let groups = s.list_groups(40, 1).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Маше");
         // Использованный не отозвать.
         assert!(!s.revoke_invite(id, 50).unwrap());
     }

@@ -1,5 +1,6 @@
 //! Администратор сервера на стороне агента (`clipwire/9`, группы сервера —
-//! `clipwire/10`, коды создания группы — `clipwire/11`, `docs/architecture.md`):
+//! `clipwire/10`, коды создания группы — `clipwire/11`, имена групп —
+//! `clipwire/12`, `docs/architecture.md`):
 //! хранение ключа администратора, разбор кодов сервера и запросы к серверу
 //! через движок ([`Controller`]).
 //!
@@ -10,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use clipwire_core::admin::{
-    AdminFail, AdminKey, GroupInfo, GroupInviteInfo, ServerSettings, ServerSummary,
+    AdminFail, AdminKey, GroupEntry, GroupInfo, GroupInviteInfo, ServerSettings, ServerSummary,
 };
 use clipwire_core::proto::{ClientMsg, ServerMsg};
 use clipwire_core::{AdminServerInfo, DeviceId, GroupId, GroupInviteCode, ServerCode, ServerInfo};
@@ -507,6 +508,10 @@ pub fn fail_text(f: &AdminFail) -> String {
             &[("max", max)],
         ),
         AdminFail::NoSuchInvite => tr("Этот код уже использован или отозван").into(),
+        AdminFail::BadGroupName { max } => trf(
+            "Имя группы — до {max} символов, без переводов строки и управляющих символов",
+            &[("max", max)],
+        ),
         AdminFail::OwnGroup => tr(
             "Это группа этого устройства. Чтобы удалить её, сначала выйдите из неё (или удалите её с другого устройства администратора).",
         )
@@ -524,6 +529,11 @@ pub fn old_server_invites() -> &'static str {
     tr(
         "Сервер не знает одноразовых кодов создания группы: попросите администратора обновить образ сервера Clipwire",
     )
+}
+
+/// Отказ серверу, который не знает имён групп (`clipwire/12`).
+pub fn old_server_names() -> &'static str {
+    tr("Сервер не умеет хранить имена групп: обновите образ сервера Clipwire")
 }
 
 fn old_server() -> &'static str {
@@ -559,6 +569,11 @@ pub enum AdminRequest {
     ListGroupInvites,
     /// Отозвать код (`clipwire/11`).
     RevokeGroupInvite(u64),
+    /// Задать имя группы сервера, пустое — снять (`clipwire/12`).
+    SetGroupName {
+        group: GroupId,
+        name: String,
+    },
 }
 
 impl AdminRequest {
@@ -583,6 +598,10 @@ impl AdminRequest {
             },
             Self::ListGroupInvites => ClientMsg::ListGroupInvites,
             Self::RevokeGroupInvite(id) => ClientMsg::RevokeGroupInvite { id: *id },
+            Self::SetGroupName { group, name } => ClientMsg::SetGroupName {
+                group: *group,
+                name: name.clone(),
+            },
         }
     }
 
@@ -594,6 +613,7 @@ impl AdminRequest {
             Self::CreateGroupInvite { .. }
             | Self::ListGroupInvites
             | Self::RevokeGroupInvite(_) => 11,
+            Self::SetGroupName { .. } => 12,
             _ => 9,
         }
     }
@@ -624,6 +644,7 @@ pub(crate) fn is_admin_reply(msg: &ServerMsg) -> bool {
             | ServerMsg::Groups(_)
             | ServerMsg::GroupInviteCreated { .. }
             | ServerMsg::GroupInvites(_)
+            | ServerMsg::GroupList(_)
     )
 }
 
@@ -636,9 +657,12 @@ pub(crate) struct AdminWaiter {
 }
 
 /// Отказ серверу, который не знает запроса: `clipwire/9` (администрирование),
-/// `clipwire/10` (группы сервера) или `clipwire/11` (коды создания группы).
+/// `clipwire/10` (группы сервера), `clipwire/11` (коды создания группы) или
+/// `clipwire/12` (имена групп).
 pub(crate) fn refuse_old(reply: AdminReply, req: &AdminRequest) {
-    let why = if req.min_protocol() >= 11 {
+    let why = if req.min_protocol() >= 12 {
+        old_server_names()
+    } else if req.min_protocol() >= 11 {
         old_server_invites()
     } else if req.min_protocol() >= 10 {
         old_server_groups()
@@ -646,6 +670,23 @@ pub(crate) fn refuse_old(reply: AdminReply, req: &AdminRequest) {
         old_server()
     };
     let _ = reply.send(Err(why.into()));
+}
+
+/// Список групп из ответа сервера: `GroupList` (`clipwire/12`) как есть, у
+/// `Groups` от сервера `clipwire/10`–`11` имена пустые.
+fn group_list(msg: ServerMsg) -> Result<Vec<GroupEntry>, String> {
+    match msg {
+        ServerMsg::GroupList(list) => Ok(list),
+        ServerMsg::Groups(list) => Ok(list.into_iter().map(unnamed).collect()),
+        m => Err(unexpected(&m)),
+    }
+}
+
+fn unnamed(info: GroupInfo) -> GroupEntry {
+    GroupEntry {
+        info,
+        name: String::new(),
+    }
 }
 
 fn unexpected(msg: &ServerMsg) -> String {
@@ -744,12 +785,23 @@ impl Controller {
         }
     }
 
-    /// Группы сервера, по убыванию последней активности.
-    pub async fn server_groups(&self) -> Result<Vec<GroupInfo>, String> {
-        match self.admin(AdminRequest::ListGroups).await? {
-            ServerMsg::Groups(list) => Ok(list),
-            m => Err(unexpected(&m)),
-        }
+    /// Группы сервера с именами, по убыванию последней активности. У сервера
+    /// старее `clipwire/12` имена пустые.
+    pub async fn server_groups(&self) -> Result<Vec<GroupEntry>, String> {
+        group_list(self.admin(AdminRequest::ListGroups).await?)
+    }
+
+    /// Задать имя группы сервера (пустое — снять). Возвращает список после
+    /// правки. Сервер старее `clipwire/12` — отказ без запроса.
+    pub async fn set_server_group_name(
+        &self,
+        group: GroupId,
+        name: String,
+    ) -> Result<Vec<GroupEntry>, String> {
+        group_list(
+            self.admin(AdminRequest::SetGroupName { group, name })
+                .await?,
+        )
     }
 
     /// Выпустить код создания группы: (весь код `cwgroup1-…`, id). Код
@@ -783,11 +835,8 @@ impl Controller {
     }
 
     /// Удалить группу сервера. Возвращает список групп после удаления.
-    pub async fn delete_server_group(&self, group: GroupId) -> Result<Vec<GroupInfo>, String> {
-        match self.admin(AdminRequest::DeleteGroup(group)).await? {
-            ServerMsg::Groups(list) => Ok(list),
-            m => Err(unexpected(&m)),
-        }
+    pub async fn delete_server_group(&self, group: GroupId) -> Result<Vec<GroupEntry>, String> {
+        group_list(self.admin(AdminRequest::DeleteGroup(group)).await?)
     }
 }
 
@@ -989,5 +1038,55 @@ mod tests {
         assert!(fail_text(&AdminFail::InviteExpired).contains("истёк"));
         assert!(fail_text(&AdminFail::InviteRevoked).contains("отозвал"));
         assert!(fail_text(&AdminFail::TooManyInvites { max: 100 }).contains("100"));
+        assert!(fail_text(&AdminFail::BadGroupName { max: 64 }).contains("64"));
+    }
+
+    #[test]
+    fn group_names_need_protocol_12() {
+        let req = AdminRequest::SetGroupName {
+            group: GroupId([1; 32]),
+            name: "Семья".into(),
+        };
+        assert_eq!(req.min_protocol(), 12);
+        assert_eq!(
+            req.msg(),
+            ClientMsg::SetGroupName {
+                group: GroupId([1; 32]),
+                name: "Семья".into()
+            }
+        );
+        assert_eq!(AdminRequest::ListGroups.min_protocol(), 10);
+        let (tx, mut rx) = oneshot::channel();
+        refuse_old(tx, &req);
+        let why = rx.try_recv().unwrap().unwrap_err();
+        assert!(why.contains("имена групп"), "{why}");
+    }
+
+    #[test]
+    fn old_group_list_has_empty_names() {
+        let info = GroupInfo {
+            group: GroupId([2; 32]),
+            created_ms: 1,
+            last_seen_ms: 2,
+            devices: 0,
+            online: 0,
+            items: 0,
+            item_bytes: 0,
+            files: 0,
+            file_bytes: 0,
+            pins: 0,
+            pin_bytes: 0,
+            has_admin: false,
+            state: clipwire_core::admin::GroupState::Live,
+        };
+        let old = group_list(ServerMsg::Groups(vec![info.clone()])).unwrap();
+        assert_eq!(old, vec![unnamed(info.clone())]);
+        let named = GroupEntry {
+            info,
+            name: "Семья".into(),
+        };
+        let new = group_list(ServerMsg::GroupList(vec![named.clone()])).unwrap();
+        assert_eq!(new, vec![named]);
+        assert!(group_list(ServerMsg::AdminOk).is_err());
     }
 }

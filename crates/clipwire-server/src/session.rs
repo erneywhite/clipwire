@@ -536,7 +536,8 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         | ClientMsg::DeleteGroup { .. }
                         | ClientMsg::CreateGroupInvite { .. }
                         | ClientMsg::ListGroupInvites
-                        | ClientMsg::RevokeGroupInvite { .. }),
+                        | ClientMsg::RevokeGroupInvite { .. }
+                        | ClientMsg::SetGroupName { .. }),
                     ) => {
                         need_admin_alpn(conn)?;
                         let ctx = AdminCtx::new(device, conn.alpn());
