@@ -137,7 +137,7 @@ impl Store {
             &conn,
             &format!(
                 "SELECT group_id, COUNT(*), SUM(size + MAX(1, (size + ?1 - 1) / ?1) * ?2)
-                 FROM blobs WHERE NOT {} GROUP BY group_id",
+                 FROM blobs WHERE NOT {} AND pin_only = 0 GROUP BY group_id",
                 super::pins::KEPT_BY_PIN
             ),
             params![CHUNK as i64, OVERHEAD as i64],

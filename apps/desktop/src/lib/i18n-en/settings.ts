@@ -224,7 +224,7 @@ const en: Record<string, string> = {
   "Открыть раздел «Сервер»": "Open the Server section",
   "Передаю…": "Handing over…",
   "По умолчанию: {value}.": "Default: {value}.",
-  "Предел для всех групп вместе, без файлов закреплённых записей.": "Limit for all groups together, not counting files of pinned items.",
+  "Предел для всех групп вместе, файлы закреплённых записей тоже здесь.": "Limit for all groups together, files of pinned items included.",
   "Предел истории элементов всех групп вместе. Лишнее вытесняется у самой большой группы.": "Limit for the item history of all groups together. The excess is evicted from the largest group.",
   "Предел одного файла": "Single file limit",
   "Предел одного элемента": "Single item limit",

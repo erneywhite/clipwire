@@ -12,8 +12,10 @@
 //! Файлы закреплённых записей (`pin_blobs`) не удаляются по сроку, пока
 //! закреп не снят: см. [`KEPT_BY_PIN`]. У них своя квота: место закрепов
 //! группы (`CLIPWIRE_PIN_BYTES`) — это записи закрепов вместе с их файлами
-//! ([`pins_used`]), а квоты файлов (`CLIPWIRE_BLOB_QUOTA`,
-//! `CLIPWIRE_BLOB_TOTAL_QUOTA`) считают только незакреплённые файлы.
+//! ([`pins_used`]), квота файлов группы (`CLIPWIRE_BLOB_QUOTA`) считает только
+//! незакреплённые файлы, а предел сервера (`CLIPWIRE_BLOB_TOTAL_QUOTA`) — все
+//! живые. Файл, заведённый как файл закрепа (`blobs.pin_only`), без закрепа
+//! сразу считается истёкшим ([`live_sql`]).
 
 use anyhow::{Context, Result};
 use clipwire_core::proto::PinRecord;
@@ -27,6 +29,24 @@ use super::Store;
 /// закреплённых записей: при снятии закрепа строки удаляются.
 pub(super) const KEPT_BY_PIN: &str = "EXISTS (SELECT 1 FROM pin_blobs AS pb
      WHERE pb.group_id = blobs.group_id AND pb.blob_id = blobs.blob_id)";
+
+/// Файл жив (не истёк): держит живой закреп, или он обычный и моложе срока.
+/// Файл, заведённый как файл закрепа (`pin_only`), без закрепа сразу
+/// считается истёкшим: иначе «закрепил → залил → снял» обходило бы квоты
+/// файлов. `nb` — параметр SQL с `not_before_ms`.
+pub(super) fn live_sql(nb: &str) -> String {
+    format!("({KEPT_BY_PIN} OR (created_ms >= {nb} AND pin_only = 0))")
+}
+
+/// Живой обычный файл: в квоте файлов группы.
+pub(super) fn unpinned_live_sql(nb: &str) -> String {
+    format!("(created_ms >= {nb} AND pin_only = 0 AND NOT {KEPT_BY_PIN})")
+}
+
+/// Истёкший файл: его чистит `purge_expired_blobs`.
+pub(super) fn expired_sql(nb: &str) -> String {
+    format!("(NOT {KEPT_BY_PIN} AND (created_ms < {nb} OR pin_only = 1))")
+}
 
 /// Зашифрованный размер файла (`clipwire_core::blob::sealed_size`) для
 /// столбца `size` таблицы `blobs`, посчитанный прямо в SQLite. Та же формула,
@@ -140,6 +160,13 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS pin_blobs_blob ON pin_blobs (group_id, blob_id);",
     )?;
+    // Файл заведён как файл закрепа: без закрепа он не живёт (см. `live_sql`).
+    let has_pin_only: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('blobs') WHERE name = 'pin_only'")?
+        .exists([])?;
+    if !has_pin_only {
+        conn.execute_batch("ALTER TABLE blobs ADD COLUMN pin_only INTEGER NOT NULL DEFAULT 0;")?;
+    }
     let has_rev: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('groups') WHERE name = 'pin_rev'")?
         .exists([])?;
@@ -881,10 +908,87 @@ mod tests {
             s.pin_stats(&g).unwrap(),
             (3, 3 * record + sealed_size(1000) + q)
         );
-        // Сняли закреп файла `pf` — он снова обычный и занимает квоту файлов.
+        // Сняли закреп файла `pf`: он заводился как файл закрепа и без
+        // закрепа сразу истёк — в квоте файлов его нет, чистка его убирает.
         put(&s, &g, pin(1), 1, false, None, &[], Q);
-        assert_eq!(s.group_stats(&g, 0).unwrap().quota_used, sealed_size(1000));
+        assert_eq!(s.group_stats(&g, 0).unwrap().quota_used, 0);
         assert_eq!(s.pin_stats(&g).unwrap(), (2, 5 + 2 * record + q));
+        assert_eq!(s.blob_info(&g, &pf, 0).unwrap(), None);
+        assert_eq!(s.purge_expired_blobs(0).unwrap(), vec![(g, pf)]);
+        // `f1` был обычным до закрепления: после снятия обоих закрепов он
+        // снова обычный, со своим временем, и в квоте файлов.
+        let rev = |id| s.pin(&g, &id).unwrap().unwrap().rev;
+        put(&s, &g, pin(2), rev(pin(2)), false, None, &[], Q);
+        put(&s, &g, pin(3), rev(pin(3)), false, None, &[], Q);
+        assert_eq!(s.group_stats(&g, 0).unwrap().quota_used, q);
+        assert!(s.purge_expired_blobs(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pin_unpin_cycle_does_not_bypass_file_quota() {
+        use crate::store::BlobBegin;
+        use clipwire_core::blob::sealed_size;
+        let (s, g) = store_with_group();
+        let q = sealed_size(1000);
+        // Квота файлов группы — на один файл. Каждый круг: закрепить запись
+        // с новым файлом, залить его (место закрепов), снять закреп.
+        for n in 1..=5u8 {
+            let b = BlobId([n; 16]);
+            put(&s, &g, pin(n), 0, true, Some(b"c"), &[b], Q);
+            assert_eq!(begin_q(&s, &g, b, 1000, q, u64::MAX), BlobBegin::Created);
+            let rev = s.pin(&g, &pin(n)).unwrap().unwrap().rev;
+            put(&s, &g, pin(n), rev, false, None, &[], Q);
+            // Снятый файл закрепа квоту файлов не занимает и истёк.
+            assert_eq!(s.group_stats(&g, 0).unwrap().quota_used, 0);
+            assert_eq!(s.blob_info(&g, &b, 0).unwrap(), None);
+        }
+        assert_eq!(s.purge_expired_blobs(0).unwrap().len(), 5);
+        // Обычный файл в квоту по-прежнему влезает ровно один.
+        assert_eq!(
+            begin_q(&s, &g, BlobId([9; 16]), 1000, q, 0),
+            BlobBegin::Created
+        );
+        assert_eq!(
+            begin_q(&s, &g, BlobId([10; 16]), 1000, q, 0),
+            BlobBegin::QuotaExceeded
+        );
+        // Повторный Put снятого файла закрепа заводит его заново как обычный,
+        // через квоту файлов.
+        assert_eq!(
+            begin_q(&s, &g, BlobId([1; 16]), 1000, q, u64::MAX),
+            BlobBegin::QuotaExceeded
+        );
+    }
+
+    #[test]
+    fn pin_file_reserve_counts_toward_server_total() {
+        use crate::store::BlobBegin;
+        use clipwire_core::blob::sealed_size;
+        let (s, g) = store_with_group();
+        let (pf, other) = (BlobId([1; 16]), BlobId([2; 16]));
+        let total = sealed_size(1000) + sealed_size(10);
+        let begin = |b: BlobId, size: u64| {
+            s.blob_begin_with_pins(
+                &g,
+                &b,
+                &DeviceId([2; 32]),
+                size,
+                100,
+                0,
+                u64::MAX,
+                total,
+                u64::MAX,
+                100,
+            )
+            .unwrap()
+        };
+        assert_eq!(begin(other, 1000), BlobBegin::Created);
+        put(&s, &g, pin(1), 0, true, Some(b"c"), &[pf], Q);
+        // Файл закрепа упирается в предел сервера, хоть место закрепов есть.
+        assert_eq!(begin(pf, 1000), BlobBegin::ServerFull);
+        assert_eq!(begin(pf, 10), BlobBegin::Created);
+        // И закреплённый файл занимает предел сервера для обычных.
+        assert_eq!(begin(BlobId([3; 16]), 1), BlobBegin::ServerFull);
     }
 
     #[test]

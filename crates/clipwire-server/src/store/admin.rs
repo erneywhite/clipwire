@@ -389,7 +389,8 @@ impl Store {
         };
         let bytes_pins = one("SELECT COALESCE(SUM(length(state) + content_len), 0) FROM pins")?
             .saturating_add(sealed("")?);
-        let bytes_files = sealed("NOT ")?;
+        // Снятые файлы закрепов (`pin_only`) уже истекли: чистка их уберёт.
+        let bytes_files = sealed("pin_only = 0 AND NOT ")?;
         Ok(ServerSummary {
             groups,
             devices,

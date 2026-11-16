@@ -250,7 +250,8 @@ the old group's files, so pinned files are uploaded again in the new group. The 
 changed the key does it as soon as it connects with the new key; files it does not have are
 uploaded a few minutes later by the devices that have them on disk or in the cache. If a pin
 ends up without its file for another reason (the server lost it, an upload failed), a device that
-has the file repairs it the same way. A device that was off
+has the file repairs it the same way. Clipwire 0.7 apps keep the old location after such a
+repair and report the file as missing until they are updated. A device that was off
 during the key change does not upload pins that other devices removed in the meantime. If the
 server database was lost or restored from an old backup, devices notice it, fetch the pins from
 the start and upload their live pins again.
@@ -720,7 +721,7 @@ app without restarting the container.
 | `CLIPWIRE_SELF_RELAY_URL` | `http://127.0.0.1:<relay port>` | how the server connects to its own relay |
 | `CLIPWIRE_MAX_FILE_BYTES`\* | `104857600` | limit for one file (100 MiB) |
 | `CLIPWIRE_BLOB_QUOTA`\* | `2147483648` | file space per group (2 GiB), not counting files of pinned entries |
-| `CLIPWIRE_BLOB_TOTAL_QUOTA`\* | `21474836480` | file space for the whole server (20 GiB), not counting files of pinned entries |
+| `CLIPWIRE_BLOB_TOTAL_QUOTA`\* | `21474836480` | file space for the whole server (20 GiB): all files, pinned ones too |
 | `CLIPWIRE_BLOB_STALL_SECS` | `120` | how long to wait for the next part of a file before an upload counts as abandoned |
 | `CLIPWIRE_RESERVE_TTL_SECS` | `600` | after how long space reserved for a file is released if the upload never started |
 | `CLIPWIRE_MAX_RESERVES`\* | `512` | how many files one device may keep reserved without a single uploaded part |
@@ -729,7 +730,7 @@ app without restarting the container.
 | `CLIPWIRE_HISTORY_TOTAL_BYTES`\* | `1073741824` | total limit of item history per server (1 GiB); the excess is evicted from the largest group |
 | `CLIPWIRE_MAX_DEVICE_CONNS`\* | `4` | simultaneous connections from one device |
 | `CLIPWIRE_PIN_MAX`\* | `5000` | how many pinned entries one group can keep on the server; a new pin over the limit is refused |
-| `CLIPWIRE_PIN_BYTES`\* | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries, the records of removed pins and the files of pinned entries. Those files don't count toward `CLIPWIRE_BLOB_QUOTA`; after unpinning they count there again |
+| `CLIPWIRE_PIN_BYTES`\* | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries, the records of removed pins and the files of pinned entries. Those files don't count toward `CLIPWIRE_BLOB_QUOTA`. A file uploaded for a pin is deleted right after the pin is removed; a file that was ordinary before pinning counts toward `CLIPWIRE_BLOB_QUOTA` again |
 
 ### What the server stores
 
