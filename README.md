@@ -506,8 +506,8 @@ Full description: [docs/storage.md](docs/storage.md).
 
 ## Updates
 
-Clipwire updates itself quietly. Every 6 hours it checks GitHub releases and downloads a new
-version in the background. It installs without an installer window once all Clipwire windows are
+Clipwire updates itself quietly. Every hour it checks GitHub releases and downloads a new
+version in the background. A release marked as recommended also shows a notification. It installs without an installer window once all Clipwire windows are
 closed, no files are being transferred (direct transfers included), sync is not paused, and
 neither the program nor the clipboard was used for a couple of minutes. If it did not manage
 before you quit, it installs at the next start. After an update you get a notification, and a

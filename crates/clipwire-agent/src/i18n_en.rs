@@ -169,6 +169,14 @@ pub static EN: &[(&str, &str)] = &[
         "The update to {version} failed to install. You can install it from the tray menu.",
     ),
     (
+        "Рекомендуется обновить Clipwire до {version}. Обновление поставится само, когда программа не нужна.",
+        "Updating Clipwire to {version} is recommended. It will install itself when you are not using the app.",
+    ),
+    (
+        "Рекомендуется обновить Clipwire до {version}. Поставить его можно из меню в трее.",
+        "Updating Clipwire to {version} is recommended. You can install it from the tray menu.",
+    ),
+    (
         "Clipwire обновлён до {current}",
         "Clipwire updated to {current}",
     ),
