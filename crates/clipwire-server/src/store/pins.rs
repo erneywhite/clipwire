@@ -228,12 +228,45 @@ impl Store {
     /// Квоты не мешают правке, которая не увеличивает занятое: снять закреп
     /// или укоротить подпись можно и сверх квоты (например, если её
     /// уменьшили в настройках сервера).
+    #[cfg(test)]
     pub fn set_pin(
         &self,
         group: &GroupId,
         w: &PinWrite<'_>,
         now_ms: i64,
         quota: PinQuota,
+    ) -> Result<PinOutcome> {
+        Ok(self.set_pin_freeing(group, w, now_ms, quota)?.0)
+    }
+
+    /// [`Store::set_pin`], которая ещё возвращает файлы, заведённые как
+    /// файлы закрепа (`pin_only`), которых после правки не держит ни один
+    /// живой закреп (закреп сняли или заменили список файлов). Их строки
+    /// удалены в той же транзакции: файлы надо сразу убрать с диска, а не
+    /// ждать чистки по сроку, иначе «закрепил, залил, снял» держало бы диск
+    /// сверх предела сервера.
+    pub fn set_pin_freeing(
+        &self,
+        group: &GroupId,
+        w: &PinWrite<'_>,
+        now_ms: i64,
+        quota: PinQuota,
+    ) -> Result<(PinOutcome, Vec<BlobId>)> {
+        let mut freed = Vec::new();
+        let out = self.set_pin_inner(group, w, now_ms, quota, &mut freed)?;
+        if !matches!(out, PinOutcome::Accepted { .. }) {
+            freed.clear();
+        }
+        Ok((out, freed))
+    }
+
+    fn set_pin_inner(
+        &self,
+        group: &GroupId,
+        w: &PinWrite<'_>,
+        now_ms: i64,
+        quota: PinQuota,
+        freed: &mut Vec<BlobId>,
     ) -> Result<PinOutcome> {
         let g = &group.0[..];
         let mut conn = self.conn();
@@ -341,6 +374,18 @@ impl Store {
                             "INSERT OR IGNORE INTO pin_blobs (group_id, pin_id, blob_id) VALUES (?1, ?2, ?3)",
                             params![g, pid, &b.0[..]],
                         )?;
+                    }
+                }
+                // Файлы закрепа, которые больше никто не держит, — сразу.
+                for b in &old_files {
+                    let n = tx.execute(
+                        "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2 AND pin_only = 1
+                           AND NOT EXISTS (SELECT 1 FROM pin_blobs AS pb
+                                           WHERE pb.group_id = ?1 AND pb.blob_id = ?2)",
+                        params![g, &b.0[..]],
+                    )?;
+                    if n > 0 {
+                        freed.push(*b);
                     }
                 }
             }
@@ -908,13 +953,23 @@ mod tests {
             s.pin_stats(&g).unwrap(),
             (3, 3 * record + sealed_size(1000) + q)
         );
-        // Сняли закреп файла `pf`: он заводился как файл закрепа и без
-        // закрепа сразу истёк — в квоте файлов его нет, чистка его убирает.
-        put(&s, &g, pin(1), 1, false, None, &[], Q);
+        // Сняли закреп файла `pf`: он заводился как файл закрепа, его строка
+        // удаляется сразу, и файл надо убрать с диска.
+        let unpin = PinWrite {
+            pin_id: pin(1),
+            base_rev: 1,
+            pinned: false,
+            state: b"state",
+            content: None,
+            blobs: &[],
+        };
+        let (out, freed) = s.set_pin_freeing(&g, &unpin, 1000, Q).unwrap();
+        assert!(matches!(out, PinOutcome::Accepted { .. }));
+        assert_eq!(freed, vec![pf]);
         assert_eq!(s.group_stats(&g, 0).unwrap().quota_used, 0);
         assert_eq!(s.pin_stats(&g).unwrap(), (2, 5 + 2 * record + q));
-        assert_eq!(s.blob_info(&g, &pf, 0).unwrap(), None);
-        assert_eq!(s.purge_expired_blobs(0).unwrap(), vec![(g, pf)]);
+        assert!(!s.blob_exists(&g, &pf).unwrap());
+        assert!(s.purge_expired_blobs(0).unwrap().is_empty());
         // `f1` был обычным до закрепления: после снятия обоих закрепов он
         // снова обычный, со своим временем, и в квоте файлов.
         let rev = |id| s.pin(&g, &id).unwrap().unwrap().rev;
@@ -942,7 +997,8 @@ mod tests {
             assert_eq!(s.group_stats(&g, 0).unwrap().quota_used, 0);
             assert_eq!(s.blob_info(&g, &b, 0).unwrap(), None);
         }
-        assert_eq!(s.purge_expired_blobs(0).unwrap().len(), 5);
+        // Строки снятых файлов закрепа удалены сразу, чистке нечего делать.
+        assert!(s.purge_expired_blobs(0).unwrap().is_empty());
         // Обычный файл в квоту по-прежнему влезает ровно один.
         assert_eq!(
             begin_q(&s, &g, BlobId([9; 16]), 1000, q, 0),
