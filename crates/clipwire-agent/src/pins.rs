@@ -793,11 +793,14 @@ pub trait PinSource: Send + Sync {
     fn blobs(&self, hash: &[u8; 32]) -> Vec<BlobId>;
     /// Порог загрузки файлов на сервер, МБ (настройка `file_upload_limit_mb`).
     fn upload_limit_mb(&self) -> u64;
-    /// Запись с этим хэшем, если в ней файлы (проверка файлов закрепов).
-    /// Своя запись — с этим устройством в `origin`, как у [`PinSource::item`].
-    fn file_item(&self, hash: &[u8; 32]) -> Option<Item> {
+    /// Запись с этим хэшем, если в ней файлы (проверка файлов закрепов), и
+    /// своя ли она: скопирована на этом устройстве (флаг `local` записи
+    /// истории). `origin` содержимого для этого не годится: его пишет любой
+    /// участник группы. По умолчанию — чужая.
+    fn file_item(&self, hash: &[u8; 32]) -> Option<(Item, bool)> {
         self.item(hash)
             .filter(|i| matches!(i.content, clipwire_core::Content::Files(_)))
+            .map(|i| (i, false))
     }
 }
 

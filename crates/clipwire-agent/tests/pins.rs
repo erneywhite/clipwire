@@ -64,12 +64,16 @@ struct Row {
     item: Item,
     pinned: bool,
     note: String,
+    /// Скопировано на этом устройстве (как `Entry::local`).
+    local: bool,
 }
 
 /// История устройства в памяти.
 struct Mem {
     device: DeviceId,
     rows: Mutex<HashMap<[u8; 32], Row>>,
+    /// Порог «сразу заливать», МБ.
+    limit_mb: std::sync::atomic::AtomicU64,
 }
 
 impl Mem {
@@ -77,6 +81,7 @@ impl Mem {
         Arc::new(Self {
             device,
             rows: Mutex::default(),
+            limit_mb: 100.into(),
         })
     }
 
@@ -94,6 +99,7 @@ impl Mem {
                 item,
                 pinned,
                 note: note.into(),
+                local: true,
             },
         );
         hash
@@ -119,6 +125,7 @@ impl Mem {
                             item: item.clone(),
                             pinned: true,
                             note: p.note.clone(),
+                            local: false,
                         },
                     );
                 }
@@ -138,8 +145,10 @@ impl Mem {
 
     /// Как сервис: `History::set_pin_files` — файлы записи из содержимого
     /// закрепа.
-    fn set_files(&self, hash: &[u8; 32], item: &Item) {
-        if let Some(r) = self.rows.lock().unwrap().get_mut(hash) {
+    fn set_files(&self, hash: &[u8; 32], item: &Item, own_write: bool) {
+        if let Some(r) = self.rows.lock().unwrap().get_mut(hash)
+            && (own_write || !r.local)
+        {
             r.item.content = item.content.clone();
             r.item.ext = item.ext.clone();
         }
@@ -187,7 +196,29 @@ impl PinSource for Mem {
         Vec::new()
     }
     fn upload_limit_mb(&self) -> u64 {
-        0
+        self.limit_mb.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn file_item(&self, hash: &[u8; 32]) -> Option<(Item, bool)> {
+        let rows = self.rows.lock().unwrap();
+        let r = rows.get(hash)?;
+        matches!(r.item.content, Content::Files(_)).then(|| (r.item.clone(), r.local))
+    }
+}
+
+impl Mem {
+    /// Добавить запись, пришедшую с другого устройства (не своя).
+    fn add_foreign(&self, item: Item, pinned: bool) -> [u8; 32] {
+        let hash = item.content.hash();
+        self.rows.lock().unwrap().insert(
+            hash,
+            Row {
+                item,
+                pinned,
+                note: String::new(),
+                local: false,
+            },
+        );
+        hash
     }
 }
 
@@ -294,7 +325,11 @@ impl Dev {
         match e {
             Event::KnownDevices(cards) => self.known = cards.clone(),
             Event::Pin(p) => self.mem.apply(p),
-            Event::PinFiles { hash, item } => self.mem.set_files(hash, item),
+            Event::PinFiles {
+                hash,
+                item,
+                own_write,
+            } => self.mem.set_files(hash, item, *own_write),
             Event::PinFailed(why) => self.failed.push(why.clone()),
             _ => {}
         }
@@ -1222,6 +1257,124 @@ async fn pin_file_over_pin_space_is_refused_and_restored() -> Result<()> {
         },
     )
     .await?;
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Файл на диске `dir` и его карточка.
+fn disk_file(dir: &std::path::Path, name: &str, len: usize) -> Result<clipwire_core::FileRef> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(name);
+    std::fs::write(&path, vec![5u8; len])?;
+    let (size, modified_ms) = clipwire_agent::blobs::file_stamp(&path)?;
+    Ok(clipwire_core::FileRef {
+        name: name.into(),
+        path: path.to_string_lossy().into_owned(),
+        size,
+        is_dir: false,
+        width: 0,
+        height: 0,
+        modified_ms,
+        blob: None,
+        blob_size: 0,
+        p2p: false,
+    })
+}
+
+/// Подождать, разбирая события, и проверить, что файл закрепа так и не
+/// залили (у закрепляющего в записи по-прежнему нет `blob`).
+async fn never_uploaded(watch: &mut Dev, other: &mut Dev, h: &[u8; 32]) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        for d in [&mut *watch, &mut *other] {
+            while let Ok(e) = d.events.try_recv() {
+                d.note(&e);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        watch.mem.files(h).iter().all(|f| f.blob.is_none()),
+        "файл залили: {:?}",
+        watch.mem.files(h)
+    );
+    if let Some(b) = &other.blobs {
+        assert!(
+            b.queued().is_empty(),
+            "в очереди загрузок: {:?}",
+            b.queued()
+        );
+    }
+    Ok(())
+}
+
+/// Чужой закреп с `origin` этого устройства и путём к его файлу не
+/// заставляет залить файл: своя запись — только по флагу истории, чужие
+/// пути файловой системой не трогаются.
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_origin_does_not_leak_local_file() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    // Секрет A на его диске.
+    let secret = disk_file(&a.dir.join("secret"), "id_ed25519", 400)?;
+    // B закрепляет «запись A» с этим путём: origin — A, время 0.
+    let mut item = Item::new(
+        a.mem.device,
+        Content::Files(vec![clipwire_core::FileRef {
+            modified_ms: 0,
+            ..secret
+        }]),
+    );
+    item.device_name = "A".into();
+    let h = b.mem.add_foreign(item, true);
+    b.pins.pin(h, "");
+    a.until("закреп пришёл", |m, _| {
+        m.state(&h).is_some_and(|(p, _)| p)
+    })
+    .await?;
+    never_uploaded(&mut b, &mut a, &h).await?;
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Чужой закреп своей записи не заливает её файл, если владелец его не
+/// передавал: порог «сразу заливать» 0 — никогда.
+#[tokio::test(flavor = "multi_thread")]
+async fn foreign_pin_respects_owner_limit() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    a.mem
+        .limit_mb
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    let file = disk_file(&a.dir.join("src"), "big.bin", 300_000)?;
+    let h = a
+        .mem
+        .add_content(Content::Files(vec![file.clone()]), false, "");
+    // У B та же запись (пришла обычной историей), B её закрепляет.
+    let item = a.mem.item(&h).context("нет записи")?;
+    b.mem.add_foreign(item, true);
+    b.pins.pin(h, "");
+    a.until("закреп пришёл", |m, _| {
+        m.state(&h).is_some_and(|(p, _)| p)
+    })
+    .await?;
+    never_uploaded(&mut b, &mut a, &h).await?;
     a.stop().await?;
     b.stop().await?;
     server.shutdown().await

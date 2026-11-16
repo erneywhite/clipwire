@@ -2041,13 +2041,16 @@ impl History {
     /// закреплении, `sync::pin_engine`): у записи с этим хэшем взять у
     /// файлов `blob`, `blob_size` и `p2p` из `files` (по порядку; путь и
     /// размер у них те же — хэш совпадает) и места файлов
-    /// (`ext::BLOB_PLACES`) из `places`. Возвращает пары «было, стало» у
-    /// файлов с другим `blob`; пусто — записи нет или ничего не поменялось.
+    /// (`ext::BLOB_PLACES`) из `places`. Свою запись (`local`) — только с
+    /// `allow_local`: её файлы меняет лишь правка этого устройства. Возвращает
+    /// пары «было, стало» у файлов с другим `blob`; пусто — записи нет или
+    /// ничего не поменялось.
     pub fn set_pin_files(
         &mut self,
         hash: &[u8; 32],
         files: &[FileRef],
         places: &clipwire_core::storage::BlobPlaces,
+        allow_local: bool,
     ) -> Result<Vec<(FileRef, FileRef)>> {
         let tx = self.tx()?;
         let Some(id) = self.id_by_hkey(&self.hkey(hash))? else {
@@ -2059,6 +2062,9 @@ impl History {
         let Some(mut e) = self.body(id)? else {
             return Ok(Vec::new());
         };
+        if e.local && !allow_local {
+            return Ok(Vec::new());
+        }
         let Content::Files(old) = &mut e.content else {
             return Ok(Vec::new());
         };
@@ -2783,8 +2789,22 @@ mod tests {
             ..f.clone()
         };
         let places = vec![(BlobId([2; 16]), BlobPlace::External { config_version: 3 })];
+        // Чужая правка свою запись не трогает: ни `blob`, ни прямую передачу.
+        let forged = FileRef {
+            blob: Some(BlobId([7; 16])),
+            p2p: true,
+            ..f.clone()
+        };
+        assert!(
+            h.set_pin_files(&hash, std::slice::from_ref(&forged), &Vec::new(), false)
+                .unwrap()
+                .is_empty()
+        );
+        let e = h.get(h.id_by_hash(&hash).unwrap()).unwrap();
+        assert_eq!(e.content, Content::Files(vec![f.clone()]));
+        // Своя правка — меняет.
         let pairs = h
-            .set_pin_files(&hash, std::slice::from_ref(&moved), &places)
+            .set_pin_files(&hash, std::slice::from_ref(&moved), &places, true)
             .unwrap();
         assert_eq!(pairs, vec![(f.clone(), moved.clone())]);
         let e = h.get(h.id_by_hash(&hash).unwrap()).unwrap();
@@ -2793,7 +2813,7 @@ mod tests {
         assert_eq!(h.blobs_of(&hash), vec![BlobId([2; 16])], "карточка тоже");
         // Повтор — без изменений; чужие файлы (другой путь) не принимаются.
         assert!(
-            h.set_pin_files(&hash, std::slice::from_ref(&moved), &places)
+            h.set_pin_files(&hash, std::slice::from_ref(&moved), &places, true)
                 .unwrap()
                 .is_empty()
         );
@@ -2801,9 +2821,9 @@ mod tests {
             path: "/y".into(),
             ..moved
         };
-        assert!(h.set_pin_files(&hash, &[other], &places).is_err());
+        assert!(h.set_pin_files(&hash, &[other], &places, true).is_err());
         assert!(
-            h.set_pin_files(&[9; 32], &[f], &Vec::new())
+            h.set_pin_files(&[9; 32], &[f], &Vec::new(), true)
                 .unwrap()
                 .is_empty()
         );

@@ -26,8 +26,8 @@ pub use admin::{Create, PENDING_KEEP};
 pub use devices::{RekeyLimits, RekeyOutcome, Rotation};
 pub use groups::DeleteOutcome;
 pub use invites::{INVITE_KEEP, InviteCheck, MAX_ACTIVE_INVITES};
-use pins::{expired_sql, live_sql, unpinned_live_sql};
 pub use pins::{PinOutcome, PinQuota, PinWrite};
+use pins::{expired_sql, live_sql, unpinned_live_sql};
 
 // shortcut: синхронный rusqlite под std::Mutex прямо из async-кода. Запросы
 // короткие, а нагрузка — единицы устройств. Переделать на пул и spawn_blocking,

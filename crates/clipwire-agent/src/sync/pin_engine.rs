@@ -94,6 +94,11 @@ pub(super) struct Repairs {
     missing: HashSet<BlobId>,
     /// Пауза перед починкой чужого закрепа; `None` — [`pin_files::REPAIR_DELAY`].
     pub(super) delay: Option<(Duration, Duration)>,
+    /// Сколько уже залито починкой за запуск ([`pin_files::REPAIR_BUDGET`]).
+    budget: pin_files::Budget,
+    /// Закрепы, чьё содержимое уже сверяли и чинить там было нечего: хэш и
+    /// `rev`. Пока `rev` тот же, заново не спрашивать.
+    checked: HashMap<[u8; 32], u64>,
 }
 
 /// Закрепы в одной сессии.
@@ -411,7 +416,11 @@ impl Engine {
             // Файлы записи — как в содержимом закрепа: после заливки или
             // починки у них новые `blob`.
             if let Some(item) = files {
-                self.emit(Event::PinFiles { hash: h, item });
+                self.emit(Event::PinFiles {
+                    hash: h,
+                    item,
+                    own_write: false,
+                });
             }
             self.ps.check.insert(h);
         }
@@ -499,6 +508,7 @@ impl Engine {
             self.emit(Event::PinFiles {
                 hash,
                 item: item.clone(),
+                own_write: true,
             });
             if !inf.uploads.is_empty() {
                 self.fix.accepted.push(Accepted {
@@ -772,22 +782,26 @@ impl Engine {
             ));
             return None;
         }
-        let uploads = self.pin_files_for_new(&mut item).await;
+        let uploads = self.pin_files_for_new(&mut item, h).await;
         let blobs = all_blobs(&item);
         Some((item, blobs, uploads))
     }
 
     /// Файлы нового закрепа, которые надо залить: свои — если их нет на
     /// сервере (не загружались, прямая передача, папка), чужие — прямая
-    /// передача или потерянные сервером, если копия есть в кэше.
-    async fn pin_files_for_new(&mut self, item: &mut Item) -> Vec<PinUpload> {
+    /// передача или потерянные сервером, если копия есть в кэше. Своя ли
+    /// запись — по флагу `local` в истории, не по `origin`.
+    async fn pin_files_for_new(&mut self, item: &mut Item, hash: [u8; 32]) -> Vec<PinUpload> {
         let Some(b) = self.blobs.clone() else {
             return Vec::new();
         };
         let Content::Files(files) = &item.content else {
             return Vec::new();
         };
-        let own = item.origin == self.device;
+        let own = self
+            .src(move |s| s.file_item(&hash).is_some_and(|(_, own)| own))
+            .await
+            .unwrap_or(false);
         let queued: HashSet<BlobId> = b.queued().iter().map(|j| j.blob).collect();
         let missing = self.fix.missing.clone();
         let files = files.clone();
@@ -1121,9 +1135,11 @@ impl Engine {
             let found = pins.read(|bk| {
                 let id = *bk.live(&hash).first()?;
                 let r = bk.records.get(&id)?;
-                Some((r.state.as_ref()?.device, r.blobs.clone()))
+                Some((r.rev, r.state.as_ref()?.device, r.blobs.clone()))
             });
-            if let Some((author, held)) = found {
+            if let Some((rev, author, held)) = found
+                && self.fix.checked.get(&hash) != Some(&rev)
+            {
                 cands.push((hash, author, held));
             }
         }
@@ -1135,26 +1151,26 @@ impl Engine {
         let files_dir = b.files_dir().to_path_buf();
         let found = self
             .src(move |s| {
+                let limit_mb = s.upload_limit_mb();
                 cands
                     .into_iter()
                     .filter(|(h, _, held)| {
-                        let Some(item) = s.file_item(h) else {
+                        let Some((item, own)) = s.file_item(h) else {
                             return false;
                         };
                         let Content::Files(files) = &item.content else {
                             return false;
                         };
-                        let own = item.origin == me;
-                        !pin_files::to_upload(
+                        // Здесь содержимого закрепа нет, только своя запись:
+                        // у своей — её файлы и есть «содержимое».
+                        pin_files::repair_picks(
                             files,
-                            |f| {
-                                pin_files::covered(f, |x| {
-                                    held.contains(&x) && !missing.contains(&x)
-                                })
-                            },
-                            |f| pin_files::local_bytes(f, own, &files_dir),
+                            own.then_some(files.as_slice()),
+                            |x| held.contains(&x) && !missing.contains(&x),
+                            limit_mb,
+                            &files_dir,
                         )
-                        .is_empty()
+                        .is_some_and(|(_, picks)| !picks.is_empty())
                     })
                     .map(|(h, a, _)| (h, a))
                     .collect::<Vec<_>>()
@@ -1178,13 +1194,19 @@ impl Engine {
     /// с новым содержимым поверх текущего `rev` (тот же хэш, закреп и
     /// подпись, `seq` на один больше). Файлы зальются, когда сервер примет
     /// правку. Закреп уже починили (файлы покрыты) — ничего.
+    ///
+    /// Содержимому с сервера доверяем только в том, где лежат файлы: у своей
+    /// записи пути, имена и время берутся из истории (`pin_files::trusted_files`),
+    /// свои файлы заливаются только с согласия владельца
+    /// (`pin_files::may_repair_own`), чужие пути не трогаются вовсе. Всё —
+    /// в пределах бюджета починки на запуск.
     async fn pin_repair(
         &mut self,
         key: &GroupKey,
         send: &mut iroh::endpoint::SendStream,
         pin_id: PinId,
         hash: [u8; 32],
-        mut item: Item,
+        remote: Item,
     ) -> Result<()> {
         let (Some(pins), Some(b)) = (self.pins.clone(), self.blobs.clone()) else {
             return Ok(());
@@ -1199,24 +1221,66 @@ impl Engine {
         }) else {
             return Ok(());
         };
-        let Content::Files(files) = &item.content else {
+        let Content::Files(remote_files) = &remote.content else {
             return Ok(());
         };
-        let own = item.origin == self.device;
+        // `PinContent` отвечает без `rev`: содержимое должно знать все файлы
+        // записи книги, иначе оно старее её (правка с новыми файлами пришла
+        // раньше ответа), и починка по нему затёрла бы чужую.
+        let sent = all_blobs(&remote);
+        if !held.iter().all(|b| sent.contains(b)) {
+            tracing::info!("содержимое закрепа старее его записи, проверю позже");
+            self.ps.check.insert(hash);
+            return Ok(());
+        }
         let missing = self.fix.missing.clone();
         let files_dir = b.files_dir().to_path_buf();
-        let files = files.clone();
-        let picks = tokio::task::spawn_blocking(move || {
-            pin_files::to_upload(
-                &files,
-                |f| pin_files::covered(f, |x| held.contains(&x) && !missing.contains(&x)),
-                |f| pin_files::local_bytes(f, own, &files_dir),
-            )
-        })
-        .await
-        .unwrap_or_default();
+        let remote_files = remote_files.clone();
+        let plan = self
+            .src(move |s| {
+                let limit_mb = s.upload_limit_mb();
+                let local = s
+                    .file_item(&hash)
+                    .filter(|(_, own)| *own)
+                    .and_then(|(i, _)| match i.content {
+                        Content::Files(f) => Some(f),
+                        _ => None,
+                    });
+                pin_files::repair_picks(
+                    &remote_files,
+                    local.as_deref(),
+                    |x| held.contains(&x) && !missing.contains(&x),
+                    limit_mb,
+                    &files_dir,
+                )
+            })
+            .await
+            .flatten();
+        let Some((files, picks)) = plan else {
+            tracing::warn!("файлы закрепа не сходятся со своей записью, не чиню");
+            self.fix.checked.insert(hash, rev);
+            return Ok(());
+        };
+        // Бюджет на запуск: каждый источник один раз, не больше
+        // `REPAIR_BUDGET` байт и файлов.
+        let picks: Vec<(usize, Bytes)> = picks
+            .into_iter()
+            .filter(|(i, bytes)| {
+                let ok =
+                    self.fix
+                        .budget
+                        .take(bytes.path(), files[*i].size, pin_files::REPAIR_BUDGET);
+                if !ok {
+                    tracing::warn!(
+                        "предел починки закрепов на этот запуск исчерпан, файл пропускаю"
+                    );
+                }
+                ok
+            })
+            .collect();
         if picks.is_empty() {
-            tracing::debug!("закреп уже починили");
+            tracing::debug!("закреп уже починили или чинить здесь нечем");
+            self.fix.checked.insert(hash, rev);
             return Ok(());
         }
         let tries = self.fix.tries.entry(hash).or_insert(0);
@@ -1225,6 +1289,8 @@ impl Engine {
             return Ok(());
         }
         *tries += 1;
+        let mut item = remote;
+        item.content = Content::Files(files);
         let uploads = self.prepare_uploads(&mut item, picks).await;
         if uploads.is_empty() {
             return Ok(());

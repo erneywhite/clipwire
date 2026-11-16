@@ -74,19 +74,26 @@ pub fn held_for_pin(
     covered(f, |b| if own { uploaded(b) } else { !missing(b) })
 }
 
-/// Байты файла на этом устройстве. У своей записи — исходный путь, если
-/// файл на месте и не изменился (размер и время те же, у папки — что она
-/// есть), иначе копия в кэше. У чужой — только кэш: её путь с другого
-/// устройства, здесь по нему может лежать что угодно.
+/// Сколько всего одно устройство заливает починкой чужих закрепов за запуск
+/// движка: байт и файлов. Закреп может прислать любой участник группы, и
+/// без предела он заставил бы перезаливать кэш снова и снова.
+pub const REPAIR_BUDGET: (u64, usize) = (1024 * 1024 * 1024, 50);
+
+/// Байты файла на этом устройстве. `own` — файл своей записи истории
+/// (флаг `local` записи, а не `origin` из содержимого: его пишет любой
+/// участник), и сам `f` взят из неё же ([`trusted_files`]). Тогда — исходный
+/// путь, если файл на месте и не изменился (размер и время те же, у папки —
+/// что она есть), иначе копия в кэше. У чужой — только кэш: её путь с
+/// другого устройства файловой системой не трогаем вовсе (ни stat, ни
+/// обход), по нему может лежать что угодно, в том числе сетевой путь.
 pub fn local_bytes(f: &FileRef, own: bool, files_dir: &Path) -> Option<Bytes> {
     if own {
         let p = PathBuf::from(&f.path);
         let fits = if f.is_dir {
             p.is_dir()
         } else {
-            crate::blobs::file_stamp(&p).is_ok_and(|(size, modified)| {
-                size == f.size && (f.modified_ms == 0 || modified == f.modified_ms)
-            })
+            crate::blobs::file_stamp(&p)
+                .is_ok_and(|(size, modified)| size == f.size && modified == f.modified_ms)
         };
         if fits {
             return Some(Bytes::Source(p));
@@ -97,6 +104,110 @@ pub fn local_bytes(f: &FileRef, own: bool, files_dir: &Path) -> Option<Bytes> {
         return None;
     }
     Some(Bytes::Cache(p))
+}
+
+/// Файлы, по которым решать о заливке и которые уйдут в содержимое
+/// починенного закрепа. `remote` — файлы содержимого закрепа с сервера,
+/// `local` — файлы своей записи истории, если запись своя. У своей записи
+/// путь, имя, папка ли, размер и время — только из `local`, из содержимого
+/// берётся лишь, где файл лежит (`blob`, `blob_size`, `p2p`). `None` — файлы
+/// не сходятся по порядку, пути и размеру (хэш содержимого тот же, так что
+/// это подделка или ошибка).
+pub fn trusted_files(remote: &[FileRef], local: Option<&[FileRef]>) -> Option<Vec<FileRef>> {
+    let Some(local) = local else {
+        return Some(remote.to_vec());
+    };
+    if local.len() != remote.len()
+        || local
+            .iter()
+            .zip(remote)
+            .any(|(l, r)| l.path != r.path || l.size != r.size)
+    {
+        return None;
+    }
+    Some(
+        local
+            .iter()
+            .zip(remote)
+            .map(|(l, r)| FileRef {
+                blob: r.blob,
+                blob_size: r.blob_size,
+                p2p: r.p2p,
+                ..l.clone()
+            })
+            .collect(),
+    )
+}
+
+/// Можно ли починкой чужого закрепа залить свой файл без вопроса: он в
+/// пределах порога «сразу заливать» (`limit_mb`), или это устройство само его
+/// уже заливало (`blob` в своей записи без прямой передачи — такие `blob`
+/// выпускает только оно). Порог 0 — никогда. Файл больше порога заливается,
+/// только когда закрепляет сам владелец (окно вставки спрашивает).
+pub fn may_repair_own(local: &FileRef, limit_mb: u64) -> bool {
+    if limit_mb == 0 {
+        return false;
+    }
+    let size = if local.is_dir && local.blob_size > 0 {
+        local.blob_size
+    } else {
+        local.size
+    };
+    crate::service::route(size, limit_mb) == crate::service::Route::Server
+        || (local.blob.is_some() && !local.p2p)
+}
+
+/// Файлы для содержимого починенного закрепа и что из них заливать (номер
+/// файла и его байты).
+pub type RepairPlan = (Vec<FileRef>, Vec<(usize, Bytes)>);
+
+/// Что залить при починке закрепа: файлы для содержимого
+/// ([`trusted_files`]) и какие из них заливать — не покрытые (`held`), с
+/// байтами здесь и, если запись своя, только с согласия владельца
+/// ([`may_repair_own`]). `None` — содержимое не сходится со своей записью.
+pub fn repair_picks(
+    remote: &[FileRef],
+    local: Option<&[FileRef]>,
+    held: impl Fn(BlobId) -> bool,
+    limit_mb: u64,
+    files_dir: &Path,
+) -> Option<RepairPlan> {
+    let files = trusted_files(remote, local)?;
+    let own = local.is_some();
+    let picks = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !covered(f, &held))
+        .filter(|(i, _)| local.is_none_or(|l| may_repair_own(&l[*i], limit_mb)))
+        .filter_map(|(i, f)| local_bytes(f, own, files_dir).map(|b| (i, b)))
+        .collect();
+    Some((files, picks))
+}
+
+/// Бюджет починки на запуск движка: не больше [`REPAIR_BUDGET`] байт и
+/// файлов, и каждый источник (свой файл или копия в кэше) — один раз.
+#[derive(Debug, Default)]
+pub struct Budget {
+    bytes: u64,
+    files: usize,
+    seen: std::collections::HashSet<PathBuf>,
+}
+
+impl Budget {
+    /// Взять из бюджета файл с байтами `src` размером `size`. `false` —
+    /// бюджет исчерпан или этот источник уже заливали.
+    pub fn take(&mut self, src: &Path, size: u64, limit: (u64, usize)) -> bool {
+        if self.seen.contains(src)
+            || self.files >= limit.1
+            || self.bytes.saturating_add(size) > limit.0
+        {
+            return false;
+        }
+        self.seen.insert(src.to_path_buf());
+        self.files += 1;
+        self.bytes = self.bytes.saturating_add(size);
+        true
+    }
 }
 
 /// Какие файлы этому устройству залить: не покрытые и с байтами здесь.
@@ -211,6 +322,9 @@ mod tests {
         std::fs::write(&src, b"abc").unwrap();
         let mut f = file(Some(1), false);
         f.path = src.to_string_lossy().into_owned();
+        // Время 0 сверку не отключает: нужно точное совпадение.
+        assert_eq!(local_bytes(&f, true, &files_dir), None);
+        f.modified_ms = crate::blobs::file_stamp(&src).unwrap().1;
         assert_eq!(
             local_bytes(&f, true, &files_dir),
             Some(Bytes::Source(src.clone()))
@@ -236,6 +350,7 @@ mod tests {
         assert_eq!(local_bytes(&f, false, &files_dir), None);
         // Сколько уйдёт при закреплении: только то, чего нет на сервере.
         std::fs::write(&src, b"abc").unwrap();
+        f.modified_ms = crate::blobs::file_stamp(&src).unwrap().1;
         assert_eq!(upload_size(&[f.clone()], true, &files_dir, |_| false), 3);
         assert_eq!(upload_size(&[f.clone()], true, &files_dir, |_| true), 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -265,5 +380,105 @@ mod tests {
         }
         let flat = (Duration::from_secs(5), Duration::from_secs(5));
         assert_eq!(repair_delay(other, me, 7, flat), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn own_files_trust_only_local_record() {
+        let local = file(Some(1), false);
+        // Содержимое с сервера подменило имя, папку и время, но не путь.
+        let remote = FileRef {
+            name: "../../evil".into(),
+            is_dir: true,
+            modified_ms: 0,
+            blob: Some(BlobId([9; 16])),
+            p2p: true,
+            ..local.clone()
+        };
+        let got = trusted_files(
+            std::slice::from_ref(&remote),
+            Some(std::slice::from_ref(&local)),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![FileRef {
+                blob: Some(BlobId([9; 16])),
+                p2p: true,
+                ..local.clone()
+            }]
+        );
+        // Другой путь или размер — не та запись.
+        let moved = FileRef {
+            path: r"C:\Users\victim\.ssh\id_ed25519".into(),
+            ..remote.clone()
+        };
+        assert_eq!(
+            trusted_files(
+                std::slice::from_ref(&moved),
+                Some(std::slice::from_ref(&local))
+            ),
+            None
+        );
+        // Чужая запись — как есть.
+        assert_eq!(
+            trusted_files(std::slice::from_ref(&moved), None),
+            Some(vec![moved])
+        );
+    }
+
+    #[test]
+    fn foreign_path_is_never_a_source() {
+        // Чужая запись с путём к существующему файлу этого устройства (или
+        // сетевым путём): в починку идёт только кэш, путь не трогается.
+        let dir = std::env::temp_dir().join(format!("clipwire-pinfiles-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("id_ed25519");
+        std::fs::write(&secret, b"key").unwrap();
+        let (size, modified_ms) = crate::blobs::file_stamp(&secret).unwrap();
+        let mut f = file(Some(1), true);
+        f.path = secret.to_string_lossy().into_owned();
+        f.size = size;
+        f.modified_ms = modified_ms;
+        let unc = FileRef {
+            path: r"\\attacker\share\x".into(),
+            is_dir: true,
+            ..f.clone()
+        };
+        for remote in [f, unc] {
+            let (_, picks) =
+                repair_picks(&[remote], None, |_| false, 100, &dir.join("files")).unwrap();
+            assert!(picks.is_empty(), "{picks:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn own_repair_needs_owner_consent() {
+        let mb = 1024 * 1024;
+        let mut f = file(None, false);
+        f.size = 5 * mb;
+        assert!(!may_repair_own(&f, 0), "порог 0 — никогда");
+        assert!(may_repair_own(&f, 10), "в пределах порога");
+        assert!(!may_repair_own(&f, 1), "больше порога и не заливался");
+        // Уже заливался этим устройством (свой blob без прямой передачи).
+        f.blob = Some(BlobId([1; 16]));
+        assert!(may_repair_own(&f, 1));
+        f.p2p = true;
+        assert!(!may_repair_own(&f, 1), "прямая передача — не заливался");
+        assert!(!may_repair_own(&f, 0));
+    }
+
+    #[test]
+    fn budget_limits_bytes_files_and_repeats() {
+        let mut b = Budget::default();
+        let lim = (100, 2);
+        assert!(b.take(Path::new("a"), 60, lim));
+        assert!(
+            !b.take(Path::new("a"), 1, lim),
+            "тот же источник второй раз"
+        );
+        assert!(!b.take(Path::new("b"), 41, lim), "сверх байт");
+        assert!(b.take(Path::new("b"), 40, lim));
+        assert!(!b.take(Path::new("c"), 0, lim), "сверх числа файлов");
     }
 }
