@@ -263,6 +263,17 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
         .context("не поднялся iroh-эндпоинт")?;
 
     let store = Store::open(&config.data_dir.join("clipwire.db"))?;
+    // Токен relay мог смениться мимо клиента (переменная окружения, правка
+    // файла): коды создания группы со старым токеном отзываются. Входу они
+    // и так не годятся (отпечаток токена не тот), отзыв — чтобы список не
+    // показывал их действующими.
+    let stale = store.revoke_stale_invites(&admin.token_fingerprint(), session::now_ms())?;
+    if stale > 0 {
+        tracing::info!(
+            stale,
+            "коды создания группы со старым токеном relay отозваны"
+        );
+    }
     let base_limits = Limits::new(config, guards);
     let shared = Arc::new(Shared {
         limits: std::sync::RwLock::new(Arc::new(base_limits.clone())),

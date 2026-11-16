@@ -24,17 +24,25 @@ struct Server {
     running: clipwire_server::Running,
     relay: String,
     dir: PathBuf,
+    /// Токен relay, с которым подключаются клиенты.
+    token: String,
 }
 
 async fn start() -> Result<Server> {
     let dir = std::env::temp_dir().join(format!("clipwire-invites-e2e-{}", uuid::Uuid::now_v7()));
+    start_on(dir, Some(TOKEN)).await
+}
+
+/// Сервер в каталоге `dir`. `relay_token: None` — токен из файла, его можно
+/// сменить из клиента.
+async fn start_on(dir: PathBuf, relay_token: Option<&str>) -> Result<Server> {
     let config = Config {
         data_dir: dir.clone(),
         public_url: "http://unused".into(),
         self_relay_url: "http://127.0.0.1:0".into(),
         relay_bind: "127.0.0.1:0".parse()?,
         quic_bind: "127.0.0.1:0".parse()?,
-        relay_token: Some(TOKEN.into()),
+        relay_token: relay_token.map(str::to_string),
         max_item_bytes: 4096,
         history_len: 10,
         ttl: Duration::from_secs(3600),
@@ -44,16 +52,20 @@ async fn start() -> Result<Server> {
         blob_stall: Duration::from_secs(10),
     };
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("admin.key"), ADMIN.0)?;
+    if !dir.join("admin.key").exists() {
+        std::fs::write(dir.join("admin.key"), ADMIN.0)?;
+    }
     let running = clipwire_server::start_with(&config, &Guards::default()).await?;
     tokio::time::timeout(T, running.endpoint().online())
         .await
         .context("сервер не подключился к своему relay")?;
     let port = running.relay_addr().context("нет адреса relay")?.port();
+    let token = running.info.relay_token.clone();
     Ok(Server {
         running,
         relay: format!("http://localhost:{port}"),
         dir,
+        token,
     })
 }
 
@@ -69,7 +81,7 @@ impl Client {
         let url: RelayUrl = s.relay.parse()?;
         let ep = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(
-                RelayMap::from_iter([url]).with_auth_token(TOKEN.to_string()),
+                RelayMap::from_iter([url]).with_auth_token(s.token.clone()),
             ))
             .bind()
             .await?;
@@ -424,4 +436,155 @@ async fn needs_admin_and_old_clients_keep_working() -> Result<()> {
     }
     assert_eq!(admin.invites().await?[0].used_ms, None);
     Ok(())
+}
+
+/// `JoinWithInvite` в существующую группу с мусорным секретом не входит,
+/// даже с верным секретом группы: с кодом пускают только повтор создания.
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_into_existing_group_needs_its_own_code() -> Result<()> {
+    let s = start().await?;
+    let key = GroupKey::generate()?;
+    let mut owner = Client::connect(&s, ALPN_11).await?;
+    owner.join_with(&as_admin(&key)).await?;
+    let mut admin = Client::admin(&s).await?;
+    let (code, _) = admin.issue("", 1).await?;
+    let mut fake = GroupInviteCode::decode(&code)?;
+    fake.secret.0 = [7; 32];
+
+    let mut c = Client::connect(&s, ALPN_11).await?;
+    assert_eq!(
+        c.refused(&with_invite(&key, &fake.encode())?).await?,
+        ServerMsg::AdminFailed(AdminFail::InviteUnknown)
+    );
+    // Настоящий неиспользованный код в чужую существующую группу — тоже нет,
+    // и код не тратится.
+    let mut c = Client::connect(&s, ALPN_11).await?;
+    assert_eq!(
+        c.refused(&with_invite(&key, &code)?).await?,
+        ServerMsg::AdminFailed(AdminFail::InviteUnknown)
+    );
+    assert_eq!(admin.invites().await?[0].used_ms, None);
+    Ok(())
+}
+
+/// После смены токена relay повтор входа с кодом создания группы не
+/// пускает с того же эндпоинта (связь с relay ещё жива), как и
+/// `JoinWithToken` со старым токеном. Выпущенные коды отзываются.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_token_rotation_cuts_invite_retries() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("clipwire-invites-e2e-{}", uuid::Uuid::now_v7()));
+    let s = start_on(dir, None).await?;
+    let mut admin = Client::admin(&s).await?;
+    let (code, id) = admin.issue("", 1).await?;
+    let (_, unused) = admin.issue("", 1).await?;
+    let key = GroupKey::generate()?;
+    let mut friend = Client::connect(&s, ALPN_11).await?;
+    friend.join_with(&with_invite(&key, &code)?).await?;
+    // До смены повтор пускает.
+    let mut again = Client::connect_on(friend.ep.clone(), &s, ALPN_11).await?;
+    again.join_with(&with_invite(&key, &code)?).await?;
+
+    match admin.ask(&ClientMsg::RotateRelayToken).await? {
+        ServerMsg::RelayTokenRotated { .. } => {}
+        other => anyhow::bail!("ждали RelayTokenRotated, пришло {other:?}"),
+    }
+    let mut after = Client::connect_on(friend.ep.clone(), &s, ALPN_11).await?;
+    assert_eq!(
+        after.refused(&with_invite(&key, &code)?).await?,
+        ServerMsg::AdminFailed(AdminFail::InviteRevoked)
+    );
+    let old = s.token.clone();
+    let mut tok = Client::connect_on(friend.ep.clone(), &s, ALPN_11).await?;
+    match tok
+        .refused(&ClientMsg::JoinWithToken {
+            group_id: key.group_id(),
+            join_secret: key.join_secret(),
+            token: old,
+        })
+        .await?
+    {
+        ServerMsg::Error(_) => {}
+        other => anyhow::bail!("ждали Error, пришло {other:?}"),
+    }
+    drop((admin, friend, again, after, tok));
+
+    // Список с новым токеном: неиспользованный код отозван, использованный
+    // остался использованным.
+    let s = Server {
+        token: current_token(&s),
+        ..s
+    };
+    let mut admin = Client::admin(&s).await?;
+    let list = admin.invites().await?;
+    let u = list.iter().find(|i| i.id == unused).context("нет кода")?;
+    assert!(u.revoked_ms.is_some(), "{u:?}");
+    let used = list.iter().find(|i| i.id == id).context("нет кода")?;
+    assert!(
+        used.used_ms.is_some() && used.revoked_ms.is_none(),
+        "{used:?}"
+    );
+    Ok(())
+}
+
+/// Токен relay из файла сервера после смены.
+fn current_token(s: &Server) -> String {
+    std::fs::read_to_string(s.dir.join("relay.token"))
+        .map(|t| t.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Смена ключа администратора отзывает все действующие коды.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_key_rotation_revokes_invites() -> Result<()> {
+    let s = start().await?;
+    let mut admin = Client::admin(&s).await?;
+    let (code, id) = admin.issue("", 1).await?;
+    match admin.ask(&ClientMsg::RotateAdminKey).await? {
+        ServerMsg::AdminKeyRotated { server_code } => {
+            let new = clipwire_core::AdminServerInfo::decode(server_code.as_str())?;
+            assert_ne!(new.admin_key, ADMIN);
+            // Права старого соединения пропали: список — новым ключом.
+            let mut c = Client::connect(&s, ALPN_11).await?;
+            assert_eq!(
+                c.ask(&ClientMsg::AdminAuth { key: new.admin_key }).await?,
+                ServerMsg::AdminOk
+            );
+            let list = c.invites().await?;
+            let r = list.iter().find(|i| i.id == id).context("нет кода")?;
+            assert!(r.revoked_ms.is_some(), "{r:?}");
+        }
+        other => anyhow::bail!("ждали AdminKeyRotated, пришло {other:?}"),
+    }
+    let mut c = Client::connect(&s, ALPN_11).await?;
+    assert_eq!(
+        c.refused(&with_invite(&GroupKey::generate()?, &code)?)
+            .await?,
+        ServerMsg::AdminFailed(AdminFail::InviteRevoked)
+    );
+    Ok(())
+}
+
+/// Токен relay сменили мимо клиента (другая переменная окружения и
+/// перезапуск): коды со старым токеном отозваны и группу не создают.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_token_changed_outside_client_revokes_codes() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("clipwire-invites-e2e-{}", uuid::Uuid::now_v7()));
+    let s = start_on(dir.clone(), Some(TOKEN)).await?;
+    let mut admin = Client::admin(&s).await?;
+    let (code, id) = admin.issue("", 1).await?;
+    drop(admin);
+    s.running.shutdown().await?;
+
+    let s = start_on(dir, Some("another-token")).await?;
+    let mut admin = Client::admin(&s).await?;
+    let list = admin.invites().await?;
+    let r = list.iter().find(|i| i.id == id).context("нет кода")?;
+    assert!(r.revoked_ms.is_some(), "{r:?}");
+    let mut c = Client::connect(&s, ALPN_11).await?;
+    assert_eq!(
+        c.refused(&with_invite(&GroupKey::generate()?, &code)?)
+            .await?,
+        ServerMsg::AdminFailed(AdminFail::InviteRevoked)
+    );
+    s.running.shutdown().await
 }

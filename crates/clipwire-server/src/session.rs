@@ -332,8 +332,12 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
             bail!("неверный ключ администратора");
         }
         // Код проверяет хранилище в транзакции создания группы: только так
-        // два входа с одним кодом не создадут две группы.
-        Credential::Invite(secret) => Create::Invite(secret.digest()),
+        // два входа с одним кодом не создадут две группы. Отпечаток токена —
+        // чтобы код, выпущенный при другом токене relay, не действовал.
+        Credential::Invite(secret) => Create::Invite(crate::store::InviteCheck {
+            hash: secret.digest(),
+            token_fp: shared.admin.token_fingerprint(),
+        }),
     };
 
     let limits = shared.limits();

@@ -71,6 +71,19 @@ impl GroupInviteSecret {
     }
 }
 
+/// Отпечаток токена relay: SHA-256 от строки с меткой назначения. Сервер
+/// запоминает его у каждого кода создания группы при выпуске и сверяет при
+/// входе: код, выпущенный при другом токене (сменили из клиента, в
+/// `CLIPWIRE_RELAY_TOKEN` или в файле с перезапуском), считается отозванным.
+/// Сам токен в базу не попадает.
+pub fn relay_token_fingerprint(token: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"clipwire relay token v1\0");
+    h.update(token.as_bytes());
+    h.finalize().into()
+}
+
 /// Наибольшая длина подписи приглашения, символов. Длиннее сервер обрезает.
 pub const MAX_INVITE_LABEL: usize = 80;
 /// Срок действия приглашения по умолчанию, часов (7 дней).
@@ -434,6 +447,14 @@ mod tests {
         assert_eq!(a.digest(), a.clone().digest());
         assert_ne!(a.digest(), b.digest());
         assert_ne!(a.digest(), a.0);
+    }
+
+    #[test]
+    fn relay_token_fingerprint_differs_per_token() {
+        let a = relay_token_fingerprint("token-a");
+        assert_eq!(a, relay_token_fingerprint("token-a"));
+        assert_ne!(a, relay_token_fingerprint("token-b"));
+        assert_ne!(a, relay_token_fingerprint(""));
     }
 
     #[test]
