@@ -1,7 +1,9 @@
 //! Устройства группы и смена ключа (`docs/devices.md`): команды для раздела
-//! «Синхронизация» и обработка `Rekeyed` / `Excluded` от движка.
-//! Исключённое устройство не стирает ключ: оно помечается
+//! «Синхронизация» и обработка `Rekeyed` / `RekeyOffered` / `Excluded` от
+//! движка. Исключённое устройство не стирает ключ: оно помечается
 //! (`devices::mark_excluded`), и человек выбирает, выйти или попробовать снова.
+//! Новый ключ от другого устройства сам не принимается: он ждёт на диске
+//! (`devices::save_offer`), пока человек не ответит.
 
 use clipwire_agent::devices::{self, Controller, DeviceView, RekeyNotice};
 use clipwire_agent::i18n::{tr, trf};
@@ -30,9 +32,18 @@ pub struct DeviceDto {
     pub online: bool,
     /// Последний вход в группу (мс Unix), 0 — неизвестно.
     pub last_seen_ms: i64,
+    /// Когда это устройство впервые увидело карточку (мс Unix, по своим
+    /// часам и записям, не со слов сервера); 0 — давно. У карточки, которой
+    /// в записях ещё нет, — «сейчас».
+    pub first_seen_ms: i64,
 }
 
-fn to_dto(v: &DeviceView, me: DeviceId) -> DeviceDto {
+fn to_dto(
+    v: &DeviceView,
+    me: DeviceId,
+    seen: &std::collections::HashMap<DeviceId, i64>,
+    now_ms: i64,
+) -> DeviceDto {
     DeviceDto {
         id: data_encoding::HEXLOWER.encode(&v.device.0),
         fingerprint: devices::fingerprint(v.device),
@@ -43,7 +54,27 @@ fn to_dto(v: &DeviceView, me: DeviceId) -> DeviceDto {
         // Это устройство на связи, раз список пришёл.
         online: v.online || v.device == me,
         last_seen_ms: v.last_seen_ms,
+        first_seen_ms: first_seen_of(v, me, seen, now_ms),
     }
+}
+
+/// Когда устройство впервые увидели здесь. Своё и устройство без карточки —
+/// 0: первое не новость, второе ключ не получит.
+fn first_seen_of(
+    v: &DeviceView,
+    me: DeviceId,
+    seen: &std::collections::HashMap<DeviceId, i64>,
+    now_ms: i64,
+) -> i64 {
+    if v.device == me || v.card.is_none() {
+        return 0;
+    }
+    seen.get(&v.device).copied().unwrap_or(now_ms)
+}
+
+/// Список id из интерфейса (подтверждённые получатели нового ключа).
+fn parse_devices(ids: &[String]) -> CmdResult<Vec<DeviceId>> {
+    ids.iter().map(|id| parse_device(id)).collect()
 }
 
 pub(crate) fn parse_device(id: &str) -> CmdResult<DeviceId> {
@@ -149,12 +180,10 @@ pub async fn stats_overview(app: AppHandle) -> StatsDto {
 pub async fn devices_list(app: AppHandle) -> CmdResult<Vec<DeviceDto>> {
     let ctl = controller(&app)?;
     let me = ctl.device();
-    let mut list: Vec<DeviceDto> = ctl
-        .list_devices()
-        .await?
-        .iter()
-        .map(|v| to_dto(v, me))
-        .collect();
+    let views = ctl.list_devices().await?;
+    let seen = devices::first_seen(&app.state::<AppState>().paths, ctl.group());
+    let now = clipwire_agent::history::now_ms();
+    let mut list: Vec<DeviceDto> = views.iter().map(|v| to_dto(v, me, &seen, now)).collect();
     list.sort_by(|a, b| {
         b.me.cmp(&a.me)
             .then_with(|| a.name.is_none().cmp(&b.name.is_none()))
@@ -173,22 +202,41 @@ pub struct RekeyDto {
     pub skipped: Vec<String>,
 }
 
-/// Удалить устройство из группы: ключ группы меняется без него.
+/// Удалить устройство из группы: ключ группы меняется без него. `confirmed`
+/// — id получателей нового ключа, которых человек видел в диалоге: если к
+/// моменту смены в группе есть кто-то ещё, движок смену отменит.
+/// `also_remove` — получатели, с которых человек снял галочку: они
+/// исключаются вместе с `device_id`.
 #[tauri::command]
-pub async fn device_remove(app: AppHandle, device_id: String) -> CmdResult<RekeyDto> {
-    let id = parse_device(&device_id)?;
-    rekey(&app, Some(id)).await
+pub async fn device_remove(
+    app: AppHandle,
+    device_id: String,
+    confirmed: Vec<String>,
+    also_remove: Vec<String>,
+) -> CmdResult<RekeyDto> {
+    let mut remove = vec![parse_device(&device_id)?];
+    remove.extend(parse_devices(&also_remove)?);
+    rekey(&app, remove, parse_devices(&confirmed)?).await
 }
 
-/// Сменить ключ группы, никого не удаляя.
+/// Сменить ключ группы. `confirmed` — как в `device_remove`, `remove` —
+/// получатели, с которых человек снял галочку (обычно пусто).
 #[tauri::command]
-pub async fn group_rekey(app: AppHandle) -> CmdResult<RekeyDto> {
-    rekey(&app, None).await
+pub async fn group_rekey(
+    app: AppHandle,
+    confirmed: Vec<String>,
+    remove: Vec<String>,
+) -> CmdResult<RekeyDto> {
+    rekey(&app, parse_devices(&remove)?, parse_devices(&confirmed)?).await
 }
 
-async fn rekey(app: &AppHandle, remove: Option<DeviceId>) -> CmdResult<RekeyDto> {
+async fn rekey(
+    app: &AppHandle,
+    remove: Vec<DeviceId>,
+    confirmed: Vec<DeviceId>,
+) -> CmdResult<RekeyDto> {
     let ctl = controller(app)?;
-    let done = ctl.rekey(remove).await?;
+    let done = ctl.rekey(remove, confirmed).await?;
     // Движок старой группы уже не подключается: сохранить ключ и запустить
     // новый. Если сохранить не вышло, при следующем запуске устройство войдёт
     // в старую группу и получит свой пакет нового ключа.
@@ -266,6 +314,10 @@ pub struct GroupNotices {
     pub rekey_failed: Option<String>,
     /// Сервер исключил устройство (`clipwire://group-excluded`).
     pub excluded: bool,
+    /// Другое устройство сменило ключ, нужен ответ человека
+    /// (`clipwire://group-rekey-offered`). Сам вопрос лежит на диске
+    /// (`group_rekey_offer`), здесь только повод открыть «Синхронизацию».
+    pub offered: bool,
 }
 
 impl GroupNotices {
@@ -281,6 +333,10 @@ impl GroupNotices {
 
     pub fn excluded(&mut self) {
         self.excluded = true;
+    }
+
+    pub fn offered(&mut self) {
+        self.offered = true;
     }
 
     pub fn take(&mut self) -> Self {
@@ -318,24 +374,135 @@ fn emit_rekeyed(app: &AppHandle, by_me: bool, by: &str, result: Option<&RekeyDto
     let _ = app.emit("clipwire://group-rekeyed", e);
 }
 
-/// Ключ группы сменили: сохранить новый и перезапустить. Если ключ сменило
-/// это устройство, а ответ сервера потерялся, интерфейс получает тот же
-/// успех, что и при обычной смене: новый код приглашения.
+/// Ключ группы сменило это устройство, а ответ сервера потерялся: сохранить
+/// новый ключ и перезапустить. Интерфейс получает тот же успех, что и при
+/// обычной смене: новый код приглашения. Ключ от другого устройства сюда не
+/// попадает (`on_rekey_offered`); если всё же попал, он ждёт ответа человека.
 pub fn on_rekeyed(app: &AppHandle, n: RekeyNotice) {
+    if !n.by_me {
+        return on_rekey_offered(app, n);
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         match switch_to(&app, n.old, n.key).await {
-            Ok(invite) if n.by_me => {
+            Ok(invite) => {
                 let dto = RekeyDto {
                     invite,
                     skipped: n.skipped.into_iter().map(devices::fingerprint).collect(),
                 };
                 emit_rekeyed(&app, true, "", Some(&dto));
             }
-            Ok(_) => emit_rekeyed(&app, false, &n.initiator_name, None),
             Err(e) => tracing::error!("новый ключ группы не принят: {e}"),
         }
     });
+}
+
+/// Смена ключа, которая ждёт ответа, для интерфейса.
+#[derive(Debug, Clone, Serialize)]
+pub struct OfferDto {
+    /// Имя, ОС и отпечаток устройства, сменившего ключ (карточка проверена).
+    pub name: String,
+    pub os: String,
+    pub fingerprint: String,
+    /// Когда новый ключ пришёл на это устройство, мс Unix.
+    pub received_ms: i64,
+}
+
+fn offer_dto(o: &devices::RekeyOffer) -> OfferDto {
+    OfferDto {
+        name: o.initiator_name.clone(),
+        os: o.initiator_os.clone(),
+        fingerprint: devices::fingerprint(o.initiator),
+        received_ms: o.received_ms,
+    }
+}
+
+fn pending_offer(app: &AppHandle) -> Option<devices::RekeyOffer> {
+    let state = app.state::<AppState>();
+    let group = state.paths.load().ok()??.invite.group_key.group_id();
+    devices::load_offer(&state.paths, group)
+}
+
+/// Ключ группы сменило другое устройство. Новый ключ сам не принимается:
+/// пакет мог собрать исключённый участник вместе с сервером, и буфер ушёл
+/// бы к нему. Предложение сохраняется на диске, синхронизация
+/// останавливается, человек отвечает в «Синхронизации»: «Перейти»
+/// (`group_rekey_accept`) или «Это не я» (`group_rekey_decline`).
+pub fn on_rekey_offered(app: &AppHandle, n: RekeyNotice) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        match devices::save_offer(&state.paths, &n, clipwire_agent::history::now_ms()) {
+            Ok(true) => {}
+            // Устройство уже в другой группе: предложение не к нему.
+            Ok(false) => return,
+            Err(e) => {
+                // Вопрос не сохранился: движок всё равно стоит, а после
+                // перезапуска пакет придёт от сервера ещё раз.
+                tracing::error!("смена ключа не запомнилась: {e:#}");
+                return;
+            }
+        }
+        crate::stop_service(&app).await;
+        if let Err(e) = crate::start_service(&app) {
+            tracing::error!("локальный режим не запустился: {e:#}");
+        }
+        crate::publish_status(&app);
+        notices(&app).offered();
+        let _ = app.emit("clipwire://group-rekey-offered", ());
+        crate::updates::notify(
+            &app,
+            &trf(
+                "Устройство «{name}» сменило ключ группы. Синхронизация остановлена: подтвердите в настройках Clipwire",
+                &[("name", &n.initiator_name)],
+            ),
+        );
+    });
+}
+
+/// Смена ключа, которая ждёт ответа человека; `None` — такой нет.
+#[tauri::command]
+pub fn group_rekey_offer(app: AppHandle) -> Option<OfferDto> {
+    pending_offer(&app).as_ref().map(offer_dto)
+}
+
+/// «Перейти»: принять новый ключ и запустить синхронизацию с ним.
+#[tauri::command]
+pub async fn group_rekey_accept(app: AppHandle) -> CmdResult<()> {
+    let offer = pending_offer(&app).ok_or_else(|| tr("Ключ группы уже сменён").to_string())?;
+    // Сервис сейчас локальный: остановить до записи ключа, чтобы он не
+    // держал файлы старой группы.
+    crate::stop_service(&app).await;
+    let accepted = devices::accept_offer(&app.state::<AppState>().paths);
+    let started = crate::start_service(&app);
+    crate::publish_status(&app);
+    accepted.map_err(|e| {
+        trf(
+            "Ключ сменён, но не сохранился: {e}",
+            &[("e", &format!("{e:#}"))],
+        )
+    })?;
+    started.map_err(|e| {
+        trf(
+            "Ключ сменён, но синхронизация не перезапустилась: {e}",
+            &[("e", &format!("{e:#}"))],
+        )
+    })?;
+    emit_rekeyed(&app, false, &offer.initiator_name, None);
+    Ok(())
+}
+
+/// «Это не я»: новый ключ выбросить, устройство пометить исключённым. Дальше
+/// как после `Excluded`: выйти из группы или попробовать снова.
+#[tauri::command]
+pub async fn group_rekey_decline(app: AppHandle) -> CmdResult<()> {
+    let declined = devices::decline_offer(&app.state::<AppState>().paths);
+    crate::stop_service(&app).await;
+    let started = crate::start_service(&app);
+    crate::publish_status(&app);
+    declined.map_err(|e| format!("{e:#}"))?;
+    started.map_err(|e| format!("{e:#}"))?;
+    Ok(())
 }
 
 /// Сервер сообщил, что устройство исключено из группы (`deleted` — группу
@@ -404,12 +571,43 @@ mod tests {
             last_seen_ms: 7,
             online: false,
         };
-        let d = to_dto(&v, me);
+        let seen = std::collections::HashMap::new();
+        let d = to_dto(&v, me, &seen, 99);
         assert!(!d.known && !d.me && !d.online);
         assert_eq!(d.name, None);
         assert_eq!(d.fingerprint, "0202020202");
-        let mine = to_dto(&DeviceView { device: me, ..v }, me);
+        assert_eq!(d.first_seen_ms, 0, "без карточки ключ не получит");
+        let mine = to_dto(&DeviceView { device: me, ..v }, me, &seen, 99);
         assert!(mine.me && mine.online);
+    }
+
+    /// Время первого появления берётся из своих записей; устройство с
+    /// карточкой, которого в них ещё нет, появилось «сейчас».
+    #[test]
+    fn first_seen_comes_from_own_records() {
+        let me = DeviceId([1; 32]);
+        let dk = [2u8; 32];
+        let key = GroupKey([7; 32]);
+        let other = clipwire_core::device::device_id(&dk);
+        let views = devices::open_entries(
+            &key,
+            vec![clipwire_core::proto::DeviceEntry {
+                device: other,
+                card: devices::sealed_card(&key, &dk, "Ноутбук", 1).unwrap(),
+                last_seen_ms: 5,
+                online: true,
+            }],
+        );
+        let mut seen = std::collections::HashMap::new();
+        assert_eq!(to_dto(&views[0], me, &seen, 99).first_seen_ms, 99);
+        seen.insert(other, 40);
+        assert_eq!(to_dto(&views[0], me, &seen, 99).first_seen_ms, 40);
+        // Своё устройство новым не бывает.
+        assert_eq!(to_dto(&views[0], other, &seen, 99).first_seen_ms, 0);
+
+        let ids = vec![data_encoding::HEXLOWER.encode(&other.0)];
+        assert_eq!(parse_devices(&ids).unwrap(), vec![other]);
+        assert!(parse_devices(&["abc".into()]).is_err());
     }
 
     /// События группы копятся до того, как окно настроек их заберёт, и

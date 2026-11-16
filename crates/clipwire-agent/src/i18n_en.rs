@@ -503,6 +503,22 @@ pub static EN: &[(&str, &str)] = &[
     ),
     ("ключ группы сменён", "the group key was rotated"),
     (
+        "ключ группы сменён, нужно подтверждение",
+        "the group key was rotated, confirmation needed",
+    ),
+    (
+        "В группе появилось новое устройство. Проверьте список получателей и подтвердите смену ключа заново",
+        "A new device has joined the group. Check the list of recipients and confirm the key rotation again",
+    ),
+    (
+        "Ключ группы сменён: подтвердите в настройках",
+        "Group key rotated: confirm in settings",
+    ),
+    (
+        "Устройство «{name}» сменило ключ группы. Синхронизация остановлена: подтвердите в настройках Clipwire",
+        "“{name}” rotated the group key. Sync is paused: confirm in Clipwire settings",
+    ),
+    (
         "устройство исключили из группы",
         "the device was removed from the group",
     ),

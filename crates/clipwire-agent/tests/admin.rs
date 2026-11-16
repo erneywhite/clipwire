@@ -312,7 +312,11 @@ async fn admin_rekeys_through_pending_group() -> Result<()> {
     let mut a = Agent::spawn(&info, &key, Some(ADMIN))?;
     a.status().await?.expect("на связи");
     let a_dev = a.ctl.device();
-    let done = a.ctl.rekey(None).await.map_err(anyhow::Error::msg)?;
+    let done = a
+        .ctl
+        .rekey(Vec::new(), Vec::new())
+        .await
+        .map_err(anyhow::Error::msg)?;
     drop(a);
     // Другое устройство с ключом администратора входит в новую группу: админ
     // у неё уже есть (перешёл из старой), и он не меняется.

@@ -106,6 +106,21 @@ const en: Record<string, string> = {
   'Подпись: Enter — сохранить, Esc — отмена': 'Note: Enter to save, Esc to cancel',
   'Подпись закреплённой записи': 'Note of the pinned item',
 
+  'в группе давно': 'in the group for a long time',
+  'появилось только что': 'first seen just now',
+  'появилось: {a}': 'first seen {a}',
+  'появилось: {a} назад': 'first seen {a} ago',
+  'Внимание: выделенные устройства появились в группе меньше суток назад. Если вы их не подключали, снимите с них галочку: новый ключ они не получат.':
+    'Warning: the highlighted devices joined the group less than a day ago. If you did not add them, untick them: they will not get the new key.',
+  'Внимание: в группе есть устройства с одинаковым именем. Сверьте отпечатки и снимите галочку с того, которое не ваше.':
+    'Warning: some devices in the group share a name. Compare the fingerprints and untick the one that is not yours.',
+  'Без галочки: {names}. Они тоже потеряют доступ к группе.': 'Unticked: {names}. They will lose access to the group too.',
+  'Устройство «{name}» ({os}, отпечаток {fp}) сменило ключ группы. Новый ключ пришёл сюда {when}. Перейти на него?':
+    '“{name}” ({os}, fingerprint {fp}) rotated the group key. The new key arrived here on {when}. Switch to it?',
+  'Пока вы не ответили, синхронизация стоит: скопированное в группу не уходит. Если ключ меняли вы, сверьте отпечаток с тем, что показывает то устройство в разделе «Устройства группы», и переходите.':
+    'Sync is paused until you answer: nothing you copy goes to the group. If you rotated the key yourself, compare the fingerprint with the one that device shows under “Group devices”, then switch.',
+  'Если вы ключ не меняли, не переходите. Новый ключ мог прислать тот, кого удалили из группы, и тогда всё скопированное уйдёт к нему.':
+    'If you did not rotate the key, do not switch. The new key may have come from someone who was removed from the group, and then everything you copy would go to them.',
   // hotkey.ts
   'Пробел': 'Space',
 }

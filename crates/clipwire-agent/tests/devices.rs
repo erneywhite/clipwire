@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clipwire_agent::devices::{Control, Controller, DeviceView, RekeyNotice};
-use clipwire_agent::state::{AgentState, random_key};
+use clipwire_agent::devices::{self, Control, Controller, DeviceView, RekeyNotice, Rekeyed};
+use clipwire_agent::state::{AgentState, Paths, random_key};
 use clipwire_agent::sync::{Engine, Event, Outgoing, Status};
 use clipwire_core::device::{DeviceCard, device_id};
 use clipwire_core::{Content, DeviceId, GroupKey, Invite, ServerInfo};
@@ -190,14 +190,60 @@ impl Agent {
     }
 
     /// Чем кончилась смена ключа для этого устройства: новый ключ с
-    /// инициатором или `None` (исключено).
+    /// инициатором или `None` (исключено). Ключ от другого устройства —
+    /// только предложение ([`Agent::rotated`]).
     async fn notice(&mut self) -> Result<Option<RekeyNotice>> {
+        Ok(match self.rotated().await? {
+            Rotated::Mine(n) | Rotated::Offered(n) => Some(n),
+            Rotated::Excluded => None,
+        })
+    }
+
+    /// Что движок сообщил о смене ключа.
+    async fn rotated(&mut self) -> Result<Rotated> {
         self.wait(|e| match e {
-            Event::Rekeyed(n) => Some(Some(n.clone())),
-            Event::Excluded { .. } => Some(None),
+            Event::Rekeyed(n) => Some(Rotated::Mine(n.clone())),
+            Event::RekeyOffered(n) => Some(Rotated::Offered(n.clone())),
+            Event::Excluded { .. } => Some(Rotated::Excluded),
             _ => None,
         })
         .await
+    }
+
+    /// Новый ключ от другого устройства, который ждёт решения человека.
+    async fn offered(&mut self) -> Result<RekeyNotice> {
+        match self.rotated().await? {
+            Rotated::Offered(n) => Ok(n),
+            other => bail!("{}: ждали предложение ключа, пришло {other:?}", self.name),
+        }
+    }
+
+    /// Сменить ключ, подтвердив получателей, которых устройство видит в
+    /// списке сейчас (как человек, открывший диалог и нажавший «Сменить»).
+    async fn rekey(&self, remove: Option<DeviceId>) -> Result<Rekeyed, String> {
+        let seen = self.ctl.list_devices().await?;
+        self.ctl
+            .rekey(
+                remove.into_iter().collect(),
+                seen.iter().map(|d| d.device).collect(),
+            )
+            .await
+    }
+
+    /// Папка данных устройства со старым ключом группы на диске, как у
+    /// приложения: в ней ждёт предложенный ключ.
+    fn disk(&self, info: &ServerInfo, key: &GroupKey) -> Result<Paths> {
+        let paths = Paths {
+            dir: std::env::temp_dir().join(format!("clipwire-offer-test-{}", uuid::Uuid::now_v7())),
+        };
+        paths.save(&AgentState {
+            invite: Invite {
+                server: info.clone(),
+                group_key: key.clone(),
+            },
+            device_key: self.device_key,
+        })?;
+        Ok(paths)
     }
 
     /// Список устройств, когда в нём `n` устройств с карточками: карточки
@@ -217,6 +263,16 @@ impl Agent {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+}
+
+/// Что движок сообщил о смене ключа.
+#[derive(Debug)]
+enum Rotated {
+    /// Ключ сменило это устройство: принимается без вопросов.
+    Mine(RekeyNotice),
+    /// Ключ сменило другое устройство: ждёт решения человека.
+    Offered(RekeyNotice),
+    Excluded,
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -247,8 +303,9 @@ async fn cards_are_listed_with_names_and_online() -> Result<()> {
     server.shutdown().await
 }
 
-/// A удаляет C: B сам получает новый ключ и продолжает получать элементы
-/// от A, C исключено и больше ничего не получает.
+/// A удаляет C: B получает новый ключ (как предложение, которое человек
+/// подтверждает) и продолжает получать элементы от A, C исключено и больше
+/// ничего не получает.
 #[tokio::test(flavor = "multi_thread")]
 async fn removing_device_moves_others_to_new_key() -> Result<()> {
     let (server, info, key) = start_server().await?;
@@ -264,24 +321,23 @@ async fn removing_device_moves_others_to_new_key() -> Result<()> {
     }
 
     // Своё устройство так не удалить.
-    assert!(a.ctl.rekey(Some(a.id())).await.is_err());
+    assert!(a.rekey(Some(a.id())).await.is_err());
 
-    let done = a
-        .ctl
-        .rekey(Some(c.id()))
-        .await
-        .map_err(anyhow::Error::msg)?;
+    let done = a.rekey(Some(c.id())).await.map_err(anyhow::Error::msg)?;
     assert_eq!(done.old, key.group_id());
     assert!(done.skipped.is_empty());
     let k2 = done.key;
     assert_ne!(k2, key);
 
-    let n = b.notice().await?.context("B должен получить ключ")?;
+    // B был в сети во время смены: ключ пришёл в живом соединении, но и так
+    // это только предложение.
+    let n = b.offered().await?;
     assert_eq!(n.key, k2);
     assert_eq!(
         (n.initiator, n.initiator_name.as_str(), n.by_me),
         (a.id(), "A", false)
     );
+    assert_eq!(n.initiator_os, devices::os_name());
     assert_eq!(c.rotation().await?, None);
 
     a.restart(&info, &k2).await?;
@@ -302,7 +358,7 @@ async fn removing_device_moves_others_to_new_key() -> Result<()> {
     assert_eq!(b.incoming_text().await?, "ещё одно");
     assert!(c.no_incoming(Duration::from_millis(500)).await);
     // Повторная смена в старой группе невозможна: C туда уже не войти.
-    assert!(c.ctl.rekey(None).await.is_err());
+    assert!(c.ctl.rekey(Vec::new(), Vec::new()).await.is_err());
 
     for x in [&mut a, &mut b, &mut c] {
         x.stop().await?;
@@ -311,9 +367,10 @@ async fn removing_device_moves_others_to_new_key() -> Result<()> {
 }
 
 /// B был выключен во время смены ключа: при входе в старую группу он
-/// получает свой пакет.
+/// получает свой пакет, но сам на новый ключ не переходит: ждёт ответа
+/// человека. После «Перейти» ключ на диске новый, и B синхронизируется.
 #[tokio::test(flavor = "multi_thread")]
-async fn offline_device_gets_its_key_later() -> Result<()> {
+async fn offline_device_waits_for_confirmation_then_moves() -> Result<()> {
     let (server, info, key) = start_server().await?;
     let mut a = Agent::new("A", &info, &key)?;
     let mut b = Agent::new("B", &info, &key)?;
@@ -326,16 +383,11 @@ async fn offline_device_gets_its_key_later() -> Result<()> {
     }
     b.stop().await?;
 
-    let k2 = a
-        .ctl
-        .rekey(Some(c.id()))
-        .await
-        .map_err(anyhow::Error::msg)?
-        .key;
+    let k2 = a.rekey(Some(c.id())).await.map_err(anyhow::Error::msg)?.key;
     assert_eq!(c.rotation().await?, None);
 
-    // Без сохранённых карточек B не знает, кто сменил ключ: не переходит, а
-    // считает себя исключённым. С карточками с диска — переходит.
+    // Без сохранённых карточек B не знает, кто сменил ключ: это исключение,
+    // спрашивать человека не о ком. С карточками с диска — предложение.
     let saved = std::mem::take(&mut b.known);
     assert!(saved.iter().any(|c| c.device == a.id()));
     b.restart(&info, &key).await?;
@@ -343,21 +395,53 @@ async fn offline_device_gets_its_key_later() -> Result<()> {
     b.stop().await?;
     b.known = saved;
     b.restart(&info, &key).await?;
-    assert_eq!(b.rotation().await?, Some(k2.clone()));
+    let n = b.offered().await?;
+    assert_eq!(
+        (n.key.clone(), n.initiator, n.by_me),
+        (k2.clone(), a.id(), false)
+    );
+    assert_eq!(n.initiator_name, "A");
 
+    // Приложение запоминает предложение на диске. Пока человек не ответил,
+    // ключ на диске старый, а движок никуда не подключается и ничего не
+    // отправляет: A в новой группе от B ничего не получает.
+    let paths = b.disk(&info, &key)?;
+    assert!(devices::save_offer(&paths, &n, 1_000)?);
+    let offer = devices::load_offer(&paths, key.group_id()).context("предложение на диске")?;
+    assert_eq!((offer.initiator, offer.received_ms), (a.id(), 1_000));
+    assert_eq!(paths.load()?.unwrap().invite.group_key, key);
     a.restart(&info, &k2).await?;
-    b.restart(&info, &k2).await?;
     a.online().await?;
+    b.copy("пароль, пока ждём ответа").await?;
+    assert!(a.no_incoming(Duration::from_millis(700)).await);
+    assert!(
+        b.ctl.list_devices().await.is_err(),
+        "движок ждёт и запросов не принимает"
+    );
+
+    // «Перейти»: новый ключ на диске, устройство входит в новую группу.
+    let accepted = devices::accept_offer(&paths)?.context("предложение принято")?;
+    assert_eq!(accepted.key, k2);
+    let on_disk = paths.load()?.unwrap().invite.group_key;
+    assert_eq!(on_disk, k2);
+    assert!(devices::load_offer(&paths, key.group_id()).is_none());
+    b.restart(&info, &on_disk).await?;
     b.online().await?;
     b.copy("B вернулся").await?;
     assert_eq!(a.incoming_text().await?, "B вернулся");
+    let _ = std::fs::remove_dir_all(&paths.dir);
 
     // A, у которого ответ сервера якобы потерялся, при входе в старую группу
-    // получает свой пакет (он кладёт его и себе) и видит, что сменил сам.
+    // получает свой пакет (он кладёт его и себе): это его смена, и ключ
+    // принимается без вопросов.
     a.restart(&info, &key).await?;
-    let n = a.notice().await?.context("A должен получить свой пакет")?;
-    assert_eq!(n.key, k2);
-    assert!(n.by_me);
+    match a.rotated().await? {
+        Rotated::Mine(n) => {
+            assert_eq!(n.key, k2);
+            assert!(n.by_me);
+        }
+        other => bail!("свой пакет должен приниматься сам: {other:?}"),
+    }
 
     for x in [&mut a, &mut b, &mut c] {
         x.stop().await?;
@@ -378,9 +462,9 @@ async fn rekey_without_removal_keeps_everyone() -> Result<()> {
     for x in [&a, &b, &c] {
         x.devices_with_cards(3).await?;
     }
-    let k2 = b.ctl.rekey(None).await.map_err(anyhow::Error::msg)?.key;
-    assert_eq!(a.rotation().await?, Some(k2.clone()));
-    assert_eq!(c.rotation().await?, Some(k2.clone()));
+    let k2 = b.rekey(None).await.map_err(anyhow::Error::msg)?.key;
+    assert_eq!(a.offered().await?.key, k2);
+    assert_eq!(c.offered().await?.key, k2);
     for x in [&mut a, &mut b, &mut c] {
         x.restart(&info, &k2).await?;
         x.online().await?;
@@ -396,9 +480,8 @@ async fn rekey_without_removal_keeps_everyone() -> Result<()> {
 }
 
 /// C вошёл в группу после последнего списка устройств у B и сразу сменил
-/// ключ: B не видел его карточку и не переходит на новый ключ, а считает
-/// себя исключённым. A, который карточку C видел, переходит и знает, кто
-/// сменил ключ.
+/// ключ: B не видел его карточку и считает себя исключённым. A, который
+/// карточку C видел, получает предложение и знает, кто сменил ключ.
 #[tokio::test(flavor = "multi_thread")]
 async fn rekey_by_unknown_device_counts_as_exclusion() -> Result<()> {
     let (server, info, key) = start_server().await?;
@@ -412,13 +495,138 @@ async fn rekey_by_unknown_device_counts_as_exclusion() -> Result<()> {
     c.devices_with_cards(3).await?;
     a.devices_with_cards(3).await?;
 
-    let k2 = c.ctl.rekey(None).await.map_err(anyhow::Error::msg)?.key;
-    let n = a.notice().await?.context("A должен получить ключ")?;
+    let k2 = c.rekey(None).await.map_err(anyhow::Error::msg)?.key;
+    let n = a.offered().await?;
     assert_eq!((n.key, n.initiator_name.as_str()), (k2, "C"));
     assert!(b.notice().await?.is_none(), "B не знает C");
     for x in [&mut a, &mut b, &mut c] {
         x.stop().await?;
     }
+    server.shutdown().await
+}
+
+/// Человек посмотрел список получателей и подтвердил его, а к моменту смены
+/// в группе появилось ещё одно устройство с настоящей карточкой (исключаемое
+/// вошло вторым идентификатором под чужим именем, или его подмешал сервер).
+/// Смена отменяется: новый ключ не уходит никому, группа работает на старом.
+/// После нового подтверждения, где лишнее устройство тоже исключено, смена
+/// проходит без него.
+#[tokio::test(flavor = "multi_thread")]
+async fn device_added_after_confirmation_cancels_rekey() -> Result<()> {
+    let (server, info, key) = start_server().await?;
+    let mut a = Agent::new("A", &info, &key)?;
+    let mut b = Agent::new("B", &info, &key)?;
+    let mut c = Agent::new("C", &info, &key)?;
+    for x in [&mut a, &mut b, &mut c] {
+        x.online().await?;
+    }
+    for x in [&a, &b, &c] {
+        x.devices_with_cards(3).await?;
+    }
+    // Диалог открыт: человек видит A, B и удаляемое C.
+    let confirmed: Vec<DeviceId> = a
+        .ctl
+        .list_devices()
+        .await
+        .map_err(anyhow::Error::msg)?
+        .iter()
+        .map(|d| d.device)
+        .filter(|d| *d != c.id())
+        .collect();
+    assert_eq!(confirmed.len(), 2);
+
+    // Пока диалог открыт, в группу входит второе устройство под именем «B».
+    let mut e2 = Agent::new("B", &info, &key)?;
+    e2.online().await?;
+    a.devices_with_cards(4).await?;
+
+    let err = a
+        .ctl
+        .rekey(vec![c.id()], confirmed.clone())
+        .await
+        .expect_err("смена должна отмениться");
+    assert!(err.contains("новое устройство"), "{err}");
+
+    // Ключ не ушёл никому: старая группа жива, все на старом ключе.
+    a.copy("старый ключ ещё работает").await?;
+    for x in [&mut b, &mut c, &mut e2] {
+        assert_eq!(x.incoming_text().await?, "старый ключ ещё работает");
+    }
+    let list = a.devices_with_cards(4).await?;
+    assert!(list.iter().any(|d| d.device == e2.id()));
+    while let Ok(ev) = b.events.try_recv() {
+        assert!(
+            !matches!(
+                ev,
+                Event::Rekeyed(_) | Event::RekeyOffered(_) | Event::Excluded { .. }
+            ),
+            "B не должен был услышать о смене ключа: {ev:?}"
+        );
+    }
+
+    // С прежним подтверждением смена отменяется и второй раз. Человек открыл
+    // диалог заново, увидел незнакомое устройство и снял с него галочку:
+    // исключаются оба, новый ключ получают только A и B.
+    assert!(a.ctl.rekey(vec![c.id()], confirmed.clone()).await.is_err());
+    let done = a
+        .ctl
+        .rekey(vec![c.id(), e2.id()], confirmed)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(done.skipped.is_empty());
+    assert_eq!(b.offered().await?.key, done.key);
+    assert_eq!(c.rotation().await?, None);
+    assert_eq!(
+        e2.rotation().await?,
+        None,
+        "подмешанное устройство ключ не получило"
+    );
+
+    for x in [&mut a, &mut b, &mut c, &mut e2] {
+        x.stop().await?;
+    }
+    server.shutdown().await
+}
+
+/// «Это не я»: предложенный ключ выбрасывается, устройство помечено
+/// исключённым, ключ группы на диске прежний.
+#[tokio::test(flavor = "multi_thread")]
+async fn declined_rekey_leaves_device_excluded_on_old_key() -> Result<()> {
+    let (server, info, key) = start_server().await?;
+    let mut a = Agent::new("A", &info, &key)?;
+    let mut b = Agent::new("B", &info, &key)?;
+    a.online().await?;
+    b.online().await?;
+    for x in [&a, &b] {
+        x.devices_with_cards(2).await?;
+    }
+    b.stop().await?;
+    let k2 = a.rekey(None).await.map_err(anyhow::Error::msg)?.key;
+
+    b.restart(&info, &key).await?;
+    let n = b.offered().await?;
+    assert_eq!(n.key, k2);
+    let paths = b.disk(&info, &key)?;
+    assert!(devices::save_offer(&paths, &n, 1_000)?);
+
+    assert!(devices::decline_offer(&paths)?);
+    assert_eq!(paths.load()?.unwrap().invite.group_key, key, "ключ прежний");
+    assert!(devices::is_excluded(&paths, key.group_id()));
+    assert!(devices::load_offer(&paths, key.group_id()).is_none());
+    assert!(
+        devices::accept_offer(&paths)?.is_none(),
+        "принимать уже нечего"
+    );
+
+    // В новую группу B не попал: A там один и от B ничего не получает.
+    a.restart(&info, &k2).await?;
+    a.online().await?;
+    let list = a.devices_with_cards(1).await?;
+    assert!(list.iter().all(|d| d.device != b.id()));
+    let _ = std::fs::remove_dir_all(&paths.dir);
+
+    a.stop().await?;
+    b.stop().await?;
     server.shutdown().await
 }
 

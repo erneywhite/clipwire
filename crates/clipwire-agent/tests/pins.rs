@@ -211,6 +211,14 @@ impl Dev {
         })
     }
 
+    /// Сменить ключ группы, подтвердив всех, кто сейчас в списке устройств.
+    async fn rekey_all(&self) -> Result<clipwire_agent::devices::Rekeyed, String> {
+        let ids = self.ctl.list_devices().await?;
+        self.ctl
+            .rekey(Vec::new(), ids.iter().map(|d| d.device).collect())
+            .await
+    }
+
     fn start(&mut self) {
         self.pins = Pins::open(&self.dir, self.key.group_id());
         let state = AgentState {
@@ -608,10 +616,10 @@ async fn pins_move_to_new_key() -> Result<()> {
     .await?;
     let old_ids: Vec<_> = a.pins.read(|b| b.live(&h));
 
-    let k2 = a.ctl.rekey(None).await.map_err(anyhow::Error::msg)?.key;
+    let k2 = a.rekey_all().await.map_err(anyhow::Error::msg)?.key;
     let n = b
         .wait(|e| match e {
-            Event::Rekeyed(n) => Some(n.key.clone()),
+            Event::RekeyOffered(n) => Some(n.key.clone()),
             _ => None,
         })
         .await?;
@@ -927,14 +935,14 @@ async fn offline_device_after_rekey_does_not_resurrect_pins() -> Result<()> {
     a.pins.unpin(gone);
     a.synced().await?;
     let only_b = b.mem.add("только в истории B", true, "");
-    let k2 = a.ctl.rekey(None).await.map_err(anyhow::Error::msg)?.key;
+    let k2 = a.rekey_all().await.map_err(anyhow::Error::msg)?.key;
     a.stop().await?;
 
     // B входит в старую группу, получает новый ключ и переходит.
     b.start();
     let n = b
         .wait(|e| match e {
-            Event::Rekeyed(n) => Some(n.key.clone()),
+            Event::RekeyOffered(n) => Some(n.key.clone()),
             _ => None,
         })
         .await?;
@@ -996,7 +1004,7 @@ async fn rekey_reports_pins_refused_by_quota() -> Result<()> {
     a.start();
     a.online().await?;
     a.synced().await?;
-    a.ctl.rekey(None).await.map_err(anyhow::Error::msg)?;
+    a.rekey_all().await.map_err(anyhow::Error::msg)?;
     let why = a
         .wait(|e| match e {
             Event::PinFailed(w) => Some(w.clone()),
