@@ -160,6 +160,16 @@ impl PinSource for HistorySource {
     fn upload_limit_mb(&self) -> u64 {
         self.limit_mb.load(Ordering::Relaxed)
     }
+
+    fn file_item(&self, hash: &[u8; 32]) -> Option<(Item, bool)> {
+        let e = self.lock().files_entry(hash)?;
+        let local = e.local;
+        let mut item = item_of(e);
+        if local {
+            item.origin = self.device;
+        }
+        Some((item, local))
+    }
 }
 
 /// Запись истории как элемент группы (содержимое закрепа): без подписи,
@@ -177,13 +187,20 @@ fn item_of(e: Entry) -> Item {
     }
 }
 
-/// Элемент из содержимого закрепа как запись истории.
-fn entry_of_pin(item: Item) -> Entry {
+/// Элемент из содержимого закрепа как запись истории: всегда чужая. `origin`
+/// содержимого пишет тот, кто закрепил, и ему не верим: запись с `origin`
+/// этого устройства (`me`) получает пустой `origin`, чтобы ничто не приняло
+/// её за свою.
+fn entry_of_pin(item: Item, me: DeviceId) -> Entry {
     let mut ext = item.ext;
     crate::history::strip_note(&mut ext);
     Entry {
         id: item.id,
-        origin: item.origin,
+        origin: if item.origin == me {
+            DeviceId([0; 32])
+        } else {
+            item.origin
+        },
         device_name: item.device_name,
         local: false,
         content: item.content,
@@ -638,7 +655,7 @@ impl Service {
                             let res = tokio::task::spawn_blocking({
                                 let history = history.clone();
                                 let book = pins_for_events.clone();
-                                move || apply_pin_event(&history, book.as_deref(), p)
+                                move || apply_pin_event(&history, book.as_deref(), p, device)
                             })
                             .await;
                             match res {
@@ -646,6 +663,28 @@ impl Service {
                                 Ok(Ok(false)) => {}
                                 Ok(Err(e)) => tracing::warn!("закреп не применился: {e:#}"),
                                 Err(e) => tracing::warn!("закреп не применился: {e}"),
+                            }
+                        }
+                        Event::PinFiles { hash, item, own } => {
+                            let res = tokio::task::spawn_blocking({
+                                let history = history.clone();
+                                let files_dir = crate::blobs::files_dir(&paths.dir);
+                                move || {
+                                    apply_pin_files(
+                                        &history,
+                                        &files_dir,
+                                        &hash,
+                                        &item,
+                                        own.as_deref(),
+                                    )
+                                }
+                            })
+                            .await;
+                            match res {
+                                Ok(Ok(true)) => on_event(UiEvent::PinsChanged),
+                                Ok(Ok(false)) => {}
+                                Ok(Err(e)) => tracing::warn!("файлы закрепа не записались: {e:#}"),
+                                Err(e) => tracing::warn!("файлы закрепа не записались: {e}"),
                             }
                         }
                         Event::PinFailed(why) => on_event(UiEvent::PinFailed(why)),
@@ -876,8 +915,9 @@ fn apply_pin_event(
     history: &Mutex<History>,
     pins: Option<&Pins>,
     p: crate::pins::PinApply,
+    me: DeviceId,
 ) -> Result<bool> {
-    let entry = p.item.map(entry_of_pin).map(|e| {
+    let entry = p.item.map(|i| entry_of_pin(i, me)).map(|e| {
         let thumb = make_thumb(&e);
         (e, thumb)
     });
@@ -886,6 +926,45 @@ fn apply_pin_event(
         return Ok(false);
     }
     h.apply_pin(&p.hash, p.pinned, &p.note, entry)
+}
+
+/// Файлы закреплённой записи переехали (`sync::Event::PinFiles`): новые
+/// `blob` и места — в историю. Своя запись меняется только по своей правке
+/// и только в файлах, которые устройство само залило (`own`): иначе чужое
+/// содержимое подсунуло бы ей `blob` и прямую передачу, и `local_p2p_file`
+/// отдал бы файл по чужому `blob`. Скачанная копия переезжает в каталог кэша
+/// нового `blob` тоже только по своей правке. `true` — запись поменялась.
+fn apply_pin_files(
+    history: &Mutex<History>,
+    files_dir: &Path,
+    hash: &[u8; 32],
+    item: &Item,
+    own: Option<&[usize]>,
+) -> Result<bool> {
+    let Content::Files(files) = &item.content else {
+        return Ok(false);
+    };
+    let places = crate::storage::external::places(&item.ext);
+    let moved = history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_pin_files(hash, files, &places, own)?;
+    if own.is_none() {
+        return Ok(!moved.is_empty());
+    }
+    for (old, new) in &moved {
+        let (Some(a), Some(b)) = (old.blob, new.blob) else {
+            continue;
+        };
+        let (from, to) = (files_dir.join(a.hex()), files_dir.join(b.hex()));
+        if from.is_dir()
+            && !to.exists()
+            && let Err(e) = std::fs::rename(&from, &to)
+        {
+            tracing::info!("скачанная копия файла закрепа не переехала: {e}");
+        }
+    }
+    Ok(!moved.is_empty())
 }
 
 /// Сведения элемента без подписи: подпись не ходит внутри элементов.
@@ -1147,11 +1226,11 @@ mod tests {
             note: String::new(),
             item: None,
         };
-        assert!(!apply_pin_event(&history, Some(&pins), unpin.clone()).unwrap());
+        assert!(!apply_pin_event(&history, Some(&pins), unpin.clone(), DeviceId([1; 32])).unwrap());
         assert!(history.lock().unwrap().row(id).unwrap().pinned);
         // Правка ушла — снятие применяется.
         pins.update(|b| b.outbox.clear());
-        assert!(apply_pin_event(&history, Some(&pins), unpin).unwrap());
+        assert!(apply_pin_event(&history, Some(&pins), unpin, DeviceId([1; 32])).unwrap());
         assert!(!history.lock().unwrap().row(id).unwrap().pinned);
     }
 

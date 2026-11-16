@@ -1,7 +1,18 @@
 //! Закрепы в движке: страницы `PinsSince`, рассылка `Pinned`, отправка своих
 //! правок с CAS по `rev`, содержимое через `PinContent`, первая выгрузка
-//! своих закрепов и перешифровка при смене ключа. Что решать, решает книга
-//! (`crate::pins::Book`), здесь — обмен с сервером и события для сервиса.
+//! своих закрепов, перешифровка при смене ключа и файлы закрепов. Что решать,
+//! решает книга (`crate::pins::Book`) и `crate::pin_files`, здесь — обмен с
+//! сервером и события для сервиса.
+//!
+//! Файлы закрепа заливаются после того, как сервер принял правку с их новыми
+//! `blob` (`PinSet::blobs`): тогда сервер уже считает их файлами закрепа и
+//! проверяет резерв по месту закрепов, а не по квоте файлов. Файл, который
+//! не зарезервировался (больше предела сервера, нет места), возвращается в
+//! содержимое прежним следующей правкой. Неполный закреп (см.
+//! `crate::pin_files`) чинит устройство с байтами файла: автор последней
+//! правки сразу, остальные после случайной паузы, перед починкой ещё раз
+//! спросив содержимое у сервера. Гонки разбирает CAS по `rev`: проигравший
+//! получает `PinRejected`, а лишние залитые им файлы уходят по сроку.
 //!
 //! Сообщения сервера о закрепах `handle_msg` не разбирает сам, а кладёт в
 //! очередь ([`PinSession::inbox`]): разбор идёт в [`Engine::pin_send`], уже
@@ -9,17 +20,21 @@
 //! уходят в `spawn_blocking`, не занимая поток движка.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clipwire_core::delete::DeleteNote;
 use clipwire_core::pin::PinState;
 use clipwire_core::proto::io::write_msg;
 use clipwire_core::proto::{ClientMsg, PinFail, PinRecord, ServerMsg};
-use clipwire_core::{BlobId, Content, GroupKey, Item, PinId};
+use clipwire_core::storage::{BlobPlace, BlobPlaces};
+use clipwire_core::{BlobId, Content, ExtList, FileRef, GroupKey, Item, PinId};
 use iroh::endpoint::Connection;
 
 use super::{Engine, Event, MAX_ITEM_BYTES};
+use crate::blobs::UploadJob;
 use crate::i18n::{tr, trf};
+use crate::pin_files::{self, Bytes};
 use crate::pins::{Desired, Edit, Op, PinApply, PinSource, PinWrite, Plan};
 
 /// Сколько раз подряд сервер может отказать правке одного хэша по `rev`,
@@ -32,8 +47,62 @@ pub(super) struct Inflight {
     w: PinWrite,
     /// Файлы содержимого (если содержимое ушло).
     blobs: Vec<BlobId>,
-    /// Своя правка из очереди; `None` — разбор дублей.
+    /// Своя правка из очереди; `None` — разбор дублей или починка закрепа.
     edit: Option<Edit>,
+    /// Ушедшее содержимое.
+    item: Option<Item>,
+    /// Файлы, которые зальются, когда сервер примет правку.
+    uploads: Vec<PinUpload>,
+}
+
+/// Файл закрепа под новым `blob`: зальётся, когда сервер примет правку.
+#[derive(Debug, Clone)]
+pub(super) struct PinUpload {
+    /// Номер файла в содержимом.
+    idx: usize,
+    /// Каким файл был до заливки: таким он вернётся в содержимое, если не
+    /// зальётся.
+    original: FileRef,
+    /// Файл своей записи истории до заливки (у своей записи): таким он
+    /// вернётся в неё. В содержимом с сервера у него мог быть чужой `blob`.
+    local_original: Option<FileRef>,
+    /// Место прежнего `blob` по `BLOB_PLACES`.
+    original_place: Option<BlobPlace>,
+    job: UploadJob,
+}
+
+/// Сервер принял правку закрепа, его файлы ждут резерва.
+#[derive(Debug)]
+pub(super) struct Accepted {
+    pin_id: PinId,
+    rev: u64,
+    state: PinState,
+    item: Item,
+    uploads: Vec<PinUpload>,
+}
+
+/// Файлы закрепов на время работы движка: что ждёт резерва и сколько раз
+/// брались чинить закреп.
+#[derive(Default)]
+pub(super) struct Repairs {
+    /// Принятые правки, чьи файлы ещё не зарезервированы (обрыв связи —
+    /// дождутся следующей сессии).
+    // shortcut: только в памяти. Выход из программы между `PinAccepted` и
+    // резервом оставит в закрепе `blob`, которого на сервере нет; закреп
+    // починят, когда скачивание ответит `NotFound` на устройстве с байтами.
+    // Хранить на диске, если такое будет встречаться.
+    accepted: Vec<Accepted>,
+    /// Попытки починки по хэшу; [`pin_files::MAX_REPAIRS`] — больше не браться.
+    tries: HashMap<[u8; 32], u32>,
+    /// Файлы, которых сервер не нашёл при скачивании.
+    missing: HashSet<BlobId>,
+    /// Пауза перед починкой чужого закрепа; `None` — [`pin_files::REPAIR_DELAY`].
+    pub(super) delay: Option<(Duration, Duration)>,
+    /// Сколько уже залито починкой за запуск ([`pin_files::REPAIR_BUDGET`]).
+    budget: pin_files::Budget,
+    /// Закрепы, чьё содержимое уже сверяли и чинить там было нечего: хэш и
+    /// `rev`. Пока `rev` тот же, заново не спрашивать.
+    checked: HashMap<[u8; 32], u64>,
 }
 
 /// Закрепы в одной сессии.
@@ -63,6 +132,21 @@ pub(super) struct PinSession {
     /// (очередь соединения на сервере переполнилась) — повод спросить
     /// страницы заново.
     max_rev: u64,
+    /// Хэши закрепов, которые стоит проверить: полные ли у них файлы.
+    check: HashSet<[u8; 32]>,
+    /// Когда браться за починку неполного закрепа.
+    due: HashMap<[u8; 32], Instant>,
+    /// Спрошено содержимое закрепа для починки: для какого хэша.
+    want_repair: HashMap<PinId, [u8; 32]>,
+    /// Содержимое пришло: чинить.
+    repair_ready: Vec<(PinId, [u8; 32], Item)>,
+}
+
+impl PinSession {
+    /// Когда ближайшая починка закрепа.
+    pub(super) fn next_repair(&self) -> Option<Instant> {
+        self.due.values().min().copied()
+    }
 }
 
 /// Сообщение о закрепах, которое разбирается из очереди сессии.
@@ -181,7 +265,13 @@ impl Engine {
             write_msg(send, &m).await?;
         }
         if self.ps.ready && std::mem::take(&mut self.ps.dirty) {
-            self.pin_flush(conn, key, send).await?;
+            self.pin_flush(key, send).await?;
+            for m in std::mem::take(&mut self.ps.out) {
+                write_msg(send, &m).await?;
+            }
+        }
+        if self.ps.ready {
+            self.pin_repairs(conn, key, send).await?;
             for m in std::mem::take(&mut self.ps.out) {
                 write_msg(send, &m).await?;
             }
@@ -242,6 +332,15 @@ impl Engine {
         self.ps.pulling = false;
         if !self.ps.ready {
             self.ps.ready = true;
+            // Файлы всех живых закрепов — проверить раз за сессию.
+            let live: Vec<[u8; 32]> = pins.read(|b| {
+                b.records
+                    .values()
+                    .filter(|r| r.pinned)
+                    .filter_map(|r| r.state.as_ref().map(|s| s.hash))
+                    .collect()
+            });
+            self.ps.check.extend(live);
             self.pin_seed().await;
             tracing::info!(
                 pins = pins.read(|b| b.live_count()),
@@ -303,17 +402,46 @@ impl Engine {
             }
             prepared.push((rec.pin_id, rec.rev, rec.pinned, state, item, rec.blobs));
         }
-        let touched: Vec<([u8; 32], Option<Item>)> = pins.update_later(|b| {
-            let mut touched = Vec::new();
+        let (touched, released) = pins.update_later(|b| {
+            let (mut touched, mut released) = (Vec::new(), Vec::new());
             for (id, rev, pinned, state, item, blobs) in prepared {
-                for h in b.apply(id, rev, pinned, state, blobs) {
+                // Файлы снятого закрепа (до правки).
+                let before = b
+                    .records
+                    .get(&id)
+                    .filter(|r| r.pinned)
+                    .map(|r| r.blobs.clone())
+                    .unwrap_or_default();
+                let hashes = b.apply(id, rev, pinned, state, blobs);
+                if !hashes.is_empty() && !pinned {
+                    released.extend(before);
+                }
+                for h in hashes {
                     touched.push((h, item.clone()));
                 }
             }
-            touched
+            (touched, released)
         });
+        self.forget_released(&released);
+        // Файлы закрепов — хранилищу и скачиванию сразу, до событий: по
+        // событию интерфейс может тут же спросить новый файл закрепа.
+        self.update_kept();
         for (h, item) in touched {
+            let files = item
+                .as_ref()
+                .filter(|i| matches!(i.content, Content::Files(_)))
+                .cloned();
             self.pin_effect(h, item).await;
+            // Файлы записи — как в содержимом закрепа: после заливки или
+            // починки у них новые `blob`.
+            if let Some(item) = files {
+                self.emit(Event::PinFiles {
+                    hash: h,
+                    item,
+                    own: None,
+                });
+            }
+            self.ps.check.insert(h);
         }
         self.update_kept();
     }
@@ -389,8 +517,39 @@ impl Engine {
         };
         let hash = inf.w.state.hash;
         if let Some(pins) = &self.pins {
-            pins.update_later(|b| b.accepted(&inf.w, rev, inf.blobs));
+            let released = pins.update_later(|b| {
+                let before = b
+                    .records
+                    .get(&pin_id)
+                    .filter(|r| r.pinned && !inf.w.state.pinned)
+                    .map(|r| r.blobs.clone())
+                    .unwrap_or_default();
+                b.accepted(&inf.w, rev, inf.blobs.clone());
+                before
+            });
+            self.forget_released(&released);
         }
+        if let Some(item) = inf
+            .item
+            .clone()
+            .filter(|i| inf.w.with_content && matches!(i.content, Content::Files(_)))
+        {
+            self.emit(Event::PinFiles {
+                hash,
+                item: item.clone(),
+                own: Some(inf.uploads.iter().map(|u| u.idx).collect()),
+            });
+            if !inf.uploads.is_empty() {
+                self.fix.accepted.push(Accepted {
+                    pin_id,
+                    rev,
+                    state: inf.w.state.clone(),
+                    item,
+                    uploads: inf.uploads,
+                });
+            }
+        }
+        self.ps.check.insert(hash);
         self.times.mark_sent();
         self.ps.rejects.remove(&hash);
         self.release(hash);
@@ -416,6 +575,7 @@ impl Engine {
         }
         if let Some(inf) = inf {
             let hash = inf.w.state.hash;
+            drop_uploads(&inf.uploads);
             self.release(hash);
             let n = self.ps.rejects.entry(hash).or_insert(0);
             *n += 1;
@@ -433,6 +593,24 @@ impl Engine {
 
     /// Содержимое закрепа, которое не вошло в страницу.
     async fn pin_content(&mut self, key: &GroupKey, pin_id: PinId, content: Option<Vec<u8>>) {
+        if let Some(hash) = self.ps.want_repair.remove(&pin_id) {
+            // Для починки: содержимое текущей правки закрепа.
+            let state = self
+                .pins
+                .as_ref()
+                .and_then(|p| p.read(|b| b.records.get(&pin_id).and_then(|r| r.state.clone())));
+            match (content, state) {
+                (Some(sealed), Some(state)) => match key.open_pin_content(&pin_id, &sealed) {
+                    Ok(item) if state.matches(&item) && state.hash == hash => {
+                        self.ps.repair_ready.push((pin_id, hash, item))
+                    }
+                    Ok(_) => tracing::warn!("содержимое закрепа не совпало с его хэшем"),
+                    Err(e) => tracing::warn!("содержимое закрепа не открылось: {e}"),
+                },
+                _ => tracing::info!("закрепа для починки на сервере уже нет"),
+            }
+            return;
+        }
         let Some(hash) = self.ps.want_content.remove(&pin_id) else {
             return;
         };
@@ -461,6 +639,7 @@ impl Engine {
             return;
         };
         let hash = inf.w.state.hash;
+        drop_uploads(&inf.uploads);
         self.release(hash);
         let Some(pins) = self.pins.clone() else {
             return;
@@ -478,6 +657,17 @@ impl Engine {
             self.pin_effect(hash, None).await;
         }
         self.ps.dirty = true;
+    }
+
+    /// Закреп сняли (здесь или на другом устройстве): забыть в журнале
+    /// загрузок, что его файлы залиты. Сервер удаляет файлы, заведённые как
+    /// файлы закрепа, сразу при снятии, и без этого повторное закрепление
+    /// сочло бы их залитыми, а закреп остался бы без файлов. Обычные файлы
+    /// при повторном закреплении просто зальются ещё раз.
+    fn forget_released(&self, blobs: &[BlobId]) {
+        if let Some(b) = &self.blobs {
+            b.forget_uploaded(blobs);
+        }
     }
 
     /// Ответов по хэшу больше не ждём — новые правки по нему можно слать.
@@ -534,7 +724,6 @@ impl Engine {
     /// Пройти дубли и очередь своих правок.
     async fn pin_flush(
         &mut self,
-        conn: &Connection,
         key: &GroupKey,
         send: &mut iroh::endpoint::SendStream,
     ) -> Result<()> {
@@ -545,7 +734,7 @@ impl Engine {
         let device = self.device;
         for w in pins.read(|b| b.dedupe(device, now_ms(), &skip)) {
             tracing::info!("два закрепа одного содержимого, снимаю лишний");
-            self.pin_write(key, send, w, None, None).await?;
+            self.pin_write(key, send, w, None, None, Vec::new()).await?;
         }
         let mut deletes = false;
         // Id новых закрепов — до отправки и на диск: повтор после обрыва
@@ -590,18 +779,18 @@ impl Engine {
                 }
                 Plan::Send(writes) => {
                     for w in writes {
-                        let content = if w.with_content {
-                            match self.pin_item(conn, &e.hash).await {
-                                Some(c) => Some(c),
+                        let (content, uploads) = if w.with_content {
+                            match self.pin_item(&e.hash).await {
+                                Some((item, blobs, uploads)) => (Some((item, blobs)), uploads),
                                 None => {
                                     pins.update(|b| b.finish(&e));
                                     continue 'edits;
                                 }
                             }
                         } else {
-                            None
+                            (None, Vec::new())
                         };
-                        self.pin_write(key, send, w, content, Some(e.clone()))
+                        self.pin_write(key, send, w, content, Some(e.clone()), uploads)
                             .await?;
                     }
                 }
@@ -613,16 +802,14 @@ impl Engine {
         Ok(())
     }
 
-    /// Содержимое нового закрепа из истории: элемент без подписи, файлы
-    /// своей записи до порога — на сервер, если их там ещё нет. `None` —
+    /// Содержимое нового закрепа из истории: элемент без подписи. Файлы,
+    /// которых нет в хранилище группы и чьи байты есть здесь, получают новые
+    /// `blob` и зальются, когда сервер примет закреп (порог «сразу заливать»
+    /// закрепу не указ: интерфейс заранее спросил про большие). `None` —
     /// записи нет или она не влезает (тогда интерфейс получает объяснение).
-    async fn pin_item(
-        &mut self,
-        conn: &Connection,
-        hash: &[u8; 32],
-    ) -> Option<(Item, Vec<BlobId>)> {
+    async fn pin_item(&mut self, hash: &[u8; 32]) -> Option<(Item, Vec<BlobId>, Vec<PinUpload>)> {
         let h = *hash;
-        let (found, limit_mb) = self.src(move |s| (s.item(&h), s.upload_limit_mb())).await?;
+        let found = self.src(move |s| s.item(&h)).await?;
         let Some(mut item) = found else {
             tracing::info!("закреплённой записи уже нет в истории, закреп не уходит");
             return None;
@@ -635,69 +822,126 @@ impl Engine {
             ));
             return None;
         }
-        if item.origin == self.device {
-            self.upload_pinned_files(conn, &mut item, limit_mb).await;
-        }
+        let uploads = self.pin_files_for_new(&mut item, h).await;
         let blobs = all_blobs(&item);
-        Some((item, blobs))
+        Some((item, blobs, uploads))
     }
 
-    /// Файлы своей закреплённой записи, которых нет на сервере: файл без
-    /// `blob` (скопирован без группы) до порога получает `blob`, такие и
-    /// незагруженные резервируются и встают в очередь загрузок.
-    // shortcut: папки и файлы больше порога остаются только на устройстве
-    // (прямая передача, пока оно в сети; README, «Закрепы»); перезаливка
-    // файлов закрепа после смены ключа — когда понадобится.
-    async fn upload_pinned_files(&mut self, conn: &Connection, item: &mut Item, limit_mb: u64) {
-        let Some(b) = self.blobs.clone() else { return };
-        let Content::Files(files) = &mut item.content else {
-            return;
+    /// Файлы нового закрепа, которые надо залить: свои — если их нет на
+    /// сервере (не загружались, прямая передача, папка), чужие — прямая
+    /// передача или потерянные сервером, если копия есть в кэше. Своя ли
+    /// запись — по флагу `local` в истории, не по `origin`.
+    async fn pin_files_for_new(&mut self, item: &mut Item, hash: [u8; 32]) -> Vec<PinUpload> {
+        let Some(b) = self.blobs.clone() else {
+            return Vec::new();
         };
+        let Content::Files(files) = &item.content else {
+            return Vec::new();
+        };
+        let own = self
+            .src(move |s| s.file_item(&hash).is_some_and(|(_, own)| own))
+            .await
+            .unwrap_or(false);
         let queued: HashSet<BlobId> = b.queued().iter().map(|j| j.blob).collect();
-        let mut need = Vec::new();
-        for (i, f) in files.iter_mut().enumerate() {
-            if f.is_dir || f.p2p || !std::path::Path::new(&f.path).exists() {
-                continue;
-            }
-            match f.blob {
-                None if crate::service::route(f.size, limit_mb)
-                    == crate::service::Route::Server =>
-                {
-                    let Ok(blob) = BlobId::random() else { continue };
-                    f.blob = Some(blob);
-                    f.blob_size = f.size;
-                    need.push(i);
+        let missing = self.fix.missing.clone();
+        let files = files.clone();
+        let b2 = b.clone();
+        let picks = tokio::task::spawn_blocking(move || {
+            pin_files::to_upload(
+                &files,
+                |f| {
+                    pin_files::held_for_pin(
+                        f,
+                        own,
+                        |x| queued.contains(&x) || b2.is_uploaded(x),
+                        |x| missing.contains(&x),
+                    )
+                },
+                |f| pin_files::local_bytes(f, own, b2.files_dir()),
+            )
+        })
+        .await
+        .unwrap_or_default();
+        let local = own.then(|| match &item.content {
+            Content::Files(f) => f.clone(),
+            _ => Vec::new(),
+        });
+        self.prepare_uploads(item, picks, local.as_deref()).await
+    }
+
+    /// Дать выбранным файлам новые `blob` текущей группы и собрать задания
+    /// заливки (архивы папок, ссылки на кэш — в outbox). Место новых файлов
+    /// в `BLOB_PLACES` — по нынешним настройкам хранилища: если резерв во
+    /// внешнем хранилище не выйдет и файл пойдёт через сервер, метку
+    /// поправит следующая правка ([`Engine::pin_reserve`]). Файл, задание
+    /// которого не собралось, остаётся прежним.
+    async fn prepare_uploads(
+        &self,
+        item: &mut Item,
+        picks: Vec<(usize, Bytes)>,
+        local: Option<&[FileRef]>,
+    ) -> Vec<PinUpload> {
+        let Some(b) = self.blobs.clone() else {
+            return Vec::new();
+        };
+        let Content::Files(files) = &item.content else {
+            return Vec::new();
+        };
+        if picks.is_empty() {
+            return Vec::new();
+        }
+        let place = b
+            .storage()
+            .external()
+            .map(|(v, _)| BlobPlace::External { config_version: v });
+        let places = crate::storage::external::places(&item.ext);
+        let outbox = b.outbox().to_path_buf();
+        let mut files = files.clone();
+        let local = local.map(<[FileRef]>::to_vec);
+        let old_places = places.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            for (i, bytes) in picks {
+                let Ok(blob) = BlobId::random() else { continue };
+                let original = files[i].clone();
+                match crate::blobs::pin_job(&outbox, blob, &original, &bytes) {
+                    Ok(job) => {
+                        files[i].blob = Some(blob);
+                        files[i].blob_size = job.size;
+                        files[i].p2p = false;
+                        let original_place = original
+                            .blob
+                            .and_then(|ob| crate::storage::external::place_of(&old_places, ob));
+                        out.push(PinUpload {
+                            idx: i,
+                            original,
+                            original_place,
+                            local_original: local.as_ref().and_then(|l| l.get(i).cloned()),
+                            job,
+                        });
+                    }
+                    Err(e) => tracing::info!(
+                        name = %original.name,
+                        "файл закрепа не подготовился к заливке: {e:#}"
+                    ),
                 }
-                Some(blob) if !b.is_uploaded(blob) && !queued.contains(&blob) => need.push(i),
-                _ => {}
+            }
+            (files, out)
+        })
+        .await;
+        let Ok((files, uploads)) = res else {
+            return Vec::new();
+        };
+        item.content = Content::Files(files);
+        let mut all = places;
+        for u in &uploads {
+            all.retain(|(b, _)| Some(*b) != u.original.blob);
+            if let Some(p) = place {
+                all.push((u.job.blob, p));
             }
         }
-        if need.is_empty() {
-            return;
-        }
-        let sub = Content::Files(need.iter().map(|&i| files[i].clone()).collect());
-        match b.reserve_files(conn, sub, true).await {
-            Ok((Content::Files(done), jobs, places)) => {
-                for (&i, f) in need.iter().zip(done) {
-                    files[i].blob = f.blob;
-                }
-                b.enqueue(jobs);
-                if !places.is_empty() {
-                    let mut all = crate::storage::external::places(&item.ext);
-                    all.retain(|(blob, _)| !places.iter().any(|(b2, _)| b2 == blob));
-                    all.extend(places);
-                    use clipwire_core::ExtList;
-                    item.ext_set(clipwire_core::item::ext::BLOB_PLACES, &all);
-                }
-            }
-            Ok(_) => {}
-            Err(f) => {
-                tracing::info!("файлы закрепа не зарезервировались: {}", f.error);
-                for &i in &need {
-                    files[i].blob = None;
-                }
-            }
-        }
+        set_places(item, &all);
+        uploads
     }
 
     /// Отправить правку и запомнить, чего ждём.
@@ -708,22 +952,31 @@ impl Engine {
         w: PinWrite,
         content: Option<(Item, Vec<BlobId>)>,
         edit: Option<Edit>,
+        uploads: Vec<PinUpload>,
     ) -> Result<()> {
         let state = match key.seal_pin_state(&w.pin_id, &w.state) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("состояние закрепа не зашифровалось: {e}");
+                drop_uploads(&uploads);
                 if let (Some(pins), Some(e)) = (&self.pins, &edit) {
                     pins.update(|b| b.finish(e));
                 }
                 return Ok(());
             }
         };
+        // Ушедшее содержимое нужно только записям с файлами (`PinFiles`,
+        // резерв после ответа): тексты и картинки до 8 МиБ не копируем.
+        let sent = content
+            .as_ref()
+            .filter(|(item, _)| matches!(item.content, Content::Files(_)))
+            .map(|(item, _)| item.clone());
         let (content, blobs) = match content {
             Some((item, blobs)) => match key.seal_pin_content(&w.pin_id, &item) {
                 Ok(c) => (Some(c), blobs),
                 Err(e) => {
                     tracing::warn!("содержимое закрепа не зашифровалось: {e}");
+                    drop_uploads(&uploads);
                     if let (Some(pins), Some(e)) = (&self.pins, &edit) {
                         pins.update(|b| b.finish(e));
                     }
@@ -749,9 +1002,16 @@ impl Engine {
         )
         .await?;
         self.ps.busy.insert(w.state.hash);
-        self.ps
-            .inflight
-            .insert(w.pin_id, Inflight { w, blobs, edit });
+        self.ps.inflight.insert(
+            w.pin_id,
+            Inflight {
+                w,
+                blobs,
+                edit,
+                item: sent,
+                uploads,
+            },
+        );
         Ok(())
     }
 
@@ -760,12 +1020,14 @@ impl Engine {
     /// сопоставить закрепы старой и новой группы). Ответы сервера разбирает
     /// ожидание списка устройств в новой группе (`Engine::rekey`): отказы
     /// по квоте приходят событием. Возвращает, сколько ушло.
+    //
+    // Файлы закрепов уходят в новую группу со старыми `blob` и пустым списком
+    // файлов: сервер и внешнее хранилище удаляют файлы старой группы, а
+    // заливать до `Rekey` некуда (новая группа ещё не завершена). Такие
+    // закрепы неполные, и их чинят уже в новой группе ([`Engine::pin_repairs`]):
+    // это устройство — сразу (оно автор правки), остальные — после паузы.
     // shortcut: содержимое берётся из своей истории; закреп, записи которого
     // здесь нет (сняли только здесь и удалили), в новую группу не попадает.
-    // Файлы закрепов в новую группу не перезаливаются: сервер и внешнее
-    // хранилище удаляют файлы старой группы, в новой закреп файлов остаётся
-    // карточкой без содержимого (README, «Смена ключа»). Перезаливать файлы,
-    // которые есть на диске, — если это понадобится.
     pub(super) async fn reseal_pins(
         &mut self,
         new_key: &GroupKey,
@@ -839,5 +1101,441 @@ impl Engine {
             tracing::info!(sent, missing, "закрепы перешифрованы для новой группы");
         }
         Ok(sent)
+    }
+
+    /// Файлы закрепов: зарезервировать залитое по принятым правкам,
+    /// проверить закрепы на полноту и починить те, чей срок подошёл.
+    async fn pin_repairs(
+        &mut self,
+        conn: &Connection,
+        key: &GroupKey,
+        send: &mut iroh::endpoint::SendStream,
+    ) -> Result<()> {
+        let (Some(pins), Some(b)) = (self.pins.clone(), self.blobs.clone()) else {
+            return Ok(());
+        };
+        self.pin_reserve(conn, key, send).await?;
+        // Сервер не нашёл файлы при скачивании: закрепы с ними проверить.
+        let lost = b.take_missing();
+        if !lost.is_empty() {
+            let hashes: Vec<[u8; 32]> = pins.read(|bk| {
+                bk.records
+                    .values()
+                    .filter(|r| r.pinned && r.blobs.iter().any(|x| lost.contains(x)))
+                    .filter_map(|r| r.state.as_ref().map(|s| s.hash))
+                    .collect()
+            });
+            self.ps.check.extend(hashes);
+            self.fix.missing.extend(lost);
+        }
+        self.pin_check().await;
+        // Срок подошёл: спросить у сервера содержимое текущей правки — его и
+        // чинить, а не то, что успело дойти до истории.
+        let now = Instant::now();
+        let ready: Vec<[u8; 32]> = self
+            .ps
+            .due
+            .iter()
+            .filter(|(_, t)| **t <= now)
+            .map(|(h, _)| *h)
+            .collect();
+        for hash in ready {
+            self.ps.due.remove(&hash);
+            if self.ps.busy.contains(&hash) || pins.read(|bk| bk.pending(&hash)) {
+                // Своя правка в пути: проверить, когда она дойдёт.
+                self.ps.check.insert(hash);
+                continue;
+            }
+            let Some(keep) = pins.read(|bk| bk.live(&hash).first().copied()) else {
+                continue;
+            };
+            if self.ps.want_repair.insert(keep, hash).is_none() {
+                self.ps.out.push(ClientMsg::PinContent { pin_id: keep });
+            }
+        }
+        for (pin_id, hash, item) in std::mem::take(&mut self.ps.repair_ready) {
+            self.pin_repair(key, send, pin_id, hash, item).await?;
+        }
+        Ok(())
+    }
+
+    /// Проверить закрепы из `ps.check`: неполному закрепу, который здесь есть
+    /// чем починить, назначить срок починки (автору правки — сразу, другим —
+    /// после случайной паузы). Хэши со своей правкой в пути ждут её ответа.
+    async fn pin_check(&mut self) {
+        if self.ps.check.is_empty() {
+            return;
+        }
+        let (Some(pins), Some(b)) = (self.pins.clone(), self.blobs.clone()) else {
+            self.ps.check.clear();
+            return;
+        };
+        let me = self.device;
+        let mut later = HashSet::new();
+        let mut cands = Vec::new();
+        for hash in std::mem::take(&mut self.ps.check) {
+            if self.ps.due.contains_key(&hash)
+                || self.fix.tries.get(&hash).copied().unwrap_or(0) >= pin_files::MAX_REPAIRS
+            {
+                continue;
+            }
+            if self.ps.busy.contains(&hash) || pins.read(|bk| bk.pending(&hash)) {
+                later.insert(hash);
+                continue;
+            }
+            let found = pins.read(|bk| {
+                let id = *bk.live(&hash).first()?;
+                let r = bk.records.get(&id)?;
+                Some((r.rev, r.state.as_ref()?.device, r.blobs.clone()))
+            });
+            if let Some((rev, author, held)) = found
+                && self.fix.checked.get(&hash) != Some(&rev)
+            {
+                cands.push((hash, author, held));
+            }
+        }
+        self.ps.check = later;
+        if cands.is_empty() {
+            return;
+        }
+        let missing = self.fix.missing.clone();
+        let files_dir = b.files_dir().to_path_buf();
+        let found = self
+            .src(move |s| {
+                let limit_mb = s.upload_limit_mb();
+                cands
+                    .into_iter()
+                    .filter(|(h, _, held)| {
+                        let Some((item, own)) = s.file_item(h) else {
+                            return false;
+                        };
+                        let Content::Files(files) = &item.content else {
+                            return false;
+                        };
+                        // Здесь содержимого закрепа нет, только своя запись:
+                        // у своей — её файлы и есть «содержимое».
+                        pin_files::repair_picks(
+                            files,
+                            own.then_some(files.as_slice()),
+                            |x| held.contains(&x) && !missing.contains(&x),
+                            limit_mb,
+                            &files_dir,
+                        )
+                        .is_some_and(|(_, picks)| !picks.is_empty())
+                    })
+                    .map(|(h, a, _)| (h, a))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+        let range = self.fix.delay.unwrap_or(pin_files::REPAIR_DELAY);
+        for (hash, author) in found {
+            let rnd = getrandom::u64().unwrap_or(0);
+            let delay = pin_files::repair_delay(author, me, rnd, range);
+            tracing::info!(
+                delay_s = delay.as_secs(),
+                "у закрепа не все файлы в хранилище группы, а здесь они есть: починю"
+            );
+            self.ps.due.insert(hash, Instant::now() + delay);
+        }
+    }
+
+    /// Починить закреп по содержимому его текущей правки: файлы, которых нет
+    /// в хранилище группы и чьи байты есть здесь, — под новые `blob`, правка
+    /// с новым содержимым поверх текущего `rev` (тот же хэш, закреп и
+    /// подпись, `seq` на один больше). Файлы зальются, когда сервер примет
+    /// правку. Закреп уже починили (файлы покрыты) — ничего.
+    ///
+    /// Содержимому с сервера доверяем только в том, где лежат файлы: у своей
+    /// записи пути, имена и время берутся из истории (`pin_files::trusted_files`),
+    /// свои файлы заливаются только с согласия владельца
+    /// (`pin_files::may_repair_own`), чужие пути не трогаются вовсе. Всё —
+    /// в пределах бюджета починки на запуск.
+    async fn pin_repair(
+        &mut self,
+        key: &GroupKey,
+        send: &mut iroh::endpoint::SendStream,
+        pin_id: PinId,
+        hash: [u8; 32],
+        remote: Item,
+    ) -> Result<()> {
+        let (Some(pins), Some(b)) = (self.pins.clone(), self.blobs.clone()) else {
+            return Ok(());
+        };
+        if self.ps.busy.contains(&hash) || pins.read(|bk| bk.pending(&hash)) {
+            self.ps.check.insert(hash);
+            return Ok(());
+        }
+        let Some((rev, state, held)) = pins.read(|bk| {
+            let r = bk.records.get(&pin_id).filter(|r| r.pinned)?;
+            Some((r.rev, r.state.clone()?, r.blobs.clone()))
+        }) else {
+            return Ok(());
+        };
+        let Content::Files(remote_files) = &remote.content else {
+            return Ok(());
+        };
+        // `PinContent` отвечает без `rev`: содержимое должно знать все файлы
+        // записи книги, иначе оно старее её (правка с новыми файлами пришла
+        // раньше ответа), и починка по нему затёрла бы чужую.
+        let sent = all_blobs(&remote);
+        if !held.iter().all(|b| sent.contains(b)) {
+            // Пока у закрепа тот же `rev`, не спрашивать снова: список
+            // файлов открытый, и чужая правка может держать его таким нарочно.
+            tracing::info!("содержимое закрепа старее его записи, жду новой правки");
+            self.fix.checked.insert(hash, rev);
+            return Ok(());
+        }
+        let missing = self.fix.missing.clone();
+        let files_dir = b.files_dir().to_path_buf();
+        let remote_files = remote_files.clone();
+        let plan = self
+            .src(move |s| {
+                let limit_mb = s.upload_limit_mb();
+                let local = s
+                    .file_item(&hash)
+                    .filter(|(_, own)| *own)
+                    .and_then(|(i, _)| match i.content {
+                        Content::Files(f) => Some(f),
+                        _ => None,
+                    });
+                let plan = pin_files::repair_picks(
+                    &remote_files,
+                    local.as_deref(),
+                    |x| held.contains(&x) && !missing.contains(&x),
+                    limit_mb,
+                    &files_dir,
+                );
+                plan.map(|p| (p, local))
+            })
+            .await
+            .flatten();
+        let Some(((files, picks), local)) = plan else {
+            tracing::warn!("файлы закрепа не сходятся со своей записью, не чиню");
+            self.fix.checked.insert(hash, rev);
+            return Ok(());
+        };
+        // Бюджет на запуск: каждый источник один раз, не больше
+        // `REPAIR_BUDGET` байт и файлов.
+        let picks: Vec<(usize, Bytes)> = picks
+            .into_iter()
+            .filter(|(i, bytes)| {
+                let ok =
+                    self.fix
+                        .budget
+                        .take(bytes.path(), files[*i].size, pin_files::REPAIR_BUDGET);
+                if !ok {
+                    tracing::warn!(
+                        "предел починки закрепов на этот запуск исчерпан, файл пропускаю"
+                    );
+                }
+                ok
+            })
+            .collect();
+        if picks.is_empty() {
+            tracing::debug!("закреп уже починили или чинить здесь нечем");
+            self.fix.checked.insert(hash, rev);
+            return Ok(());
+        }
+        let tries = self.fix.tries.entry(hash).or_insert(0);
+        if *tries >= pin_files::MAX_REPAIRS {
+            tracing::warn!("закреп так и не починился, больше не берусь");
+            return Ok(());
+        }
+        *tries += 1;
+        let mut item = remote;
+        item.content = Content::Files(files);
+        let uploads = self
+            .prepare_uploads(&mut item, picks, local.as_deref())
+            .await;
+        if uploads.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            files = uploads.len(),
+            "чиню закреп: заливаю его файлы в хранилище группы заново"
+        );
+        let w = PinWrite {
+            pin_id,
+            base_rev: rev,
+            state: PinState {
+                seq: state.seq.saturating_add(1),
+                device: self.device,
+                ..state
+            },
+            with_content: true,
+        };
+        let blobs = all_blobs(&item);
+        self.pin_write(key, send, w, Some((item, blobs)), None, uploads)
+            .await
+    }
+
+    /// Зарезервировать файлы принятых правок и поставить их в очередь
+    /// загрузок. Сервер уже знает их как файлы закрепа и проверяет по месту
+    /// закрепов. Обрыв связи — повторить в следующий раз.
+    async fn pin_reserve(
+        &mut self,
+        conn: &Connection,
+        key: &GroupKey,
+        send: &mut iroh::endpoint::SendStream,
+    ) -> Result<()> {
+        let Some(b) = self.blobs.clone() else {
+            return Ok(());
+        };
+        let mut list: VecDeque<Accepted> = std::mem::take(&mut self.fix.accepted).into();
+        while let Some(acc) = list.pop_front() {
+            let jobs = acc
+                .uploads
+                .iter()
+                .map(|u| (u.job.clone(), u.original.name.clone()))
+                .collect();
+            match b.reserve_pin_jobs(conn, jobs).await {
+                Ok((ok, failed)) => {
+                    b.enqueue(ok.clone());
+                    self.pin_correct(key, send, acc, &ok, &failed).await?;
+                }
+                Err(e) => {
+                    tracing::info!("резерв файлов закрепа не дошёл до сервера, повторю: {e}");
+                    self.fix.accepted.push(acc);
+                    self.fix.accepted.extend(list);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// После резерва: файлы, которые сервер не принял (больше предела, нет
+    /// места), вернуть в содержимое прежними, а места файлов, ушедших не
+    /// туда, куда думали (внешнее хранилище не ответило), поправить —
+    /// правкой поверх принятой. Если закреп с тех пор правили, их правка
+    /// новее, и её не трогаем.
+    async fn pin_correct(
+        &mut self,
+        key: &GroupKey,
+        send: &mut iroh::endpoint::SendStream,
+        acc: Accepted,
+        ok: &[UploadJob],
+        failed: &[(BlobId, String)],
+    ) -> Result<()> {
+        let hash = acc.state.hash;
+        let external = self
+            .blobs
+            .as_ref()
+            .and_then(|b| b.storage().external())
+            .is_some();
+        let mut item = acc.item.clone();
+        let mut places = crate::storage::external::places(&item.ext);
+        let mut changed = false;
+        if let Content::Files(files) = &mut item.content {
+            for u in &acc.uploads {
+                let blob = u.job.blob;
+                if failed.iter().any(|(x, _)| *x == blob) {
+                    files[u.idx] = u.original.clone();
+                    places.retain(|(x, _)| *x != blob);
+                    if let (Some(ob), Some(op)) = (u.original.blob, u.original_place) {
+                        places.push((ob, op));
+                    }
+                    changed = true;
+                } else if let Some(j) = ok.iter().find(|j| j.blob == blob) {
+                    let real = match j.external {
+                        Some(v) => Some(BlobPlace::External { config_version: v }),
+                        None if external => Some(BlobPlace::Server),
+                        None => None,
+                    };
+                    let had = crate::storage::external::place_of(&places, blob);
+                    if had != real {
+                        places.retain(|(x, _)| *x != blob);
+                        if let Some(p) = real {
+                            places.push((blob, p));
+                        }
+                        changed = true;
+                    }
+                }
+            }
+        }
+        for (blob, why) in failed {
+            let name = acc
+                .uploads
+                .iter()
+                .find(|u| u.job.blob == *blob)
+                .map(|u| u.original.name.clone())
+                .unwrap_or_default();
+            self.emit(Event::PinFailed(trf(
+                "Файл закрепа «{name}» не залился в хранилище группы ({why}): его можно взять, только пока это устройство в сети",
+                &[("name", &name), ("why", why)],
+            )));
+        }
+        if !failed.is_empty() {
+            // Сервер такой файл не примет и в следующий раз.
+            self.fix.tries.insert(hash, pin_files::MAX_REPAIRS);
+            // Своя запись уже взяла новые `blob` (по принятой правке): вернуть
+            // ей прежние файлы, а не те, что пришли в содержимом с сервера.
+            let mut restore = acc.item.clone();
+            let mut idx = Vec::new();
+            if let Content::Files(files) = &mut restore.content {
+                for u in acc
+                    .uploads
+                    .iter()
+                    .filter(|u| failed.iter().any(|(x, _)| *x == u.job.blob))
+                {
+                    if let Some(l) = &u.local_original {
+                        files[u.idx] = l.clone();
+                        idx.push(u.idx);
+                    }
+                }
+            }
+            if !idx.is_empty() {
+                self.emit(Event::PinFiles {
+                    hash,
+                    item: restore,
+                    own: Some(idx),
+                });
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        set_places(&mut item, &places);
+        let Some(pins) = self.pins.clone() else {
+            return Ok(());
+        };
+        if pins.read(|bk| bk.records.get(&acc.pin_id).map(|r| r.rev)) != Some(acc.rev)
+            || self.ps.busy.contains(&hash)
+        {
+            tracing::info!("закреп правили, пока файлы резервировались: содержимое не трогаю");
+            return Ok(());
+        }
+        let w = PinWrite {
+            pin_id: acc.pin_id,
+            base_rev: acc.rev,
+            state: PinState {
+                seq: acc.state.seq.saturating_add(1),
+                device: self.device,
+                ..acc.state
+            },
+            with_content: true,
+        };
+        let blobs = all_blobs(&item);
+        self.pin_write(key, send, w, Some((item, blobs)), None, Vec::new())
+            .await
+    }
+}
+
+/// Правка не ушла или не принята: собранные для неё архивы и ссылки в
+/// outbox больше не нужны.
+fn drop_uploads(uploads: &[PinUpload]) {
+    for u in uploads.iter().filter(|u| u.job.outbox) {
+        let _ = std::fs::remove_file(&u.job.path);
+    }
+}
+
+/// Места файлов элемента (`BLOB_PLACES`); пустой список — без метки.
+fn set_places(item: &mut Item, places: &BlobPlaces) {
+    use clipwire_core::item::ext::BLOB_PLACES;
+    if places.is_empty() {
+        item.ext.retain(|e| e.tag != BLOB_PLACES);
+    } else {
+        item.ext_set(BLOB_PLACES, places);
     }
 }

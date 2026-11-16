@@ -182,16 +182,26 @@ impl Store {
             [],
         )?;
         // Та же формула sealed_size, что у квоты файлов и сводки сервера.
+        // Файлы живых закрепов считаются в месте закрепов, как в квотах.
         let blobs = per_group(
             &conn,
-            "SELECT group_id, COUNT(*), SUM(size + MAX(1, (size + ?1 - 1) / ?1) * ?2)
-             FROM blobs GROUP BY group_id",
+            &format!(
+                "SELECT group_id, COUNT(*), SUM(size + MAX(1, (size + ?1 - 1) / ?1) * ?2)
+                 FROM blobs WHERE NOT {} AND pin_only = 0 GROUP BY group_id",
+                super::pins::KEPT_BY_PIN
+            ),
             params![CHUNK as i64, OVERHEAD as i64],
         )?;
         let pins = per_group(
             &conn,
-            "SELECT group_id, SUM(pinned), SUM(length(state) + content_len) FROM pins GROUP BY group_id",
-            [],
+            "SELECT group_id, SUM(n), SUM(b) FROM (
+                 SELECT group_id, pinned AS n, length(state) + content_len AS b FROM pins
+                 UNION ALL
+                 SELECT group_id, 0, size + MAX(1, (size + ?1 - 1) / ?1) * ?2 FROM blobs
+                 WHERE EXISTS (SELECT 1 FROM pin_blobs AS pb
+                               WHERE pb.group_id = blobs.group_id AND pb.blob_id = blobs.blob_id))
+             GROUP BY group_id",
+            params![CHUNK as i64, OVERHEAD as i64],
         )?;
         let mut stmt = conn.prepare(
             "SELECT group_id, created_ms, admin_device IS NOT NULL, pending_by IS NOT NULL,

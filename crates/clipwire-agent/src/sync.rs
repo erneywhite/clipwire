@@ -248,6 +248,18 @@ pub enum Event {
     /// разбора дублей): поставить в истории закреп и подпись, добавить запись
     /// из содержимого, если её здесь нет (`History::apply_pin`).
     Pin(PinApply),
+    /// Файлы закреплённой записи переехали: закреп залили или починили, у
+    /// файлов новые `blob` и места. Поправить их у записи с этим хэшем, если
+    /// она есть (`History::set_pin_files`); `item` — содержимое закрепа.
+    /// `own` — правку отправило это устройство: номера файлов, которые оно
+    /// само залило (или вернуло прежними). Только они берутся в свою запись,
+    /// и только по своей правке скачанная копия переезжает в кэше. `None` —
+    /// правка чужая, своя запись не меняется.
+    PinFiles {
+        hash: [u8; 32],
+        item: Item,
+        own: Option<Vec<usize>>,
+    },
     /// Сервер не принял закреп (квота, размер): текст для человека. Запись
     /// остаётся закреплённой только на этом устройстве.
     PinFailed(String),
@@ -426,6 +438,9 @@ pub struct Engine {
     pin_source: Option<Arc<dyn PinSource>>,
     /// Закрепы в текущей сессии: страницы, ответы, отправленное.
     ps: pin_engine::PinSession,
+    /// Файлы закрепов, которые ждут резерва, и починка закрепов: живёт
+    /// дольше сессии (до перезапуска движка).
+    fix: pin_engine::Repairs,
     /// Ждут ответа `PinStats`, по порядку запросов.
     pin_stats_waiters: VecDeque<tokio::sync::oneshot::Sender<Result<PinStats, String>>>,
     /// Ждут ответа на запросы администратора, по порядку запросов.
@@ -493,6 +508,7 @@ impl Engine {
             pins: None,
             pin_source: None,
             ps: Default::default(),
+            fix: Default::default(),
             pin_stats_waiters: VecDeque::new(),
             admin_waiters: VecDeque::new(),
             admin_reauth: false,
@@ -523,6 +539,13 @@ impl Engine {
     /// создаётся новая группа.
     pub fn with_admin_key(mut self, key: Option<AdminKey>) -> Self {
         self.admin_key = key;
+        self
+    }
+
+    /// Пауза перед починкой чужого закрепа (по умолчанию
+    /// [`crate::pin_files::REPAIR_DELAY`]): от и до. Для проверок.
+    pub fn with_repair_delay(mut self, min: Duration, max: Duration) -> Self {
+        self.fix.delay = Some((min, max));
         self
     }
 
@@ -1010,7 +1033,17 @@ impl Engine {
         let pins = self.pins.clone();
 
         loop {
+            let repair_at = self.ps.next_repair();
             tokio::select! {
+                // Подошёл срок починки закрепа (`pin_engine::pin_repairs`).
+                _ = async {
+                    match repair_at {
+                        Some(t) => tokio::time::sleep_until(t.into()).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.ps.ready && repair_at.is_some() => {
+                    self.pin_send(&conn, &key, &mut send).await?;
+                }
                 // В очереди закрепов новая правка (здесь или из импорта).
                 _ = async {
                     match &pins {

@@ -445,6 +445,14 @@ impl GroupStorage {
     }
 
     /// Файлы живых закрепов: их чистка по сроку не удаляет.
+    /// Держит ли этот файл живой закреп (по книге закрепов).
+    pub fn is_kept(&self, blob: clipwire_core::BlobId) -> bool {
+        self.kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&blob)
+    }
+
     pub fn set_kept(&self, blobs: std::collections::HashSet<clipwire_core::BlobId>) {
         *self.kept.lock().unwrap_or_else(|e| e.into_inner()) = blobs;
     }

@@ -64,12 +64,16 @@ struct Row {
     item: Item,
     pinned: bool,
     note: String,
+    /// Скопировано на этом устройстве (как `Entry::local`).
+    local: bool,
 }
 
 /// История устройства в памяти.
 struct Mem {
     device: DeviceId,
     rows: Mutex<HashMap<[u8; 32], Row>>,
+    /// Порог «сразу заливать», МБ.
+    limit_mb: std::sync::atomic::AtomicU64,
 }
 
 impl Mem {
@@ -77,6 +81,7 @@ impl Mem {
         Arc::new(Self {
             device,
             rows: Mutex::default(),
+            limit_mb: 100.into(),
         })
     }
 
@@ -94,6 +99,7 @@ impl Mem {
                 item,
                 pinned,
                 note: note.into(),
+                local: true,
             },
         );
         hash
@@ -119,6 +125,7 @@ impl Mem {
                             item: item.clone(),
                             pinned: true,
                             note: p.note.clone(),
+                            local: false,
                         },
                     );
                 }
@@ -134,6 +141,45 @@ impl Mem {
             .unwrap()
             .get(hash)
             .map(|r| (r.pinned, r.note.clone()))
+    }
+
+    /// Как сервис: `History::set_pin_files` — файлы записи из содержимого
+    /// закрепа.
+    fn set_files(&self, hash: &[u8; 32], item: &Item, own: Option<&[usize]>) {
+        let mut rows = self.rows.lock().unwrap();
+        let Some(r) = rows.get_mut(hash) else { return };
+        if !r.local {
+            r.item.content = item.content.clone();
+            r.item.ext = item.ext.clone();
+            return;
+        }
+        // Своя запись — только файлы, которые устройство само залило.
+        let (Some(own), Content::Files(mine), Content::Files(new)) =
+            (own, &mut r.item.content, &item.content)
+        else {
+            return;
+        };
+        for &i in own {
+            if let (Some(a), Some(b)) = (mine.get_mut(i), new.get(i)) {
+                a.blob = b.blob;
+                a.blob_size = b.blob_size;
+                a.p2p = b.p2p;
+            }
+        }
+    }
+
+    /// Файлы записи.
+    fn files(&self, hash: &[u8; 32]) -> Vec<clipwire_core::FileRef> {
+        match self
+            .rows
+            .lock()
+            .unwrap()
+            .get(hash)
+            .map(|r| r.item.content.clone())
+        {
+            Some(Content::Files(f)) => f,
+            _ => Vec::new(),
+        }
     }
 
     fn set(&self, hash: &[u8; 32], pinned: bool, note: &str) {
@@ -164,7 +210,29 @@ impl PinSource for Mem {
         Vec::new()
     }
     fn upload_limit_mb(&self) -> u64 {
-        0
+        self.limit_mb.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn file_item(&self, hash: &[u8; 32]) -> Option<(Item, bool)> {
+        let rows = self.rows.lock().unwrap();
+        let r = rows.get(hash)?;
+        matches!(r.item.content, Content::Files(_)).then(|| (r.item.clone(), r.local))
+    }
+}
+
+impl Mem {
+    /// Добавить запись, пришедшую с другого устройства (не своя).
+    fn add_foreign(&self, item: Item, pinned: bool) -> [u8; 32] {
+        let hash = item.content.hash();
+        self.rows.lock().unwrap().insert(
+            hash,
+            Row {
+                item,
+                pinned,
+                note: String::new(),
+                local: false,
+            },
+        );
+        hash
     }
 }
 
@@ -184,6 +252,10 @@ struct Dev {
     ctl: Controller,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     failed: Vec<String>,
+    /// С передачей файлов (`Engine::with_blobs`): заводится заново при
+    /// каждом запуске, под текущий ключ группы.
+    files: bool,
+    blobs: Option<Arc<clipwire_agent::blobs::Blobs>>,
 }
 
 impl Dev {
@@ -208,6 +280,8 @@ impl Dev {
             ctl: Controller::new(ctx, key.clone(), device_id(&device_key)),
             task: None,
             failed: Vec::new(),
+            files: false,
+            blobs: None,
         })
     }
 
@@ -231,11 +305,19 @@ impl Dev {
         let (etx, events) = mpsc::unbounded_channel();
         let (local, lrx) = mpsc::channel(16);
         let (ctx, crx) = mpsc::channel::<Control>(4);
-        let engine = Engine::new(state, self.name.into(), None, etx, Arc::new(|| {}))
+        let mut engine = Engine::new(state, self.name.into(), None, etx, Arc::new(|| {}))
             .with_admin_key(Some(TEST_ADMIN))
             .with_control(crx)
             .with_known_devices(self.known.clone())
             .with_pins(self.pins.clone(), self.mem.clone());
+        if self.files {
+            let b =
+                clipwire_agent::blobs::Blobs::new(self.key.clone(), &self.dir, Arc::new(|_| {}));
+            engine = engine
+                .with_blobs(b.clone())
+                .with_repair_delay(Duration::from_millis(200), Duration::from_millis(400));
+            self.blobs = Some(b);
+        }
         self.ctl = Controller::new(ctx, self.key.clone(), engine.device());
         self.task = Some(tokio::spawn(engine.run(lrx)));
         self.events = events;
@@ -257,6 +339,7 @@ impl Dev {
         match e {
             Event::KnownDevices(cards) => self.known = cards.clone(),
             Event::Pin(p) => self.mem.apply(p),
+            Event::PinFiles { hash, item, own } => self.mem.set_files(hash, item, own.as_deref()),
             Event::PinFailed(why) => self.failed.push(why.clone()),
             _ => {}
         }
@@ -1013,5 +1096,411 @@ async fn rekey_reports_pins_refused_by_quota() -> Result<()> {
         .await?;
     assert!(why.contains("1"), "{why}");
     a.stop().await?;
+    server.shutdown().await
+}
+
+/// Скачать файлы записи через передачу файлов устройства (из кэша или с
+/// сервера) и вернуть их байты.
+async fn fetch(d: &Dev, hash: &[u8; 32]) -> Result<Vec<Vec<u8>>> {
+    let b = d.blobs.clone().context("без передачи файлов")?;
+    let origin = d.mem.item(hash).context("записи нет")?.origin;
+    let mut out = Vec::new();
+    for f in d.mem.files(hash) {
+        let p = b.download(&f, origin).await?;
+        out.push(std::fs::read(p)?);
+    }
+    Ok(out)
+}
+
+/// Файл, у которого нет `blob` (скопирован без группы), закреп всё равно
+/// заливает, другое устройство его скачивает. После смены ключа файлы
+/// старой группы удалены: закреп чинит устройство, у которого есть файл.
+/// Если это инициатор (автор перешифрованного закрепа) — сразу, иначе —
+/// после паузы. Другое устройство скачивает файл уже из новой группы.
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_file_repaired_after_rekey_by_owner() -> Result<()> {
+    repaired_after_rekey(false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_file_repaired_after_rekey_by_initiator() -> Result<()> {
+    repaired_after_rekey(true).await
+}
+
+/// `initiator_owns` — файл у того, кто меняет ключ (A), иначе у B.
+async fn repaired_after_rekey(initiator_owns: bool) -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    b.files = true;
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    a.devices_with_cards(2).await?;
+    b.devices_with_cards(2).await?;
+    let (owner, other) = if initiator_owns {
+        (&mut a, &mut b)
+    } else {
+        (&mut b, &mut a)
+    };
+
+    let src = owner.dir.join("src");
+    std::fs::create_dir_all(&src)?;
+    let path = src.join("отчёт.bin");
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &bytes)?;
+    let (size, modified_ms) = clipwire_agent::blobs::file_stamp(&path)?;
+    let file = clipwire_core::FileRef {
+        name: "отчёт.bin".into(),
+        path: path.to_string_lossy().into_owned(),
+        size,
+        is_dir: false,
+        width: 0,
+        height: 0,
+        modified_ms,
+        blob: None,
+        blob_size: 0,
+        p2p: false,
+    };
+    let h = owner.mem.add_content(Content::Files(vec![file]), true, "");
+    owner.pins.pin(h, "файл");
+    other
+        .until("закреп с файлом пришёл", |m, _| {
+            m.state(&h) == Some((true, "файл".into()))
+                && m.files(&h)
+                    .first()
+                    .is_some_and(|f| f.blob.is_some() && !f.p2p)
+        })
+        .await?;
+    assert_eq!(fetch(other, &h).await?, vec![bytes.clone()]);
+    let before = other.mem.files(&h)[0].blob;
+    // Скачанная копия у другого устройства — под старым `blob`: убрать,
+    // чтобы чинил только владелец файла.
+    let _ = std::fs::remove_dir_all(clipwire_agent::blobs::files_dir(&other.dir));
+
+    let k2 = a.rekey_all().await.map_err(anyhow::Error::msg)?.key;
+    b.wait(|e| matches!(e, Event::RekeyOffered(_)).then_some(()))
+        .await?;
+    for d in [&mut a, &mut b] {
+        d.stop().await?;
+        d.key = k2.clone();
+        d.start();
+        d.online().await?;
+    }
+    let (owner, other) = if initiator_owns {
+        (&mut a, &mut b)
+    } else {
+        (&mut b, &mut a)
+    };
+    other
+        .until(
+            "закреп починили, у файла новый blob",
+            |m, _| {
+                m.files(&h)
+                    .first()
+                    .is_some_and(|f| f.blob.is_some() && f.blob != before && !f.p2p)
+            },
+        )
+        .await?;
+    assert_eq!(fetch(other, &h).await?, vec![bytes.clone()]);
+    owner
+        .until("у владельца закреп тот же", |m, p| {
+            m.state(&h) == Some((true, "файл".into())) && p.read(|bk| bk.live(&h).len()) == 1
+        })
+        .await?;
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Место закрепов кончилось: файл закрепа не резервируется, устройство
+/// говорит об этом и возвращает файл в содержимое прежним (без `blob`), а
+/// запись остаётся закреплённой везде.
+#[tokio::test(flavor = "multi_thread")]
+async fn pin_file_over_pin_space_is_refused_and_restored() -> Result<()> {
+    let (server, info) = start_server(Guards {
+        pin_bytes: 100 * 1024,
+        ..Guards::default()
+    })
+    .await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    std::fs::create_dir_all(&a.dir)?;
+    let path = a.dir.join("большой.bin");
+    std::fs::write(&path, vec![7u8; 300_000])?;
+    let (size, modified_ms) = clipwire_agent::blobs::file_stamp(&path)?;
+    let file = clipwire_core::FileRef {
+        name: "большой.bin".into(),
+        path: path.to_string_lossy().into_owned(),
+        size,
+        is_dir: false,
+        width: 0,
+        height: 0,
+        modified_ms,
+        blob: None,
+        blob_size: 0,
+        p2p: false,
+    };
+    let h = a.mem.add_content(Content::Files(vec![file]), true, "");
+    a.pins.pin(h, "");
+    let why = a
+        .wait(|e| match e {
+            Event::PinFailed(w) if w.contains("большой.bin") => Some(w.clone()),
+            _ => None,
+        })
+        .await?;
+    assert!(why.contains("закреп"), "{why}");
+    b.until(
+        "закреп есть, файл вернулся без blob",
+        |m, _| {
+            m.state(&h).is_some_and(|(p, _)| p)
+                && m.files(&h).first().is_some_and(|f| f.blob.is_none())
+        },
+    )
+    .await?;
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Файл на диске `dir` и его карточка.
+fn disk_file(dir: &std::path::Path, name: &str, len: usize) -> Result<clipwire_core::FileRef> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(name);
+    std::fs::write(&path, vec![5u8; len])?;
+    let (size, modified_ms) = clipwire_agent::blobs::file_stamp(&path)?;
+    Ok(clipwire_core::FileRef {
+        name: name.into(),
+        path: path.to_string_lossy().into_owned(),
+        size,
+        is_dir: false,
+        width: 0,
+        height: 0,
+        modified_ms,
+        blob: None,
+        blob_size: 0,
+        p2p: false,
+    })
+}
+
+/// Подождать, разбирая события, и проверить, что файл закрепа так и не
+/// залили (у закрепляющего в записи по-прежнему нет `blob`).
+async fn never_uploaded(watch: &mut Dev, other: &mut Dev, h: &[u8; 32]) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        for d in [&mut *watch, &mut *other] {
+            while let Ok(e) = d.events.try_recv() {
+                d.note(&e);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        watch.mem.files(h).iter().all(|f| f.blob.is_none()),
+        "файл залили: {:?}",
+        watch.mem.files(h)
+    );
+    if let Some(b) = &other.blobs {
+        assert!(
+            b.queued().is_empty(),
+            "в очереди загрузок: {:?}",
+            b.queued()
+        );
+    }
+    Ok(())
+}
+
+/// Чужой закреп с `origin` этого устройства и путём к его файлу не
+/// заставляет залить файл: своя запись — только по флагу истории, чужие
+/// пути файловой системой не трогаются.
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_origin_does_not_leak_local_file() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    // Секрет A на его диске.
+    let secret = disk_file(&a.dir.join("secret"), "id_ed25519", 400)?;
+    // B закрепляет «запись A» с этим путём: origin — A, время 0.
+    let mut item = Item::new(
+        a.mem.device,
+        Content::Files(vec![clipwire_core::FileRef {
+            modified_ms: 0,
+            ..secret
+        }]),
+    );
+    item.device_name = "A".into();
+    let h = b.mem.add_foreign(item, true);
+    b.pins.pin(h, "");
+    a.until("закреп пришёл", |m, _| {
+        m.state(&h).is_some_and(|(p, _)| p)
+    })
+    .await?;
+    never_uploaded(&mut b, &mut a, &h).await?;
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Чужой закреп своей записи не заливает её файл, если владелец его не
+/// передавал: порог «сразу заливать» 0 — никогда.
+#[tokio::test(flavor = "multi_thread")]
+async fn foreign_pin_respects_owner_limit() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    a.mem
+        .limit_mb
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    let file = disk_file(&a.dir.join("src"), "big.bin", 300_000)?;
+    let h = a
+        .mem
+        .add_content(Content::Files(vec![file.clone()]), false, "");
+    // У B та же запись (пришла обычной историей), B её закрепляет.
+    let item = a.mem.item(&h).context("нет записи")?;
+    b.mem.add_foreign(item, true);
+    b.pins.pin(h, "");
+    a.until("закреп пришёл", |m, _| {
+        m.state(&h).is_some_and(|(p, _)| p)
+    })
+    .await?;
+    never_uploaded(&mut b, &mut a, &h).await?;
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Чужое содержимое закрепа не попадает в свою запись и через свою же
+/// починку: у большого файла (больше порога, не заливался) атакующий ставит
+/// чужой `blob` с прямой передачей, владелец чинит маленький файл — в его
+/// запись уходит только залитое им самим, большой остаётся как был.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_repair_keeps_foreign_blobs_out_of_own_record() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    // Порог 1 МБ: маленький файл в нём, большой — нет.
+    a.mem
+        .limit_mb
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    let dir = a.dir.join("src");
+    let small = disk_file(&dir, "small.bin", 1000)?;
+    let big = disk_file(&dir, "big.bin", 2 * 1024 * 1024)?;
+    let h = a
+        .mem
+        .add_content(Content::Files(vec![small, big.clone()]), false, "");
+    // B закрепляет ту же запись, подсунув большому файлу свой `blob` и
+    // прямую передачу.
+    let mut forged = a.mem.item(&h).context("нет записи")?;
+    let x = BlobId::random()?;
+    if let Content::Files(f) = &mut forged.content {
+        f[1].blob = Some(x);
+        f[1].blob_size = f[1].size;
+        f[1].p2p = true;
+    }
+    b.mem.add_foreign(forged, true);
+    b.pins.pin(h, "");
+    // A чинит маленький файл: у него появляется свой `blob`.
+    a.until("маленький файл залит", |m, _| {
+        m.files(&h)
+            .first()
+            .is_some_and(|f| f.blob.is_some() && !f.p2p)
+    })
+    .await?;
+    let files = a.mem.files(&h);
+    assert_eq!(
+        (files[1].blob, files[1].p2p),
+        (big.blob, big.p2p),
+        "в свою запись попал чужой blob: {files:?}"
+    );
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// «Снял и сразу закрепил снова»: сервер удаляет файл закрепа при снятии,
+/// поэтому журнал загрузок владельца его забывает, и повторное закрепление
+/// заливает файл заново — второе устройство его скачивает.
+#[tokio::test(flavor = "multi_thread")]
+async fn unpin_then_pin_again_uploads_file_again() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    b.files = true;
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    let file = disk_file(&a.dir.join("src"), "doc.bin", 200_000)?;
+    let bytes = std::fs::read(&file.path)?;
+    let h = a.mem.add_content(Content::Files(vec![file]), true, "");
+    a.pins.pin(h, "");
+    b.until("закреп с файлом пришёл", |m, _| {
+        m.state(&h).is_some_and(|(p, _)| p)
+            && m.files(&h)
+                .first()
+                .is_some_and(|f| f.blob.is_some() && !f.p2p)
+    })
+    .await?;
+    assert_eq!(fetch(&b, &h).await?, vec![bytes.clone()]);
+    let first = b.mem.files(&h)[0].blob;
+
+    a.mem.set(&h, false, "");
+    a.pins.unpin(h);
+    b.until("закреп снят", |m, _| {
+        m.state(&h).is_some_and(|(p, _)| !p)
+    })
+    .await?;
+    a.synced().await?;
+    // Как сервис: файлы своей записи уже переехали на залитый `blob`.
+    a.until(
+        "своя запись знает залитый blob",
+        |m, _| m.files(&h).first().is_some_and(|f| f.blob.is_some()),
+    )
+    .await?;
+    a.mem.set(&h, true, "");
+    a.pins.pin(h, "");
+    b.until(
+        "закреп снова с файлом под новым blob",
+        |m, _| {
+            m.state(&h).is_some_and(|(p, _)| p)
+                && m.files(&h)
+                    .first()
+                    .is_some_and(|f| f.blob.is_some() && f.blob != first)
+        },
+    )
+    .await?;
+    let _ = std::fs::remove_dir_all(clipwire_agent::blobs::files_dir(&b.dir));
+    assert_eq!(fetch(&b, &h).await?, vec![bytes]);
+    a.stop().await?;
+    b.stop().await?;
     server.shutdown().await
 }

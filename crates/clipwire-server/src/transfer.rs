@@ -257,7 +257,7 @@ async fn begin(
     live: &Live,
 ) -> Result<(u64, bool), Fail> {
     let (limits, group) = (shared.limits(), at.group);
-    let begin = shared.store.blob_begin(
+    let begin = shared.store.blob_begin_with_pins(
         group,
         blob,
         at.origin,
@@ -266,6 +266,7 @@ async fn begin(
         shared.not_before_ms(),
         limits.blob_quota,
         limits.blob_total_quota,
+        limits.pin_quota.max_bytes,
         limits.max_reserves,
     )?;
     let (have, fresh) = match begin {

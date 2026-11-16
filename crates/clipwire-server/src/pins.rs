@@ -56,7 +56,7 @@ fn check(w: &PinWrite<'_>, max_content: usize) -> Option<PinFail> {
 /// Обработать `PinSet`. Возвращает ответ отправителю (`None` — ключ группы
 /// сменён, соединение и так закроется по `kick`).
 pub fn set(
-    shared: &Shared,
+    shared: &std::sync::Arc<Shared>,
     group: &GroupId,
     conn_id: u64,
     w: &PinWrite<'_>,
@@ -68,7 +68,13 @@ pub fn set(
     }
     let failed = |reason| Ok(Some(ServerMsg::PinFailed { pin_id, reason }));
     let q = limits.pin_quota;
-    match shared.store.set_pin(group, w, now_ms(), q)? {
+    let (outcome, freed) = shared.store.set_pin_freeing(group, w, now_ms(), q)?;
+    if !freed.is_empty() {
+        // Снятые файлы закрепа — с диска сейчас, а не по чистке.
+        tracing::debug!(n = freed.len(), "файлы снятого закрепа удаляются");
+        tokio::spawn(crate::devices::remove_files(shared.clone(), *group, freed));
+    }
+    match outcome {
         PinOutcome::Accepted { rev } => {
             // Рассылка той же записью, что отдаёт `PinsSince`: большое
             // содержимое получатель спросит сам.

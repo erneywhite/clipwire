@@ -10,7 +10,12 @@
 //! если устройство видело текущий `rev` этого закрепа (сравнение с заменой).
 //!
 //! Файлы закреплённых записей (`pin_blobs`) не удаляются по сроку, пока
-//! закреп не снят: см. [`KEPT_BY_PIN`].
+//! закреп не снят: см. [`KEPT_BY_PIN`]. У них своя квота: место закрепов
+//! группы (`CLIPWIRE_PIN_BYTES`) — это записи закрепов вместе с их файлами
+//! ([`pins_used`]), квота файлов группы (`CLIPWIRE_BLOB_QUOTA`) считает только
+//! незакреплённые файлы, а предел сервера (`CLIPWIRE_BLOB_TOTAL_QUOTA`) — все
+//! живые. Файл, заведённый как файл закрепа (`blobs.pin_only`), без закрепа
+//! сразу считается истёкшим ([`live_sql`]).
 
 use anyhow::{Context, Result};
 use clipwire_core::proto::PinRecord;
@@ -24,6 +29,103 @@ use super::Store;
 /// закреплённых записей: при снятии закрепа строки удаляются.
 pub(super) const KEPT_BY_PIN: &str = "EXISTS (SELECT 1 FROM pin_blobs AS pb
      WHERE pb.group_id = blobs.group_id AND pb.blob_id = blobs.blob_id)";
+
+/// Файл жив (не истёк): держит живой закреп, или он обычный и моложе срока.
+/// Файл, заведённый как файл закрепа (`pin_only`), без закрепа сразу
+/// считается истёкшим: иначе «закрепил → залил → снял» обходило бы квоты
+/// файлов. `nb` — параметр SQL с `not_before_ms`.
+pub(super) fn live_sql(nb: &str) -> String {
+    format!("({KEPT_BY_PIN} OR (created_ms >= {nb} AND pin_only = 0))")
+}
+
+/// Живой обычный файл: в квоте файлов группы.
+pub(super) fn unpinned_live_sql(nb: &str) -> String {
+    format!("(created_ms >= {nb} AND pin_only = 0 AND NOT {KEPT_BY_PIN})")
+}
+
+/// Истёкший файл: его чистит `purge_expired_blobs`.
+pub(super) fn expired_sql(nb: &str) -> String {
+    format!("(NOT {KEPT_BY_PIN} AND (created_ms < {nb} OR pin_only = 1))")
+}
+
+/// Зашифрованный размер файла (`clipwire_core::blob::sealed_size`) для
+/// столбца `size` таблицы `blobs`, посчитанный прямо в SQLite. Та же формула,
+/// что у квоты файлов в `Store::blob_begin`.
+pub(super) fn sealed_sql() -> String {
+    use clipwire_core::blob::{CHUNK, OVERHEAD};
+    format!("(size + MAX(1, (size + {CHUNK} - 1) / {CHUNK}) * {OVERHEAD})")
+}
+
+/// Сколько места занимают закреплённые файлы группы (по `sealed_size`).
+pub(super) fn pin_files_bytes(conn: &Connection, group: &GroupId) -> Result<u64> {
+    let v: i64 = conn.query_row(
+        &format!(
+            "SELECT COALESCE(SUM({}), 0) FROM blobs WHERE group_id = ?1 AND {KEPT_BY_PIN}",
+            sealed_sql()
+        ),
+        params![&group.0[..]],
+        |r| r.get(0),
+    )?;
+    Ok(v.max(0) as u64)
+}
+
+/// Место закрепов группы в счёт `CLIPWIRE_PIN_BYTES`: все записи (и снятые)
+/// плюс файлы живых закрепов.
+pub(super) fn pins_used(conn: &Connection, group: &GroupId) -> Result<u64> {
+    let records: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(length(state) + content_len), 0) FROM pins WHERE group_id = ?1",
+        params![&group.0[..]],
+        |r| r.get(0),
+    )?;
+    Ok((records.max(0) as u64).saturating_add(pin_files_bytes(conn, group)?))
+}
+
+/// Держит ли файл живой закреп группы.
+pub(super) fn is_pin_blob(conn: &Connection, group: &GroupId, blob: &BlobId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT 1 FROM pin_blobs WHERE group_id = ?1 AND blob_id = ?2")?
+        .exists(params![&group.0[..], &blob.0[..]])?)
+}
+
+/// Сколько места займут файлы `blobs`, которые уже есть на сервере и ещё не
+/// закреплены другими закрепами группы (кроме `pin`). Файлы, которых пока нет
+/// (закреп пришёл раньше заливки), места не занимают: их проверит квота при
+/// заливке (`Store::blob_begin`).
+fn own_files_bytes(
+    conn: &Connection,
+    group: &GroupId,
+    pin: &PinId,
+    blobs: &[BlobId],
+) -> Result<u64> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM blobs WHERE group_id = ?1 AND blob_id = ?2
+           AND NOT EXISTS (SELECT 1 FROM pin_blobs AS pb WHERE pb.group_id = ?1
+                           AND pb.blob_id = ?2 AND pb.pin_id <> ?3)",
+        sealed_sql()
+    ))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    for b in blobs.iter().filter(|b| seen.insert(**b)) {
+        let s: Option<i64> = stmt
+            .query_row(params![&group.0[..], &b.0[..], &pin.0[..]], |r| r.get(0))
+            .optional()?;
+        total = total.saturating_add(s.unwrap_or(0).max(0) as u64);
+    }
+    Ok(total)
+}
+
+/// Файлы, которые сейчас держит закреп `pin`.
+fn pin_blob_list(conn: &Connection, group: &GroupId, pin: &PinId) -> Result<Vec<BlobId>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT blob_id FROM pin_blobs WHERE group_id = ?1 AND pin_id = ?2")?;
+    stmt.query_map(params![&group.0[..], &pin.0[..]], |r| {
+        r.get::<_, Vec<u8>>(0)
+    })?
+    .map(|b| -> Result<BlobId> {
+        Ok(BlobId(b?.try_into().ok().context("битый blob_id в базе")?))
+    })
+    .collect()
+}
 
 /// Сколько записей в одной странице `Pins`.
 pub const PAGE_RECORDS: usize = 256;
@@ -58,6 +160,13 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS pin_blobs_blob ON pin_blobs (group_id, blob_id);",
     )?;
+    // Файл заведён как файл закрепа: без закрепа он не живёт (см. `live_sql`).
+    let has_pin_only: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('blobs') WHERE name = 'pin_only'")?
+        .exists([])?;
+    if !has_pin_only {
+        conn.execute_batch("ALTER TABLE blobs ADD COLUMN pin_only INTEGER NOT NULL DEFAULT 0;")?;
+    }
     let has_rev: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('groups') WHERE name = 'pin_rev'")?
         .exists([])?;
@@ -78,7 +187,8 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
 pub struct PinQuota {
     /// Закреплённых записей (`CLIPWIRE_PIN_MAX`).
     pub max_pins: u64,
-    /// Байт всех записей, включая снятые (`CLIPWIRE_PIN_BYTES`).
+    /// Байт всех записей, включая снятые, вместе с файлами живых закрепов
+    /// (`CLIPWIRE_PIN_BYTES`).
     pub max_bytes: u64,
 }
 
@@ -118,12 +228,45 @@ impl Store {
     /// Квоты не мешают правке, которая не увеличивает занятое: снять закреп
     /// или укоротить подпись можно и сверх квоты (например, если её
     /// уменьшили в настройках сервера).
+    #[cfg(test)]
     pub fn set_pin(
         &self,
         group: &GroupId,
         w: &PinWrite<'_>,
         now_ms: i64,
         quota: PinQuota,
+    ) -> Result<PinOutcome> {
+        Ok(self.set_pin_freeing(group, w, now_ms, quota)?.0)
+    }
+
+    /// [`Store::set_pin`], которая ещё возвращает файлы, заведённые как
+    /// файлы закрепа (`pin_only`), которых после правки не держит ни один
+    /// живой закреп (закреп сняли или заменили список файлов). Их строки
+    /// удалены в той же транзакции: файлы надо сразу убрать с диска, а не
+    /// ждать чистки по сроку, иначе «закрепил, залил, снял» держало бы диск
+    /// сверх предела сервера.
+    pub fn set_pin_freeing(
+        &self,
+        group: &GroupId,
+        w: &PinWrite<'_>,
+        now_ms: i64,
+        quota: PinQuota,
+    ) -> Result<(PinOutcome, Vec<BlobId>)> {
+        let mut freed = Vec::new();
+        let out = self.set_pin_inner(group, w, now_ms, quota, &mut freed)?;
+        if !matches!(out, PinOutcome::Accepted { .. }) {
+            freed.clear();
+        }
+        Ok((out, freed))
+    }
+
+    fn set_pin_inner(
+        &self,
+        group: &GroupId,
+        w: &PinWrite<'_>,
+        now_ms: i64,
+        quota: PinQuota,
+        freed: &mut Vec<BlobId>,
     ) -> Result<PinOutcome> {
         let g = &group.0[..];
         let mut conn = self.conn();
@@ -169,14 +312,25 @@ impl Store {
                 return Ok(PinOutcome::TooMany);
             }
         }
-        let new_bytes = w.state.len() as i64 + content_len;
-        if new_bytes > old_bytes {
-            let used: i64 = tx.query_row(
-                "SELECT COALESCE(SUM(length(state) + content_len), 0) FROM pins WHERE group_id = ?1",
-                params![g],
-                |r| r.get(0),
-            )?;
-            if ((used - old_bytes + new_bytes) as u64) > quota.max_bytes {
+        // Место закрепов: записи и файлы, которые уже лежат на сервере.
+        // Сколько файлов держит этот закреп до правки и будет держать после.
+        let old_files = pin_blob_list(&tx, group, &w.pin_id)?;
+        let new_files: &[BlobId] = match (w.pinned, w.content) {
+            (false, _) => &[],
+            (true, Some(_)) => w.blobs,
+            (true, None) => &old_files,
+        };
+        let before = (old_bytes.max(0) as u64)
+            + if was_pinned {
+                own_files_bytes(&tx, group, &w.pin_id, &old_files)?
+            } else {
+                0
+            };
+        let after = (w.state.len() as u64 + content_len.max(0) as u64)
+            + own_files_bytes(&tx, group, &w.pin_id, new_files)?;
+        if after > before {
+            let used = pins_used(&tx, group)?;
+            if used.saturating_sub(before).saturating_add(after) > quota.max_bytes {
                 return Ok(PinOutcome::NoSpace);
             }
         }
@@ -220,6 +374,18 @@ impl Store {
                             "INSERT OR IGNORE INTO pin_blobs (group_id, pin_id, blob_id) VALUES (?1, ?2, ?3)",
                             params![g, pid, &b.0[..]],
                         )?;
+                    }
+                }
+                // Файлы закрепа, которые больше никто не держит, — сразу.
+                for b in &old_files {
+                    let n = tx.execute(
+                        "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2 AND pin_only = 1
+                           AND NOT EXISTS (SELECT 1 FROM pin_blobs AS pb
+                                           WHERE pb.group_id = ?1 AND pb.blob_id = ?2)",
+                        params![g, &b.0[..]],
+                    )?;
+                    if n > 0 {
+                        freed.push(*b);
                     }
                 }
             }
@@ -282,16 +448,17 @@ impl Store {
             .flatten())
     }
 
-    /// Сколько у группы закреплённых записей и сколько байт занимают все
-    /// записи закрепов, включая снятые.
+    /// Сколько у группы закреплённых записей и сколько места закрепов
+    /// занято: все записи, включая снятые, и файлы живых закрепов (то, что
+    /// считается в `CLIPWIRE_PIN_BYTES`).
     pub fn pin_stats(&self, group: &GroupId) -> Result<(u64, u64)> {
-        let (pins, bytes): (i64, i64) = self.conn().query_row(
-            "SELECT COALESCE(SUM(pinned), 0), COALESCE(SUM(length(state) + content_len), 0)
-             FROM pins WHERE group_id = ?1",
+        let conn = self.conn();
+        let pins: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(pinned), 0) FROM pins WHERE group_id = ?1",
             params![&group.0[..]],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )?;
-        Ok((pins as u64, bytes as u64))
+        Ok((pins.max(0) as u64, pins_used(&conn, group)?))
     }
 
     /// Метка закрепов группы в этой базе (`ServerMsg::Pins::epoch`):
@@ -647,9 +814,13 @@ mod tests {
         let nb = 1000;
         assert_eq!(s.blob_info(&g, &kept, nb).unwrap(), Some((10, 1)));
         assert_eq!(s.blob_info(&g, &gone, nb).unwrap(), None);
+        // Закреплённый файл считается в месте закрепов, не в файлах группы.
         let stats = s.group_stats(&g, nb).unwrap();
-        assert_eq!((stats.files, stats.file_bytes), (1, 10));
-        assert_eq!(stats.quota_used, clipwire_core::blob::sealed_size(10));
+        assert_eq!((stats.files, stats.file_bytes, stats.quota_used), (0, 0, 0));
+        assert_eq!(
+            s.pin_stats(&g).unwrap(),
+            (1, 5 + 1 + clipwire_core::blob::sealed_size(10))
+        );
         // Повторный Put закреплённого файла продолжает его, а не заводит заново.
         let again = s
             .blob_begin(
@@ -665,7 +836,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(again, BlobBegin::Existing { have: 1 });
-        // Квота считает закреплённый файл: второй такой же не влезает.
+        // Квота файлов закреплённый файл не считает: такой же обычный влезает.
         let tight = clipwire_core::blob::sealed_size(10) + 5;
         let other = s
             .blob_begin(
@@ -680,7 +851,7 @@ mod tests {
                 100,
             )
             .unwrap();
-        assert_eq!(other, BlobBegin::QuotaExceeded);
+        assert_eq!(other, BlobBegin::Created);
         // Чистка по сроку убирает только незакреплённый.
         assert_eq!(s.purge_expired_blobs(nb).unwrap(), vec![(g, gone)]);
         assert!(s.blob_exists(&g, &kept).unwrap());
@@ -688,6 +859,192 @@ mod tests {
         put(&s, &g, pin(1), 1, false, None, &[], Q);
         assert_eq!(s.blob_info(&g, &kept, nb).unwrap(), None);
         assert_eq!(s.purge_expired_blobs(nb).unwrap(), vec![(g, kept)]);
+    }
+
+    /// Начать файл `size` байт с квотами файлов группы `quota` и закрепов
+    /// `pin_bytes`.
+    fn begin_q(
+        s: &Store,
+        g: &GroupId,
+        b: BlobId,
+        size: u64,
+        quota: u64,
+        pin_bytes: u64,
+    ) -> crate::store::BlobBegin {
+        s.blob_begin_with_pins(
+            g,
+            &b,
+            &DeviceId([2; 32]),
+            size,
+            100,
+            0,
+            quota,
+            u64::MAX,
+            pin_bytes,
+            100,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pin_files_have_own_quota() {
+        use crate::store::BlobBegin;
+        use clipwire_core::blob::sealed_size;
+        let (s, g) = store_with_group();
+        let (pf, f1, f2) = (BlobId([1; 16]), BlobId([2; 16]), BlobId([3; 16]));
+        // Запись закрепа (state + c = 6 байт) приходит раньше файла: файла
+        // ещё нет, место он не занимает.
+        assert!(matches!(
+            put(&s, &g, pin(1), 0, true, Some(b"c"), &[pf], Q),
+            PinOutcome::Accepted { .. }
+        ));
+        let record = 6;
+        // Файл закрепа не лезет в место закрепов — отказ, хотя квота файлов
+        // группы пустая и ни при чём.
+        let tight = record + sealed_size(1000) - 1;
+        assert_eq!(
+            begin_q(&s, &g, pf, 1000, u64::MAX, tight),
+            BlobBegin::QuotaExceeded
+        );
+        // Влезает в место закрепов — заводится, даже если квота файлов 0.
+        assert_eq!(begin_q(&s, &g, pf, 1000, 0, tight + 1), BlobBegin::Created);
+        assert_eq!(s.pin_stats(&g).unwrap(), (1, record + sealed_size(1000)));
+        // Обычные файлы занимают квоту файлов, закреплённый в ней не виден.
+        let q = sealed_size(10);
+        assert_eq!(begin_q(&s, &g, f1, 10, q, 0), BlobBegin::Created);
+        assert_eq!(
+            begin_q(&s, &g, f2, 10, q, u64::MAX),
+            BlobBegin::QuotaExceeded
+        );
+        assert_eq!(s.group_stats(&g, 0).unwrap().quota_used, q);
+        // Закрепить запись с уже залитым файлом: файл считается в месте
+        // закрепов сразу, при `PinSet`.
+        let small = PinQuota {
+            max_pins: 10,
+            max_bytes: record + sealed_size(1000) + record + q - 1,
+        };
+        assert_eq!(
+            put(&s, &g, pin(2), 0, true, Some(b"c"), &[f1], small),
+            PinOutcome::NoSpace
+        );
+        let fits = PinQuota {
+            max_bytes: small.max_bytes + 1,
+            ..small
+        };
+        assert!(matches!(
+            put(&s, &g, pin(2), 0, true, Some(b"c"), &[f1], fits),
+            PinOutcome::Accepted { .. }
+        ));
+        assert_eq!(s.group_stats(&g, 0).unwrap().quota_used, 0);
+        // Тот же файл у второго закрепа второй раз не считается.
+        assert!(matches!(
+            put(&s, &g, pin(3), 0, true, Some(b"c"), &[f1], fits),
+            PinOutcome::NoSpace
+        ));
+        let roomy = PinQuota {
+            max_bytes: fits.max_bytes + record,
+            ..fits
+        };
+        assert!(matches!(
+            put(&s, &g, pin(3), 0, true, Some(b"c"), &[f1], roomy),
+            PinOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            s.pin_stats(&g).unwrap(),
+            (3, 3 * record + sealed_size(1000) + q)
+        );
+        // Сняли закреп файла `pf`: он заводился как файл закрепа, его строка
+        // удаляется сразу, и файл надо убрать с диска.
+        let unpin = PinWrite {
+            pin_id: pin(1),
+            base_rev: 1,
+            pinned: false,
+            state: b"state",
+            content: None,
+            blobs: &[],
+        };
+        let (out, freed) = s.set_pin_freeing(&g, &unpin, 1000, Q).unwrap();
+        assert!(matches!(out, PinOutcome::Accepted { .. }));
+        assert_eq!(freed, vec![pf]);
+        assert_eq!(s.group_stats(&g, 0).unwrap().quota_used, 0);
+        assert_eq!(s.pin_stats(&g).unwrap(), (2, 5 + 2 * record + q));
+        assert!(!s.blob_exists(&g, &pf).unwrap());
+        assert!(s.purge_expired_blobs(0).unwrap().is_empty());
+        // `f1` был обычным до закрепления: после снятия обоих закрепов он
+        // снова обычный, со своим временем, и в квоте файлов.
+        let rev = |id| s.pin(&g, &id).unwrap().unwrap().rev;
+        put(&s, &g, pin(2), rev(pin(2)), false, None, &[], Q);
+        put(&s, &g, pin(3), rev(pin(3)), false, None, &[], Q);
+        assert_eq!(s.group_stats(&g, 0).unwrap().quota_used, q);
+        assert!(s.purge_expired_blobs(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pin_unpin_cycle_does_not_bypass_file_quota() {
+        use crate::store::BlobBegin;
+        use clipwire_core::blob::sealed_size;
+        let (s, g) = store_with_group();
+        let q = sealed_size(1000);
+        // Квота файлов группы — на один файл. Каждый круг: закрепить запись
+        // с новым файлом, залить его (место закрепов), снять закреп.
+        for n in 1..=5u8 {
+            let b = BlobId([n; 16]);
+            put(&s, &g, pin(n), 0, true, Some(b"c"), &[b], Q);
+            assert_eq!(begin_q(&s, &g, b, 1000, q, u64::MAX), BlobBegin::Created);
+            let rev = s.pin(&g, &pin(n)).unwrap().unwrap().rev;
+            put(&s, &g, pin(n), rev, false, None, &[], Q);
+            // Снятый файл закрепа квоту файлов не занимает и истёк.
+            assert_eq!(s.group_stats(&g, 0).unwrap().quota_used, 0);
+            assert_eq!(s.blob_info(&g, &b, 0).unwrap(), None);
+        }
+        // Строки снятых файлов закрепа удалены сразу, чистке нечего делать.
+        assert!(s.purge_expired_blobs(0).unwrap().is_empty());
+        // Обычный файл в квоту по-прежнему влезает ровно один.
+        assert_eq!(
+            begin_q(&s, &g, BlobId([9; 16]), 1000, q, 0),
+            BlobBegin::Created
+        );
+        assert_eq!(
+            begin_q(&s, &g, BlobId([10; 16]), 1000, q, 0),
+            BlobBegin::QuotaExceeded
+        );
+        // Повторный Put снятого файла закрепа заводит его заново как обычный,
+        // через квоту файлов.
+        assert_eq!(
+            begin_q(&s, &g, BlobId([1; 16]), 1000, q, u64::MAX),
+            BlobBegin::QuotaExceeded
+        );
+    }
+
+    #[test]
+    fn pin_file_reserve_counts_toward_server_total() {
+        use crate::store::BlobBegin;
+        use clipwire_core::blob::sealed_size;
+        let (s, g) = store_with_group();
+        let (pf, other) = (BlobId([1; 16]), BlobId([2; 16]));
+        let total = sealed_size(1000) + sealed_size(10);
+        let begin = |b: BlobId, size: u64| {
+            s.blob_begin_with_pins(
+                &g,
+                &b,
+                &DeviceId([2; 32]),
+                size,
+                100,
+                0,
+                u64::MAX,
+                total,
+                u64::MAX,
+                100,
+            )
+            .unwrap()
+        };
+        assert_eq!(begin(other, 1000), BlobBegin::Created);
+        put(&s, &g, pin(1), 0, true, Some(b"c"), &[pf], Q);
+        // Файл закрепа упирается в предел сервера, хоть место закрепов есть.
+        assert_eq!(begin(pf, 1000), BlobBegin::ServerFull);
+        assert_eq!(begin(pf, 10), BlobBegin::Created);
+        // И закреплённый файл занимает предел сервера для обычных.
+        assert_eq!(begin(BlobId([3; 16]), 1), BlobBegin::ServerFull);
     }
 
     #[test]

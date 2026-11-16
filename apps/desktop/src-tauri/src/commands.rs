@@ -443,6 +443,47 @@ pub fn history_pin(
     Ok(())
 }
 
+/// Сколько байт файлов уйдёт в хранилище группы, если закрепить запись:
+/// закреп заливает файлы независимо от порога «сразу заливать», и окно
+/// вставки сначала спрашивает подтверждение. 0 — спрашивать не нужно: не в
+/// группе, в записи нет файлов или они не больше порога.
+#[tauri::command]
+pub fn history_pin_size(state: State<'_, AppState>, id: String) -> CmdResult<u64> {
+    let id = parse_id(&id)?;
+    if group_pins(&state).is_none() {
+        return Ok(0);
+    }
+    let blobs = state
+        .service
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|s| s.blobs());
+    let Some(blobs) = blobs else { return Ok(0) };
+    let entry = state
+        .history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .ok_or_else(|| tr("Элемента уже нет в истории").to_string())?;
+    let clipwire_core::Content::Files(files) = &entry.content else {
+        return Ok(0);
+    };
+    let queued: std::collections::HashSet<_> = blobs.queued().iter().map(|j| j.blob).collect();
+    let bytes =
+        clipwire_agent::pin_files::upload_size(files, entry.local, blobs.files_dir(), |b| {
+            queued.contains(&b) || blobs.is_uploaded(b)
+        });
+    let limit_mb = state
+        .upload_limit_mb
+        .load(std::sync::atomic::Ordering::Relaxed);
+    Ok(if bytes > limit_mb.saturating_mul(1024 * 1024) {
+        bytes
+    } else {
+        0
+    })
+}
+
 /// Подпись закреплённой записи (пустая — убрать). Возвращает сохранённую
 /// подпись: без переводов строк и пробелов по краям, до 80 символов.
 #[tauri::command]
