@@ -690,7 +690,13 @@ fn unnamed(info: GroupInfo) -> GroupEntry {
 }
 
 fn unexpected(msg: &ServerMsg) -> String {
-    tracing::warn!("неожиданный ответ на запрос администратора: {msg:?}");
+    // Только имя варианта: тело ответа в журнал не нужно.
+    let dbg = format!("{msg:?}");
+    let kind = dbg
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("?");
+    tracing::warn!("неожиданный ответ на запрос администратора: {kind}");
     tr("Сервер ответил не то, что ожидалось").into()
 }
 
