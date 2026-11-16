@@ -297,6 +297,48 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
     Ok(configured)
 }
 
+/// Журнал: stdout (удобно в dev) и файлы `<папка данных>/logs/clipwire.log.<дата>`,
+/// по файлу на день, хранятся последние 7. `RUST_LOG` переопределяет уровень.
+/// Содержимого буфера в журнале нет: тексты записей туда не пишутся.
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(
+                "info,iroh=warn,iroh_relay=warn,noq=warn,noq_proto=warn",
+            )
+        })
+    };
+    let stdout = tracing_subscriber::fmt::layer().with_filter(filter());
+    let file = Paths::resolve().ok().and_then(|p| {
+        let dir = p.log_dir();
+        tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("clipwire")
+            .filename_suffix("log")
+            .max_log_files(7)
+            .build(&dir)
+            .map_err(|e| eprintln!("журнал в файл не включён ({}): {e}", dir.display()))
+            .ok()
+    });
+    let (file_layer, guard) = match file {
+        Some(w) => {
+            let (nb, guard) = tracing_appender::non_blocking(w);
+            let layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(nb)
+                .with_filter(filter());
+            (Some(layer), Some(guard))
+        }
+        None => (None, None),
+    };
+    tracing_subscriber::registry()
+        .with(stdout)
+        .with(file_layer)
+        .init();
+    guard
+}
+
 fn load_state() -> anyhow::Result<AppState> {
     let paths = Paths::resolve()?;
     // Остатки кэша прошлой группы, которые не удалились при выходе (файл был
@@ -573,15 +615,8 @@ pub fn run() {
     // Подписи, как на маке, тут нет, поэтому и у `tauri dev` тоже.
     #[cfg(target_os = "linux")]
     clipwire_agent::secret::enable_keychain();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "info,iroh=warn,iroh_relay=warn,noq=warn,noq_proto=warn",
-                )
-            }),
-        )
-        .init();
+    // Держим до конца работы: при выходе guard дописывает файл журнала.
+    let _log_guard = init_logging();
 
     // TLS для карточек ссылок (reqwest без встроенного провайдера). Если провайдер
     // уже поставил кто-то другой, это не ошибка.
@@ -645,6 +680,7 @@ pub fn run() {
             commands::save_settings,
             commands::leave_group,
             commands::device_info,
+            commands::logs_open,
             devices::devices_list,
             devices::stats_overview,
             devices::device_remove,

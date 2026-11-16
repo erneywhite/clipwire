@@ -725,6 +725,8 @@ pub struct DeviceInfo {
     pub relay_url: Option<String>,
     /// Короткий отпечаток устройства (первые байты endpoint ID).
     pub device_id: Option<String>,
+    /// Отпечаток id группы, как в списке групп сервера; нет — устройство без группы.
+    pub group_fingerprint: Option<String>,
     /// Программа-источник копирования известна (на Wayland — нет).
     pub knows_source_app: bool,
     /// Окно вставки само вставляет в прежнее окно (на Wayland — только в буфер).
@@ -748,9 +750,13 @@ pub fn device_info(app: AppHandle) -> DeviceInfo {
                 .map(|b| format!("{b:02x}"))
                 .collect()
         });
+    let group_fingerprint = agent
+        .as_ref()
+        .map(|a| crate::admin::group_fingerprint(&a.invite.group_key.group_id()));
     DeviceInfo {
         version: app.package_info().version.to_string(),
         relay_url: agent.map(|a| a.invite.server.relay_url),
+        group_fingerprint,
         device_id,
         knows_source_app: clipwire_agent::clipboard::knows_source_app(),
         can_paste_into_active: crate::popup::can_paste_into_active(),
@@ -761,6 +767,19 @@ pub fn device_info(app: AppHandle) -> DeviceInfo {
         #[cfg(not(target_os = "linux"))]
         system_shortcut: false,
     }
+}
+
+/// Открыть папку журналов в файловом менеджере.
+#[tauri::command]
+pub fn logs_open(app: AppHandle) -> CmdResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = clipwire_agent::state::Paths::resolve()
+        .map_err(err)?
+        .log_dir();
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(err)
 }
 
 /// Положить текст в буфер, не отправляя в синхронизацию (код приглашения и т. п.).

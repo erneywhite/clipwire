@@ -373,6 +373,11 @@ pub struct ServerGroupDto {
     pub days_left: Option<u32>,
 }
 
+/// Короткий отпечаток id группы (10 hex): в списке групп и у самого клиента.
+pub fn group_fingerprint(group: &GroupId) -> String {
+    data_encoding::HEXLOWER.encode(&group.0[..5])
+}
+
 fn group_dto(e: &GroupEntry, mine: Option<GroupId>) -> ServerGroupDto {
     let g = &e.info;
     let (state, days_left) = match g.state {
@@ -383,7 +388,7 @@ fn group_dto(e: &GroupEntry, mine: Option<GroupId>) -> ServerGroupDto {
     };
     ServerGroupDto {
         id: data_encoding::HEXLOWER.encode(&g.group.0),
-        fingerprint: data_encoding::HEXLOWER.encode(&g.group.0[..5]),
+        fingerprint: group_fingerprint(&g.group),
         name: e.name.clone(),
         mine: mine == Some(g.group),
         created_ms: g.created_ms,

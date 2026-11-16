@@ -95,6 +95,20 @@
   const showServer = $derived(adminKey && configured && status.kind !== 'excluded' && status.kind !== 'awaiting')
   const sections = $derived(allSections.filter((x) => x.id !== 'server' || showServer))
 
+  // Имя своей группы: заметка администратора сервера, обычным участникам не видна.
+  let ownGroupName = $state('')
+
+  async function loadOwnGroupName() {
+    ownGroupName = ''
+    if (!adminKey || !configured) return
+    try {
+      const g = await api.serverGroups()
+      ownGroupName = g.names ? (g.groups.find((x) => x.mine)?.name ?? '') : ''
+    } catch {
+      ownGroupName = ''
+    }
+  }
+
   async function loadAdmin() {
     try {
       const a = await api.adminState()
@@ -106,6 +120,7 @@
     } finally {
       adminLoaded = true
     }
+    loadOwnGroupName()
   }
 
   async function claimAdmin() {
@@ -294,6 +309,17 @@
       error = String(e)
     } finally {
       busy = false
+    }
+  }
+
+  let logsError = $state('')
+
+  async function openLogs() {
+    logsError = ''
+    try {
+      await api.logsOpen()
+    } catch (e) {
+      logsError = String(e)
     }
   }
 
@@ -831,6 +857,12 @@
           <div class="card">
             <div class="kv"><span>{t('Состояние')}</span><span>{statusText(status)}</span></div>
             <div class="kv"><span>{t('Сервер')}</span><span class="mono">{info?.relay_url ?? '—'}</span></div>
+            {#if info?.group_fingerprint}
+              <div class="kv">
+                <span>{t('Группа')}</span>
+                <span>{#if ownGroupName}{ownGroupName} {/if}<span class="mono">{info.group_fingerprint}</span></span>
+              </div>
+            {/if}
             <div class="kv"><span>{t('Отпечаток устройства')}</span><span class="mono">{info?.device_id ?? '—'}</span></div>
           </div>
 
@@ -881,7 +913,7 @@
           <h2>{t('Файлы')}</h2>
           <div class="card pad">
             <label class="field">
-              <span>{t('Загружать в хранилище файлы до N МБ')}</span>
+              <span>{t('Автоматически загружать файлы до, МБ')}</span>
               <input
                 class="num"
                 type="number"
@@ -893,7 +925,7 @@
               />
             </label>
             <p class="hint">
-              {t('Скопированные файлы такого размера сразу уходят зашифрованными в хранилище группы (сервер Clipwire или своё, см. «Хранилище файлов»), и другие устройства вставляют их, даже когда этот компьютер выключен. 0 — не загружать. Файлы крупнее порога другие устройства берут напрямую с этого компьютера, пока он в сети.')}
+              {t('Такие файлы сразу загружаются в хранилище, и их можно вставить на другом устройстве, даже если этот компьютер выключен. Файлы больше передаются напрямую, пока компьютер включён. Закреплённые файлы загружаются всегда. 0 — не загружать автоматически.')}
             </p>
             <div class="cache">
               <span>{t('Скачанные файлы занимают')} <span class="mono">{cacheBytes === null ? '—' : bytesLabel(cacheBytes)}</span></span>
@@ -1184,6 +1216,15 @@
         {#if configured}
           <p class="hint outside">{t('На сервере всё лежит зашифрованным и удаляется по сроку, заданному на сервере.')}</p>
         {/if}
+
+        <div class="card pad">
+          <div class="cache">
+            <span>{t('Журнал работы программы')}</span>
+            <button onclick={openLogs}>{t('Открыть папку журналов')}</button>
+          </div>
+          {#if logsError}<p class="error" role="alert">{logsError}</p>{/if}
+          <p class="hint">{t('Журнал помогает разобраться, если что-то пошло не так. Содержимого буфера в нём нет. Хранятся последние 7 дней.')}</p>
+        </div>
 
         <h2>{t('О проекте')}</h2>
         <div class="card">

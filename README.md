@@ -585,6 +585,23 @@ group sit on the server, how much of the server's quota for files is used
 (`CLIPWIRE_BLOB_QUOTA`; pinned files are counted in the pins row), and how many devices are in the group and how many are online. Server
 numbers need server 0.1.2 or newer. The Ko-fi button is there too.
 
+The **Sync** page shows which group the device is in: the group fingerprint, the same short id
+as in the server's group list. On the server administrator's device the group's name is shown
+next to it, if one is set.
+
+### Logs
+
+If something goes wrong, the app log helps to find out why. It has no clipboard content, only
+events and errors. Files are named `clipwire.<date>.log`, one per day, the last 7 are kept. The
+**Open logs folder** button in **About** opens them. Where they are:
+
+- Windows: `%APPDATA%\Clipwire\config\logs`
+- macOS: `~/Library/Application Support/Clipwire/logs`
+- Linux: `~/.config/clipwire/logs`
+
+With `CLIPWIRE_HOME` set, the `logs` folder is inside it. The `RUST_LOG` variable changes the
+log level (for example `RUST_LOG=debug`).
+
 ## Self-hosted server
 
 The server is one container with the iroh relay built in. It needs HTTPS (a reverse proxy in

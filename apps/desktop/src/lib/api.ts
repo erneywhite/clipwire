@@ -40,6 +40,8 @@ export interface DeviceInfo {
   version: string
   relay_url: string | null
   device_id: string | null
+  /** Отпечаток id группы, как в списке групп сервера; null — устройство без группы. */
+  group_fingerprint: string | null
   /** Программа-источник копирования известна (на Wayland — нет). */
   knows_source_app: boolean
   /** Окно вставки само вставляет в прежнее окно (на Wayland — только в буфер). */
@@ -506,6 +508,8 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   settingsCloseGuard: (on: boolean) => invoke<void>('settings_close_guard', { on }),
   leaveGroup: () => invoke<void>('leave_group'),
   deviceInfo: () => invoke<DeviceInfo>('device_info'),
+  /** Открыть папку журналов в файловом менеджере. */
+  logsOpen: () => invoke<void>('logs_open'),
   /** Поставить обновление сейчас; на Windows программа закроется и запустится заново. */
   updateInstall: () => invoke<void>('update_install'),
   /** Версия, которая уже скачана и поставится сама, или null. */
