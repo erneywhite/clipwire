@@ -865,6 +865,15 @@ pub static EN: &[(&str, &str)] = &[
         "The server administrator deleted the group",
     ),
     ("Неверный id группы", "Invalid group id"),
+    // Имена групп (`clipwire/12`).
+    (
+        "Имя группы — до {max} символов, без переводов строки и управляющих символов",
+        "A group name can be up to {max} characters, without line breaks or control characters",
+    ),
+    (
+        "Сервер не умеет хранить имена групп: обновите образ сервера Clipwire",
+        "The server cannot store group names: update the Clipwire server image",
+    ),
     // Коды создания группы (`clipwire/11`).
     (
         "Код создания группы не разобрался ({e}). Скопируйте его целиком, он начинается с cwgroup1-.",

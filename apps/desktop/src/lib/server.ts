@@ -300,11 +300,38 @@ export function groupSizeText(g: Pick<ServerGroup, 'item_bytes' | 'file_bytes' |
   return parts.length ? parts.join(' · ') : t('на сервере пусто')
 }
 
+// --- Имена групп (`clipwire/12`) ---
+
+/** Наибольшая длина имени группы, символов (`admin::MAX_GROUP_NAME`). */
+export const GROUP_NAME_MAX = 64
+
+/** Группа в тексте: «Семья» (ababababab) или просто отпечаток, если имени нет. */
+export function groupLabel(g: Pick<ServerGroup, 'name' | 'fingerprint'>): string {
+  return g.name ? t('«{name}» ({fp})', { name: g.name, fp: g.fingerprint }) : g.fingerprint
+}
+
+/** Управляющие символы и символы направления текста: те же, что отклоняет сервер. */
+const BAD_NAME_CHARS = /[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/
+
+/**
+ * Проверка имени до отправки, по правилам сервера (`normalize_group_name`):
+ * края без пробелов, не длиннее {@link GROUP_NAME_MAX} символов, без
+ * управляющих. Пустое — снять имя. Ошибка — текст, иначе пустая строка.
+ */
+export function groupNameError(text: string): string {
+  const name = text.trim()
+  // Символы, а не UTF-16: эмодзи — один символ, как на сервере.
+  if (BAD_NAME_CHARS.test(name) || [...name].length > GROUP_NAME_MAX) {
+    return t('Имя группы — до {max} символов, без переводов строки и управляющих символов', { max: GROUP_NAME_MAX })
+  }
+  return ''
+}
+
 /** Текст подтверждения удаления группы, абзацами. */
 export function deleteGroupText(g: ServerGroup): string[] {
   const out = [
     t('С сервера удалятся все данные группы {fp}: история ({items}), файлы ({files}), закрепы ({pins}), карточки устройств и настройки группы.', {
-      fp: g.fingerprint,
+      fp: groupLabel(g),
       items: tn(g.items, ['элемент', 'элемента', 'элементов'], ['item', 'items']),
       files: tn(g.files, ['файл', 'файла', 'файлов'], ['file', 'files']),
       pins: tn(g.pins, ['закреп', 'закрепа', 'закрепов'], ['pin', 'pins']),
