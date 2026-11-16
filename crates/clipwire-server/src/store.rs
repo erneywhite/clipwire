@@ -501,8 +501,10 @@ impl Store {
     }
 
     /// Что лежит у группы на сервере, без просроченного (до `not_before_ms`).
-    /// Файл считается, только если загружен целиком. Квоту (`quota`) знает
-    /// не база, а настройки сервера: её заполняет вызывающий.
+    /// Файл считается, только если загружен целиком. Файлы живых закрепов
+    /// сюда не входят: они в месте закрепов (`Store::pin_stats`), как и в
+    /// квотах. Квоту (`quota`) знает не база, а настройки сервера: её
+    /// заполняет вызывающий.
     pub fn group_stats(&self, group: &GroupId, not_before_ms: i64) -> Result<GroupStats> {
         let conn = self.conn();
         let (items, item_bytes): (i64, i64) = conn.query_row(
@@ -514,7 +516,7 @@ impl Store {
         let mut files = 0u64;
         let mut file_bytes = 0u64;
         let mut stmt = conn.prepare(&format!(
-            "SELECT size, have FROM blobs WHERE group_id = ?1 AND (created_ms >= ?2 OR {KEPT_BY_PIN})"
+            "SELECT size, have FROM blobs WHERE group_id = ?1 AND created_ms >= ?2 AND NOT {KEPT_BY_PIN}"
         ))?;
         let rows = stmt.query_map(params![&group.0[..], not_before_ms], |r| {
             Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
@@ -531,7 +533,7 @@ impl Store {
         let quota_used: i64 = conn.query_row(
             &format!(
                 "SELECT COALESCE(SUM(size + MAX(1, (size + ?3 - 1) / ?3) * ?4), 0)
-                 FROM blobs WHERE group_id = ?1 AND (created_ms >= ?2 OR {KEPT_BY_PIN})"
+                 FROM blobs WHERE group_id = ?1 AND created_ms >= ?2 AND NOT {KEPT_BY_PIN}"
             ),
             params![&group.0[..], not_before_ms, CHUNK as i64, OVERHEAD as i64],
             |r| r.get(0),
@@ -562,6 +564,10 @@ impl Store {
     /// У уже заведённого файла обновляется `last_touch_ms`: так повторный
     /// `Reserve` продлевает резерв. `max_reserves` — сколько файлов без единой
     /// части может держать устройство `origin` (по всем группам).
+    ///
+    /// Квота закрепов здесь не ограничена: см. [`Store::blob_begin_with_pins`].
+    /// Для проверок: сервер зовёт `blob_begin_with_pins`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn blob_begin(
         &self,
@@ -573,6 +579,39 @@ impl Store {
         not_before_ms: i64,
         quota: u64,
         total_quota: u64,
+        max_reserves: usize,
+    ) -> Result<BlobBegin> {
+        self.blob_begin_with_pins(
+            group,
+            blob,
+            origin,
+            size,
+            now_ms,
+            not_before_ms,
+            quota,
+            total_quota,
+            u64::MAX,
+            max_reserves,
+        )
+    }
+
+    /// [`Store::blob_begin`] с квотой закрепов. Файл, который уже числится
+    /// в `pin_blobs` живого закрепа группы (закреп пришёл раньше заливки),
+    /// проверяется против места закрепов (`pin_bytes`, записи закрепов вместе
+    /// с их файлами), остальные — против квот файлов. Закреплённые файлы в
+    /// квотах файлов группы и сервера не считаются.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blob_begin_with_pins(
+        &self,
+        group: &GroupId,
+        blob: &BlobId,
+        origin: &DeviceId,
+        size: u64,
+        now_ms: i64,
+        not_before_ms: i64,
+        quota: u64,
+        total_quota: u64,
+        pin_bytes: u64,
         max_reserves: usize,
     ) -> Result<BlobBegin> {
         let mut conn = self.conn();
@@ -613,23 +652,32 @@ impl Store {
             }
             None => {}
         }
-        // sealed_size(size) = size + max(1, ceil(size / CHUNK)) * OVERHEAD,
-        // посчитано прямо в SQLite: так не надо тянуть все строки в память.
-        let (group_used, total_used): (i64, i64) = tx.query_row(
-            &format!(
-                "SELECT COALESCE(SUM(CASE WHEN group_id = ?1 THEN s END), 0), COALESCE(SUM(s), 0)
-                 FROM (SELECT group_id, size + MAX(1, (size + ?3 - 1) / ?3) * ?4 AS s
-                       FROM blobs WHERE created_ms >= ?2 OR {KEPT_BY_PIN})"
-            ),
-            params![&group.0[..], not_before_ms, CHUNK as i64, OVERHEAD as i64],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
         let need = clipwire_core::blob::sealed_size(size);
-        if (group_used as u64).saturating_add(need) > quota {
-            return Ok(BlobBegin::QuotaExceeded);
-        }
-        if (total_used as u64).saturating_add(need) > total_quota {
-            return Ok(BlobBegin::ServerFull);
+        if pins::is_pin_blob(&tx, group, blob)? {
+            // Файл закрепа: своё место, квоты файлов его не касаются.
+            let used = pins::pins_used(&tx, group)?;
+            if used.saturating_add(need) > pin_bytes {
+                return Ok(BlobBegin::QuotaExceeded);
+            }
+        } else {
+            // sealed_size(size) = size + max(1, ceil(size / CHUNK)) * OVERHEAD,
+            // посчитано прямо в SQLite: так не надо тянуть все строки в память.
+            // Закреплённые файлы считаются в месте закрепов, не здесь.
+            let (group_used, total_used): (i64, i64) = tx.query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(CASE WHEN group_id = ?1 THEN s END), 0), COALESCE(SUM(s), 0)
+                     FROM (SELECT group_id, size + MAX(1, (size + ?3 - 1) / ?3) * ?4 AS s
+                           FROM blobs WHERE created_ms >= ?2 AND NOT {KEPT_BY_PIN})"
+                ),
+                params![&group.0[..], not_before_ms, CHUNK as i64, OVERHEAD as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if (group_used as u64).saturating_add(need) > quota {
+                return Ok(BlobBegin::QuotaExceeded);
+            }
+            if (total_used as u64).saturating_add(need) > total_quota {
+                return Ok(BlobBegin::ServerFull);
+            }
         }
         // Файлы без единой части: резервы и только что начатые Put. Каждый
         // держит квоту, поэтому их число ограничено. Считаем на устройство, а

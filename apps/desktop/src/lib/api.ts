@@ -93,7 +93,7 @@ export interface GroupStats {
 export interface PinStats {
   /** Закреплённых записей (снятые не считаются). */
   pins: number
-  /** Сколько места занимают все записи закрепов, включая снятые, байт. */
+  /** Место закрепов, байт: все записи закрепов (и снятые) вместе с файлами живых закрепов. */
   bytes: number
   /** Пределы сервера: CLIPWIRE_PIN_MAX и CLIPWIRE_PIN_BYTES. */
   max_pins: number

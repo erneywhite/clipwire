@@ -373,18 +373,28 @@ impl Store {
              JOIN groups AS g ON g.group_id = d.group_id
              WHERE g.rotated_ms IS NULL AND g.tombstone_ms IS NULL AND g.idle_ms IS NULL")?;
         let bytes_items = one("SELECT COALESCE(SUM(length(ciphertext)), 0) FROM items")?;
-        let bytes_pins = one("SELECT COALESCE(SUM(length(state) + content_len), 0) FROM pins")?;
         // Та же формула sealed_size, что у квоты файлов (`blob_begin`).
-        let bytes_files: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(size + MAX(1, (size + ?1 - 1) / ?1) * ?2), 0) FROM blobs",
-            params![CHUNK as i64, OVERHEAD as i64],
-            |r| r.get(0),
-        )?;
+        // Файлы живых закрепов — в месте закрепов, не в файлах.
+        let sealed = |kept: &str| -> Result<u64> {
+            let v: i64 = conn.query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(size + MAX(1, (size + ?1 - 1) / ?1) * ?2), 0) FROM blobs
+                     WHERE {kept}{}",
+                    super::pins::KEPT_BY_PIN
+                ),
+                params![CHUNK as i64, OVERHEAD as i64],
+                |r| r.get(0),
+            )?;
+            Ok(v.max(0) as u64)
+        };
+        let bytes_pins = one("SELECT COALESCE(SUM(length(state) + content_len), 0) FROM pins")?
+            .saturating_add(sealed("")?);
+        let bytes_files = sealed("NOT ")?;
         Ok(ServerSummary {
             groups,
             devices,
             bytes_items,
-            bytes_files: bytes_files.max(0) as u64,
+            bytes_files,
             bytes_pins,
             version: String::new(),
         })
