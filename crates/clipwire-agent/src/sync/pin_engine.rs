@@ -423,6 +423,9 @@ impl Engine {
             (touched, released)
         });
         self.forget_released(&released);
+        // Файлы закрепов — хранилищу и скачиванию сразу, до событий: по
+        // событию интерфейс может тут же спросить новый файл закрепа.
+        self.update_kept();
         for (h, item) in touched {
             let files = item
                 .as_ref()

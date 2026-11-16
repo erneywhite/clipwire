@@ -1288,6 +1288,13 @@ pub struct Blobs {
     missing: Mutex<HashSet<BlobId>>,
 }
 
+/// Сколько ждать файл закрепа, которого ещё нет на сервере: правка закрепа
+/// с новым `blob` уходит раньше резерва (сервер должен знать, что это файл
+/// закрепа), и получатель может спросить файл в этот промежуток.
+const PIN_FILE_WAIT: Duration = Duration::from_secs(30);
+/// Пауза между попытками.
+const PIN_FILE_RETRY: Duration = Duration::from_millis(500);
+
 /// Сколько потерянных файлов помнить до того, как движок их заберёт.
 const MAX_MISSING: usize = 1024;
 
@@ -1889,55 +1896,66 @@ impl Blobs {
                 None => (self.storage.external(), Waits::untagged()),
             };
             let progress = |done| self.transfers.progress(blob, Direction::Down, done, size);
-            let from_external = match (f.p2p, external) {
-                (false, Some((_, store))) => {
-                    match download(
-                        store.as_ref(),
-                        &self.key,
-                        blob,
-                        size,
-                        &target,
-                        waits,
-                        progress,
-                    )
-                    .await
-                    {
-                        Ok(p) => Some(p),
-                        // Файла во внешнем хранилище нет: его отправили через
-                        // сервер (хранилище было недоступно) или раньше выбора.
-                        Err(GetError::Gone) => None,
-                        // Метки нет, а хранилище не отвечает: файл мог уйти
-                        // через сервер, там и искать.
-                        Err(GetError::Unavailable(e)) if place.is_none() => {
-                            tracing::info!(blob = %blob.hex(), "внешнее хранилище недоступно, беру файл с сервера: {e:#}");
-                            None
-                        }
-                        Err(GetError::Unavailable(e) | GetError::Failed(e)) => return Err(e),
-                    }
-                }
-                _ => None,
-            };
-            let got = if let Some(p) = from_external {
-                p
-            } else if f.p2p {
-                self.download_p2p(origin, blob, size, &target).await?
-            } else {
-                let conn = self
-                    .wait_conn(WAIT_CONN)
-                    .await
-                    .ok_or_else(|| anyhow!(tr("нет связи с сервером")))?;
-                match download_blob(&conn, &self.key, blob, size, &target, progress).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        if e.downcast_ref::<BlobFail>() == Some(&BlobFail::NotFound) {
-                            let mut m = self.missing.lock().unwrap_or_else(|e| e.into_inner());
-                            if m.len() < MAX_MISSING {
-                                m.insert(blob);
+            let wait_until = Instant::now() + PIN_FILE_WAIT;
+            let got = loop {
+                let from_external = match (f.p2p, external.clone()) {
+                    (false, Some((_, store))) => {
+                        match download(
+                            store.as_ref(),
+                            &self.key,
+                            blob,
+                            size,
+                            &target,
+                            waits,
+                            progress,
+                        )
+                        .await
+                        {
+                            Ok(p) => Some(p),
+                            // Файла во внешнем хранилище нет: его отправили через
+                            // сервер (хранилище было недоступно) или раньше выбора.
+                            Err(GetError::Gone) => None,
+                            // Метки нет, а хранилище не отвечает: файл мог уйти
+                            // через сервер, там и искать.
+                            Err(GetError::Unavailable(e)) if place.is_none() => {
+                                tracing::info!(blob = %blob.hex(), "внешнее хранилище недоступно, беру файл с сервера: {e:#}");
+                                None
                             }
+                            Err(GetError::Unavailable(e) | GetError::Failed(e)) => return Err(e),
                         }
-                        return Err(e);
+                    }
+                    _ => None,
+                };
+                let attempt = if let Some(p) = from_external {
+                    Ok(p)
+                } else if f.p2p {
+                    self.download_p2p(origin, blob, size, &target).await
+                } else {
+                    let conn = self
+                        .wait_conn(WAIT_CONN)
+                        .await
+                        .ok_or_else(|| anyhow!(tr("нет связи с сервером")))?;
+                    download_blob(&conn, &self.key, blob, size, &target, progress).await
+                };
+                let e = match attempt {
+                    Ok(p) => break p,
+                    Err(e) => e,
+                };
+                let not_found = e.downcast_ref::<BlobFail>() == Some(&BlobFail::NotFound);
+                // Файл закрепа: правка с его новым `blob` приходит раньше, чем
+                // источник его зарезервирует (`sync::pin_engine`), — подождать.
+                if not_found && self.storage.is_kept(blob) && Instant::now() < wait_until {
+                    tracing::info!(blob = %blob.hex(), "файла закрепа ещё нет на сервере, жду заливки");
+                    tokio::time::sleep(PIN_FILE_RETRY).await;
+                    continue;
+                }
+                if not_found {
+                    let mut m = self.missing.lock().unwrap_or_else(|e| e.into_inner());
+                    if m.len() < MAX_MISSING {
+                        m.insert(blob);
                     }
                 }
+                return Err(e);
             };
             // Файл с другого устройства — как скачанный из интернета: метка
             // ставится до того, как путь уйдёт в буфер или в «Открыть».
