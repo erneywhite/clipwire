@@ -1,4 +1,4 @@
-//! Обработка одного подключения агента по ALPN от `clipwire/3` до `clipwire/10`:
+//! Обработка одного подключения агента по ALPN от `clipwire/3` до `clipwire/11`:
 //! формат кадров один, новые версии только добавляют сообщения (`proto.rs`).
 
 use std::collections::HashMap;
@@ -10,8 +10,8 @@ use clipwire_core::admin::AdminFail;
 use clipwire_core::delete::MAX_DELETE_BYTES;
 use clipwire_core::proto::io::{IoError, read_msg, read_msg_limited, write_msg};
 use clipwire_core::proto::{
-    ClientMsg, ServerMsg, knows_admin, knows_deletes, knows_devices_changed, knows_pins,
-    knows_server_groups, knows_server_info,
+    ClientMsg, ServerMsg, knows_admin, knows_deletes, knows_devices_changed, knows_group_invites,
+    knows_pins, knows_server_info,
 };
 use clipwire_core::storage::MAX_CONFIG_BYTES;
 use clipwire_core::{DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
@@ -216,6 +216,8 @@ enum Credential {
     Token(String),
     /// `JoinAsAdmin`: ключ администратора сервера.
     Admin(clipwire_core::AdminKey),
+    /// `JoinWithInvite`: одноразовый код создания группы (`clipwire/11`).
+    Invite(clipwire_core::admin::GroupInviteSecret),
 }
 
 /// Что прислал клиент первым кадром.
@@ -280,12 +282,18 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
             secret: join_secret,
             cred: Credential::Admin(admin_key),
         },
+        Ok(Some(ClientMsg::JoinWithInvite {
+            group_id,
+            join_secret,
+            invite_secret,
+        })) if knows_group_invites(conn.alpn()) => JoinRequest {
+            group: group_id,
+            secret: join_secret,
+            cred: Credential::Invite(invite_secret),
+        },
         // Соединение только для администрирования сервера, без группы.
         Ok(Some(ClientMsg::AdminAuth { key })) if knows_admin(conn.alpn()) => {
-            let ctx = AdminCtx {
-                device,
-                groups: knows_server_groups(conn.alpn()),
-            };
+            let ctx = AdminCtx::new(device, conn.alpn());
             return serve_admin(shared, send, recv, key, closing, ctx).await;
         }
         Ok(Some(_)) => {
@@ -323,6 +331,9 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                 .await;
             bail!("неверный ключ администратора");
         }
+        // Код проверяет хранилище в транзакции создания группы: только так
+        // два входа с одним кодом не создадут две группы.
+        Credential::Invite(secret) => Create::Invite(secret.digest()),
     };
 
     let limits = shared.limits();
@@ -349,6 +360,13 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
             crate::devices::close_with(&mut send, Some(&msg)).await;
             tracing::info!(group = %short(&group), rekeyed, deleted, "вход в группу со сменённым ключом");
             return Ok(());
+        }
+        JoinOutcome::InviteRefused(f) => {
+            // Типизированный отказ: клиент показывает человеку, что с кодом
+            // (использован, истёк, отозван).
+            let msg = ServerMsg::AdminFailed(f.clone());
+            crate::devices::close_with(&mut send, Some(&msg)).await;
+            bail!("код создания группы не подошёл: {f}");
         }
         JoinOutcome::Created | JoinOutcome::Joined => None,
         JoinOutcome::Denied => Some("неверный секрет группы"),
@@ -453,7 +471,8 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     Some(
                         ClientMsg::Join { .. }
                         | ClientMsg::JoinWithToken { .. }
-                        | ClientMsg::JoinAsAdmin { .. },
+                        | ClientMsg::JoinAsAdmin { .. }
+                        | ClientMsg::JoinWithInvite { .. },
                     ) => {
                         bail!("повторный Join")
                     }
@@ -510,13 +529,13 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         | ClientMsg::RotateRelayToken
                         | ClientMsg::RotateAdminKey
                         | ClientMsg::ListGroups
-                        | ClientMsg::DeleteGroup { .. }),
+                        | ClientMsg::DeleteGroup { .. }
+                        | ClientMsg::CreateGroupInvite { .. }
+                        | ClientMsg::ListGroupInvites
+                        | ClientMsg::RevokeGroupInvite { .. }),
                     ) => {
                         need_admin_alpn(conn)?;
-                        let ctx = AdminCtx {
-                            device,
-                            groups: knows_server_groups(conn.alpn()),
-                        };
+                        let ctx = AdminCtx::new(device, conn.alpn());
                         match crate::admin::handle(shared, &admin, &msg, &ctx)? {
                             Some(AdminReply::Send(reply)) => write_msg(&mut send, &reply).await?,
                             Some(AdminReply::SendAndCloseAll(reply)) => {

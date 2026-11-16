@@ -20,10 +20,12 @@ mod config;
 mod deletes;
 mod devices;
 mod groups;
+mod invites;
 mod pins;
 pub use admin::{Create, PENDING_KEEP};
 pub use devices::{RekeyLimits, RekeyOutcome, Rotation};
 pub use groups::DeleteOutcome;
+pub use invites::{INVITE_KEEP, MAX_ACTIVE_INVITES};
 use pins::KEPT_BY_PIN;
 pub use pins::{PinOutcome, PinQuota, PinWrite};
 
@@ -82,6 +84,9 @@ pub enum JoinOutcome {
     /// Секрет совпал, но ключ группы сменён: устройству отдаётся только
     /// его пакет нового ключа или «исключено» (`docs/devices.md`).
     Rotated(Rotation),
+    /// Группы нет, а код создания (`Create::Invite`) не годится: не найден,
+    /// использован, истёк или отозван.
+    InviteRefused(clipwire_core::admin::AdminFail),
 }
 
 /// Условие «группа `g` заброшена» для [`Store::idle_groups`] и
@@ -211,6 +216,7 @@ impl Store {
         deletes::migrate(&conn)?;
         pins::migrate(&conn)?;
         groups::migrate(&conn)?;
+        invites::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -268,6 +274,14 @@ impl Store {
                     if admin::pending_count(&tx, device)? > 0 {
                         return Ok(JoinOutcome::TooManyGroups);
                     }
+                }
+                // Код гасится в этой же транзакции: любой отказ ниже (предел
+                // групп) откатывает и его, а второй вход с тем же кодом ждёт
+                // замка базы и видит код уже использованным.
+                if let Create::Invite(hash) = &create
+                    && let Err(f) = invites::consume(&tx, hash, group, now_ms)?
+                {
+                    return Ok(JoinOutcome::InviteRefused(f));
                 }
                 // Надгробия и группы со сменённым ключом (`store/devices.rs`),
                 // заброшенные группы места не занимают.

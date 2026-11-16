@@ -312,6 +312,12 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
                     Ok(n) => tracing::info!("удалено брошенных групп смены ключа: {n}"),
                     Err(e) => tracing::warn!("очистка групп смены ключа не удалась: {e:#}"),
                 }
+                let invites_before = session::now_ms() - store::INVITE_KEEP.as_millis() as i64;
+                match shared.store.purge_invites(invites_before) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("удалено старых кодов создания группы: {n}"),
+                    Err(e) => tracing::warn!("очистка кодов создания группы не удалась: {e:#}"),
+                }
                 match devices::purge_rotated(&shared) {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("групп со сменённым ключом стало надгробиями: {n}"),

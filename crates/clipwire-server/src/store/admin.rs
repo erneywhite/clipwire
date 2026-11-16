@@ -65,6 +65,10 @@ pub enum Create {
     ForRekey,
     /// Можно, устройство станет админом группы (`JoinAsAdmin`).
     Admin,
+    /// Можно по одноразовому коду (`JoinWithInvite`, `clipwire/11`): хэш
+    /// секрета. Код гасится в транзакции создания, устройство становится
+    /// админом группы, но не администратором сервера.
+    Invite([u8; 32]),
 }
 
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
@@ -178,7 +182,7 @@ pub(super) fn mark_created(
 ) -> Result<()> {
     match create {
         Create::No => {}
-        Create::Admin => {
+        Create::Admin | Create::Invite(_) => {
             conn.execute(
                 "UPDATE groups SET admin_device = ?2 WHERE group_id = ?1",
                 params![&group.0[..], &device.0[..]],

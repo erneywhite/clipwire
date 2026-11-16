@@ -14,7 +14,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::admin::{AdminFail, AdminKey, GroupInfo, SecretCode, ServerSettings, ServerSummary};
+use crate::admin::{
+    AdminFail, AdminKey, GroupInfo, GroupInviteInfo, GroupInviteSecret, SecretCode, ServerSettings,
+    ServerSummary,
+};
 use crate::blob::BlobId;
 use crate::crypto::{GroupId, JoinSecret, SealedItem};
 use crate::item::DeviceId;
@@ -62,10 +65,16 @@ pub const ALPN_9: &[u8] = b"clipwire/9";
 /// `clipwire/9` не меняются, новые добавлены в конец enum.
 pub const ALPN_10: &[u8] = b"clipwire/10";
 
+/// Как [`ALPN_10`], плюс одноразовые приглашения на создание группы:
+/// `JoinWithInvite`, `CreateGroupInvite`, `ListGroupInvites`,
+/// `RevokeGroupInvite` и ответы на них. Варианты `clipwire/10` не меняются,
+/// новые добавлены в конец enum.
+pub const ALPN_11: &[u8] = b"clipwire/11";
+
 /// Все ALPN, новейший первым: в этом порядке их предлагает агент и
 /// принимает сервер.
-pub const ALPNS: [&[u8]; 8] = [
-    ALPN_10, ALPN_9, ALPN_8, ALPN_7, ALPN_6, ALPN_5, ALPN_4, ALPN,
+pub const ALPNS: [&[u8]; 9] = [
+    ALPN_11, ALPN_10, ALPN_9, ALPN_8, ALPN_7, ALPN_6, ALPN_5, ALPN_4, ALPN,
 ];
 
 /// Номер версии протокола из ALPN (`clipwire/7` → 7), 0 — не наш ALPN.
@@ -112,6 +121,11 @@ pub fn knows_admin(alpn: &[u8]) -> bool {
 /// `DeleteGroup`, `GroupDeleted`).
 pub fn knows_server_groups(alpn: &[u8]) -> bool {
     alpn_version(alpn) >= 10
+}
+
+/// Знает ли соединение с этим ALPN приглашения на создание группы.
+pub fn knows_group_invites(alpn: &[u8]) -> bool {
+    alpn_version(alpn) >= 11
 }
 
 /// Версия `a` младше `b` («0.3.0» < «0.3.1» < «0.10.0»). Части сравниваются
@@ -290,6 +304,30 @@ pub enum ClientMsg {
     /// удаления); отказы — `AdminFailed(NoSuchGroup | OwnGroup |
     /// NotAuthorized)`. Только по [`ALPN_10`].
     DeleteGroup { group: GroupId },
+    /// Войти, создав группу по одноразовому коду администратора
+    /// (`cwgroup1-…`). Только по [`ALPN_11`]. Если группы нет, сервер в одной
+    /// транзакции гасит код и создаёт группу; входящий становится её админом,
+    /// но не администратором сервера. Если группа уже есть, это обычный вход
+    /// (доступ решает секрет группы), код не тратится: так повтор после
+    /// потерянного ответа не ломается. Код не подошёл — ответ
+    /// `AdminFailed(InviteUnknown | InviteUsed | InviteExpired |
+    /// InviteRevoked)` вместо `Joined`, и сервер закрывает поток.
+    JoinWithInvite {
+        group_id: GroupId,
+        join_secret: JoinSecret,
+        invite_secret: GroupInviteSecret,
+    },
+    /// Выпустить код создания группы (только после `AdminAuth`, как все
+    /// запросы администратора). `label` — для кого (сервер обрезает до
+    /// `admin::MAX_INVITE_LABEL` символов), `ttl_hours` — срок действия от 1
+    /// до `admin::MAX_INVITE_TTL_HOURS`. Ответ — `GroupInviteCreated`;
+    /// отказы — `AdminFailed(OutOfRange | TooManyInvites | NotAuthorized)`.
+    CreateGroupInvite { label: String, ttl_hours: u32 },
+    /// Выпущенные коды — ответ `GroupInvites`.
+    ListGroupInvites,
+    /// Отозвать неиспользованный код. Ответ — `GroupInvites` (список после
+    /// отзыва); нечего отзывать — `AdminFailed(NoSuchInvite)`.
+    RevokeGroupInvite { id: u64 },
 }
 
 /// Закреп на сервере (в `Pins`, `Pinned`, `PinRejected`).
@@ -463,6 +501,14 @@ pub enum ServerMsg {
     /// Группу этого соединения удалил администратор сервера (сразу или при
     /// входе в неё). Следом сервер закрывает поток; входить снова незачем.
     GroupDeleted,
+    /// Код создания группы выпущен (ответ на `CreateGroupInvite`, только по
+    /// [`ALPN_11`], как и всё ниже). `code_secret` — весь код `cwgroup1-…`:
+    /// сервер хранит только хэш секрета, так что показать код можно только
+    /// сейчас.
+    GroupInviteCreated { code_secret: SecretCode, id: u64 },
+    /// Выпущенные коды, новые первыми (ответ на `ListGroupInvites` и
+    /// `RevokeGroupInvite`).
+    GroupInvites(Vec<GroupInviteInfo>),
 }
 
 /// Первый кадр потока файла.
@@ -689,8 +735,11 @@ mod tests {
         assert_eq!(alpn_version(ALPN), 3);
         assert_eq!(alpn_version(ALPN_7), 7);
         assert_eq!(alpn_version(ALPN_8), 8);
-        assert_eq!(ALPNS[0], ALPN_10);
-        assert_eq!(ALPNS[1], ALPN_9);
+        assert_eq!(ALPNS[0], ALPN_11);
+        assert_eq!(ALPNS[1], ALPN_10);
+        assert_eq!(ALPNS[2], ALPN_9);
+        assert_eq!(alpn_version(ALPN_11), 11);
+        assert!(!knows_group_invites(ALPN_10) && knows_group_invites(ALPN_11));
         assert_eq!(alpn_version(ALPN_9), 9);
         assert_eq!(alpn_version(ALPN_10), 10);
         assert!(!knows_server_groups(ALPN_9) && knows_server_groups(ALPN_10));
@@ -706,6 +755,7 @@ mod tests {
             assert_eq!(knows_pins(a), v >= 8);
             assert_eq!(knows_admin(a), v >= 9);
             assert_eq!(knows_server_groups(a), v >= 10);
+            assert_eq!(knows_group_invites(a), v >= 11);
         }
         assert!(knows_deletes(b"clipwire/9"));
     }
@@ -770,6 +820,45 @@ mod tests {
         let own = postcard::to_stdvec(&AdminFail::OwnGroup).unwrap();
         assert_eq!(own[0], 8, "новые отказы — после Unavailable (6)");
         assert_eq!(postcard::to_stdvec(&AdminFail::NoSuchGroup).unwrap()[0], 7);
+        // `clipwire/11`: тоже только в конце.
+        let inv = ClientMsg::JoinWithInvite {
+            group_id: GroupId([0; 32]),
+            join_secret: JoinSecret([0; 32]),
+            invite_secret: GroupInviteSecret([0; 32]),
+        };
+        assert_eq!(tag(postcard::to_stdvec(&inv).unwrap()), 27);
+        let create = ClientMsg::CreateGroupInvite {
+            label: String::new(),
+            ttl_hours: 1,
+        };
+        assert_eq!(tag(postcard::to_stdvec(&create).unwrap()), 28);
+        assert_eq!(
+            tag(postcard::to_stdvec(&ClientMsg::ListGroupInvites).unwrap()),
+            29
+        );
+        assert_eq!(
+            tag(postcard::to_stdvec(&ClientMsg::RevokeGroupInvite { id: 1 }).unwrap()),
+            30
+        );
+        let created = ServerMsg::GroupInviteCreated {
+            code_secret: SecretCode(String::new()),
+            id: 1,
+        };
+        assert_eq!(tag(postcard::to_stdvec(&created).unwrap()), 30);
+        assert_eq!(
+            tag(postcard::to_stdvec(&ServerMsg::GroupInvites(vec![])).unwrap()),
+            31
+        );
+        assert_eq!(
+            postcard::to_stdvec(&AdminFail::InviteUnknown).unwrap()[0],
+            9
+        );
+        assert_eq!(
+            postcard::to_stdvec(&AdminFail::NoSuchInvite).unwrap()[0],
+            14
+        );
+        // Вход по приглашению влезает в предел первого кадра.
+        assert!(postcard::to_stdvec(&inv).unwrap().len() < 128);
         // Вход администратора влезает в предел первого кадра сервера (512).
         assert!(postcard::to_stdvec(&join).unwrap().len() < 128);
     }

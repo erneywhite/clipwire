@@ -1,6 +1,8 @@
 //! Администрирование сервера (`clipwire/9`): ключ администратора и
 //! настройки сервера, которые админ меняет из клиента. С `clipwire/10` —
-//! список групп сервера и удаление группы ([`GroupInfo`]).
+//! список групп сервера и удаление группы ([`GroupInfo`]). С `clipwire/11` —
+//! одноразовые приглашения на создание группы ([`GroupInviteSecret`],
+//! [`GroupInviteInfo`]).
 //!
 //! Ключ администратора — 32 случайных байта, сервер создаёт его при первом
 //! запуске и кладёт в каталог данных. Он есть только в коде сервера
@@ -38,6 +40,60 @@ impl AdminKey {
             .fold(0u8, |acc, (x, y)| acc | (x ^ y))
             == 0
     }
+}
+
+/// Одноразовый секрет создания группы (`clipwire/11`): с ним человек без
+/// ключа администратора создаёт одну свою группу (`ClientMsg::JoinWithInvite`).
+/// Лежит в коде `cwgroup1-…` ([`crate::invite::GroupInviteCode`]); сервер
+/// хранит только SHA-256 от него ([`GroupInviteSecret::digest`]).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupInviteSecret(pub [u8; 32]);
+
+impl std::fmt::Debug for GroupInviteSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GroupInviteSecret(..)")
+    }
+}
+
+impl GroupInviteSecret {
+    /// Новый случайный секрет. `None` — системе нечем дать случайные байты.
+    pub fn generate() -> Option<Self> {
+        let mut raw = [0u8; 32];
+        getrandom::fill(&mut raw).ok()?;
+        Some(Self(raw))
+    }
+
+    /// Что хранит сервер: SHA-256 от секрета. Секрет — 32 случайных байта,
+    /// так что по хэшу его не подобрать.
+    pub fn digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(self.0).into()
+    }
+}
+
+/// Наибольшая длина подписи приглашения, символов. Длиннее сервер обрезает.
+pub const MAX_INVITE_LABEL: usize = 80;
+/// Срок действия приглашения по умолчанию, часов (7 дней).
+pub const DEFAULT_INVITE_TTL_HOURS: u32 = 7 * 24;
+/// Наибольший срок действия приглашения, часов (90 дней).
+pub const MAX_INVITE_TTL_HOURS: u32 = 90 * 24;
+
+/// Приглашение на создание группы в списке администратора
+/// (`ServerMsg::GroupInvites`, `clipwire/11`). Самого секрета здесь нет:
+/// сервер его не знает, код показывается один раз при выпуске.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupInviteInfo {
+    pub id: u64,
+    /// Для кого выпущено (задаёт администратор, может быть пустой).
+    pub label: String,
+    pub created_ms: i64,
+    pub expires_ms: i64,
+    /// Когда по коду создали группу; `None` — не использован.
+    pub used_ms: Option<i64>,
+    /// Какую группу создали.
+    pub used_group: Option<GroupId>,
+    /// Когда администратор отозвал код.
+    pub revoked_ms: Option<i64>,
 }
 
 /// Код сервера `cwserver2-…` в ответах `RelayTokenRotated` и
@@ -322,6 +378,26 @@ pub enum AdminFail {
     /// из неё.
     #[error("это группа самого администратора: сначала выйдите из неё")]
     OwnGroup,
+    /// Варианты ниже — только по `clipwire/11` (приглашения на создание
+    /// группы). Кода приглашения на сервере нет: опечатка, код другого
+    /// сервера или запись давно удалена.
+    #[error("сервер не знает такой код приглашения")]
+    InviteUnknown,
+    /// По коду уже создали группу.
+    #[error("по этому коду уже создали группу")]
+    InviteUsed,
+    /// Срок действия кода вышел.
+    #[error("срок действия кода истёк")]
+    InviteExpired,
+    /// Администратор отозвал код.
+    #[error("администратор отозвал этот код")]
+    InviteRevoked,
+    /// Неиспользованных кодов уже `max`: новый не выпустить.
+    #[error("действующих кодов уже {max}, больше нельзя")]
+    TooManyInvites { max: u64 },
+    /// Отозвать нечего: кода нет, он уже использован или отозван.
+    #[error("такого действующего кода нет")]
+    NoSuchInvite,
 }
 
 #[cfg(test)]
@@ -347,6 +423,17 @@ mod tests {
             postcard::to_stdvec(&c).unwrap(),
             postcard::to_stdvec(&"cwserver2-секрет".to_string()).unwrap()
         );
+    }
+
+    #[test]
+    fn invite_secret_is_hidden_and_hashed() {
+        let a = GroupInviteSecret::generate().unwrap();
+        let b = GroupInviteSecret::generate().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(format!("{a:?}"), "GroupInviteSecret(..)");
+        assert_eq!(a.digest(), a.clone().digest());
+        assert_ne!(a.digest(), b.digest());
+        assert_ne!(a.digest(), a.0);
     }
 
     #[test]
