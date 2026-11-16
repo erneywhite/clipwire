@@ -1,7 +1,8 @@
 //! Администрирование сервера из агента (`clipwire/9`) против настоящего
 //! сервера на 127.0.0.1: создание группы с ключом администратора и без него,
 //! вход администратора на устройстве в группе, настройки сервера, смена
-//! ключа администратора и токена relay, админ группы.
+//! ключа администратора и токена relay, админ группы. Группы сервера и их
+//! удаление (`clipwire/10`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -401,5 +402,92 @@ async fn new_invite_in_place_after_token_rotation() -> Result<()> {
     b.status().await?.expect("с новым кодом на связи");
     let _ = std::fs::remove_dir_all(&paths.dir);
     drop((a, b));
+    server.shutdown().await
+}
+
+/// Дождаться `GroupDeleted` и убедиться, что движок после него не
+/// переподключается.
+async fn deleted_and_quiet(a: &mut Agent) -> Result<()> {
+    tokio::time::timeout(T, async {
+        loop {
+            match a.events.recv().await.context("движок остановился")? {
+                Event::GroupDeleted { .. } => return Ok::<_, anyhow::Error>(()),
+                Event::Excluded { .. } => anyhow::bail!("ждали GroupDeleted, пришло Excluded"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("не дождались GroupDeleted")??;
+    // Три секунды тишины: ни «подключение», ни «на связи».
+    let quiet = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match a.events.recv().await {
+                Some(Event::Status(s)) => return Some(s),
+                Some(_) => {}
+                None => std::future::pending::<()>().await,
+            }
+        }
+    })
+    .await;
+    anyhow::ensure!(
+        quiet.is_err(),
+        "после удаления группы движок снова подключается: {quiet:?}"
+    );
+    Ok(())
+}
+
+/// Группы сервера у администратора (`clipwire/10`): список с «своей»
+/// группой, отказ на удаление своей, удаление чужой — её устройства
+/// получают `GroupDeleted` и не переподключаются по кругу.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_lists_and_deletes_groups() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let (mine, theirs) = (GroupKey::generate()?, GroupKey::generate()?);
+    let mut a = Agent::spawn(&info, &mine, Some(ADMIN))?;
+    a.status().await?.expect("на связи");
+    let mut b = Agent::spawn(&info, &theirs, Some(ADMIN))?;
+    b.status().await?.expect("на связи");
+    let mut c = Agent::spawn(&info, &theirs, None)?;
+    c.status().await?.expect("на связи");
+
+    // Без ключа администратора — понятный отказ.
+    let err = c.ctl.server_groups().await.unwrap_err();
+    assert!(err.contains("код сервера администратора"), "{err}");
+
+    let list = a.ctl.server_groups().await.map_err(anyhow::Error::msg)?;
+    assert_eq!(list.len(), 2);
+    let g = list
+        .iter()
+        .find(|g| g.group == theirs.group_id())
+        .context("чужая группа в списке")?;
+    assert_eq!((g.devices, g.online), (2, 2));
+
+    let err = a
+        .ctl
+        .delete_server_group(mine.group_id())
+        .await
+        .unwrap_err();
+    assert!(err.contains("выйдите"), "{err}");
+    let after = a
+        .ctl
+        .delete_server_group(theirs.group_id())
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].group, mine.group_id());
+    deleted_and_quiet(&mut b).await?;
+    deleted_and_quiet(&mut c).await?;
+    // Новый движок с ключом администратора группу заново не создаёт: тоже «удалена».
+    let mut c2 = Agent::spawn(&info, &theirs, Some(ADMIN))?;
+    deleted_and_quiet(&mut c2).await?;
+    // Удалённую второй раз — «уже нет».
+    let err = a
+        .ctl
+        .delete_server_group(theirs.group_id())
+        .await
+        .unwrap_err();
+    assert!(err.contains("уже нет"), "{err}");
+    drop((a, b, c, c2));
     server.shutdown().await
 }

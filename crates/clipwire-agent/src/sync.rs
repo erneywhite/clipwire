@@ -191,6 +191,12 @@ pub enum Event {
     /// (`Paths::forget_admin_key`), интерфейс просит ввести новый код
     /// сервера администратора.
     AdminKeyStale,
+    /// Группу `old` удалил администратор сервера (`GroupDeleted`). Движок
+    /// дальше не подключается: устройство помечается исключённым с этой
+    /// причиной (`devices::mark_group_deleted`), человек выходит из группы.
+    GroupDeleted {
+        old: GroupId,
+    },
 }
 
 /// Своя версия: сервер младше неё — подсказка обновить образ.
@@ -647,6 +653,17 @@ impl Engine {
         }
     }
 
+    /// Группу удалил администратор сервера: дальше не подключаться. Ошибка —
+    /// та, которой заканчивается сессия. Как и с `Excluded`, ключ и история
+    /// не стираются: решение за человеком (`devices::mark_group_deleted`).
+    fn group_deleted(&mut self) -> anyhow::Error {
+        let old = self.state.invite.group_key.group_id();
+        self.terminal = true;
+        tracing::info!("группу удалил администратор сервера");
+        self.emit(Event::GroupDeleted { old });
+        anyhow!(tr("группу удалил администратор сервера"))
+    }
+
     /// Можно ли верить пакету: его выпустило это устройство (ответ на свой
     /// `Rekey` потерялся) или устройство группы, карточку которого этот
     /// клиент проверял. `None` — инициатор неизвестен.
@@ -747,6 +764,7 @@ impl Engine {
             Ok((send, recv)) => (conn, send, recv),
             Err(JoinFail::Other(e)) => return Err(e),
             Err(JoinFail::Rotated(env)) => return Err(self.rotated(env)),
+            Err(JoinFail::Deleted) => return Err(self.group_deleted()),
             Err(JoinFail::BadAdminKey) => bail!(tr("сервер не принял ключ администратора")),
             Err(first) => {
                 // Старый сервер не знает `JoinWithToken`: кадр не разбирается,
@@ -757,6 +775,7 @@ impl Engine {
                 match join(&conn, &key, None, None).await {
                     Ok((send, recv)) => (conn, send, recv),
                     Err(JoinFail::Rotated(env)) => return Err(self.rotated(env)),
+                    Err(JoinFail::Deleted) => return Err(self.group_deleted()),
                     // Если на первый вход сервер отказал внятно, его причина
                     // понятнее второй.
                     Err(second) => match first {
@@ -959,14 +978,14 @@ impl Engine {
                         }
                     }
                     Control::Admin { req, reply } => {
-                        if knows_admin(conn.alpn()) {
+                        if alpn_version(conn.alpn()) >= req.min_protocol() {
                             write_msg(&mut send, &req.msg()).await?;
                             self.admin_waiters.push_back(crate::admin::AdminWaiter {
                                 reply: Some(reply),
                                 auth: req.auth_key(),
                             });
                         } else {
-                            crate::admin::refuse_old(reply);
+                            crate::admin::refuse_old(reply, &req);
                         }
                     }
                     Control::SetGroupConfig { sealed, config, reply } => {
@@ -1051,6 +1070,7 @@ impl Engine {
             ServerMsg::Devices(list) => self.answer_devices(list),
             ServerMsg::Rekeyed { envelope } => return Err(self.rotated(Some(envelope))),
             ServerMsg::Excluded => return Err(self.rotated(None)),
+            ServerMsg::GroupDeleted => return Err(self.group_deleted()),
             ServerMsg::Error(e) => bail!(trf("сервер: {e}", &[("e", &e)])),
             ServerMsg::GroupConfig(sealed) => self.group_config(key, sealed),
             ServerMsg::Deleted(sealed) => match key.open_delete(&sealed) {
@@ -1734,6 +1754,8 @@ enum JoinFail {
     /// `JoinAsAdmin` с ключом, которого сервер не знает (его сменили):
     /// повторить вход с токеном relay.
     BadAdminKey,
+    /// Группу удалил администратор сервера (`GroupDeleted`).
+    Deleted,
 }
 
 impl std::fmt::Display for JoinFail {
@@ -1744,6 +1766,7 @@ impl std::fmt::Display for JoinFail {
             JoinFail::Other(e) => write!(f, "{e:#}"),
             JoinFail::Rotated(_) => f.write_str(tr("ключ группы сменён")),
             JoinFail::BadAdminKey => f.write_str(tr("сервер не принял ключ администратора")),
+            JoinFail::Deleted => f.write_str(tr("группу удалил администратор сервера")),
         }
     }
 }
@@ -1789,6 +1812,7 @@ async fn join(
         Ok(Some(ServerMsg::Error(e))) => Err(JoinFail::Refused(e)),
         Ok(Some(ServerMsg::Rekeyed { envelope })) => Err(JoinFail::Rotated(Some(envelope))),
         Ok(Some(ServerMsg::Excluded)) => Err(JoinFail::Rotated(None)),
+        Ok(Some(ServerMsg::GroupDeleted)) => Err(JoinFail::Deleted),
         Ok(Some(ServerMsg::AdminFailed(clipwire_core::admin::AdminFail::BadKey))) => {
             Err(JoinFail::BadAdminKey)
         }

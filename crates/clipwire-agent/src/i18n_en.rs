@@ -819,4 +819,26 @@ pub static EN: &[(&str, &str)] = &[
         "Ключ сменён, но не сохранился на этом устройстве: {e}. Запишите код: {code}",
         "The key was changed, but it was not saved on this device: {e}. Write down the code: {code}",
     ),
+    // Группы сервера (`clipwire/10`).
+    (
+        "Такой группы на сервере уже нет",
+        "This group is no longer on the server",
+    ),
+    (
+        "Это группа этого устройства. Чтобы удалить её, сначала выйдите из неё (или удалите её с другого устройства администратора).",
+        "This is this device's own group. To delete it, leave it first (or delete it from another administrator device).",
+    ),
+    (
+        "Сервер не умеет показывать группы: обновите образ сервера Clipwire",
+        "The server cannot list groups: update the Clipwire server image",
+    ),
+    (
+        "группу удалил администратор сервера",
+        "the server administrator deleted the group",
+    ),
+    (
+        "Группу удалил администратор сервера",
+        "The server administrator deleted the group",
+    ),
+    ("Неверный id группы", "Invalid group id"),
 ];

@@ -1,4 +1,5 @@
-//! Администратор сервера на стороне агента (`clipwire/9`, `docs/architecture.md`):
+//! Администратор сервера на стороне агента (`clipwire/9`, группы сервера —
+//! `clipwire/10`, `docs/architecture.md`):
 //! хранение ключа администратора, разбор кодов сервера и запросы к серверу
 //! через движок ([`Controller`]).
 //!
@@ -8,9 +9,9 @@
 //! которое перешло на другой сервер, старый ключ не использует.
 
 use anyhow::{Context, Result};
-use clipwire_core::admin::{AdminFail, AdminKey, ServerSettings, ServerSummary};
+use clipwire_core::admin::{AdminFail, AdminKey, GroupInfo, ServerSettings, ServerSummary};
 use clipwire_core::proto::{ClientMsg, ServerMsg};
-use clipwire_core::{AdminServerInfo, DeviceId, ServerCode};
+use clipwire_core::{AdminServerInfo, DeviceId, GroupId, ServerCode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -280,7 +281,17 @@ pub fn fail_text(f: &AdminFail) -> String {
         AdminFail::NoSuchDevice => tr("Такого устройства нет в группе").into(),
         // Причину сервер пишет сам (по-русски): переводить нечего.
         AdminFail::Unavailable(why) => why.clone(),
+        AdminFail::NoSuchGroup => tr("Такой группы на сервере уже нет").into(),
+        AdminFail::OwnGroup => tr(
+            "Это группа этого устройства. Чтобы удалить её, сначала выйдите из неё (или удалите её с другого устройства администратора).",
+        )
+        .into(),
     }
+}
+
+/// Отказ серверу, который не знает групп сервера (`clipwire/10`).
+pub fn old_server_groups() -> &'static str {
+    tr("Сервер не умеет показывать группы: обновите образ сервера Clipwire")
 }
 
 fn old_server() -> &'static str {
@@ -303,6 +314,10 @@ pub enum AdminRequest {
     /// Забрать роль админа группы себе (администратор сервера, прежний админ
     /// потерян).
     ClaimGroupAdmin,
+    /// Группы сервера (`clipwire/10`).
+    ListGroups,
+    /// Удалить группу сервера (`clipwire/10`).
+    DeleteGroup(GroupId),
 }
 
 impl AdminRequest {
@@ -319,6 +334,17 @@ impl AdminRequest {
             Self::GroupAdmin => ClientMsg::GetGroupAdmin,
             Self::TransferGroupAdmin(device) => ClientMsg::TransferGroupAdmin { device: *device },
             Self::ClaimGroupAdmin => ClientMsg::ClaimGroupAdmin,
+            Self::ListGroups => ClientMsg::ListGroups,
+            Self::DeleteGroup(group) => ClientMsg::DeleteGroup { group: *group },
+        }
+    }
+
+    /// С какой версии протокола сервер знает запрос. Старому серверу его
+    /// слать нельзя: незнакомое сообщение он встречает обрывом соединения.
+    pub(crate) fn min_protocol(&self) -> u32 {
+        match self {
+            Self::ListGroups | Self::DeleteGroup(_) => 10,
+            _ => 9,
         }
     }
 
@@ -345,6 +371,7 @@ pub(crate) fn is_admin_reply(msg: &ServerMsg) -> bool {
             | ServerMsg::AdminKeyRotated { .. }
             | ServerMsg::GroupAdmin { .. }
             | ServerMsg::AdminFailed(_)
+            | ServerMsg::Groups(_)
     )
 }
 
@@ -356,9 +383,15 @@ pub(crate) struct AdminWaiter {
     pub auth: Option<AdminKey>,
 }
 
-/// Отказ серверу, который не знает `clipwire/9`.
-pub(crate) fn refuse_old(reply: AdminReply) {
-    let _ = reply.send(Err(old_server().into()));
+/// Отказ серверу, который не знает запроса: `clipwire/9` (администрирование)
+/// или `clipwire/10` (группы сервера).
+pub(crate) fn refuse_old(reply: AdminReply, req: &AdminRequest) {
+    let why = if req.min_protocol() >= 10 {
+        old_server_groups()
+    } else {
+        old_server()
+    };
+    let _ = reply.send(Err(why.into()));
 }
 
 fn unexpected(msg: &ServerMsg) -> String {
@@ -453,6 +486,22 @@ impl Controller {
     pub async fn transfer_group_admin(&self, device: DeviceId) -> Result<(), String> {
         match self.admin(AdminRequest::TransferGroupAdmin(device)).await? {
             ServerMsg::GroupAdmin { .. } => Ok(()),
+            m => Err(unexpected(&m)),
+        }
+    }
+
+    /// Группы сервера, по убыванию последней активности.
+    pub async fn server_groups(&self) -> Result<Vec<GroupInfo>, String> {
+        match self.admin(AdminRequest::ListGroups).await? {
+            ServerMsg::Groups(list) => Ok(list),
+            m => Err(unexpected(&m)),
+        }
+    }
+
+    /// Удалить группу сервера. Возвращает список групп после удаления.
+    pub async fn delete_server_group(&self, group: GroupId) -> Result<Vec<GroupInfo>, String> {
+        match self.admin(AdminRequest::DeleteGroup(group)).await? {
+            ServerMsg::Groups(list) => Ok(list),
             m => Err(unexpected(&m)),
         }
     }
@@ -590,5 +639,7 @@ mod tests {
             fail_text(&AdminFail::Unavailable("причина".into())),
             "причина"
         );
+        assert!(fail_text(&AdminFail::OwnGroup).contains("выйдите"));
+        assert!(fail_text(&AdminFail::NoSuchGroup).contains("нет"));
     }
 }

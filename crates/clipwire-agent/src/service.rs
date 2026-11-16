@@ -49,6 +49,11 @@ pub enum UiEvent {
     Excluded {
         old: clipwire_core::GroupId,
     },
+    /// Группу `old` удалил администратор сервера: пометить
+    /// (`devices::mark_group_deleted`), ключ и история остаются.
+    GroupDeleted {
+        old: clipwire_core::GroupId,
+    },
     /// Смена ключа на этом устройстве не состоялась, хотя ответ на неё
     /// потерялся (текст для человека).
     RekeyLost(String),
@@ -566,6 +571,7 @@ impl Service {
                         }
                         Event::Rekeyed(n) => on_event(UiEvent::Rekeyed(n)),
                         Event::Excluded { old } => on_event(UiEvent::Excluded { old }),
+                        Event::GroupDeleted { old } => on_event(UiEvent::GroupDeleted { old }),
                         Event::RekeyLost(why) => on_event(UiEvent::RekeyLost(why)),
                         Event::DevicesChanged => on_event(UiEvent::DevicesChanged),
                         Event::ServerOutdated(v) => on_event(UiEvent::ServerOutdated(v)),
