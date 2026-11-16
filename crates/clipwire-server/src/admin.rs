@@ -1,6 +1,7 @@
 //! Администратор сервера (`clipwire/9`, `docs/architecture.md`): секреты
 //! сервера, которые можно сменить из клиента, настройки сервера поверх
-//! переменных окружения и обработка запросов администратора.
+//! переменных окружения и обработка запросов администратора. С
+//! `clipwire/10` — список групп сервера и удаление группы.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,10 +12,11 @@ use clipwire_core::admin::{
     AdminFail, AdminKey, SETTINGS, SecretCode, ServerSettings, check_setting,
 };
 use clipwire_core::proto::{ClientMsg, ServerMsg};
-use clipwire_core::{AdminServerInfo, ServerInfo};
+use clipwire_core::{AdminServerInfo, DeviceId, GroupId, ServerInfo};
 use tokio::sync::watch;
 
 use crate::session::{Limits, Shared, now_ms};
+use crate::store::DeleteOutcome;
 
 /// Секреты сервера, которые меняются на ходу, и всё, что нужно, чтобы
 /// напечатать новый код сервера.
@@ -229,23 +231,75 @@ pub enum AdminReply {
     SendAndCloseAll(ServerMsg),
 }
 
-/// Запрос администратора сервера (`GetServerSettings` … `RotateAdminKey`).
-/// `None` — это не запрос администратора.
-pub fn handle(
-    shared: &Shared,
-    session: &AdminSession,
-    msg: &ClientMsg,
-) -> Result<Option<AdminReply>> {
-    let is_admin_msg = matches!(
+/// Запрос ли это администратора сервера: его разбирает [`handle`].
+pub fn is_admin_msg(msg: &ClientMsg) -> bool {
+    matches!(
         msg,
         ClientMsg::GetServerSettings
             | ClientMsg::SetServerSettings { .. }
             | ClientMsg::GetServerSummary
             | ClientMsg::RotateRelayToken
             | ClientMsg::RotateAdminKey
+            | ClientMsg::ListGroups
+            | ClientMsg::DeleteGroup { .. }
+    )
+}
+
+/// Откуда пришёл запрос администратора.
+pub struct AdminCtx {
+    /// Устройство соединения: свою группу оно удалить не может.
+    pub device: DeviceId,
+    /// Соединение по `clipwire/10`: знает группы сервера.
+    pub groups: bool,
+}
+
+/// Группы сервера для `Groups`: из базы, кто на связи — из hub.
+pub fn groups_msg(shared: &Shared) -> Result<ServerMsg> {
+    let keep = shared.limits().rotated_keep.as_millis() as i64;
+    let mut list = shared.store.list_groups(now_ms(), keep)?;
+    for g in &mut list {
+        g.online = shared.hub.online_devices(&g.group).len() as u64;
+    }
+    Ok(ServerMsg::Groups(list))
+}
+
+/// `DeleteGroup`: удалить группу, разбудить её соединения (они отдадут
+/// своим устройствам `GroupDeleted` или `Excluded` и закроются, как при
+/// смене ключа) и убрать файлы с диска в фоне.
+fn delete_group(shared: &Arc<Shared>, ctx: &AdminCtx, group: &GroupId) -> Result<ServerMsg> {
+    let blobs = match shared.store.delete_group(group, &ctx.device, now_ms())? {
+        DeleteOutcome::Deleted { blobs } => blobs,
+        DeleteOutcome::NoSuchGroup => return Ok(ServerMsg::AdminFailed(AdminFail::NoSuchGroup)),
+        DeleteOutcome::OwnGroup => return Ok(ServerMsg::AdminFailed(AdminFail::OwnGroup)),
+    };
+    let woken = shared.hub.kick(group, u64::MAX);
+    tracing::info!(
+        group = %crate::session::short(group),
+        woken,
+        files = blobs.len(),
+        "группа удалена администратором сервера"
     );
-    if !is_admin_msg {
+    if !blobs.is_empty() {
+        tokio::spawn(crate::devices::remove_files(shared.clone(), *group, blobs));
+    }
+    groups_msg(shared)
+}
+
+/// Запрос администратора сервера (`GetServerSettings` … `RotateAdminKey`,
+/// `ListGroups`, `DeleteGroup`). `None` — это не запрос администратора.
+/// Ошибка — сбой сервера или нарушение протокола (сообщение `clipwire/10`
+/// по старому ALPN): соединение закрывается.
+pub fn handle(
+    shared: &Arc<Shared>,
+    session: &AdminSession,
+    msg: &ClientMsg,
+    ctx: &AdminCtx,
+) -> Result<Option<AdminReply>> {
+    if !is_admin_msg(msg) {
         return Ok(None);
+    }
+    if matches!(msg, ClientMsg::ListGroups | ClientMsg::DeleteGroup { .. }) && !ctx.groups {
+        anyhow::bail!("сообщение clipwire/10 по старому протоколу");
     }
     let fail = |f| Ok(Some(AdminReply::Send(ServerMsg::AdminFailed(f))));
     if !session.authorized(shared) {
@@ -302,6 +356,8 @@ pub fn handle(
                 server_code: SecretCode(server_code),
             }
         }
+        ClientMsg::ListGroups => groups_msg(shared)?,
+        ClientMsg::DeleteGroup { group } => delete_group(shared, ctx, group)?,
         _ => unreachable!("проверено выше"),
     };
     Ok(Some(AdminReply::Send(reply)))

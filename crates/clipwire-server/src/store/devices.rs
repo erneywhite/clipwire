@@ -77,6 +77,8 @@ pub enum Rotation {
     Rekeyed(Vec<u8>),
     /// Пакета нет: устройство исключили.
     Excluded,
+    /// Группу удалил администратор сервера (`store/groups.rs`).
+    Deleted,
 }
 
 impl Store {
@@ -327,6 +329,9 @@ pub(super) fn rotation_in(
         .optional()?;
     if !matches!(rotated, Some(Some(_))) {
         return Ok(None);
+    }
+    if super::groups::is_deleted(conn, group)? {
+        return Ok(Some(Rotation::Deleted));
     }
     let envelope: Option<Vec<u8>> = conn
         .query_row(

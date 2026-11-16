@@ -1,4 +1,4 @@
-//! Обработка одного подключения агента по ALPN от `clipwire/3` до `clipwire/9`:
+//! Обработка одного подключения агента по ALPN от `clipwire/3` до `clipwire/10`:
 //! формат кадров один, новые версии только добавляют сообщения (`proto.rs`).
 
 use std::collections::HashMap;
@@ -11,7 +11,7 @@ use clipwire_core::delete::MAX_DELETE_BYTES;
 use clipwire_core::proto::io::{IoError, read_msg, read_msg_limited, write_msg};
 use clipwire_core::proto::{
     ClientMsg, ServerMsg, knows_admin, knows_deletes, knows_devices_changed, knows_pins,
-    knows_server_info,
+    knows_server_groups, knows_server_info,
 };
 use clipwire_core::storage::MAX_CONFIG_BYTES;
 use clipwire_core::{DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
@@ -20,7 +20,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use crate::admin::{AdminReply, AdminSession, AdminState};
+use crate::admin::{AdminCtx, AdminReply, AdminSession, AdminState};
 use crate::blobs::Blobs;
 use crate::config::Guards;
 use crate::hub::{Hub, QUEUE};
@@ -282,7 +282,11 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         },
         // Соединение только для администрирования сервера, без группы.
         Ok(Some(ClientMsg::AdminAuth { key })) if knows_admin(conn.alpn()) => {
-            return serve_admin(shared, send, recv, key, closing).await;
+            let ctx = AdminCtx {
+                device,
+                groups: knows_server_groups(conn.alpn()),
+            };
+            return serve_admin(shared, send, recv, key, closing, ctx).await;
         }
         Ok(Some(_)) => {
             refuse(&mut send, "первым сообщением должен быть Join").await;
@@ -337,10 +341,13 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
     let reason = match &outcome {
         JoinOutcome::Rotated(r) => {
             // Ключ сменён: ни истории, ни входа, только пакет этого устройства.
-            let msg = crate::devices::rotation_msg(r.clone());
+            // Ключ сменён или группу удалили: ни истории, ни входа, только
+            // пакет этого устройства, «исключено» или «группа удалена».
+            let msg = crate::devices::rotation_msg(r.clone(), conn.alpn());
             let rekeyed = matches!(msg, ServerMsg::Rekeyed { .. });
+            let deleted = *r == crate::store::Rotation::Deleted;
             crate::devices::close_with(&mut send, Some(&msg)).await;
-            tracing::info!(group = %short(&group), rekeyed, "вход в группу со сменённым ключом");
+            tracing::info!(group = %short(&group), rekeyed, deleted, "вход в группу со сменённым ключом");
             return Ok(());
         }
         JoinOutcome::Created | JoinOutcome::Joined => None,
@@ -501,10 +508,16 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         | ClientMsg::SetServerSettings { .. }
                         | ClientMsg::GetServerSummary
                         | ClientMsg::RotateRelayToken
-                        | ClientMsg::RotateAdminKey),
+                        | ClientMsg::RotateAdminKey
+                        | ClientMsg::ListGroups
+                        | ClientMsg::DeleteGroup { .. }),
                     ) => {
                         need_admin_alpn(conn)?;
-                        match crate::admin::handle(shared, &admin, &msg)? {
+                        let ctx = AdminCtx {
+                            device,
+                            groups: knows_server_groups(conn.alpn()),
+                        };
+                        match crate::admin::handle(shared, &admin, &msg, &ctx)? {
                             Some(AdminReply::Send(reply)) => write_msg(&mut send, &reply).await?,
                             Some(AdminReply::SendAndCloseAll(reply)) => {
                                 write_msg(&mut send, &reply).await?;
@@ -620,9 +633,13 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                 return Ok(());
             }
             () = reg.kick.notified() => {
-                // Ключ группы сменили с другого устройства.
+                // Ключ группы сменили с другого устройства или группу удалил
+                // администратор сервера.
                 streams.shutdown().await;
-                let msg = shared.store.rotation(&group, &device)?.map(crate::devices::rotation_msg);
+                let msg = shared
+                    .store
+                    .rotation(&group, &device)?
+                    .map(|r| crate::devices::rotation_msg(r, conn.alpn()));
                 crate::devices::close_with(&mut send, msg.as_ref()).await;
                 return Ok(());
             }
@@ -669,6 +686,7 @@ async fn serve_admin(
     mut recv: iroh::endpoint::RecvStream,
     key: clipwire_core::AdminKey,
     mut closing: tokio::sync::watch::Receiver<u64>,
+    ctx: AdminCtx,
 ) -> Result<()> {
     let mut admin = AdminSession::default();
     if !admin.auth(shared, &key) {
@@ -692,7 +710,7 @@ async fn serve_admin(
                     write_msg(&mut send, &reply).await?;
                     continue;
                 }
-                match crate::admin::handle(shared, &admin, &msg)? {
+                match crate::admin::handle(shared, &admin, &msg, &ctx)? {
                     Some(AdminReply::Send(reply)) => write_msg(&mut send, &reply).await?,
                     Some(AdminReply::SendAndCloseAll(reply)) => {
                         write_msg(&mut send, &reply).await?;
@@ -790,7 +808,7 @@ async fn refuse(send: &mut iroh::endpoint::SendStream, reason: &str) {
     let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
 }
 
-fn short(g: &GroupId) -> String {
+pub(crate) fn short(g: &GroupId) -> String {
     g.0[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clipwire_core::proto::io::write_msg;
-use clipwire_core::proto::{DeviceEntry, MAX_FRAME, ServerMsg};
+use clipwire_core::proto::{DeviceEntry, MAX_FRAME, ServerMsg, knows_server_groups};
 use clipwire_core::{BlobId, DeviceId, GroupId};
 use iroh::endpoint::SendStream;
 
@@ -19,11 +19,16 @@ pub const MAX_CARD_BYTES: usize = 4096;
 /// Предел одного пакета нового ключа. Настоящий — 32 + 32 + 24 + 32 + 16 байт.
 pub const MAX_ENVELOPE_BYTES: usize = 512;
 
-/// Что сказать устройству, которое пришло в группу со сменённым ключом.
-pub fn rotation_msg(r: Rotation) -> ServerMsg {
+/// Что сказать устройству, которое пришло в группу со сменённым ключом или
+/// в удалённую группу. Удалённую клиенту старее `clipwire/10` — `Excluded`:
+/// `GroupDeleted` он не разберёт и переподключался бы по кругу, а
+/// «исключено» и так останавливает его синхронизацию до решения человека.
+pub fn rotation_msg(r: Rotation, alpn: &[u8]) -> ServerMsg {
     match r {
         Rotation::Rekeyed(envelope) => ServerMsg::Rekeyed { envelope },
         Rotation::Excluded => ServerMsg::Excluded,
+        Rotation::Deleted if knows_server_groups(alpn) => ServerMsg::GroupDeleted,
+        Rotation::Deleted => ServerMsg::Excluded,
     }
 }
 
@@ -136,7 +141,7 @@ pub fn rekey(
 
 /// Убрать файлы группы с диска так же, как при отмене: под замком записи,
 /// ждущие `Get` получают `Cancelled`. Строк в базе уже нет.
-async fn remove_files(shared: Arc<Shared>, group: GroupId, blobs: Vec<BlobId>) {
+pub async fn remove_files(shared: Arc<Shared>, group: GroupId, blobs: Vec<BlobId>) {
     for blob in &blobs {
         let live = shared.blobs.live(&group, blob, 0);
         let _writer = live.writer.lock().await;
