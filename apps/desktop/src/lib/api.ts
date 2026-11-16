@@ -236,8 +236,11 @@ export type Status =
   | { kind: 'online' }
   | { kind: 'offline'; detail: string }
   | { kind: 'paused' }
-  /** Сервер сообщил, что устройство исключено: синхронизация остановлена, ключ на месте. */
-  | { kind: 'excluded' }
+  /**
+   * Сервер сообщил, что устройство исключено: синхронизация остановлена, ключ на месте.
+   * `deleted` — группу удалил администратор сервера.
+   */
+  | { kind: 'excluded'; detail: { deleted: boolean } }
 
 /** События группы, которые окно настроек забирает у Rust (`group_notices_take`). */
 export interface GroupNotices {
@@ -375,6 +378,38 @@ export interface RelayRotated {
   invite: string
 }
 
+/** Группа сервера (`server_groups`, `clipwire/10`). Имён у групп нет: только отпечаток id. */
+export interface ServerGroup {
+  /** Id группы, 64 hex. */
+  id: string
+  /** Короткий отпечаток id (10 hex). */
+  fingerprint: string
+  /** Группа этого устройства: её удалить нельзя. */
+  mine: boolean
+  created_ms: number
+  /** Последний вход любого устройства; 0 — устройств нет. */
+  last_seen_ms: number
+  devices: number
+  online: number
+  items: number
+  item_bytes: number
+  files: number
+  file_bytes: number
+  pins: number
+  pin_bytes: number
+  has_admin: boolean
+  state: 'live' | 'pending' | 'rotated' | 'idle'
+  /** У `rotated`: сколько дней ещё ждут пакеты нового ключа. */
+  days_left: number | null
+}
+
+/** Ответ `server_groups`. */
+export interface ServerGroups {
+  /** Сервер знает группы сервера; нет — список пустой, нужно обновить сервер. */
+  supported: boolean
+  groups: ServerGroup[]
+}
+
 /** Админ группы (`group_admin`). */
 export interface GroupAdmin {
   /** Сервер знает админов групп (0.5.0 и новее). */
@@ -466,6 +501,9 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   serverSettings: () => invoke<ServerSetting[]>('server_settings_get'),
   serverSettingsSet: (changes: SettingChange[]) => invoke<ServerSetting[]>('server_settings_set', { changes }),
   serverSummary: () => invoke<ServerSummary>('server_summary'),
+  serverGroups: () => invoke<ServerGroups>('server_groups'),
+  /** Удалить группу сервера целиком: возвращает список после удаления. */
+  serverGroupDelete: (groupId: string) => invoke<ServerGroup[]>('server_group_delete', { groupId }),
   /** Сменить токен relay: все устройства отключатся и войдут по новому коду приглашения. */
   serverRotateRelayToken: () => invoke<RelayRotated>('server_rotate_relay_token'),
   /** Сменить ключ администратора: возвращает новый код сервера. */

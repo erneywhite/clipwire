@@ -1,7 +1,7 @@
 // Логика формы раздела «Сервер»: подписи настроек, единицы, разбор ввода,
 // проверка пределов до отправки и сброс к значению по умолчанию. Без Svelte,
 // чтобы проверялось в Node (`server.test.ts`).
-import type { ServerSetting, ServerSummary, SettingChange } from './api'
+import type { ServerGroup, ServerSetting, ServerSummary, SettingChange } from './api'
 import { t, tn, lang } from './i18n.ts'
 
 const KIB = 1024
@@ -235,4 +235,88 @@ export function tokenRefused(detail: string): boolean {
     'relay отказал в доступе',
     'the relay denied access',
   ].some((p) => d.includes(p))
+}
+
+// --- Карточка «Группы» (`clipwire/10`) ---
+
+const DAY = 86_400_000
+
+/** Полночь дня `ms` по местному времени. */
+function dayStart(ms: number): number {
+  const d = new Date(ms)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+
+/** Последняя активность группы по дням: «сегодня», «вчера», «3 дня назад». */
+export function groupActivity(ms: number, now = Date.now()): string {
+  if (!ms) return t('устройства не входили')
+  // Через округление: в день перевода часов сутки короче или длиннее.
+  const days = Math.max(0, Math.round((dayStart(now) - dayStart(ms)) / DAY))
+  if (days === 0) return t('сегодня')
+  if (days === 1) return t('вчера')
+  return t('{a} назад', { a: tn(days, ['день', 'дня', 'дней'], ['day', 'days']) })
+}
+
+/** Пояснение к состоянию группы; у обычной — пусто. */
+export function groupStateText(g: Pick<ServerGroup, 'state' | 'days_left'>): string {
+  switch (g.state) {
+    case 'live':
+      return ''
+    case 'pending':
+      return t('смена ключа не завершена')
+    case 'rotated':
+      return g.days_left
+        ? t('ключ сменён, новый ключ ждёт устройства ещё {days}', { days: tn(g.days_left, ['день', 'дня', 'дней'], ['day', 'days']) })
+        : t('ключ сменён, осталось надгробие')
+    case 'idle':
+      return t('заброшена, данные удалены')
+  }
+}
+
+/** Пустая или надгробная группа: строка приглушена. */
+export function groupMuted(g: ServerGroup): boolean {
+  if (g.state === 'rotated' || g.state === 'idle') return true
+  return g.devices === 0 && g.items === 0 && g.files === 0 && g.pins === 0
+}
+
+/** Свежая активность первой, при равенстве — новее созданная. */
+export function sortGroups(list: ServerGroup[]): ServerGroup[] {
+  return [...list].sort((a, b) => b.last_seen_ms - a.last_seen_ms || b.created_ms - a.created_ms)
+}
+
+/** «3 устройства, в сети 1». */
+export function groupDevicesText(g: Pick<ServerGroup, 'devices' | 'online'>): string {
+  if (!g.devices) return t('без устройств')
+  return t('{devices}, в сети {online}', { devices: tn(g.devices, ['устройство', 'устройства', 'устройств'], ['device', 'devices']), online: g.online })
+}
+
+/** Что лежит на сервере: «история 2 МБ · файлы 40 МБ · закрепы 12 КБ», пустое — «пусто». */
+export function groupSizeText(g: Pick<ServerGroup, 'item_bytes' | 'file_bytes' | 'pin_bytes'>): string {
+  const parts: string[] = []
+  if (g.item_bytes) parts.push(t('история {size}', { size: bytesText(g.item_bytes) }))
+  if (g.file_bytes) parts.push(t('файлы {size}', { size: bytesText(g.file_bytes) }))
+  if (g.pin_bytes) parts.push(t('закрепы {size}', { size: bytesText(g.pin_bytes) }))
+  return parts.length ? parts.join(' · ') : t('на сервере пусто')
+}
+
+/** Текст подтверждения удаления группы, абзацами. */
+export function deleteGroupText(g: ServerGroup): string[] {
+  const out = [
+    t('С сервера удалятся все данные группы {fp}: история ({items}), файлы ({files}), закрепы ({pins}), карточки устройств и настройки группы.', {
+      fp: g.fingerprint,
+      items: tn(g.items, ['элемент', 'элемента', 'элементов'], ['item', 'items']),
+      files: tn(g.files, ['файл', 'файла', 'файлов'], ['file', 'files']),
+      pins: tn(g.pins, ['закреп', 'закрепа', 'закрепов'], ['pin', 'pins']),
+    }),
+  ]
+  if (g.devices) {
+    out.push(
+      t('{devices} группы отключатся и больше не войдут в неё: на них появится «Группу удалил администратор сервера». Локальная история на устройствах останется.', {
+        devices: tn(g.devices, ['устройство', 'устройства', 'устройств'], ['device', 'devices']),
+      }),
+    )
+  }
+  out.push(t('Это необратимо: вернуть группу нельзя, для синхронизации её устройствам понадобится новая группа.'))
+  return out
 }

@@ -19,9 +19,11 @@ mod admin;
 mod config;
 mod deletes;
 mod devices;
+mod groups;
 mod pins;
 pub use admin::{Create, PENDING_KEEP};
 pub use devices::{RekeyLimits, RekeyOutcome, Rotation};
+pub use groups::DeleteOutcome;
 use pins::KEPT_BY_PIN;
 pub use pins::{PinOutcome, PinQuota, PinWrite};
 
@@ -208,6 +210,7 @@ impl Store {
         config::migrate(&conn)?;
         deletes::migrate(&conn)?;
         pins::migrate(&conn)?;
+        groups::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

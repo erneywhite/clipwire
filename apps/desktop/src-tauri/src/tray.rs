@@ -139,7 +139,7 @@ fn wire_for(st: &StatusDto, update: bool) -> (Wire, bool) {
         StatusDto::Online => (Wire::Online, false),
         StatusDto::Local => (Wire::Local, false),
         StatusDto::Connecting => (Wire::Connecting, true),
-        StatusDto::Offline(_) | StatusDto::Unconfigured | StatusDto::Excluded => {
+        StatusDto::Offline(_) | StatusDto::Unconfigured | StatusDto::Excluded { .. } => {
             (Wire::Error, false)
         }
         StatusDto::Paused => (Wire::Paused, false),
@@ -352,7 +352,8 @@ fn describe(st: &StatusDto) -> String {
         StatusDto::Online => tr("Синхронизация включена").into(),
         StatusDto::Offline(e) => trf("Нет связи: {reason}", &[("reason", &short(e))]),
         StatusDto::Paused => tr("На паузе").into(),
-        StatusDto::Excluded => tr("Сервер исключил устройство из группы").into(),
+        StatusDto::Excluded { deleted: false } => tr("Сервер исключил устройство из группы").into(),
+        StatusDto::Excluded { deleted: true } => tr("Группу удалил администратор сервера").into(),
     }
 }
 

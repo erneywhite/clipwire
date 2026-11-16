@@ -495,8 +495,8 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
   the old code, otherwise it is folded into a link. An invite to another group is not accepted
   there.
 - The **Server** section, for the server administrator only: a summary (groups, devices, space
-  used by history, files and pins, version), server limits and secret changes (see
-  [Administrator code](#administrator-code)).
+  used by history, files and pins, version), the server's groups with deletion, server limits
+  and secret changes (see [Administrator code](#administrator-code)).
 - Paste window size (one slider with a live preview next to it) and the hotkey.
 - Programs that must not be synced (password managers by default).
 - Hiding Clipwire windows during screen sharing (Windows and macOS; Linux has no way to do it).
@@ -577,6 +577,20 @@ at once, without a restart; the environment variables become the defaults. Each 
 default, and **Reset** returns a limit set from the app to it. Sizes are entered in MB or GB,
 durations in hours; the app does not send a value outside the allowed range.
 
+The **Groups** card of the **Server** section lists every group on the server, most recently
+active first. Groups have no names (the server only knows their ids), so a group is shown by its
+id fingerprint, and this device's group is marked **your group**. Each row shows how many devices
+the group has and how many are online, when any device last signed in, how much space history,
+files and pins take on the server, and the state when it is not the usual one (key change not
+finished, key changed, abandoned). Empty groups and tombstones are dimmed. **Delete**, after a
+confirmation, removes everything the group has on the server: history, files, pins, device cards
+and settings. The group's devices are disconnected at once and cannot rejoin it; they show "The
+server administrator deleted the group", and their local history stays. This cannot be undone.
+Your own group cannot be deleted this way: leave it first or delete it from another administrator
+device. The group list needs a server with protocol `clipwire/10`; on an older server the card
+asks you to update the image. Devices running older versions treat a deleted group as being
+removed from the group.
+
 On a device that is already in a group, enter the code in **Sync → I am the server
 administrator**. The app checks that the code belongs to the same server and that the key works;
 if the access token in the code is newer than the stored one, the key is checked over a separate
@@ -633,6 +647,8 @@ app without restarting the container.
 
 - Encrypted items, for the retention period `CLIPWIRE_TTL_HOURS`, up to `CLIPWIRE_HISTORY_LEN`
   per group.
+  A device that was offline gets all of it when it joins, in batches of 200 items, so a long
+  history is never held in memory at once.
 - Encrypted files in `<CLIPWIRE_DATA_DIR>/blobs`, removed after the same period.
 - If a group chose its own storage (S3 or SFTP), only its encrypted settings, up to 16 KB, which
   the server hands out to the group's devices. They are deleted on a key change and together with
@@ -643,6 +659,8 @@ app without restarting the container.
   in with the old key gets "removed" and does not create the group again. Tombstones do not count
   toward `CLIPWIRE_MAX_GROUPS`.
 - Encrypted deletion notes.
+- For a group deleted by the server administrator, only a tombstone (the group id and the secret
+  hash): its devices learn that the group is gone, and it is not created again.
 - Limits set from the app (table `settings`) and the admin of every group (a device ID).
 - Encrypted pins of the group (`clipwire/8`) with their notes and the pinned entries
   themselves, with no expiry: a pin lives until it is removed, and a removed pin stays as a

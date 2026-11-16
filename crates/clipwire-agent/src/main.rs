@@ -132,7 +132,13 @@ fn main() -> Result<()> {
             let state = paths
                 .load()?
                 .context("устройство ещё не в группе: сначала create или join")?;
-            if clipwire_agent::devices::is_excluded(&paths, state.invite.group_key.group_id()) {
+            let group = state.invite.group_key.group_id();
+            if clipwire_agent::devices::is_group_deleted(&paths, group) {
+                bail!(
+                    "группу удалил администратор сервера. Выйти из группы — clipwire-agent reset"
+                );
+            }
+            if clipwire_agent::devices::is_excluded(&paths, group) {
                 bail!(
                     "сервер сообщил, что это устройство исключено из группы. Выйти из группы — \
                      clipwire-agent reset, попробовать снова — clipwire-agent retry"
@@ -205,11 +211,15 @@ fn headless(state: AgentState, paths: &Paths, send: Option<String>) -> Result<()
                     eprintln!("в истории группы новых элементов: {}", items.len())
                 }
                 Event::Cursor(_) => {}
+                Event::Flush(done) => {
+                    let _ = done.send(());
+                }
                 // Отладочный режим ничего не сохраняет: только сообщает.
                 Event::Rekeyed(n) => {
                     eprintln!("ключ группы сменило устройство «{}»", n.initiator_name)
                 }
                 Event::Excluded { .. } => eprintln!("сервер сообщил, что устройство исключено"),
+                Event::GroupDeleted { .. } => eprintln!("группу удалил администратор сервера"),
                 Event::KnownDevices(_) => {}
                 Event::RekeyLost(why) => eprintln!("{why}"),
                 Event::Deleted(n) => eprintln!("удалено на другом устройстве: {}", n.hashes.len()),
@@ -311,6 +321,17 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
                          clipwire-agent retry"
                     ),
                     Err(e) => eprintln!("отметка об исключении не сохранилась: {e:#}"),
+                }
+            }
+            UiEvent::GroupDeleted { old } => {
+                match Paths::resolve()
+                    .and_then(|p| clipwire_agent::devices::mark_group_deleted(&p, old))
+                {
+                    Ok(_) => eprintln!(
+                        "группу удалил администратор сервера. История осталась на этом \
+                         устройстве: выйти из группы — clipwire-agent reset"
+                    ),
+                    Err(e) => eprintln!("отметка об удалении группы не сохранилась: {e:#}"),
                 }
             }
             UiEvent::RekeyLost(why) => eprintln!("{why}"),

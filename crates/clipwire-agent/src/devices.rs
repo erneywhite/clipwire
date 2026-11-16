@@ -220,20 +220,51 @@ fn group_hex(g: GroupId) -> String {
 /// так `Excluded` из старой группы не тронет устройство, которое уже
 /// перешло на новый ключ.
 pub fn mark_excluded(paths: &Paths, old: GroupId) -> Result<bool> {
+    mark(paths, old, false)
+}
+
+/// Вторая строка файла отметки: группу удалил администратор сервера.
+const DELETED_MARK: &str = "deleted";
+
+/// Группу `old` удалил администратор сервера (`GroupDeleted`). Отметка та
+/// же, что у исключения ([`mark_excluded`]), с причиной: интерфейс пишет
+/// «группу удалил администратор сервера» и предлагает только выйти.
+pub fn mark_group_deleted(paths: &Paths, old: GroupId) -> Result<bool> {
+    mark(paths, old, true)
+}
+
+fn mark(paths: &Paths, old: GroupId, deleted: bool) -> Result<bool> {
     match paths.load()? {
         Some(s) if s.invite.group_key.group_id() == old => {
             std::fs::create_dir_all(&paths.dir)?;
-            crate::state::write_atomic(&paths.dir.join(EXCLUDED_FILE), group_hex(old).as_bytes())?;
+            let mut text = group_hex(old);
+            if deleted {
+                text = format!("{text}\n{DELETED_MARK}");
+            }
+            crate::state::write_atomic(&paths.dir.join(EXCLUDED_FILE), text.as_bytes())?;
             Ok(true)
         }
         _ => Ok(false),
     }
 }
 
-/// Помечено ли устройство исключённым из группы `group`.
+/// Отметка на диске для группы `group`: `Some(true)` — группу удалили,
+/// `Some(false)` — исключили, `None` — отметки нет.
+fn marked(paths: &Paths, group: GroupId) -> Option<bool> {
+    let s = std::fs::read_to_string(paths.dir.join(EXCLUDED_FILE)).ok()?;
+    let mut lines = s.lines().map(str::trim);
+    (lines.next()? == group_hex(group)).then(|| lines.next() == Some(DELETED_MARK))
+}
+
+/// Помечено ли устройство исключённым из группы `group` (в том числе потому,
+/// что группу удалили).
 pub fn is_excluded(paths: &Paths, group: GroupId) -> bool {
-    std::fs::read_to_string(paths.dir.join(EXCLUDED_FILE))
-        .is_ok_and(|s| s.trim() == group_hex(group))
+    marked(paths, group).is_some()
+}
+
+/// Удалил ли группу `group` администратор сервера (по отметке на диске).
+pub fn is_group_deleted(paths: &Paths, group: GroupId) -> bool {
+    marked(paths, group) == Some(true)
 }
 
 /// Снять отметку «исключено» («Попробовать снова»).
@@ -699,6 +730,25 @@ mod tests {
         mark_excluded(&paths, cur).unwrap();
         paths.reset().unwrap();
         assert!(!is_excluded(&paths, cur));
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[test]
+    fn deleted_group_is_marked_with_reason() {
+        let paths = tmp();
+        paths.save(&state(5)).unwrap();
+        let (old, cur) = (GroupKey([2; 32]).group_id(), GroupKey([5; 32]).group_id());
+        assert!(!mark_group_deleted(&paths, old).unwrap());
+        assert!(mark_group_deleted(&paths, cur).unwrap());
+        // Удалённая группа — тоже «исключено»: синхронизация не запускается.
+        assert!(is_excluded(&paths, cur) && is_group_deleted(&paths, cur));
+        assert!(!is_group_deleted(&paths, old));
+        // Обычное исключение причину снимает; отметка старого формата
+        // (только id группы) читается как исключение.
+        mark_excluded(&paths, cur).unwrap();
+        assert!(is_excluded(&paths, cur) && !is_group_deleted(&paths, cur));
+        std::fs::write(paths.dir.join(EXCLUDED_FILE), group_hex(cur)).unwrap();
+        assert!(is_excluded(&paths, cur) && !is_group_deleted(&paths, cur));
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 

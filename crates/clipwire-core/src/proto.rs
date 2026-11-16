@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::admin::{AdminFail, AdminKey, SecretCode, ServerSettings, ServerSummary};
+use crate::admin::{AdminFail, AdminKey, GroupInfo, SecretCode, ServerSettings, ServerSummary};
 use crate::blob::BlobId;
 use crate::crypto::{GroupId, JoinSecret, SealedItem};
 use crate::item::DeviceId;
@@ -57,9 +57,16 @@ pub const ALPN_8: &[u8] = b"clipwire/8";
 /// не шлёт, так что клиенту, который их не знает, `clipwire/9` безопасен.
 pub const ALPN_9: &[u8] = b"clipwire/9";
 
+/// Как [`ALPN_9`], плюс группы сервера у администратора: `ListGroups`,
+/// `DeleteGroup` и `GroupDeleted` устройствам удалённой группы. Варианты
+/// `clipwire/9` не меняются, новые добавлены в конец enum.
+pub const ALPN_10: &[u8] = b"clipwire/10";
+
 /// Все ALPN, новейший первым: в этом порядке их предлагает агент и
 /// принимает сервер.
-pub const ALPNS: [&[u8]; 7] = [ALPN_9, ALPN_8, ALPN_7, ALPN_6, ALPN_5, ALPN_4, ALPN];
+pub const ALPNS: [&[u8]; 8] = [
+    ALPN_10, ALPN_9, ALPN_8, ALPN_7, ALPN_6, ALPN_5, ALPN_4, ALPN,
+];
 
 /// Номер версии протокола из ALPN (`clipwire/7` → 7), 0 — не наш ALPN.
 /// Новые возможности проверяются сравнением номера, а не перечислением ALPN:
@@ -99,6 +106,12 @@ pub fn knows_pins(alpn: &[u8]) -> bool {
 /// Знает ли соединение с этим ALPN администрирование сервера и админа группы.
 pub fn knows_admin(alpn: &[u8]) -> bool {
     alpn_version(alpn) >= 9
+}
+
+/// Знает ли соединение с этим ALPN группы сервера (`ListGroups`,
+/// `DeleteGroup`, `GroupDeleted`).
+pub fn knows_server_groups(alpn: &[u8]) -> bool {
+    alpn_version(alpn) >= 10
 }
 
 /// Версия `a` младше `b` («0.3.0» < «0.3.1» < «0.10.0»). Части сравниваются
@@ -265,6 +278,18 @@ pub enum ClientMsg {
     /// устройству группы. Ответ — `GroupAdmin`, остальным — `DevicesChanged`;
     /// без прав — `AdminFailed(NotAuthorized)`.
     ClaimGroupAdmin,
+    /// Группы сервера — ответ `Groups`. Только по [`ALPN_10`] и после
+    /// `AdminAuth`, как запросы администратора `clipwire/9`.
+    ListGroups,
+    /// Удалить группу целиком: элементы, файлы (и с диска), карточки,
+    /// устройства, закрепы, записки об удалении, настройки, пакеты смены
+    /// ключа. От группы остаётся надгробие (id и хэш секрета), чтобы её
+    /// устройства получили `GroupDeleted` (клиенты старее `clipwire/10` —
+    /// `Excluded`) и не создали группу заново. Подключённые устройства группы
+    /// получают то же и отключаются. Ответ — `Groups` (список после
+    /// удаления); отказы — `AdminFailed(NoSuchGroup | OwnGroup |
+    /// NotAuthorized)`. Только по [`ALPN_10`].
+    DeleteGroup { group: GroupId },
 }
 
 /// Закреп на сервере (в `Pins`, `Pinned`, `PinRejected`).
@@ -432,6 +457,12 @@ pub enum ServerMsg {
     /// Запрос администратора или админа группы не выполнен. Соединение
     /// остаётся.
     AdminFailed(AdminFail),
+    /// Ответ на `ListGroups` и `DeleteGroup`, по убыванию последней
+    /// активности. Только по [`ALPN_10`], как и всё ниже.
+    Groups(Vec<GroupInfo>),
+    /// Группу этого соединения удалил администратор сервера (сразу или при
+    /// входе в неё). Следом сервер закрывает поток; входить снова незачем.
+    GroupDeleted,
 }
 
 /// Первый кадр потока файла.
@@ -658,8 +689,11 @@ mod tests {
         assert_eq!(alpn_version(ALPN), 3);
         assert_eq!(alpn_version(ALPN_7), 7);
         assert_eq!(alpn_version(ALPN_8), 8);
-        assert_eq!(ALPNS[0], ALPN_9);
+        assert_eq!(ALPNS[0], ALPN_10);
+        assert_eq!(ALPNS[1], ALPN_9);
         assert_eq!(alpn_version(ALPN_9), 9);
+        assert_eq!(alpn_version(ALPN_10), 10);
+        assert!(!knows_server_groups(ALPN_9) && knows_server_groups(ALPN_10));
         assert_eq!(alpn_version(b"clipwire/12"), 12);
         assert_eq!(alpn_version(b"other/7"), 0);
         // Новая версия не теряет старые возможности.
@@ -671,6 +705,7 @@ mod tests {
             assert_eq!(knows_server_info(a), v >= 7);
             assert_eq!(knows_pins(a), v >= 8);
             assert_eq!(knows_admin(a), v >= 9);
+            assert_eq!(knows_server_groups(a), v >= 10);
         }
         assert!(knows_deletes(b"clipwire/9"));
     }
@@ -715,6 +750,26 @@ mod tests {
         assert_eq!(tag(postcard::to_stdvec(&ServerMsg::AdminOk).unwrap()), 21);
         let fail = ServerMsg::AdminFailed(AdminFail::BadKey);
         assert_eq!(tag(postcard::to_stdvec(&fail).unwrap()), 27);
+        // `clipwire/10`: только в конце, `clipwire/9` не сдвинут.
+        assert_eq!(
+            tag(postcard::to_stdvec(&ClientMsg::ListGroups).unwrap()),
+            25
+        );
+        let del = ClientMsg::DeleteGroup {
+            group: GroupId([0; 32]),
+        };
+        assert_eq!(tag(postcard::to_stdvec(&del).unwrap()), 26);
+        assert_eq!(
+            tag(postcard::to_stdvec(&ServerMsg::Groups(vec![])).unwrap()),
+            28
+        );
+        assert_eq!(
+            tag(postcard::to_stdvec(&ServerMsg::GroupDeleted).unwrap()),
+            29
+        );
+        let own = postcard::to_stdvec(&AdminFail::OwnGroup).unwrap();
+        assert_eq!(own[0], 8, "новые отказы — после Unavailable (6)");
+        assert_eq!(postcard::to_stdvec(&AdminFail::NoSuchGroup).unwrap()[0], 7);
         // Вход администратора влезает в предел первого кадра сервера (512).
         assert!(postcard::to_stdvec(&join).unwrap().len() < 128);
     }

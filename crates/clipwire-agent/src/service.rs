@@ -49,6 +49,11 @@ pub enum UiEvent {
     Excluded {
         old: clipwire_core::GroupId,
     },
+    /// Группу `old` удалил администратор сервера: пометить
+    /// (`devices::mark_group_deleted`), ключ и история остаются.
+    GroupDeleted {
+        old: clipwire_core::GroupId,
+    },
     /// Смена ключа на этом устройстве не состоялась, хотя ответ на неё
     /// потерялся (текст для человека).
     RekeyLost(String),
@@ -531,8 +536,9 @@ impl Service {
                                 })
                                 .collect();
                             // Миниатюры — без замка истории и только новым
-                            // записям: в пачке до тысячи элементов, часть
-                            // картинки, и большинство обычно уже знакомо.
+                            // записям: в пачке до двухсот элементов
+                            // (`sync::HISTORY_BATCH_ITEMS`), часть картинки,
+                            // и большинство обычно уже знакомо.
                             let fresh: Vec<bool> = {
                                 let h = history.lock().unwrap_or_else(|e| e.into_inner());
                                 entries.iter().map(|e| !h.knows(e)).collect()
@@ -564,8 +570,14 @@ impl Service {
                                 on_event(UiEvent::HistoryMerged(added));
                             }
                         }
+                        // События обрабатываются по порядку: всё до `Flush`
+                        // (пачка истории при входе) уже записано.
+                        Event::Flush(done) => {
+                            let _ = done.send(());
+                        }
                         Event::Rekeyed(n) => on_event(UiEvent::Rekeyed(n)),
                         Event::Excluded { old } => on_event(UiEvent::Excluded { old }),
+                        Event::GroupDeleted { old } => on_event(UiEvent::GroupDeleted { old }),
                         Event::RekeyLost(why) => on_event(UiEvent::RekeyLost(why)),
                         Event::DevicesChanged => on_event(UiEvent::DevicesChanged),
                         Event::ServerOutdated(v) => on_event(UiEvent::ServerOutdated(v)),

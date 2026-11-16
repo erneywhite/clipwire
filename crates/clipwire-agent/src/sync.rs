@@ -46,34 +46,72 @@ fn backfill_pause(batch_bytes: usize) -> Duration {
 /// обычно сотни килобайт — пара мегабайт.
 pub const MAX_ITEM_BYTES: usize = 7 * 1024 * 1024 + 512 * 1024;
 
-/// Сколько элементов истории принимается за один вход. Сервер по умолчанию
-/// хранит 50 на группу (`CLIPWIRE_HISTORY_LEN`); запас с большим
-/// превышением. Больше — сервер врёт или сломан, вход прекращается.
-const MAX_JOIN_HISTORY_ITEMS: usize = 1000;
-/// Сколько байт шифротекста истории принимается за один вход. Элементы
-/// копятся в памяти до `HistoryEnd`, так что предел держит память клиента.
-const MAX_JOIN_HISTORY_BYTES: usize = 256 * 1024 * 1024;
+/// История группы при входе применяется пачками по стольку элементов...
+const HISTORY_BATCH_ITEMS: usize = 200;
+/// ...или по стольку байт шифротекста, что наберётся раньше.
+///
+/// Общего предела на историю нет: администратор может поднять
+/// `history_len` до 100 000 (`clipwire_core::admin::SETTINGS`, а через
+/// переменную окружения и выше), и вход не должен из-за этого срываться.
+/// Память держат пределы на пачку: в памяти одновременно не больше двух
+/// пачек (одна копится, предыдущая ждёт записи в сервисе, см.
+/// [`Event::Flush`]) и самого свежего элемента для буфера. Размер одного
+/// элемента ограничивает кадр протокола (`proto::MAX_FRAME`, 16 МиБ), так
+/// что пачка перерастает предел не больше чем на один кадр. Бесконечный поток
+/// от сломанного сервера память не съест: на диск попадают только настоящие
+/// элементы группы (шифротекст под ключом группы сервер не подделает), а
+/// повторы отсекает история по id.
+const HISTORY_BATCH_BYTES: usize = 32 * 1024 * 1024;
 
-/// Счётчик истории, пришедшей при входе: пределы по числу и размеру.
+/// Нарезка истории при входе на пачки по [`HISTORY_BATCH_ITEMS`] и
+/// [`HISTORY_BATCH_BYTES`].
 #[derive(Default)]
-struct HistoryBudget {
-    items: usize,
+struct HistoryBatcher {
+    part: Vec<(clipwire_core::SealedItem, bool)>,
     bytes: usize,
 }
 
-impl HistoryBudget {
-    /// Учесть ещё один элемент; ошибка, если предел превышен.
-    fn admit(&mut self, item: &clipwire_core::SealedItem) -> Result<()> {
-        self.admit_size(item.ciphertext.len())
+impl HistoryBatcher {
+    /// Добавить элемент; готовая пачка, если она набралась.
+    fn push(
+        &mut self,
+        item: clipwire_core::SealedItem,
+        backfill: bool,
+    ) -> Option<Vec<(clipwire_core::SealedItem, bool)>> {
+        self.bytes = self.bytes.saturating_add(item.ciphertext.len());
+        self.part.push((item, backfill));
+        (self.part.len() >= HISTORY_BATCH_ITEMS || self.bytes >= HISTORY_BATCH_BYTES)
+            .then(|| self.take())
     }
 
-    fn admit_size(&mut self, len: usize) -> Result<()> {
-        self.items += 1;
-        self.bytes = self.bytes.saturating_add(len);
-        if self.items > MAX_JOIN_HISTORY_ITEMS || self.bytes > MAX_JOIN_HISTORY_BYTES {
-            bail!(tr("сервер прислал слишком много истории"));
+    /// Забрать то, что накопилось (остаток после `HistoryEnd`).
+    fn take(&mut self) -> Vec<(clipwire_core::SealedItem, bool)> {
+        self.bytes = 0;
+        std::mem::take(&mut self.part)
+    }
+}
+
+/// Что переходит между пачками истории одного входа.
+struct JoinHistory {
+    /// Курсор на момент входа. Двигается только после `HistoryEnd`: обрыв
+    /// посреди истории не должен оставить её хвост «уже виденным».
+    cursor: Option<ItemId>,
+    now: u64,
+    /// Самый свежий новый id, по которому встанет курсор.
+    newest: Option<ItemId>,
+    /// Кандидат в буфер: последний обычный элемент, которого ещё не видели.
+    /// В историю он уходит, только если за ним пришёл более свежий.
+    held: Option<Item>,
+}
+
+impl JoinHistory {
+    fn new(cursor: Option<ItemId>) -> Self {
+        Self {
+            cursor,
+            now: now_ms(),
+            newest: None,
+            held: None,
         }
-        Ok(())
     }
 }
 
@@ -191,6 +229,17 @@ pub enum Event {
     /// (`Paths::forget_admin_key`), интерфейс просит ввести новый код
     /// сервера администратора.
     AdminKeyStale,
+    /// Группу `old` удалил администратор сервера (`GroupDeleted`). Движок
+    /// дальше не подключается: устройство помечается исключённым с этой
+    /// причиной (`devices::mark_group_deleted`), человек выходит из группы.
+    GroupDeleted {
+        old: GroupId,
+    },
+    /// Ответить, когда все события до этого обработаны. Так движок ждёт,
+    /// пока сервис запишет пачку истории при входе, и не копит следующие в
+    /// канале. Не ответить (просто выбросить) тоже можно: движок перестанет
+    /// ждать.
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 /// Своя версия: сервер младше неё — подсказка обновить образ.
@@ -647,6 +696,17 @@ impl Engine {
         }
     }
 
+    /// Группу удалил администратор сервера: дальше не подключаться. Ошибка —
+    /// та, которой заканчивается сессия. Как и с `Excluded`, ключ и история
+    /// не стираются: решение за человеком (`devices::mark_group_deleted`).
+    fn group_deleted(&mut self) -> anyhow::Error {
+        let old = self.state.invite.group_key.group_id();
+        self.terminal = true;
+        tracing::info!("группу удалил администратор сервера");
+        self.emit(Event::GroupDeleted { old });
+        anyhow!(tr("группу удалил администратор сервера"))
+    }
+
     /// Можно ли верить пакету: его выпустило это устройство (ответ на свой
     /// `Rekey` потерялся) или устройство группы, карточку которого этот
     /// клиент проверял. `None` — инициатор неизвестен.
@@ -747,6 +807,7 @@ impl Engine {
             Ok((send, recv)) => (conn, send, recv),
             Err(JoinFail::Other(e)) => return Err(e),
             Err(JoinFail::Rotated(env)) => return Err(self.rotated(env)),
+            Err(JoinFail::Deleted) => return Err(self.group_deleted()),
             Err(JoinFail::BadAdminKey) => bail!(tr("сервер не принял ключ администратора")),
             Err(first) => {
                 // Старый сервер не знает `JoinWithToken`: кадр не разбирается,
@@ -757,6 +818,7 @@ impl Engine {
                 match join(&conn, &key, None, None).await {
                     Ok((send, recv)) => (conn, send, recv),
                     Err(JoinFail::Rotated(env)) => return Err(self.rotated(env)),
+                    Err(JoinFail::Deleted) => return Err(self.group_deleted()),
                     // Если на первый вход сервер отказал внятно, его причина
                     // понятнее второй.
                     Err(second) => match first {
@@ -791,17 +853,21 @@ impl Engine {
             ));
         }
         // История идёт по элементу; таймаут на каждый, а не на всю: с
-        // картинками она может качаться дольше CONNECT_TIMEOUT.
-        let mut history = Vec::new();
-        let mut budget = HistoryBudget::default();
+        // картинками она может качаться дольше CONNECT_TIMEOUT. Применяется
+        // пачками по мере прихода ([`HISTORY_BATCH_BYTES`]).
+        let mut batcher = HistoryBatcher::default();
+        let mut join_history = JoinHistory::new(self.cursor);
+        let mut flushed = None;
         loop {
             match tokio::time::timeout(CONNECT_TIMEOUT, read_msg(&mut recv))
                 .await
                 .context(tr("сервер не дослал историю"))??
             {
                 Some(ServerMsg::History { item, backfill }) => {
-                    budget.admit(&item)?;
-                    history.push((item, backfill));
+                    if let Some(part) = batcher.push(item, backfill) {
+                        self.history_part_paced(&mut join_history, part, &mut flushed)
+                            .await;
+                    }
                 }
                 Some(ServerMsg::HistoryEnd) => break,
                 Some(ServerMsg::Error(e)) => bail!(trf("сервер: {e}", &[("e", &e)])),
@@ -809,7 +875,12 @@ impl Engine {
                 None => bail!(tr("сервер закрыл соединение")),
             }
         }
-        self.apply_history(history);
+        // Остаток без `Flush`: дальше история не идёт, ждать нечего.
+        if let Some(rx) = flushed.take() {
+            let _ = rx.await;
+        }
+        self.history_part(&mut join_history, batcher.take());
+        self.history_done(join_history);
         self.config_supported = false;
         self.want_config = false;
         self.config_push = None;
@@ -959,14 +1030,14 @@ impl Engine {
                         }
                     }
                     Control::Admin { req, reply } => {
-                        if knows_admin(conn.alpn()) {
+                        if alpn_version(conn.alpn()) >= req.min_protocol() {
                             write_msg(&mut send, &req.msg()).await?;
                             self.admin_waiters.push_back(crate::admin::AdminWaiter {
                                 reply: Some(reply),
                                 auth: req.auth_key(),
                             });
                         } else {
-                            crate::admin::refuse_old(reply);
+                            crate::admin::refuse_old(reply, &req);
                         }
                     }
                     Control::SetGroupConfig { sealed, config, reply } => {
@@ -1051,6 +1122,7 @@ impl Engine {
             ServerMsg::Devices(list) => self.answer_devices(list),
             ServerMsg::Rekeyed { envelope } => return Err(self.rotated(Some(envelope))),
             ServerMsg::Excluded => return Err(self.rotated(None)),
+            ServerMsg::GroupDeleted => return Err(self.group_deleted()),
             ServerMsg::Error(e) => bail!(trf("сервер: {e}", &[("e", &e)])),
             ServerMsg::GroupConfig(sealed) => self.group_config(key, sealed),
             ServerMsg::Deleted(sealed) => match key.open_delete(&sealed) {
@@ -1370,20 +1442,46 @@ impl Engine {
         }))
     }
 
-    /// История группы при входе. В буфер идёт только самый свежий чужой
-    /// элемент, которого ещё не видели, и только если курсор уже есть: при
-    /// первом входе буфер не перезатираем. Остальное новое — в историю.
-    /// Курсор двигается только по элементам, которые расшифровались: мусор с
-    /// чужим id не должен его сдвинуть.
+    /// Вся история входа одной пачкой (для тестов): как `session`, только
+    /// без ожидания сервиса.
+    #[cfg(test)]
     fn apply_history(&mut self, history: Vec<(clipwire_core::SealedItem, bool)>) {
+        let mut j = JoinHistory::new(self.cursor);
+        self.history_part(&mut j, history);
+        self.history_done(j);
+    }
+
+    /// Пачка истории при входе, когда за ней придут ещё: сначала дождаться,
+    /// пока сервис запишет предыдущую, потом отдать эту и попросить
+    /// [`Event::Flush`]. Так в памяти не больше двух пачек, даже если сервис
+    /// пишет медленнее, чем приходит история.
+    async fn history_part_paced(
+        &mut self,
+        j: &mut JoinHistory,
+        part: Vec<(clipwire_core::SealedItem, bool)>,
+        flushed: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    ) {
+        if let Some(rx) = flushed.take() {
+            // Ошибка — получатель выбросил `Flush`, не ответив: ждать нечего.
+            let _ = rx.await;
+        }
+        self.history_part(j, part);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.emit(Event::Flush(tx));
+        *flushed = Some(rx);
+    }
+
+    /// Пачка истории группы при входе. Новое чужое — в историю, кроме
+    /// кандидата в буфер ([`JoinHistory::held`]): самого свежего обычного
+    /// элемента, которого ещё не видели, и только если курсор уже есть (при
+    /// первом входе буфер не перезатираем). Сравнение идёт с курсором на
+    /// момент входа, а не с текущим.
+    fn history_part(&mut self, j: &mut JoinHistory, part: Vec<(clipwire_core::SealedItem, bool)>) {
         let key = self.state.invite.group_key.clone();
-        let (cursor, now) = (self.cursor, now_ms());
-        let mut newest: Option<ItemId> = None;
-        // Расшифрованные элементы для истории и их флаг `backfill`.
-        let mut items: Vec<(Item, bool)> = Vec::new();
-        for (sealed, backfill) in &history {
-            let unseen = cursor.is_none_or(|c| sealed.id > c);
-            let wanted = wanted_from_history(sealed, *backfill, cursor, self.device);
+        let mut out: Vec<Item> = Vec::new();
+        for (sealed, backfill) in &part {
+            let unseen = j.cursor.is_none_or(|c| sealed.id > c);
+            let wanted = wanted_from_history(sealed, *backfill, j.cursor, self.device);
             if !wanted && !unseen {
                 continue;
             }
@@ -1392,28 +1490,37 @@ impl Engine {
                     self.note_places(&item);
                     // Id из будущего не в счёт: иначе он перекрыл бы
                     // настоящий самый свежий, а курсор по нему не встанет.
-                    if unseen && !ahead_of_clock(item.id, now) {
-                        newest = newest.max(Some(item.id));
+                    if unseen && !ahead_of_clock(item.id, j.now) {
+                        j.newest = j.newest.max(Some(item.id));
                     }
-                    if wanted {
-                        items.push((item, *backfill));
+                    if !wanted {
+                        continue;
+                    }
+                    // История идёт от старых к новым: обычный элемент
+                    // вытесняет прежнего кандидата в историю.
+                    if !*backfill && j.cursor.is_some() {
+                        out.extend(j.held.replace(item));
+                    } else {
+                        out.push(item);
                     }
                 }
                 Err(e) => tracing::warn!("элемент из истории не расшифровался: {e}"),
             }
         }
-        // В буфер — самый свежий обычный элемент (не первый вход).
-        let current = cursor
-            .and_then(|_| items.iter().rposition(|(_, backfill)| !backfill))
-            .map(|i| items.remove(i).0);
-        let items: Vec<Item> = items.into_iter().map(|(item, _)| item).collect();
-        if !items.is_empty() {
-            self.emit(Event::History(items));
+        if !out.is_empty() {
+            self.emit(Event::History(out));
         }
-        if let Some(item) = current {
+    }
+
+    /// История дошла до `HistoryEnd`: кандидат — в буфер (или в историю, если
+    /// скопирован давно), курсор — на самый свежий новый id.
+    /// Курсор двигается только по элементам, которые расшифровались: мусор с
+    /// чужим id не должен его сдвинуть.
+    fn history_done(&mut self, j: JoinHistory) {
+        if let Some(item) = j.held {
             self.accept(item, FRESH_FROM_HISTORY);
         }
-        if let Some(max) = newest {
+        if let Some(max) = j.newest {
             self.set_cursor(max);
         }
     }
@@ -1734,6 +1841,8 @@ enum JoinFail {
     /// `JoinAsAdmin` с ключом, которого сервер не знает (его сменили):
     /// повторить вход с токеном relay.
     BadAdminKey,
+    /// Группу удалил администратор сервера (`GroupDeleted`).
+    Deleted,
 }
 
 impl std::fmt::Display for JoinFail {
@@ -1744,6 +1853,7 @@ impl std::fmt::Display for JoinFail {
             JoinFail::Other(e) => write!(f, "{e:#}"),
             JoinFail::Rotated(_) => f.write_str(tr("ключ группы сменён")),
             JoinFail::BadAdminKey => f.write_str(tr("сервер не принял ключ администратора")),
+            JoinFail::Deleted => f.write_str(tr("группу удалил администратор сервера")),
         }
     }
 }
@@ -1789,6 +1899,7 @@ async fn join(
         Ok(Some(ServerMsg::Error(e))) => Err(JoinFail::Refused(e)),
         Ok(Some(ServerMsg::Rekeyed { envelope })) => Err(JoinFail::Rotated(Some(envelope))),
         Ok(Some(ServerMsg::Excluded)) => Err(JoinFail::Rotated(None)),
+        Ok(Some(ServerMsg::GroupDeleted)) => Err(JoinFail::Deleted),
         Ok(Some(ServerMsg::AdminFailed(clipwire_core::admin::AdminFail::BadKey))) => {
             Err(JoinFail::BadAdminKey)
         }
@@ -1890,19 +2001,73 @@ mod tests {
         assert_eq!(super::backfill_pause(3 << 20), Duration::from_secs(3));
     }
 
+    /// Элемент с шифротекстом заданного размера (для нарезки содержимое не
+    /// важно).
+    fn sized(len: usize) -> SealedItem {
+        let mut s = sealed(2, 1);
+        s.ciphertext = vec![0; len];
+        s
+    }
+
     #[test]
-    fn join_history_budget_stops_runaway_server() {
-        use super::*;
-        let mut b = HistoryBudget::default();
-        for _ in 0..MAX_JOIN_HISTORY_ITEMS {
-            b.admit_size(10).unwrap();
+    fn join_history_is_cut_into_bounded_batches() {
+        // По числу: 450 элементов — две полные пачки и остаток.
+        let mut b = HistoryBatcher::default();
+        let mut parts: Vec<usize> = (0..450)
+            .filter_map(|_| b.push(sized(10), false))
+            .map(|p| p.len())
+            .collect();
+        parts.push(b.take().len());
+        assert_eq!(parts, vec![HISTORY_BATCH_ITEMS, HISTORY_BATCH_ITEMS, 50]);
+        assert!(b.take().is_empty(), "после остатка пусто");
+
+        // По размеру: пачка закрывается на элементе, который довёл её до
+        // предела, и счёт байт начинается заново.
+        let mut b = HistoryBatcher::default();
+        let mib = 1 << 20;
+        let mut parts = Vec::new();
+        for _ in 0..40 {
+            if let Some(p) = b.push(sized(7 * mib), true) {
+                assert!(p.iter().all(|(_, backfill)| *backfill), "флаг сохраняется");
+                parts.push(p.len());
+            }
         }
-        assert!(b.admit_size(10).is_err(), "лишний элемент по числу");
-        let mut b = HistoryBudget::default();
-        b.admit_size(MAX_JOIN_HISTORY_BYTES).unwrap();
-        assert!(b.admit_size(1).is_err(), "лишний байт по размеру");
-        let mut b = HistoryBudget::default();
-        assert!(b.admit_size(usize::MAX).is_err(), "переполнение суммы");
+        // 5 × 7 МиБ = 35 МиБ ≥ 32 МиБ: по пять элементов, восемь пачек.
+        assert_eq!(parts, vec![5; 8]);
+        assert!(b.take().is_empty());
+
+        // Сумма размеров не переполняется даже на мусорных длинах.
+        let mut b = HistoryBatcher {
+            bytes: usize::MAX,
+            ..Default::default()
+        };
+        assert!(b.push(sized(1), false).is_some());
+    }
+
+    #[test]
+    fn rejoin_history_in_batches_matches_single_batch() {
+        // Кандидат в буфер переходит через границу пачки, курсор встаёт
+        // только в конце, и итог тот же, что одной пачкой.
+        let now = now_ms();
+        let seen = sealed(2, now - 10_000);
+        let all = [
+            (seen.clone(), false),
+            (sealed(3, now - 50_000), true),
+            (sealed(2, now - 3000), false),
+            (sealed(2, now - 2000), false),
+            (sealed(3, now - 1000), true),
+        ];
+        let (mut e, mut rx) = engine(Some(seen.id));
+        let mut j = JoinHistory::new(e.cursor);
+        for part in all.chunks(2) {
+            e.history_part(&mut j, part.to_vec());
+            assert_eq!(e.cursor, Some(seen.id), "курсор до HistoryEnd не двигается");
+        }
+        e.history_done(j);
+        let (clip, hist) = drain(&mut rx);
+        assert_eq!(clip, texts(&[now - 2000]));
+        assert_eq!(hist, texts(&[now - 50_000, now - 3000, now - 1000]));
+        assert_eq!(e.cursor, Some(all[4].0.id));
     }
 
     use super::*;

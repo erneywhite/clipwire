@@ -44,6 +44,9 @@ pub struct AppState {
     /// Сервер сообщил, что устройство исключено (`devices::mark_excluded`):
     /// сервис работает локально, ключ группы на месте.
     pub excluded: std::sync::atomic::AtomicBool,
+    /// Отметка исключения с причиной «группу удалил администратор сервера»
+    /// (`devices::mark_group_deleted`).
+    pub group_deleted: std::sync::atomic::AtomicBool,
     /// События группы для окна настроек, пока оно их не забрало.
     pub group_notices: Mutex<devices::GroupNotices>,
     /// Сервер не принял ключ администратора (его сменили), и сервис его
@@ -66,8 +69,11 @@ pub enum StatusDto {
     Paused,
     /// Сервер сообщил, что устройство исключено из группы. Синхронизация
     /// остановлена, ключ и история на месте: человек решает, выйти из группы
-    /// или попробовать снова.
-    Excluded,
+    /// или попробовать снова. `deleted` — группу удалил администратор
+    /// сервера: остаётся только выйти.
+    Excluded {
+        deleted: bool,
+    },
 }
 
 impl StatusDto {
@@ -90,7 +96,13 @@ pub fn current_status(app: &AppHandle) -> StatusDto {
     let state = app.state::<AppState>();
     let guard = state.service.lock().unwrap_or_else(|e| e.into_inner());
     match guard.as_ref() {
-        Some(_) if state.excluded.load(std::sync::atomic::Ordering::Relaxed) => StatusDto::Excluded,
+        Some(_) if state.excluded.load(std::sync::atomic::Ordering::Relaxed) => {
+            StatusDto::Excluded {
+                deleted: state
+                    .group_deleted
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            }
+        }
         Some(s) => StatusDto::from_service(s),
         None if !state
             .service_attempted
@@ -171,6 +183,12 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
     state
         .excluded
         .store(excluded, std::sync::atomic::Ordering::Relaxed);
+    let deleted = agent.as_ref().is_some_and(|s| {
+        clipwire_agent::devices::is_group_deleted(&state.paths, s.invite.group_key.group_id())
+    });
+    state
+        .group_deleted
+        .store(deleted, std::sync::atomic::Ordering::Relaxed);
     let agent = if excluded { None } else { agent };
     let handle = app.clone();
     let device_name = state
@@ -212,7 +230,8 @@ fn start_service_with(app: &AppHandle, backfill: bool) -> anyhow::Result<bool> {
                 let _ = handle.emit("clipwire://transfer", &t);
             }
             UiEvent::Rekeyed(n) => devices::on_rekeyed(&handle, n),
-            UiEvent::Excluded { old } => devices::on_excluded(&handle, old),
+            UiEvent::Excluded { old } => devices::on_excluded(&handle, old, false),
+            UiEvent::GroupDeleted { old } => devices::on_excluded(&handle, old, true),
             UiEvent::RekeyLost(why) => devices::on_rekey_lost(&handle, why),
             // Открытый список устройств перечитывается сам.
             UiEvent::DevicesChanged => {
@@ -290,6 +309,7 @@ fn load_state() -> anyhow::Result<AppState> {
         service: Mutex::new(None),
         service_attempted: Default::default(),
         excluded: Default::default(),
+        group_deleted: Default::default(),
         group_notices: Default::default(),
         admin_stale: Default::default(),
         paths,
@@ -642,6 +662,8 @@ pub fn run() {
             admin::group_admin,
             admin::device_make_admin,
             admin::group_admin_claim,
+            admin::server_groups,
+            admin::server_group_delete,
             admin::sync_update_invite,
         ])
         .setup(|app| {
