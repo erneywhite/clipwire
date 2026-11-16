@@ -479,7 +479,7 @@
       case 'unconfigured':
         return t('Синхронизация не запустилась')
       case 'excluded':
-        return t('Устройство исключено из группы')
+        return st.detail?.deleted ? t('Группу удалил администратор сервера') : t('Устройство исключено из группы')
     }
   }
 
@@ -689,7 +689,20 @@
         </div>
       {:else if section === 'sync'}
         <h1>{t('Синхронизация')}</h1>
-        {#if status.kind === 'excluded'}
+        {#if status.kind === 'excluded' && status.detail?.deleted}
+          <div class="card pad">
+            <h2 class="in-card">{t('Группу удалил администратор сервера')}</h2>
+            <p class="hint">
+              {t('Администратор сервера удалил эту группу вместе со всем, что лежало на сервере. Синхронизация остановлена. История осталась на этом устройстве.')}
+            </p>
+            <p class="hint">
+              {t('Выйдите из группы, чтобы подключиться к другой группе или создать новую.')}
+            </p>
+            <div class="buttons">
+              <button class="danger" disabled={retrying} onclick={leave}>{t('Выйти из группы')}</button>
+            </div>
+          </div>
+        {:else if status.kind === 'excluded'}
           <div class="card pad">
             <h2 class="in-card">{t('Устройство исключено из группы')}</h2>
             <p class="hint">

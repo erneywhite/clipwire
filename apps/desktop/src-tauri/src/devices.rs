@@ -338,16 +338,22 @@ pub fn on_rekeyed(app: &AppHandle, n: RekeyNotice) {
     });
 }
 
-/// Сервер сообщил, что устройство исключено из группы. Ключ и история
-/// остаются, синхронизация останавливается до решения человека: «Выйти из
-/// группы» (`leave_group`) или «Попробовать снова» (`group_retry`).
-pub fn on_excluded(app: &AppHandle, old: GroupId) {
+/// Сервер сообщил, что устройство исключено из группы (`deleted` — группу
+/// удалил администратор сервера). Ключ и история остаются, синхронизация
+/// останавливается до решения человека: «Выйти из группы» (`leave_group`)
+/// или «Попробовать снова» (`group_retry`).
+pub fn on_excluded(app: &AppHandle, old: GroupId, deleted: bool) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         // Устройство уже перешло на новый ключ: `Excluded` из старой группы
         // не в счёт.
-        match devices::mark_excluded(&state.paths, old) {
+        let marked = if deleted {
+            devices::mark_group_deleted(&state.paths, old)
+        } else {
+            devices::mark_excluded(&state.paths, old)
+        };
+        match marked {
             Ok(true) => {}
             Ok(false) => return,
             Err(e) => tracing::error!("отметка об исключении не сохранилась: {e:#}"),

@@ -1,13 +1,17 @@
 //! Администратор сервера и админ группы (`clipwire/9`): команды раздела
-//! «Сервер» в настройках, «Я администратор сервера» в «Синхронизации» и роли
-//! в списке устройств. Запросы идут через движок (`clipwire_agent::admin`),
+//! «Сервер» в настройках (с `clipwire/10` — и список групп сервера с
+//! удалением), «Я администратор сервера» в «Синхронизации» и роли в списке
+//! устройств. Запросы идут через движок (`clipwire_agent::admin`),
 //! ключ администратора лежит в `admin.bin`.
 
 use std::sync::atomic::Ordering;
 
 use clipwire_agent::admin::{adopt_server_code, check_admin_code, claim_code, fail_text};
 use clipwire_agent::i18n::{tr, trf};
-use clipwire_core::admin::{SETTINGS, ServerSettings, ServerSummary, SettingUnit, check_setting};
+use clipwire_core::GroupId;
+use clipwire_core::admin::{
+    GroupInfo, GroupState, SETTINGS, ServerSettings, ServerSummary, SettingUnit, check_setting,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
@@ -337,9 +341,154 @@ pub async fn group_admin_claim(window: WebviewWindow, app: AppHandle) -> CmdResu
     controller(&app)?.claim_group_admin().await
 }
 
+/// Группа сервера для карточки «Группы».
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerGroupDto {
+    /// Id группы (64 hex): им карточка просит удалить.
+    pub id: String,
+    /// Короткий отпечаток id (10 hex), как у устройств: имён у групп нет.
+    pub fingerprint: String,
+    /// Группа этого устройства.
+    pub mine: bool,
+    pub created_ms: i64,
+    /// Последний вход любого устройства, 0 — устройств нет.
+    pub last_seen_ms: i64,
+    pub devices: u64,
+    pub online: u64,
+    pub items: u64,
+    pub item_bytes: u64,
+    pub files: u64,
+    pub file_bytes: u64,
+    pub pins: u64,
+    pub pin_bytes: u64,
+    pub has_admin: bool,
+    /// `live`, `pending`, `rotated` или `idle`.
+    pub state: &'static str,
+    /// У `rotated`: сколько дней ещё ждут пакеты нового ключа.
+    pub days_left: Option<u32>,
+}
+
+fn group_dto(g: &GroupInfo, mine: Option<GroupId>) -> ServerGroupDto {
+    let (state, days_left) = match g.state {
+        GroupState::Live => ("live", None),
+        GroupState::Pending => ("pending", None),
+        GroupState::Rotated { days_left } => ("rotated", Some(days_left)),
+        GroupState::Idle => ("idle", None),
+    };
+    ServerGroupDto {
+        id: data_encoding::HEXLOWER.encode(&g.group.0),
+        fingerprint: data_encoding::HEXLOWER.encode(&g.group.0[..5]),
+        mine: mine == Some(g.group),
+        created_ms: g.created_ms,
+        last_seen_ms: g.last_seen_ms,
+        devices: g.devices,
+        online: g.online,
+        items: g.items,
+        item_bytes: g.item_bytes,
+        files: g.files,
+        file_bytes: g.file_bytes,
+        pins: g.pins,
+        pin_bytes: g.pin_bytes,
+        has_admin: g.has_admin,
+        state,
+        days_left,
+    }
+}
+
+fn groups_dto(list: &[GroupInfo], app: &AppHandle) -> Vec<ServerGroupDto> {
+    let mine = app
+        .state::<AppState>()
+        .paths
+        .load()
+        .ok()
+        .flatten()
+        .map(|s| s.invite.group_key.group_id());
+    list.iter().map(|g| group_dto(g, mine)).collect()
+}
+
+/// Ответ `server_groups`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerGroupsDto {
+    /// Сервер знает группы сервера (`clipwire/10`). Нет — список пустой, в
+    /// карточке пояснение «обновите сервер».
+    pub supported: bool,
+    pub groups: Vec<ServerGroupDto>,
+}
+
+#[tauri::command]
+pub async fn server_groups(window: WebviewWindow, app: AppHandle) -> CmdResult<ServerGroupsDto> {
+    only_settings(&window)?;
+    let ctl = controller(&app)?;
+    // Группы сервера появились в `clipwire/10`; старому серверу запрос не
+    // шлём совсем (он оборвал бы соединение).
+    if ctl.link().await?.server_protocol < 10 {
+        return Ok(ServerGroupsDto {
+            supported: false,
+            groups: Vec::new(),
+        });
+    }
+    let list = ctl.server_groups().await?;
+    Ok(ServerGroupsDto {
+        supported: true,
+        groups: groups_dto(&list, &app),
+    })
+}
+
+/// Удалить группу сервера целиком. Возвращает список после удаления.
+#[tauri::command]
+pub async fn server_group_delete(
+    window: WebviewWindow,
+    app: AppHandle,
+    group_id: String,
+) -> CmdResult<Vec<ServerGroupDto>> {
+    only_settings(&window)?;
+    let bytes: [u8; 32] = data_encoding::HEXLOWER
+        .decode(group_id.as_bytes())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| tr("Неверный id группы").to_string())?;
+    let list = controller(&app)?
+        .delete_server_group(GroupId(bytes))
+        .await?;
+    Ok(groups_dto(&list, &app))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_dto_marks_mine_and_state() {
+        let g = GroupInfo {
+            group: GroupId([0xab; 32]),
+            created_ms: 1,
+            last_seen_ms: 2,
+            devices: 3,
+            online: 1,
+            items: 4,
+            item_bytes: 5,
+            files: 6,
+            file_bytes: 7,
+            pins: 8,
+            pin_bytes: 9,
+            has_admin: true,
+            state: GroupState::Rotated { days_left: 12 },
+        };
+        let d = group_dto(&g, Some(GroupId([0xab; 32])));
+        assert!(d.mine);
+        assert_eq!(d.fingerprint, "ababababab");
+        assert_eq!(d.id.len(), 64);
+        assert_eq!((d.state, d.days_left), ("rotated", Some(12)));
+        let other = group_dto(
+            &GroupInfo {
+                state: GroupState::Idle,
+                ..g
+            },
+            None,
+        );
+        assert!(!other.mine);
+        assert_eq!((other.state, other.days_left), ("idle", None));
+    }
 
     #[test]
     fn settings_follow_spec_and_mark_stored() {
