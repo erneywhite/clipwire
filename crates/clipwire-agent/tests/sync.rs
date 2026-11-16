@@ -149,6 +149,29 @@ async fn text_goes_from_one_agent_to_another() -> Result<()> {
     server.shutdown().await
 }
 
+/// Движок сообщает, что своё копирование ушло на сервер: по этому сервис
+/// снимает пометку «не отправлено». Без связи сообщения нет — копирование
+/// ждёт входа, и после него `Pushed` приходит.
+#[tokio::test(flavor = "multi_thread")]
+async fn pushed_reports_sent_copy() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key, None)?;
+    a.online().await?;
+    let content = Content::Text("ушло на сервер".into());
+    a.local.send(content.clone().into()).await?;
+    let hash = a
+        .wait(|e| match e {
+            Event::Pushed(h) => Some(*h),
+            _ => None,
+        })
+        .await?;
+    assert_eq!(hash, content.hash());
+    drop(a.local);
+    a.task.await??;
+    server.shutdown().await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn history_respects_cursor() -> Result<()> {
     let (server, info) = start_server().await?;
