@@ -55,7 +55,9 @@ pub(super) fn consume(
     group: &GroupId,
     now_ms: i64,
 ) -> Result<Result<(), AdminFail>> {
-    let row: Option<(i64, Vec<u8>, Option<i64>, Option<i64>, i64)> = conn
+    // id, хэш, когда использован, когда отозван, до какого времени действует.
+    type Row = (i64, Vec<u8>, Option<i64>, Option<i64>, i64);
+    let row: Option<Row> = conn
         .query_row(
             "SELECT id, secret_hash, used_ms, revoked_ms, expires_ms
              FROM group_invites WHERE secret_hash = ?1",

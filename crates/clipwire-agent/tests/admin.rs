@@ -2,7 +2,7 @@
 //! сервера на 127.0.0.1: создание группы с ключом администратора и без него,
 //! вход администратора на устройстве в группе, настройки сервера, смена
 //! ключа администратора и токена relay, админ группы. Группы сервера и их
-//! удаление (`clipwire/10`).
+//! удаление (`clipwire/10`). Коды создания группы (`clipwire/11`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,13 +65,18 @@ impl Agent {
             },
             device_key: random_key()?,
         };
+        Self::spawn_state(state, admin)
+    }
+
+    fn spawn_state(state: AgentState, admin: Option<AdminKey>) -> Result<Self> {
+        let key = state.invite.group_key.clone();
         let (etx, events) = mpsc::unbounded_channel();
         let (local, lrx) = mpsc::channel(16);
         let (ctx, crx) = mpsc::channel::<Control>(4);
         let engine = Engine::new(state, "тест".into(), None, etx, Arc::new(|| {}))
             .with_admin_key(admin)
             .with_control(crx);
-        let ctl = Controller::new(ctx, key.clone(), engine.device());
+        let ctl = Controller::new(ctx, key, engine.device());
         let task = tokio::spawn(engine.run(lrx));
         Ok(Self {
             ctl,
@@ -493,5 +498,102 @@ async fn admin_lists_and_deletes_groups() -> Result<()> {
         .unwrap_err();
     assert!(err.contains("уже нет"), "{err}");
     drop((a, b, c, c2));
+    server.shutdown().await
+}
+
+/// Код создания группы `cwgroup1-…` со своим адресом relay: в тестовом
+/// сервере `public_url` заглушка, настоящий адрес — в `info`.
+fn invite_code(code: &str, info: &ServerInfo) -> Result<clipwire_core::GroupInviteCode> {
+    match clipwire_agent::admin::creation_code(code).map_err(anyhow::Error::msg)? {
+        clipwire_agent::admin::Creation::Invite(mut c) => {
+            assert_eq!(c.server.server_id, info.server_id);
+            assert_eq!(c.server.relay_token, info.relay_token);
+            c.server.relay_url = info.relay_url.clone();
+            Ok(c)
+        }
+        other => anyhow::bail!("ждали код создания группы, пришло {other:?}"),
+    }
+}
+
+fn fresh_state(code: &clipwire_core::GroupInviteCode) -> Result<AgentState> {
+    Ok(AgentState {
+        invite: Invite {
+            server: code.server.clone(),
+            group_key: GroupKey::generate()?,
+        },
+        device_key: random_key()?,
+    })
+}
+
+/// Администратор выпускает код, человек создаёт по нему свою группу и
+/// становится её админом, но не администратором сервера. Код одноразовый,
+/// отозванный не действует.
+#[tokio::test(flavor = "multi_thread")]
+async fn group_invite_creates_group_without_server_admin() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let mut a = Agent::spawn(&info, &GroupKey::generate()?, Some(ADMIN))?;
+    a.status().await?.expect("на связи");
+
+    let (code, id) = a
+        .ctl
+        .create_group_invite("Маше".into(), 24)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let list = a.ctl.group_invites().await.map_err(anyhow::Error::msg)?;
+    assert_eq!((list[0].id, list[0].label.as_str()), (id, "Маше"));
+    assert_eq!(list[0].used_ms, None);
+
+    let inv = invite_code(&code, &info)?;
+    let state = fresh_state(&inv)?;
+    clipwire_agent::admin::create_group_with_invite(&state, &inv)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    // Второй раз тем же кодом — понятный отказ.
+    let err = clipwire_agent::admin::create_group_with_invite(&fresh_state(&inv)?, &inv)
+        .await
+        .unwrap_err();
+    assert!(err.contains("уже создали"), "{err}");
+
+    // Движок входит в созданную группу обычным входом: устройство — админ
+    // группы, но не администратор сервера.
+    let mut f = Agent::spawn_state(state.clone(), None)?;
+    f.status().await?.expect("на связи");
+    assert_eq!(
+        f.ctl.group_admin().await.map_err(anyhow::Error::msg)?,
+        Some(f.ctl.device())
+    );
+    let err = f.ctl.server_settings().await.unwrap_err();
+    assert!(err.contains("код сервера администратора"), "{err}");
+    let err = f.ctl.group_invites().await.unwrap_err();
+    assert!(err.contains("код сервера администратора"), "{err}");
+    let err = f.ctl.admin_auth(AdminKey([1; 32])).await.unwrap_err();
+    assert!(err.contains("не подошёл"), "{err}");
+    let err = f.ctl.claim_group_admin().await.unwrap_err();
+    assert!(err.contains("код сервера администратора"), "{err}");
+
+    let list = a.ctl.group_invites().await.map_err(anyhow::Error::msg)?;
+    assert!(list[0].used_ms.is_some());
+    assert_eq!(list[0].used_group, Some(state.invite.group_key.group_id()));
+
+    // Отозванный код не создаёт группу.
+    let (code2, id2) = a
+        .ctl
+        .create_group_invite(String::new(), 1)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let list = a
+        .ctl
+        .revoke_group_invite(id2)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(list.iter().any(|i| i.id == id2 && i.revoked_ms.is_some()));
+    let inv2 = invite_code(&code2, &info)?;
+    let err = clipwire_agent::admin::create_group_with_invite(&fresh_state(&inv2)?, &inv2)
+        .await
+        .unwrap_err();
+    assert!(err.contains("отозвал"), "{err}");
+
+    drop(f);
+    drop(a);
     server.shutdown().await
 }

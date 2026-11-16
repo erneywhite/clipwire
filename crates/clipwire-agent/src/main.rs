@@ -7,9 +7,10 @@ const USAGE: &str = "\
 clipwire-agent — общий буфер обмена Clipwire
 
 Команды:
-  create <код сервера>        создать группу на сервере (первое устройство)
+  create <код>                создать группу на сервере (первое устройство)
                               и напечатать код приглашения для остальных;
                               нужен код сервера администратора (cwserver2-…)
+                              или одноразовый код создания группы (cwgroup1-…)
   join <код приглашения> [<код сервера>]
                               подключить это устройство к группе; с кодом
                               сервера администратора устройство станет
@@ -46,6 +47,8 @@ clipwire-agent — общий буфер обмена Clipwire
 
 Код сервера администратора (cwserver2-…) печатает сервер при запуске и команда
 clipwire-server info. В нём ключ администратора: с ним создают группы.
+Одноразовый код создания группы (cwgroup1-…) выпускает администратор сервера
+в разделе «Сервер»: по нему создают одну группу, без прав администратора.
 Код приглашения (clipwire1-…) содержит ключ группы — передавайте его только себе.";
 
 fn main() -> Result<()> {
@@ -63,19 +66,33 @@ fn main() -> Result<()> {
     let paths = Paths::resolve()?;
     match args.first().map(String::as_str).unwrap_or("run") {
         "create" => {
+            use clipwire_agent::admin::Creation;
             let code = args
                 .get(1)
-                .context("нужен код сервера: create cwserver2-…")?;
-            let admin = clipwire_agent::admin::creation_code(code).map_err(anyhow::Error::msg)?;
+                .context("нужен код: create cwserver2-… или create cwgroup1-…")?;
+            let creation =
+                clipwire_agent::admin::creation_code(code).map_err(anyhow::Error::msg)?;
             ensure_empty(&paths)?;
             let state = AgentState {
                 invite: Invite {
-                    server: admin.server.clone(),
+                    server: creation.server().clone(),
                     group_key: GroupKey::generate()?,
                 },
                 device_key: random_key()?,
             };
-            paths.save_admin_key(admin.server.server_id, &admin.admin_key)?;
+            match &creation {
+                // Группу создаст движок при первом входе с ключом администратора.
+                Creation::Admin(admin) => {
+                    paths.save_admin_key(admin.server.server_id, &admin.admin_key)?
+                }
+                // Код одноразовый: группа создаётся сразу, и только потом
+                // сохраняется состояние. Секрет на диск не попадает.
+                Creation::Invite(invite) => tokio::runtime::Runtime::new()?
+                    .block_on(clipwire_agent::admin::create_group_with_invite(
+                        &state, invite,
+                    ))
+                    .map_err(anyhow::Error::msg)?,
+            }
             paths.save(&state)?;
             println!("Группа создана. Код приглашения для остальных устройств:\n");
             println!("{}\n", state.invite.encode());

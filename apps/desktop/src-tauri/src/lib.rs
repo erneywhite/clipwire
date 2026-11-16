@@ -695,6 +695,9 @@ pub fn run() {
             admin::group_admin_claim,
             admin::server_groups,
             admin::server_group_delete,
+            admin::server_invites,
+            admin::server_invite_create,
+            admin::server_invite_revoke,
             admin::sync_update_invite,
         ])
         .setup(|app| {

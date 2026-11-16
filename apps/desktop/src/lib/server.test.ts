@@ -1,7 +1,7 @@
 // Проверка логики формы «Сервер». Запуск: node src/lib/server.test.ts
 // (Node 23.6+ сам убирает типы), как storage.test.ts.
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
-import type { ServerGroup, ServerSetting } from './api'
+import type { GroupInvite, ServerGroup, ServerSetting } from './api'
 
 const { bytesText, collectChanges, tokenRefused, draftsFor, groupSettings, hoursText, parseInput, pickUnit, rangeError, resetDraft, settingText, switchUnit, toInput } =
   (await import('./server' + '.ts')) as typeof import('./server')
@@ -120,5 +120,35 @@ check(confirm[0].includes('5 элементов') && confirm[0].includes('1 фа
 check(confirm[1].startsWith('3 устройства группы отключатся'), confirm[1])
 check(confirm[2].includes('необратимо'), 'необратимо')
 check(deleteGroupText(group({})).length === 2, 'без устройств — без абзаца об отключении')
+
+// Коды создания группы.
+const { creationKind, inviteIssuedText, inviteLabel, inviteState, inviteStateText, inviteTtlText, sortInvites, timeLeftText, DEFAULT_INVITE_TTL, INVITE_TTLS } =
+  (await import('./server' + '.ts')) as typeof import('./server')
+const HOUR = 3_600_000
+function invite(over: Partial<GroupInvite>): GroupInvite {
+  return { id: 1, label: 'Маше', created_ms: noon - HOUR, expires_ms: noon + 7 * 24 * HOUR, used_ms: null, used_group: null, revoked_ms: null, ...over }
+}
+check(inviteState(invite({}), noon) === 'active', 'действует')
+check(inviteState(invite({ expires_ms: noon }), noon) === 'expired', 'срок вышел ровно сейчас')
+check(inviteState(invite({ revoked_ms: noon - 1 }), noon) === 'revoked', 'отозван')
+// Использован важнее истёкшего: использованный код потом и истекает.
+check(inviteState(invite({ used_ms: noon - 1, expires_ms: noon - 1 }), noon) === 'used', 'использован')
+check(timeLeftText(noon + 7 * 24 * HOUR, noon) === '7 дней', 'дни')
+check(timeLeftText(noon + 5 * HOUR + 1, noon) === '5 часов', 'часы')
+check(timeLeftText(noon + HOUR - 1, noon) === 'меньше часа', 'меньше часа')
+check(inviteStateText(invite({}), noon) === 'действует ещё 7 дней', inviteStateText(invite({}), noon))
+check(inviteStateText(invite({ used_ms: noon - 1, used_group: 'abcdef0123' }), noon) === 'использован сегодня, группа abcdef0123', 'использован с группой')
+check(inviteStateText(invite({ used_ms: noon - 1 }), noon) === 'использован сегодня', 'использован без группы')
+check(inviteStateText(invite({ expires_ms: noon - 24 * HOUR }), noon) === 'истёк вчера', 'истёк')
+check(inviteStateText(invite({ revoked_ms: noon - 3 * 24 * HOUR }), noon) === 'отозван 3 дня назад', 'отозван')
+check(inviteIssuedText(invite({}), noon) === 'выпущен сегодня', 'выпущен')
+check(inviteLabel(invite({ label: '  ' })) === 'без подписи' && inviteLabel(invite({})) === 'Маше', 'подпись')
+const inv = sortInvites([invite({ id: 1, created_ms: 1, used_ms: 5 }), invite({ id: 2, created_ms: 2 }), invite({ id: 3, created_ms: 3, revoked_ms: 4 }), invite({ id: 4, created_ms: 1 })], noon)
+check(inv.map((i) => i.id).join('') === '2431', 'действующие первыми, внутри новые первыми')
+check(INVITE_TTLS.includes(DEFAULT_INVITE_TTL) && DEFAULT_INVITE_TTL === 168, 'по умолчанию 7 дней')
+check(inviteTtlText(168) === '7 дней' && inviteTtlText(24) === '1 день' && inviteTtlText(5) === '5 часов', 'срок кнопки')
+check(creationKind(' CWSERVER2-abc') === 'admin', 'код администратора')
+check(creationKind('cwgroup1-abc\n') === 'invite', 'код создания группы')
+check(creationKind('clipwire1-abc') === 'unknown' && creationKind('') === 'unknown', 'остальное')
 
 console.log('server: всё прошло')

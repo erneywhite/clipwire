@@ -107,7 +107,9 @@ history is merged into the local one. The clipboard itself is not touched.
 
 **Connecting a server.** Set up the server first (see [Self-hosted server](#self-hosted-server)); it
 prints a server code that looks like `cwserver2-…`. That is the administrator's code: groups are
-created with it (see [Administrator code](#administrator-code)).
+created with it (see [Administrator code](#administrator-code)). If the server belongs to someone else,
+its administrator can issue you a one-time group creation code `cwgroup1-…` (see
+[Group creation codes](#group-creation-codes)); you enter it in the same place as the server code.
 
 1. On the first device open **Sync**, enter the server code `cwserver2-…` and create a group.
    The device becomes the group admin and the server administrator: a **Server** section appears
@@ -643,6 +645,27 @@ device. The group list needs a server with protocol `clipwire/10`; on an older s
 asks you to update the image. Devices running older versions treat a deleted group as being
 removed from the group.
 
+### Group creation codes
+
+To let a friend use your server without giving them administrator rights, issue them a one-time
+group creation code. In **Server → Group creation codes** enter who the code is for, pick how long
+it is valid (1, 7 or 30 days, 7 by default) and press **Issue code**. The code starts with
+`cwgroup1-` and is shown only once: the server keeps only its hash. Copy it right away and send
+it so that nobody else sees it: whoever enters it first creates the group.
+
+Your friend pastes the code in **Sync → Create group** on their first device (or runs
+`clipwire-agent create cwgroup1-…`). One group is created, and their device becomes its admin: it
+can remove devices and change the group key, but it has no **Server** section. Their other
+devices join with the usual invitation code of their group. If the code has been used, has
+expired or was revoked, the app says so, and the device stays without a group.
+
+The code list shows who each code is for, when it was issued and its state: active, used (when,
+and the fingerprint of the created group, the same as in the **Groups** card), expired or revoked.
+An unused code can be revoked. There can be at most 100 active codes; finished ones disappear from
+the list after 30 days. Groups created with codes count towards the server's group limit.
+Changing the access token revokes all unused codes. This needs a server with protocol
+`clipwire/11`; on an older server the card asks you to update the image.
+
 On a device that is already in a group, enter the code in **Sync → I am the server
 administrator**. The app checks that the code belongs to the same server and that the key works;
 if the access token in the code is newer than the stored one, the key is checked over a separate
@@ -797,7 +820,7 @@ CLIPWIRE_SFTP_HOST=127.0.0.1 CLIPWIRE_SFTP_PORT=2222 CLIPWIRE_SFTP_USER=... CLIP
 `node src/lib/i18n.test.ts`, `devices.test.ts`, `format.test.ts`, `overview.test.ts`,
 `platform.test.ts` and `transfer.test.ts`.
 
-The agent crate also has a console client for debugging: `create <cwserver2-…>`, `join <invite
+The agent crate also has a console client for debugging: `create <cwserver2-…|cwgroup1-…>`, `join <invite
 code> [<cwserver2-…>]`, `admin <cwserver2-…>` (store the administrator key), `reinvite <invite code>` (a new invite code to the same group), `run` (sync without a
 UI), `listen`, `send <text>`. The `CLIPWIRE_HOME` variable sets another settings directory, so
 two clients can run on one machine.

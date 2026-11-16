@@ -1,5 +1,5 @@
 //! Администратор сервера на стороне агента (`clipwire/9`, группы сервера —
-//! `clipwire/10`, `docs/architecture.md`):
+//! `clipwire/10`, коды создания группы — `clipwire/11`, `docs/architecture.md`):
 //! хранение ключа администратора, разбор кодов сервера и запросы к серверу
 //! через движок ([`Controller`]).
 //!
@@ -9,9 +9,11 @@
 //! которое перешло на другой сервер, старый ключ не использует.
 
 use anyhow::{Context, Result};
-use clipwire_core::admin::{AdminFail, AdminKey, GroupInfo, ServerSettings, ServerSummary};
+use clipwire_core::admin::{
+    AdminFail, AdminKey, GroupInfo, GroupInviteInfo, ServerSettings, ServerSummary,
+};
 use clipwire_core::proto::{ClientMsg, ServerMsg};
-use clipwire_core::{AdminServerInfo, DeviceId, GroupId, ServerCode};
+use clipwire_core::{AdminServerInfo, DeviceId, GroupId, GroupInviteCode, ServerCode, ServerInfo};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -103,13 +105,45 @@ pub fn parse_server_code(code: &str) -> Result<ServerCode, String> {
     })
 }
 
-/// Код сервера, с которым можно создать группу: только `cwserver2-…` с ключом
-/// администратора. Старый `cwserver1-…` — понятная ошибка: какой нужен
-/// сервер и где взять новый код.
-pub fn creation_code(code: &str) -> Result<AdminServerInfo, String> {
-    match parse_server_code(code)? {
-        ServerCode::Admin(a) => Ok(a),
-        ServerCode::Plain(_) => Err(format!(
+/// С каким кодом создаётся группа.
+#[derive(Debug, Clone)]
+pub enum Creation {
+    /// Код сервера администратора `cwserver2-…`: устройство становится и
+    /// админом группы, и администратором сервера.
+    Admin(AdminServerInfo),
+    /// Одноразовый код создания группы `cwgroup1-…` (`clipwire/11`):
+    /// устройство становится только админом своей группы.
+    Invite(GroupInviteCode),
+}
+
+impl Creation {
+    pub fn server(&self) -> &ServerInfo {
+        match self {
+            Self::Admin(a) => &a.server,
+            Self::Invite(i) => &i.server,
+        }
+    }
+}
+
+/// Код, с которым можно создать группу: `cwserver2-…` с ключом администратора
+/// или одноразовый `cwgroup1-…`. Старый `cwserver1-…` — понятная ошибка:
+/// какой нужен сервер и где взять новый код.
+pub fn creation_code(code: &str) -> Result<Creation, String> {
+    if GroupInviteCode::looks_like(code) {
+        return GroupInviteCode::decode(code).map(Creation::Invite).map_err(|e| {
+            trf(
+                "Код создания группы не разобрался ({e}). Скопируйте его целиком, он начинается с cwgroup1-.",
+                &[("e", &e)],
+            )
+        });
+    }
+    match ServerCode::decode(code) {
+        Ok(ServerCode::Admin(a)) => Ok(Creation::Admin(a)),
+        Err(e) => Err(trf(
+            "Код не разобрался ({e}). Группу создают по коду администратора сервера (cwserver2-…) или по одноразовому коду создания группы (cwgroup1-…).",
+            &[("e", &e)],
+        )),
+        Ok(ServerCode::Plain(_)) => Err(format!(
             "{} {}",
             tr(
                 "С кодом cwserver1- группу не создать: эта версия Clipwire создаёт группы только на сервере 0.5.0 или новее и только с его кодом администратора cwserver2-. Если сервер старее, обновите его образ, и он напечатает новый код."
@@ -154,6 +188,78 @@ pub fn adopt_invite(paths: &Paths, code: &str) -> Result<AgentState, String> {
             .map_err(|e| trf("Код не сохранился: {e}", &[("e", &format!("{e:#}"))]))?;
     }
     Ok(state)
+}
+
+/// Создать группу `state` по одноразовому коду отдельным соединением с ключом
+/// этого устройства (`JoinWithInvite`): сервер гасит код и делает устройство
+/// админом новой группы. Вызывать до сохранения состояния: при отказе (код
+/// использован, истёк, отозван, сервер старый) устройство остаётся без группы,
+/// и человек сразу видит причину. Секрет нигде не сохраняется: после
+/// создания движок входит в уже существующую группу обычным входом с токеном.
+///
+/// shortcut: если сервер создал группу, а ответ потерялся, ключ группы здесь
+/// не сохранится, и код окажется потрачен на пустую группу. Администратор
+/// увидит это в списке кодов и выпустит новый; хранить состояние до ответа,
+/// если такое начнёт случаться.
+pub async fn create_group_with_invite(
+    state: &AgentState,
+    code: &GroupInviteCode,
+) -> Result<(), String> {
+    use clipwire_core::proto::io::{read_msg, write_msg};
+    use iroh::endpoint::presets;
+    use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
+
+    let server = &code.server;
+    let url: RelayUrl = server
+        .relay_url
+        .parse()
+        .map_err(|_| trf("кривой адрес relay {url}", &[("url", &server.relay_url)]))?;
+    let ep = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&state.device_key))
+        .relay_mode(RelayMode::Custom(
+            RelayMap::from_iter([url.clone()]).with_auth_token(server.relay_token.clone()),
+        ))
+        .bind()
+        .await
+        .map_err(|e| format!("{}: {e}", tr("не поднялся iroh-эндпоинт")))?;
+    let res = async {
+        let id = PublicKey::from_bytes(&server.server_id).map_err(|e| e.to_string())?;
+        let conn = crate::sync::connect(&ep, EndpointAddr::new(id).with_relay_url(url))
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        if !clipwire_core::proto::knows_group_invites(conn.alpn()) {
+            return Err(old_server_invites().to_string());
+        }
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+        let key = &state.invite.group_key;
+        let msg = ClientMsg::JoinWithInvite {
+            group_id: key.group_id(),
+            join_secret: key.join_secret(),
+            invite_secret: code.secret.clone(),
+        };
+        write_msg(&mut send, &msg)
+            .await
+            .map_err(|e| e.to_string())?;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            read_msg::<_, ServerMsg>(&mut recv),
+        )
+        .await
+        .map_err(|_| tr("сервер не ответил").to_string())?
+        .map_err(|e| e.to_string())?;
+        let _ = send.finish();
+        conn.close(0u32.into(), b"bye");
+        match reply {
+            Some(ServerMsg::Joined) => Ok(()),
+            Some(ServerMsg::AdminFailed(f)) => Err(fail_text(&f)),
+            Some(ServerMsg::Error(e)) => Err(trf("сервер отказал: {e}", &[("e", &e)])),
+            Some(m) => Err(unexpected(&m)),
+            None => Err(tr("сервер закрыл соединение").into()),
+        }
+    }
+    .await;
+    ep.close().await;
+    res
 }
 
 /// Проверить код сервера администратора отдельным соединением: relay и
@@ -282,6 +388,27 @@ pub fn fail_text(f: &AdminFail) -> String {
         // Причину сервер пишет сам (по-русски): переводить нечего.
         AdminFail::Unavailable(why) => why.clone(),
         AdminFail::NoSuchGroup => tr("Такой группы на сервере уже нет").into(),
+        AdminFail::InviteUnknown => tr(
+            "Сервер не знает этот код создания группы. Проверьте, что код скопирован целиком и выпущен на этом сервере.",
+        )
+        .into(),
+        AdminFail::InviteUsed => tr(
+            "По этому коду уже создали группу. Код одноразовый: попросите администратора сервера выпустить новый.",
+        )
+        .into(),
+        AdminFail::InviteExpired => tr(
+            "Срок действия кода истёк. Попросите администратора сервера выпустить новый.",
+        )
+        .into(),
+        AdminFail::InviteRevoked => tr(
+            "Администратор сервера отозвал этот код. Попросите у него новый.",
+        )
+        .into(),
+        AdminFail::TooManyInvites { max } => trf(
+            "Действующих кодов уже {max}. Отзовите ненужные или дождитесь, пока их используют.",
+            &[("max", max)],
+        ),
+        AdminFail::NoSuchInvite => tr("Этот код уже использован или отозван").into(),
         AdminFail::OwnGroup => tr(
             "Это группа этого устройства. Чтобы удалить её, сначала выйдите из неё (или удалите её с другого устройства администратора).",
         )
@@ -292,6 +419,13 @@ pub fn fail_text(f: &AdminFail) -> String {
 /// Отказ серверу, который не знает групп сервера (`clipwire/10`).
 pub fn old_server_groups() -> &'static str {
     tr("Сервер не умеет показывать группы: обновите образ сервера Clipwire")
+}
+
+/// Отказ серверу, который не знает кодов создания группы (`clipwire/11`).
+pub fn old_server_invites() -> &'static str {
+    tr(
+        "Сервер не знает одноразовых кодов создания группы: попросите администратора обновить образ сервера Clipwire",
+    )
 }
 
 fn old_server() -> &'static str {
@@ -318,6 +452,15 @@ pub enum AdminRequest {
     ListGroups,
     /// Удалить группу сервера (`clipwire/10`).
     DeleteGroup(GroupId),
+    /// Выпустить код создания группы (`clipwire/11`): подпись и срок, часов.
+    CreateGroupInvite {
+        label: String,
+        ttl_hours: u32,
+    },
+    /// Выпущенные коды (`clipwire/11`).
+    ListGroupInvites,
+    /// Отозвать код (`clipwire/11`).
+    RevokeGroupInvite(u64),
 }
 
 impl AdminRequest {
@@ -336,6 +479,12 @@ impl AdminRequest {
             Self::ClaimGroupAdmin => ClientMsg::ClaimGroupAdmin,
             Self::ListGroups => ClientMsg::ListGroups,
             Self::DeleteGroup(group) => ClientMsg::DeleteGroup { group: *group },
+            Self::CreateGroupInvite { label, ttl_hours } => ClientMsg::CreateGroupInvite {
+                label: label.clone(),
+                ttl_hours: *ttl_hours,
+            },
+            Self::ListGroupInvites => ClientMsg::ListGroupInvites,
+            Self::RevokeGroupInvite(id) => ClientMsg::RevokeGroupInvite { id: *id },
         }
     }
 
@@ -344,6 +493,9 @@ impl AdminRequest {
     pub(crate) fn min_protocol(&self) -> u32 {
         match self {
             Self::ListGroups | Self::DeleteGroup(_) => 10,
+            Self::CreateGroupInvite { .. }
+            | Self::ListGroupInvites
+            | Self::RevokeGroupInvite(_) => 11,
             _ => 9,
         }
     }
@@ -372,6 +524,8 @@ pub(crate) fn is_admin_reply(msg: &ServerMsg) -> bool {
             | ServerMsg::GroupAdmin { .. }
             | ServerMsg::AdminFailed(_)
             | ServerMsg::Groups(_)
+            | ServerMsg::GroupInviteCreated { .. }
+            | ServerMsg::GroupInvites(_)
     )
 }
 
@@ -383,10 +537,12 @@ pub(crate) struct AdminWaiter {
     pub auth: Option<AdminKey>,
 }
 
-/// Отказ серверу, который не знает запроса: `clipwire/9` (администрирование)
-/// или `clipwire/10` (группы сервера).
+/// Отказ серверу, который не знает запроса: `clipwire/9` (администрирование),
+/// `clipwire/10` (группы сервера) или `clipwire/11` (коды создания группы).
 pub(crate) fn refuse_old(reply: AdminReply, req: &AdminRequest) {
-    let why = if req.min_protocol() >= 10 {
+    let why = if req.min_protocol() >= 11 {
+        old_server_invites()
+    } else if req.min_protocol() >= 10 {
         old_server_groups()
     } else {
         old_server()
@@ -498,6 +654,36 @@ impl Controller {
         }
     }
 
+    /// Выпустить код создания группы: (весь код `cwgroup1-…`, id). Код
+    /// показывается только сейчас: сервер хранит лишь хэш секрета.
+    pub async fn create_group_invite(
+        &self,
+        label: String,
+        ttl_hours: u32,
+    ) -> Result<(String, u64), String> {
+        let req = AdminRequest::CreateGroupInvite { label, ttl_hours };
+        match self.admin(req).await? {
+            ServerMsg::GroupInviteCreated { code_secret, id } => Ok((code_secret.0, id)),
+            m => Err(unexpected(&m)),
+        }
+    }
+
+    /// Выпущенные коды создания группы, новые первыми.
+    pub async fn group_invites(&self) -> Result<Vec<GroupInviteInfo>, String> {
+        match self.admin(AdminRequest::ListGroupInvites).await? {
+            ServerMsg::GroupInvites(list) => Ok(list),
+            m => Err(unexpected(&m)),
+        }
+    }
+
+    /// Отозвать код. Возвращает список после отзыва.
+    pub async fn revoke_group_invite(&self, id: u64) -> Result<Vec<GroupInviteInfo>, String> {
+        match self.admin(AdminRequest::RevokeGroupInvite(id)).await? {
+            ServerMsg::GroupInvites(list) => Ok(list),
+            m => Err(unexpected(&m)),
+        }
+    }
+
     /// Удалить группу сервера. Возвращает список групп после удаления.
     pub async fn delete_server_group(&self, group: GroupId) -> Result<Vec<GroupInfo>, String> {
         match self.admin(AdminRequest::DeleteGroup(group)).await? {
@@ -571,7 +757,9 @@ mod tests {
 
     #[test]
     fn creation_needs_admin_code() {
-        let a = creation_code(&admin_code(1, "t", 7)).unwrap();
+        let Creation::Admin(a) = creation_code(&admin_code(1, "t", 7)).unwrap() else {
+            panic!("ждали код администратора");
+        };
         assert_eq!(a.admin_key, AdminKey([7; 32]));
         let old = creation_code(&server(1, "t").encode()).unwrap_err();
         assert!(
@@ -585,6 +773,29 @@ mod tests {
         // Код приглашения — не код сервера.
         let invite = state(1).invite.encode();
         assert!(creation_code(&invite).is_err());
+    }
+
+    #[test]
+    fn creation_accepts_group_invite_code() {
+        let code = GroupInviteCode {
+            server: server(1, "t"),
+            secret: clipwire_core::admin::GroupInviteSecret([4; 32]),
+        };
+        let Creation::Invite(c) = creation_code(&format!(" {}\n", code.encode())).unwrap() else {
+            panic!("ждали код создания группы");
+        };
+        assert_eq!(c, code);
+        assert_eq!(
+            creation_code(&code.encode()).unwrap().server(),
+            &server(1, "t")
+        );
+        let bad = creation_code("cwgroup1-!!!").unwrap_err();
+        assert!(bad.contains("cwgroup1-"), "{bad}");
+        let junk = creation_code("hello").unwrap_err();
+        assert!(
+            junk.contains("cwserver2-") && junk.contains("cwgroup1-"),
+            "{junk}"
+        );
     }
 
     #[test]
@@ -641,5 +852,9 @@ mod tests {
         );
         assert!(fail_text(&AdminFail::OwnGroup).contains("выйдите"));
         assert!(fail_text(&AdminFail::NoSuchGroup).contains("нет"));
+        assert!(fail_text(&AdminFail::InviteUsed).contains("уже создали"));
+        assert!(fail_text(&AdminFail::InviteExpired).contains("истёк"));
+        assert!(fail_text(&AdminFail::InviteRevoked).contains("отозвал"));
+        assert!(fail_text(&AdminFail::TooManyInvites { max: 100 }).contains("100"));
     }
 }

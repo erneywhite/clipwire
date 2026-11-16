@@ -58,25 +58,34 @@ fn ensure_unconfigured(app: &AppHandle) -> CmdResult<()> {
 }
 
 /// Первое устройство: создать группу по коду сервера администратора
-/// (`cwserver2-…`). Ключ администратора сохраняется: с ним движок создаёт
-/// группу, а устройство видит раздел «Сервер». Возвращает код приглашения.
+/// (`cwserver2-…`) или по одноразовому коду создания группы (`cwgroup1-…`).
+/// Ключ администратора сохраняется: с ним движок создаёт группу, а
+/// устройство видит раздел «Сервер». По одноразовому коду группа создаётся
+/// сразу, до сохранения состояния: если код не подошёл, устройство остаётся
+/// без группы, а человек видит причину. Возвращает код приглашения.
 #[tauri::command]
 pub async fn create_group(app: AppHandle, server_code: String) -> CmdResult<String> {
-    let admin = clipwire_agent::admin::creation_code(server_code.trim())?;
+    use clipwire_agent::admin::Creation;
+    let creation = clipwire_agent::admin::creation_code(server_code.trim())?;
     ensure_unconfigured(&app)?;
     let paths = &app.state::<AppState>().paths;
-    // Ключ раньше состояния: сервис, который запустится по состоянию, должен
-    // уже найти ключ, иначе группа не создастся.
-    paths
-        .save_admin_key(admin.server.server_id, &admin.admin_key)
-        .map_err(err)?;
     let agent = AgentState {
         invite: Invite {
-            server: admin.server,
+            server: creation.server().clone(),
             group_key: GroupKey::generate().map_err(err)?,
         },
         device_key: random_key().map_err(err)?,
     };
+    match &creation {
+        // Ключ раньше состояния: сервис, который запустится по состоянию,
+        // должен уже найти ключ, иначе группа не создастся.
+        Creation::Admin(admin) => paths
+            .save_admin_key(admin.server.server_id, &admin.admin_key)
+            .map_err(err)?,
+        Creation::Invite(code) => {
+            clipwire_agent::admin::create_group_with_invite(&agent, code).await?
+        }
+    }
     app.state::<AppState>().paths.save(&agent).map_err(err)?;
     crate::restart_service_joined(&app).await.map_err(err)?;
     Ok(agent.invite.encode())

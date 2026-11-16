@@ -19,7 +19,7 @@
   import Devices from './Devices.svelte'
   import Storage from './Storage.svelte'
   import Server from './Server.svelte'
-  import { tokenRefused } from '../lib/server'
+  import { creationKind, tokenRefused } from '../lib/server'
 
   type Section = 'general' | 'sync' | 'server' | 'privacy' | 'keys' | 'about'
   const allSections: { id: Section; title: string; icon: string }[] = [
@@ -791,11 +791,16 @@
           <div class="card pad">
             <h2 class="in-card">{t('Это первое устройство')}</h2>
             <p class="hint">
-              {t('Группу создаёт администратор сервера по коду сервера администратора, строка начинается с')} <code>cwserver2-</code>.
+              {t('Группу создают по коду сервера администратора, строка начинается с')} <code>cwserver2-</code>.
               {t('Его печатает сервер Clipwire при запуске (лог контейнера в Docker-панели) и команда')} <code>clipwire-server info</code>.
-              {t('Это устройство станет админом группы и администратором сервера.')}
+              {t('Если сервер чужой, попросите у его администратора одноразовый код создания группы, он начинается с')} <code>cwgroup1-</code>.
             </p>
-            <textarea bind:value={serverCode} rows="3" placeholder="cwserver2-…" spellcheck="false"></textarea>
+            <textarea bind:value={serverCode} rows="3" placeholder="cwserver2-… / cwgroup1-…" spellcheck="false"></textarea>
+            {#if creationKind(serverCode) === 'admin'}
+              <p class="hint">{t('Это устройство станет админом группы и администратором сервера.')}</p>
+            {:else if creationKind(serverCode) === 'invite'}
+              <p class="hint">{t('Это устройство станет админом новой группы. Администратором сервера оно не станет, код сработает один раз.')}</p>
+            {/if}
             <button class="primary" disabled={busy || !serverCode.trim()} onclick={createGroup}>{t('Создать группу')}</button>
           </div>
           <div class="card pad">

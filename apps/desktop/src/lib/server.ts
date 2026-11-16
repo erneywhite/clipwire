@@ -1,7 +1,7 @@
 // Логика формы раздела «Сервер»: подписи настроек, единицы, разбор ввода,
 // проверка пределов до отправки и сброс к значению по умолчанию. Без Svelte,
 // чтобы проверялось в Node (`server.test.ts`).
-import type { ServerGroup, ServerSetting, ServerSummary, SettingChange } from './api'
+import type { GroupInvite, ServerGroup, ServerSetting, ServerSummary, SettingChange } from './api'
 import { t, tn, lang } from './i18n.ts'
 
 const KIB = 1024
@@ -319,4 +319,75 @@ export function deleteGroupText(g: ServerGroup): string[] {
   }
   out.push(t('Это необратимо: вернуть группу нельзя, для синхронизации её устройствам понадобится новая группа.'))
   return out
+}
+// --- Коды создания группы (`clipwire/11`) ---
+
+const HOUR = 3_600_000
+
+/** Состояние кода: действует, использован, истёк, отозван. */
+export type InviteState = 'active' | 'used' | 'expired' | 'revoked'
+
+export function inviteState(i: Pick<GroupInvite, 'used_ms' | 'revoked_ms' | 'expires_ms'>, now = Date.now()): InviteState {
+  if (i.used_ms != null) return 'used'
+  if (i.revoked_ms != null) return 'revoked'
+  if (i.expires_ms <= now) return 'expired'
+  return 'active'
+}
+
+/** Сколько осталось: «6 дней», «5 часов», меньше часа — «меньше часа». */
+export function timeLeftText(ms: number, now = Date.now()): string {
+  const left = ms - now
+  if (left < HOUR) return t('меньше часа')
+  if (left < DAY) return tn(Math.floor(left / HOUR), ['час', 'часа', 'часов'], ['hour', 'hours'])
+  return tn(Math.floor(left / DAY), ['день', 'дня', 'дней'], ['day', 'days'])
+}
+
+/** Строка состояния кода в списке. */
+export function inviteStateText(i: GroupInvite, now = Date.now()): string {
+  switch (inviteState(i, now)) {
+    case 'active':
+      return t('действует ещё {left}', { left: timeLeftText(i.expires_ms, now) })
+    case 'used':
+      return i.used_group
+        ? t('использован {when}, группа {fp}', { when: groupActivity(i.used_ms!, now), fp: i.used_group })
+        : t('использован {when}', { when: groupActivity(i.used_ms!, now) })
+    case 'expired':
+      return t('истёк {when}', { when: groupActivity(i.expires_ms, now) })
+    case 'revoked':
+      return t('отозван {when}', { when: groupActivity(i.revoked_ms!, now) })
+  }
+}
+
+/** «Выпущен сегодня», «выпущен 3 дня назад». */
+export function inviteIssuedText(i: Pick<GroupInvite, 'created_ms'>, now = Date.now()): string {
+  return t('выпущен {when}', { when: groupActivity(i.created_ms, now) })
+}
+
+/** Подпись кода или «без подписи». */
+export function inviteLabel(i: Pick<GroupInvite, 'label'>): string {
+  return i.label.trim() || t('без подписи')
+}
+
+/** Действующие первыми, внутри — новые первыми. */
+export function sortInvites(list: GroupInvite[], now = Date.now()): GroupInvite[] {
+  const rank = (i: GroupInvite) => (inviteState(i, now) === 'active' ? 0 : 1)
+  return [...list].sort((a, b) => rank(a) - rank(b) || b.created_ms - a.created_ms || b.id - a.id)
+}
+
+/** Сроки действия на выбор, часов; по умолчанию 7 дней. */
+export const INVITE_TTLS = [24, 7 * 24, 30 * 24]
+export const DEFAULT_INVITE_TTL = 7 * 24
+
+/** Срок действия кода для кнопки: «1 день», «7 дней», «30 дней». */
+export function inviteTtlText(hours: number): string {
+  if (hours % 24 === 0) return tn(hours / 24, ['день', 'дня', 'дней'], ['day', 'days'])
+  return tn(hours, ['час', 'часа', 'часов'], ['hour', 'hours'])
+}
+
+/** Какой код ввели в «Создать группу»: по префиксу, без разбора. */
+export function creationKind(code: string): 'admin' | 'invite' | 'unknown' {
+  const c = code.trim().toLowerCase()
+  if (c.startsWith('cwserver2-')) return 'admin'
+  if (c.startsWith('cwgroup1-')) return 'invite'
+  return 'unknown'
 }

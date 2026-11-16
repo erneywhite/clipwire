@@ -428,6 +428,34 @@ export interface ServerGroups {
   groups: ServerGroup[]
 }
 
+/** Код создания группы (`server_invites`, `clipwire/11`). Секрета нет: код показывается один раз при выпуске. */
+export interface GroupInvite {
+  id: number
+  /** Для кого выпущен; может быть пустой. */
+  label: string
+  created_ms: number
+  expires_ms: number
+  /** Когда по коду создали группу; null — не использован. */
+  used_ms: number | null
+  /** Отпечаток созданной группы (10 hex). */
+  used_group: string | null
+  revoked_ms: number | null
+}
+
+/** Ответ `server_invites`. */
+export interface GroupInvites {
+  /** Сервер знает коды создания группы; нет — список пустой, нужно обновить сервер. */
+  supported: boolean
+  invites: GroupInvite[]
+}
+
+/** Ответ `server_invite_create`: весь код cwgroup1-… (больше его не узнать) и список. */
+export interface InviteCreated {
+  code: string
+  id: number
+  invites: GroupInvite[]
+}
+
 /** Админ группы (`group_admin`). */
 export interface GroupAdmin {
   /** Сервер знает админов групп (0.5.0 и новее). */
@@ -531,6 +559,12 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   serverGroups: () => invoke<ServerGroups>('server_groups'),
   /** Удалить группу сервера целиком: возвращает список после удаления. */
   serverGroupDelete: (groupId: string) => invoke<ServerGroup[]>('server_group_delete', { groupId }),
+  /** Коды создания группы (clipwire/11). */
+  serverInvites: () => invoke<GroupInvites>('server_invites'),
+  /** Выпустить код создания группы: код возвращается один раз. */
+  serverInviteCreate: (label: string, ttlHours: number) => invoke<InviteCreated>('server_invite_create', { label, ttlHours }),
+  /** Отозвать неиспользованный код: возвращает список после отзыва. */
+  serverInviteRevoke: (id: number) => invoke<GroupInvite[]>('server_invite_revoke', { id }),
   /** Сменить токен relay: все устройства отключатся и войдут по новому коду приглашения. */
   serverRotateRelayToken: () => invoke<RelayRotated>('server_rotate_relay_token'),
   /** Сменить ключ администратора: возвращает новый код сервера. */

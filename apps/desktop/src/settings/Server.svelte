@@ -1,12 +1,20 @@
 <script lang="ts">
   // Раздел «Сервер» (только у администратора сервера): сводка, группы
-  // сервера с удалением, пределы сервера, смена токена доступа и ключа
+  // сервера с удалением, одноразовые коды создания группы, пределы сервера, смена токена доступа и ключа
   // администратора.
   import { onMount } from 'svelte'
   import { t } from '../lib/i18n'
-  import { api, type RelayRotated, type ServerGroups, type ServerSetting, type ServerSummary } from '../lib/api'
+  import { api, type GroupInvites, type RelayRotated, type ServerGroups, type ServerSetting, type ServerSummary } from '../lib/api'
   import {
     BYTE_UNITS,
+    DEFAULT_INVITE_TTL,
+    INVITE_TTLS,
+    inviteIssuedText,
+    inviteLabel,
+    inviteState,
+    inviteStateText,
+    inviteTtlText,
+    sortInvites,
     collectChanges,
     deleteGroupText,
     groupActivity,
@@ -57,6 +65,19 @@
   let groupError = $state('')
   const groupList = $derived(groupsInfo ? sortGroups(groupsInfo.groups) : [])
 
+  let invitesInfo = $state<GroupInvites | null>(null)
+  let invitesError = $state('')
+  let inviteLabelInput = $state('')
+  let inviteTtl = $state(DEFAULT_INVITE_TTL)
+  let issuing = $state(false)
+  /** Только что выпущенный код: показывается один раз. */
+  let issuedCode = $state('')
+  let inviteError = $state('')
+  /** Код, отзыв которого подтверждаем (id). */
+  let confirmInvite = $state<number | null>(null)
+  let revoking = $state(false)
+  const inviteList = $derived(invitesInfo ? sortInvites(invitesInfo.invites) : [])
+
   const pending = $derived(settings ? collectChanges(settings, drafts) : { changes: [], errors: {} as Record<string, string> })
   const hasErrors = $derived(Object.keys(pending.errors).length > 0)
   const dirty = $derived(pending.changes.length > 0 || hasErrors)
@@ -79,6 +100,46 @@
     } catch (e) {
       groupsInfo = null
       groupsError = String(e)
+    }
+  }
+
+  async function loadInvites() {
+    try {
+      invitesInfo = await api.serverInvites()
+      invitesError = ''
+    } catch (e) {
+      invitesInfo = null
+      invitesError = String(e)
+    }
+  }
+
+  async function issueInvite() {
+    issuing = true
+    inviteError = ''
+    try {
+      const r = await api.serverInviteCreate(inviteLabelInput.trim(), inviteTtl)
+      issuedCode = r.code
+      invitesInfo = { supported: true, invites: r.invites }
+      inviteLabelInput = ''
+      copied = ''
+    } catch (e) {
+      inviteError = String(e)
+    } finally {
+      issuing = false
+    }
+  }
+
+  async function revokeInvite(id: number) {
+    revoking = true
+    inviteError = ''
+    try {
+      const invites = await api.serverInviteRevoke(id)
+      invitesInfo = { supported: true, invites }
+      confirmInvite = null
+    } catch (e) {
+      inviteError = String(e)
+    } finally {
+      revoking = false
     }
   }
 
@@ -116,6 +177,7 @@
     }
     loadSummary()
     loadGroups()
+    loadInvites()
   }
 
   async function save() {
@@ -251,6 +313,79 @@
   </div>
 {/if}
 
+<h2>{t('Коды создания группы')}</h2>
+{#if invitesError}
+  <div class="card pad"><p class="error" role="alert">{invitesError}</p></div>
+{:else if !invitesInfo}
+  <div class="card pad"><p class="hint">{t('Загружаю…')}</p></div>
+{:else if !invitesInfo.supported}
+  <div class="card pad">
+    <p class="hint">{t('Сервер не знает кодов создания группы: обновите образ сервера Clipwire.')}</p>
+  </div>
+{:else}
+  <p class="hint outside">
+    {t('С таким кодом другой человек создаёт на этом сервере одну свою группу. Он станет админом своей группы, но не администратором сервера. Код одноразовый.')}
+  </p>
+  <div class="card pad">
+    <div class="field">
+      <label for="invite-label">{t('Для кого')}</label>
+      <input id="invite-label" class="wide" maxlength="80" bind:value={inviteLabelInput} placeholder={t('Например, Маша')} />
+    </div>
+    <div class="field">
+      <span id="invite-ttl-label">{t('Срок действия')}</span>
+      <div class="segmented" role="radiogroup" aria-labelledby="invite-ttl-label">
+        {#each INVITE_TTLS as h (h)}
+          <button role="radio" aria-checked={inviteTtl === h} class:on={inviteTtl === h} onclick={() => (inviteTtl = h)}>{inviteTtlText(h)}</button>
+        {/each}
+      </div>
+    </div>
+    <button class="primary" disabled={issuing} onclick={issueInvite}>{issuing ? t('Выпускаю…') : t('Выпустить код')}</button>
+    {#if issuedCode}
+      <div class="done" role="status">
+        <p>{t('Код выпущен. Скопируйте его сейчас: сервер хранит только его хэш, и показать код ещё раз нельзя.')}</p>
+        <code class="code selectable">{issuedCode}</code>
+        <div class="buttons">
+          <button onclick={() => copy(issuedCode, 'invite-code')}>{copied === 'invite-code' ? t('Скопировано') : t('Скопировать код')}</button>
+          <button onclick={() => (issuedCode = '')}>{t('Скрыть')}</button>
+        </div>
+        <p class="hint">{t('Человек вставляет код в «Синхронизация» → «Создать группу». Передайте его так, чтобы никто другой не увидел: кто первым введёт код, тот и создаст группу.')}</p>
+      </div>
+    {/if}
+    {#if inviteError}<p class="error" role="alert">{inviteError}</p>{/if}
+  </div>
+  {#if inviteList.length > 0}
+    <div class="card list">
+      {#each inviteList as inv (inv.id)}
+        {@const st = inviteState(inv)}
+        <div class="group">
+          <div class="group-row" class:muted={st !== 'active'}>
+            <div class="group-main">
+              <div class="group-title">
+                <span>{inviteLabel(inv)}</span>
+                <span class="tag" class:accent={st === 'active'}>{inviteStateText(inv)}</span>
+              </div>
+              <div class="group-meta">{inviteIssuedText(inv)}</div>
+            </div>
+            {#if st === 'active' && confirmInvite !== inv.id}
+              <button class="small danger" disabled={revoking} onclick={() => (confirmInvite = inv.id)}>{t('Отозвать')}</button>
+            {/if}
+          </div>
+          {#if confirmInvite === inv.id}
+            <div class="confirm group-confirm" role="alertdialog">
+              <strong>{t('Отозвать код «{label}»?', { label: inviteLabel(inv) })}</strong>
+              <p class="hint">{t('Создать группу по этому коду больше не получится.')}</p>
+              <div class="buttons">
+                <button class="danger" disabled={revoking} onclick={() => revokeInvite(inv.id)}>{revoking ? t('Отзываю…') : t('Отозвать код')}</button>
+                <button disabled={revoking} onclick={() => (confirmInvite = null)}>{t('Отмена')}</button>
+              </div>
+            </div>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
+{/if}
+
 <h2>{t('Пределы сервера')}</h2>
 <p class="hint outside">
   {t('Новые значения действуют сразу, перезапускать сервер не нужно. Значения по умолчанию берутся из переменных окружения контейнера; «Сбросить» возвращает поле к ним.')}
@@ -318,7 +453,7 @@
 <div class="card pad">
   <h3 class="in-card">{t('Токен доступа')}</h3>
   <p class="hint">
-    {t('Токен доступа есть в каждом коде приглашения. Смените его, если код приглашения или устройство попали в чужие руки: старые коды перестанут работать.')}
+    {t('Токен доступа есть в каждом коде приглашения и коде создания группы. Смените его, если код или устройство попали в чужие руки: старые коды перестанут работать, неиспользованные коды создания группы будут отозваны.')}
   </p>
   {#if confirming === 'relay'}
     <div class="confirm" role="alertdialog">
@@ -570,6 +705,10 @@
     padding: 7px var(--space-3);
     color: var(--c-text);
     font: inherit;
+  }
+  input.wide {
+    width: 100%;
+    max-width: 40ch;
   }
   input.num {
     width: 14ch;
