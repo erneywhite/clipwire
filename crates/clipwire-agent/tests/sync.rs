@@ -365,12 +365,9 @@ async fn long_history_arrives_in_batches() -> Result<()> {
             .send(Content::Text(format!("пропущено {i}")).into())
             .await?;
     }
-    drop(a.local);
-    tokio::time::timeout(Duration::from_secs(120), a.task).await???;
-
-    // Сервер мог ещё не сохранить хвост отправленного (на медленных машинах
-    // CI): входим заново, пока устройство не получит всё. Так проверяется сам
-    // вход пачками, а не то, как быстро сервер дочитывает чужую отправку.
+    // Отправитель остаётся на связи, пока сервер не сохранит всё: на
+    // медленных машинах CI хвост ещё в пути. Входим заново, пока устройство
+    // не получит всё, — проверяется сам вход пачками, а не скорость отправки.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     let (hist, batches, clip) = loop {
         let got = join_and_count(&info, &key, before).await?;
@@ -379,6 +376,8 @@ async fn long_history_arrives_in_batches() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
+    drop(a.local);
+    tokio::time::timeout(Duration::from_secs(120), a.task).await???;
     assert_eq!(
         clip,
         vec![Content::Text(format!("пропущено {}", MISSED - 1))]
