@@ -248,6 +248,7 @@ impl Store {
             params![&group.0[..], &new_group.0[..], now_ms, &sender.0[..]],
         )?;
         super::admin::inherit_admin(&tx, new_group, old_admin.as_ref())?;
+        super::groups::inherit_name(&tx, group, new_group)?;
         for (device, envelope) in envelopes {
             tx.execute(
                 "INSERT INTO rekeys (group_id, device_id, envelope) VALUES (?1, ?2, ?3)",
