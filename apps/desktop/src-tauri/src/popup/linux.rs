@@ -255,6 +255,12 @@ pub fn foreground() -> Option<u32> {
     X::open()?.active()
 }
 
+/// Окно `w` — файловый менеджер (Nautilus, Dolphin и другие, по `WM_CLASS`):
+/// картинка туда вставляется файлом.
+pub fn is_file_manager(w: u32) -> bool {
+    X::open().is_some_and(|x| clipwire_agent::image_file::is_linux_file_manager(&x.wm_class(w)))
+}
+
 /// Терминалы вставляют по Ctrl+Shift+V: Ctrl+V там — управляющий символ.
 fn is_terminal(wm_class: &str) -> bool {
     [

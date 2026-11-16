@@ -132,6 +132,8 @@ const en: Record<string, string> = {
   "Режим": "Mode",
   "Сразу вставлять в активное окно": "Paste straight into the active window",
   "Двойной клик или Enter вставляет туда, где стоит курсор. Иначе элемент только попадает в буфер.": "Double-click or Enter pastes where your cursor is. Otherwise the item only goes to the clipboard.",
+  "Картинку из буфера вставлять в Проводник файлом": "Paste clipboard images into File Explorer as files",
+  "Скриншот или скопированная картинка вставляется в папку или на рабочий стол PNG-файлом. В остальные программы она по-прежнему вставляется картинкой.": "A screenshot or copied image is pasted into a folder or onto the desktop as a PNG file. Other apps still receive it as an image.",
   "Срок хранения истории": "History retention",
   "Разделы настроек": "Settings sections",
   "Удалять на всех устройствах": "Delete on all devices",

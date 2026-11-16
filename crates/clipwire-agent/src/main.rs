@@ -274,6 +274,13 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
         &file_paths,
         clipwire_agent::cache::VIRTUAL_GRACE,
     );
+    // PNG, положенные файлом для вставки в файловый менеджер.
+    clipwire_agent::cache::prune_virtual(
+        &clipwire_agent::image_file::pasted_dir(&paths.dir),
+        &Default::default(),
+        clipwire_agent::image_file::PASTED_GRACE,
+    );
+    clipwire_agent::clipboard::set_image_as_file(settings.image_as_file);
     let rt = tokio::runtime::Runtime::new()?;
     let service = Service::start(
         rt.handle(),

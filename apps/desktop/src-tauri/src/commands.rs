@@ -591,6 +591,7 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
         settings.file_upload_limit_mb,
         std::sync::atomic::Ordering::Relaxed,
     );
+    clipwire_agent::clipboard::set_image_as_file(settings.image_as_file);
 
     if old.popup_hotkey != settings.popup_hotkey
         && let Err(e) = crate::popup::register_hotkey(&app)

@@ -89,6 +89,9 @@ pub struct Settings {
     /// Wayland: вставлять через портал удалённого управления (система один
     /// раз спрашивает разрешение). Выключено — окно вставки только кладёт в буфер.
     pub portal_paste: bool,
+    /// Windows: к картинке в буфере добавлять виртуальный PNG-файл, чтобы
+    /// обычный Ctrl+V в Проводнике вставлял её файлом (см. `image_file`).
+    pub image_as_file: bool,
 }
 
 impl Default for Settings {
@@ -112,6 +115,7 @@ impl Default for Settings {
             delete_everywhere: false,
             language: "system".into(),
             portal_paste: false,
+            image_as_file: true,
         }
     }
 }
@@ -309,6 +313,10 @@ mod tests {
         assert!(s.auto_update);
         let s: Settings = serde_json::from_str(r#"{"auto_update":false}"#).unwrap();
         assert!(!s.auto_update);
+        // Картинка файлом в Проводник — включена и в старом файле без поля.
+        assert!(s.image_as_file);
+        let s: Settings = serde_json::from_str(r#"{"image_as_file":false}"#).unwrap();
+        assert!(!s.image_as_file);
     }
 
     #[test]

@@ -69,6 +69,19 @@ fn prune_now(app: &AppHandle) {
     if r.removed > 0 {
         tracing::info!(removed = r.removed, "удалены ненужные виртуальные файлы");
     }
+    // PNG, положенные файлом для вставки в файловый менеджер: на них не
+    // ссылается ни одна запись, держатся сутки (буфер помнит путь).
+    let r = clipwire_agent::cache::prune_virtual(
+        &clipwire_agent::image_file::pasted_dir(&state.paths.dir),
+        &HashSet::new(),
+        clipwire_agent::image_file::PASTED_GRACE,
+    );
+    if r.removed > 0 {
+        tracing::info!(
+            removed = r.removed,
+            "удалены старые картинки для вставки файлом"
+        );
+    }
 }
 
 /// Сколько места занимает кэш скачанного, байт.

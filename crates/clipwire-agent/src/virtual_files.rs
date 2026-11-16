@@ -210,6 +210,33 @@ pub fn descriptor_format() -> u32 {
     formats().0 as u32
 }
 
+/// Номер формата `FileContents`.
+pub fn contents_format() -> u32 {
+    formats().1 as u32
+}
+
+/// `FILEGROUPDESCRIPTORW` на один файл: имя, размер и время изменения (мс
+/// Unix). Обратная операция — [`parse_descriptors`].
+pub fn descriptor_bytes(name: &str, size: u64, modified_ms: u64) -> Vec<u8> {
+    /// Показывать окно хода копирования (shlobj_core.h).
+    const FD_PROGRESSUI: u32 = 0x4000;
+    const FD_UNICODE: u32 = 0x8000_0000;
+    let mut b = 1u32.to_le_bytes().to_vec();
+    let mut d = vec![0u8; FD_SIZE];
+    let flags = FD_FILESIZE | FD_WRITESTIME | FD_PROGRESSUI | FD_UNICODE;
+    d[0..4].copy_from_slice(&flags.to_le_bytes());
+    let ft = FILETIME_UNIX_EPOCH + modified_ms * 10_000;
+    d[FD_OFF_WRITE..FD_OFF_WRITE + 8].copy_from_slice(&ft.to_le_bytes());
+    d[FD_OFF_SIZE_HIGH..FD_OFF_SIZE_HIGH + 4].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
+    d[FD_OFF_SIZE_LOW..FD_OFF_SIZE_LOW + 4].copy_from_slice(&(size as u32).to_le_bytes());
+    // Последний символ остаётся нулём: имя длиннее обрезается.
+    for (i, u) in name.encode_utf16().take(FD_NAME_CHARS - 1).enumerate() {
+        d[FD_OFF_NAME + i * 2..FD_OFF_NAME + i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+    }
+    b.extend_from_slice(&d);
+    b
+}
+
 fn formatetc(cf: u16, lindex: i32, tymed: i32) -> FORMATETC {
     FORMATETC {
         cfFormat: cf,
@@ -553,12 +580,10 @@ fn read_clipboard(root: &Path, max_bytes: u64, seq: u32) -> Result<Captured> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    use windows::Win32::Foundation::{
-        DV_E_FORMATETC, E_NOTIMPL, OLE_E_ADVISENOTSUPPORTED, S_FALSE, S_OK,
-    };
+    use windows::Win32::Foundation::{DV_E_FORMATETC, E_NOTIMPL, OLE_E_ADVISENOTSUPPORTED, S_OK};
     use windows::Win32::System::Com::StructuredStorage::CreateStreamOnHGlobal;
     use windows::Win32::System::Com::{
-        IAdviseSink, IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA,
+        IAdviseSink, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA,
     };
     use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc};
     use windows::core::{BOOL, HRESULT, Ref, implement};
@@ -589,6 +614,30 @@ mod tests {
     const FILE: u32 = FD_FILESIZE | FD_WRITESTIME | FD_ATTRIBUTES | 0x8000_0000;
     /// 2026-01-01T00:00:00Z в FILETIME.
     const FT_2026: u64 = FILETIME_UNIX_EPOCH + 1_767_225_600_000 * 10_000;
+
+    #[test]
+    fn own_descriptor_roundtrips() {
+        let b = descriptor_bytes(
+            "Снимок 2026-11-16 14-05-09.png",
+            5_000_000_000,
+            1_767_225_600_000,
+        );
+        assert_eq!(b.len(), 4 + FD_SIZE);
+        let d = parse_descriptors(&b, 10).unwrap();
+        assert_eq!(
+            d,
+            [Descriptor {
+                name: "Снимок 2026-11-16 14-05-09.png".into(),
+                is_dir: false,
+                size: Some(5_000_000_000),
+                modified_ms: Some(1_767_225_600_000),
+            }]
+        );
+        // Слишком длинное имя обрезается, а не портит структуру.
+        let long = "я".repeat(400);
+        let d = parse_descriptors(&descriptor_bytes(&long, 1, 0), 10).unwrap();
+        assert_eq!(d[0].name.chars().count(), FD_NAME_CHARS - 1);
+    }
 
     #[test]
     fn descriptor_bytes_are_parsed() {
@@ -808,11 +857,7 @@ mod tests {
             if dir != 1 {
                 return Err(E_NOTIMPL.into());
             }
-            Ok(FormatEnum {
-                items: self.formats(),
-                pos: std::cell::Cell::new(0),
-            }
-            .into())
+            Ok(crate::clipboard::image_offer::FormatEnum::new(self.formats()).into())
         }
         fn DAdvise(
             &self,
@@ -827,42 +872,6 @@ mod tests {
         }
         fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
             Err(OLE_E_ADVISENOTSUPPORTED.into())
-        }
-    }
-
-    #[implement(IEnumFORMATETC)]
-    struct FormatEnum {
-        items: Vec<FORMATETC>,
-        pos: std::cell::Cell<usize>,
-    }
-
-    impl IEnumFORMATETC_Impl for FormatEnum_Impl {
-        fn Next(&self, celt: u32, out: *mut FORMATETC, fetched: *mut u32) -> HRESULT {
-            let mut n = 0;
-            while (n as u32) < celt && self.pos.get() < self.items.len() {
-                unsafe { *out.add(n) = self.items[self.pos.get()] };
-                self.pos.set(self.pos.get() + 1);
-                n += 1;
-            }
-            if !fetched.is_null() {
-                unsafe { *fetched = n as u32 };
-            }
-            if n as u32 == celt { S_OK } else { S_FALSE }
-        }
-        fn Skip(&self, celt: u32) -> windows::core::Result<()> {
-            self.pos.set(self.pos.get() + celt as usize);
-            Ok(())
-        }
-        fn Reset(&self) -> windows::core::Result<()> {
-            self.pos.set(0);
-            Ok(())
-        }
-        fn Clone(&self) -> windows::core::Result<IEnumFORMATETC> {
-            Ok(FormatEnum {
-                items: self.items.clone(),
-                pos: std::cell::Cell::new(self.pos.get()),
-            }
-            .into())
         }
     }
 
@@ -1027,7 +1036,7 @@ mod tests {
             crate::clipboard::WatchOptions {
                 virtual_dir: crate::clipboard::virtual_dir(&state),
                 limit_mb: Arc::new(AtomicU64::new(10)),
-                accept_virtual: Box::new(|_| true),
+                accept_owner: Box::new(|_| true),
                 on_late_virtual: Box::new(|_, _, _| false),
             },
             move |content, _owner| {

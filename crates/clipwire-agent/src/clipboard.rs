@@ -176,16 +176,35 @@ const CONSISTENT_ATTEMPTS: usize = 3;
 /// Прочитать буфер согласованно: номер версии буфера (`seq`) до чтения и
 /// после должен совпасть, иначе части результата могут относиться к разному
 /// содержимому. До [`CONSISTENT_ATTEMPTS`] попыток, потом `None` — пропустить.
+/// Вторым значением — номер версии, к которой относится прочитанное.
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
-fn read_consistent<T>(mut seq: impl FnMut() -> u32, mut read: impl FnMut() -> T) -> Option<T> {
+fn read_consistent<T>(
+    mut seq: impl FnMut() -> u32,
+    mut read: impl FnMut() -> T,
+) -> Option<(T, u32)> {
     for _ in 0..CONSISTENT_ATTEMPTS {
         let before = seq();
         let v = read();
         if seq() == before {
-            return Some(v);
+            return Some((v, before));
         }
     }
     None
+}
+
+/// Добавлять ли к картинке в буфере виртуальный PNG-файл для Проводника
+/// (настройка «Картинку из буфера вставлять в Проводник файлом»). Только
+/// Windows; на других ОС ничего не меняет.
+static IMAGE_AS_FILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Включить или выключить виртуальный файл к картинке (Windows).
+pub fn set_image_as_file(on: bool) {
+    IMAGE_AS_FILE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn image_as_file() -> bool {
+    IMAGE_AS_FILE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Что брать из буфера Windows по набору форматов в нём.
@@ -285,8 +304,9 @@ pub fn virtual_dir(state_dir: &std::path::Path) -> std::path::PathBuf {
     state_dir.join("virtual")
 }
 
-/// Проверка владельца буфера перед чтением виртуальных файлов.
-pub type AcceptVirtual = Box<dyn Fn(Option<&str>) -> bool + Send>;
+/// Проверка владельца буфера перед чтением виртуальных файлов и перед
+/// подменой картинки картинкой с файлом.
+pub type AcceptOwner = Box<dyn Fn(Option<&str>) -> bool + Send>;
 
 /// Виртуальные файлы, дочитанные уже после того, как буфер сменился:
 /// содержимое, путь exe владельца и время начала чтения (мс Unix). Их место
@@ -305,8 +325,10 @@ pub struct WatchOptions {
     pub limit_mb: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Брать ли виртуальные файлы от этой программы (путь exe владельца
     /// буфера): проверяется до чтения, чтобы не писать на диск то, что всё
-    /// равно не уйдёт (пауза, игнорируемая программа).
-    pub accept_virtual: AcceptVirtual,
+    /// равно не уйдёт (пауза, игнорируемая программа). Та же проверка —
+    /// перед тем как добавить к картинке виртуальный файл (Windows): буфер
+    /// из игнорируемой программы и на паузе Clipwire не трогает.
+    pub accept_owner: AcceptOwner,
     /// Куда деть виртуальные файлы, дочитанные после смены буфера.
     pub on_late_virtual: OnLateVirtual,
 }
@@ -347,7 +369,11 @@ pub(crate) fn local_file_ref(p: &std::path::Path) -> clipwire_core::FileRef {
 }
 
 #[cfg(windows)]
+pub(crate) mod image_offer;
+#[cfg(windows)]
 pub use win::Watcher;
+#[cfg(windows)]
+pub(crate) use win::window_exe;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod mac;
@@ -369,6 +395,7 @@ mod win {
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
         GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, KillTimer, MSG, PostMessageW,
@@ -406,6 +433,10 @@ mod win {
         virt_rx: std_mpsc::Receiver<VirtualResult>,
         /// Какой буфер с виртуальными файлами забран и какой ждёт очереди.
         virt: super::VirtualQueue,
+        /// OLE в потоке слежения запустился: можно класть свой объект в буфер.
+        ole: bool,
+        /// Свой объект «картинка с файлом», положенный в буфер последним.
+        offered: Option<windows::Win32::System::Com::IDataObject>,
     }
 
     /// Следит за буфером, пока жив. Колбэк вызывается в потоке слежения на
@@ -425,6 +456,13 @@ mod win {
                 .name("clipboard-watch".into())
                 .spawn(move || {
                     let (virt_tx, virt_rx) = std_mpsc::channel();
+                    // OLE нужен для своего объекта в буфере (картинка с
+                    // файлом, см. `image_offer`): его вызовы идут через цикл
+                    // сообщений этого потока.
+                    let ole = unsafe { OleInitialize(None) }.is_ok();
+                    if !ole {
+                        tracing::info!("OLE в потоке слежения не запустился: картинка без файла");
+                    }
                     let ctx = Box::new(Ctx {
                         formats: ExclusionFormats::register(),
                         on_change: Box::new(on_change),
@@ -433,6 +471,8 @@ mod win {
                         virt_tx,
                         virt_rx,
                         virt: Default::default(),
+                        ole,
+                        offered: None,
                     });
                     let hwnd = match create_window(ctx) {
                         Ok(h) => h,
@@ -453,8 +493,12 @@ mod win {
                             DispatchMessageW(&msg);
                         }
                         let _ = RemoveClipboardFormatListener(hwnd);
+                        flush_offer(hwnd);
                         drop_ctx(hwnd);
                         let _ = DestroyWindow(hwnd);
+                        if ole {
+                            OleUninitialize();
+                        }
                     }
                 })
                 .context("не запустился поток слежения за буфером")?;
@@ -500,14 +544,36 @@ mod win {
                     // другое. Поэтому сверяем номер версии буфера до и после.
                     let seq = || unsafe { GetClipboardSequenceNumber() };
                     match super::read_consistent(seq, || snapshot(ctx, hwnd)) {
-                        Some(Snapshot::Content(content, owner)) => {
+                        Some((Snapshot::Content(content, owner), seq)) => {
+                            // Картинку — ещё и виртуальным файлом для
+                            // Проводника. Решение по форматам буфера — в
+                            // `image_offer::offer`, здесь — настройка,
+                            // пауза и игнорируемые программы.
+                            let png = match &content {
+                                Content::Image { png, .. }
+                                    if ctx.ole
+                                        && super::image_as_file()
+                                        && (ctx.opts.accept_owner)(owner.as_deref()) =>
+                                {
+                                    Some(png.clone())
+                                }
+                                _ => None,
+                            };
                             (ctx.on_change)(content, owner);
+                            if let Some(png) = png
+                                && let Some(obj) = super::image_offer::offer(hwnd, &png, seq)
+                            {
+                                ctx.offered = Some(obj);
+                            }
                         }
-                        Some(Snapshot::Virtual(owner)) => start_virtual(ctx, hwnd, owner),
-                        Some(Snapshot::Excluded) => {
+                        Some((Snapshot::Virtual(owner), _)) => start_virtual(ctx, hwnd, owner),
+                        Some((Snapshot::Excluded, _)) => {
                             tracing::debug!("буфер помечен как приватный, пропускаю");
                         }
-                        Some(Snapshot::Empty) => {}
+                        Some((Snapshot::Ours, _)) => {
+                            tracing::debug!("в буфере своя картинка с файлом, пропускаю");
+                        }
+                        Some((Snapshot::Empty, _)) => {}
                         None => tracing::debug!("буфер менялся во время чтения, пропускаю"),
                     }
                 }
@@ -574,12 +640,19 @@ mod win {
         Virtual(Option<String>),
         /// Помечено как приватное (или метку не удалось прочитать).
         Excluded,
+        /// Своя подмена: картинка, уже отданная, теперь с виртуальным файлом.
+        Ours,
         /// Ничего, что мы умеем брать.
         Empty,
     }
 
     /// Один проход чтения буфера: метки исключения, содержимое, владелец.
     fn snapshot(ctx: &Ctx, hwnd: HWND) -> Snapshot {
+        // Раньше остальных проверок: метки истории в своём объекте выглядят
+        // как приватные, а чтение их данных зря дёргало бы свой же объект.
+        if raw_available(ctx.formats.image_file) {
+            return Snapshot::Ours;
+        }
         if ctx.formats.excluded(hwnd) {
             return Snapshot::Excluded;
         }
@@ -639,7 +712,7 @@ mod win {
             tracing::debug!("виртуальные файлы этого буфера уже забраны");
             return;
         }
-        if !(ctx.opts.accept_virtual)(owner.as_deref()) {
+        if !(ctx.opts.accept_owner)(owner.as_deref()) {
             return;
         }
         let limit = ctx.opts.limit_mb.load(std::sync::atomic::Ordering::Relaxed);
@@ -696,6 +769,39 @@ mod win {
             )?;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ctx) as isize);
             Ok(hwnd)
+        }
+    }
+
+    /// Перед выходом: если в буфере всё ещё своя картинка с файлом, оставить
+    /// в нём картинку без файла и отдать данные системе (`OleFlushClipboard`).
+    /// Без этого буфер опустеет, когда поток с объектом закончится. Почему
+    /// без файла — в `image_offer::without_file`.
+    unsafe fn flush_offer(hwnd: HWND) {
+        use windows::Win32::System::Ole::{OleFlushClipboard, OleSetClipboard};
+        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Ctx;
+        // SAFETY: как в wndproc; цикл сообщений уже закончился.
+        let Some(ctx) = (unsafe { ptr.as_mut() }) else {
+            return;
+        };
+        // `OleIsCurrentClipboard` в windows-rs отдаёт Result и путает S_OK
+        // с S_FALSE, поэтому смотрим на метку: она бывает только у своего
+        // объекта.
+        let Some(obj) = ctx.offered.take() else {
+            return;
+        };
+        if !raw_available(ctx.formats.image_file) {
+            return;
+        }
+        // Не вышло собрать картинку без файла — сбросить как есть: вставка в
+        // Проводник после выхода не сработает, зато картинка не пропадёт.
+        if let Some(plain) = super::image_offer::without_file(&obj)
+            && let Err(e) = unsafe { OleSetClipboard(&plain) }
+        {
+            tracing::info!("картинка без файла не положилась в буфер: {e}");
+        }
+        match unsafe { OleFlushClipboard() } {
+            Ok(()) => tracing::debug!("картинка оставлена в буфере"),
+            Err(e) => tracing::warn!("картинка не сбросилась в буфер: {e}"),
         }
     }
 
@@ -816,6 +922,8 @@ mod win {
         viewer_ignore: u32,
         can_history: u32,
         can_cloud: u32,
+        /// Метка своего объекта «картинка с файлом» (`image_offer`).
+        image_file: u32,
     }
 
     impl ExclusionFormats {
@@ -826,6 +934,7 @@ mod win {
                 viewer_ignore: reg("Clipboard Viewer Ignore"),
                 can_history: reg("CanIncludeInClipboardHistory"),
                 can_cloud: reg("CanUploadToCloudClipboard"),
+                image_file: super::image_offer::marker_format(),
             }
         }
 
@@ -859,7 +968,7 @@ mod win {
     }
 
     /// Полный путь exe процесса, которому принадлежит окно.
-    unsafe fn window_exe(hwnd: HWND) -> Option<String> {
+    pub(crate) unsafe fn window_exe(hwnd: HWND) -> Option<String> {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Threading::{
             OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -959,7 +1068,7 @@ mod tests {
                 "a"
             },
         );
-        assert_eq!((got, reads.get()), (Some("a"), 1));
+        assert_eq!((got, reads.get()), (Some(("a", 7)), 1));
 
         // Сменился во время первого чтения — второе чтение берётся.
         let n = Cell::new(0u32);
@@ -973,7 +1082,7 @@ mod tests {
             reads.set(reads.get() + 1);
             reads.get()
         });
-        assert_eq!(got, Some(2));
+        assert_eq!(got, Some((2, 3)));
 
         // Меняется всё время — после трёх попыток пропускаем.
         let n = Cell::new(0u32);

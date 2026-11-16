@@ -92,6 +92,8 @@ pub const VIRTUAL_GRACE: Duration = Duration::from_secs(3600);
 /// которые не ссылается ни один путь из `keep` (пути файлов записей
 /// истории). Папки моложе `grace` не трогаем: их ещё забирают или запись
 /// вот-вот появится. Имена не из 32 hex не трогаем: их клал не Clipwire.
+/// Так же, с пустым `keep`, чистятся PNG для вставки картинки файлом
+/// (`image_file::pasted_dir`).
 pub fn prune_virtual(virtual_dir: &Path, keep: &HashSet<PathBuf>, grace: Duration) -> Cleaned {
     let used: HashSet<&std::ffi::OsStr> = keep
         .iter()

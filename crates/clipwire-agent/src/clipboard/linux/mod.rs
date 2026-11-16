@@ -238,7 +238,7 @@ mod live {
         let opts = super::super::WatchOptions {
             virtual_dir: std::env::temp_dir(),
             limit_mb: Default::default(),
-            accept_virtual: Box::new(|_| true),
+            accept_owner: Box::new(|_| true),
             on_late_virtual: Box::new(|_, _, _| false),
         };
         let _w = Watcher::start(opts, move |c, owner| {
