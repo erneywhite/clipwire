@@ -60,8 +60,12 @@ pub(super) struct Inflight {
 pub(super) struct PinUpload {
     /// Номер файла в содержимом.
     idx: usize,
-    /// Каким файл был до заливки: таким он вернётся, если не зальётся.
+    /// Каким файл был до заливки: таким он вернётся в содержимое, если не
+    /// зальётся.
     original: FileRef,
+    /// Файл своей записи истории до заливки (у своей записи): таким он
+    /// вернётся в неё. В содержимом с сервера у него мог быть чужой `blob`.
+    local_original: Option<FileRef>,
     /// Место прежнего `blob` по `BLOB_PLACES`.
     original_place: Option<BlobPlace>,
     job: UploadJob,
@@ -419,7 +423,7 @@ impl Engine {
                 self.emit(Event::PinFiles {
                     hash: h,
                     item,
-                    own_write: false,
+                    own: None,
                 });
             }
             self.ps.check.insert(h);
@@ -508,7 +512,7 @@ impl Engine {
             self.emit(Event::PinFiles {
                 hash,
                 item: item.clone(),
-                own_write: true,
+                own: Some(inf.uploads.iter().map(|u| u.idx).collect()),
             });
             if !inf.uploads.is_empty() {
                 self.fix.accepted.push(Accepted {
@@ -822,7 +826,11 @@ impl Engine {
         })
         .await
         .unwrap_or_default();
-        self.prepare_uploads(item, picks).await
+        let local = own.then(|| match &item.content {
+            Content::Files(f) => f.clone(),
+            _ => Vec::new(),
+        });
+        self.prepare_uploads(item, picks, local.as_deref()).await
     }
 
     /// Дать выбранным файлам новые `blob` текущей группы и собрать задания
@@ -831,7 +839,12 @@ impl Engine {
     /// внешнем хранилище не выйдет и файл пойдёт через сервер, метку
     /// поправит следующая правка ([`Engine::pin_reserve`]). Файл, задание
     /// которого не собралось, остаётся прежним.
-    async fn prepare_uploads(&self, item: &mut Item, picks: Vec<(usize, Bytes)>) -> Vec<PinUpload> {
+    async fn prepare_uploads(
+        &self,
+        item: &mut Item,
+        picks: Vec<(usize, Bytes)>,
+        local: Option<&[FileRef]>,
+    ) -> Vec<PinUpload> {
         let Some(b) = self.blobs.clone() else {
             return Vec::new();
         };
@@ -848,6 +861,7 @@ impl Engine {
         let places = crate::storage::external::places(&item.ext);
         let outbox = b.outbox().to_path_buf();
         let mut files = files.clone();
+        let local = local.map(<[FileRef]>::to_vec);
         let old_places = places.clone();
         let res = tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
@@ -866,6 +880,7 @@ impl Engine {
                             idx: i,
                             original,
                             original_place,
+                            local_original: local.as_ref().and_then(|l| l.get(i).cloned()),
                             job,
                         });
                     }
@@ -1229,8 +1244,10 @@ impl Engine {
         // раньше ответа), и починка по нему затёрла бы чужую.
         let sent = all_blobs(&remote);
         if !held.iter().all(|b| sent.contains(b)) {
-            tracing::info!("содержимое закрепа старее его записи, проверю позже");
-            self.ps.check.insert(hash);
+            // Пока у закрепа тот же `rev`, не спрашивать снова: список
+            // файлов открытый, и чужая правка может держать его таким нарочно.
+            tracing::info!("содержимое закрепа старее его записи, жду новой правки");
+            self.fix.checked.insert(hash, rev);
             return Ok(());
         }
         let missing = self.fix.missing.clone();
@@ -1246,17 +1263,18 @@ impl Engine {
                         Content::Files(f) => Some(f),
                         _ => None,
                     });
-                pin_files::repair_picks(
+                let plan = pin_files::repair_picks(
                     &remote_files,
                     local.as_deref(),
                     |x| held.contains(&x) && !missing.contains(&x),
                     limit_mb,
                     &files_dir,
-                )
+                );
+                plan.map(|p| (p, local))
             })
             .await
             .flatten();
-        let Some((files, picks)) = plan else {
+        let Some(((files, picks), local)) = plan else {
             tracing::warn!("файлы закрепа не сходятся со своей записью, не чиню");
             self.fix.checked.insert(hash, rev);
             return Ok(());
@@ -1291,7 +1309,9 @@ impl Engine {
         *tries += 1;
         let mut item = remote;
         item.content = Content::Files(files);
-        let uploads = self.prepare_uploads(&mut item, picks).await;
+        let uploads = self
+            .prepare_uploads(&mut item, picks, local.as_deref())
+            .await;
         if uploads.is_empty() {
             return Ok(());
         }
@@ -1413,6 +1433,29 @@ impl Engine {
         if !failed.is_empty() {
             // Сервер такой файл не примет и в следующий раз.
             self.fix.tries.insert(hash, pin_files::MAX_REPAIRS);
+            // Своя запись уже взяла новые `blob` (по принятой правке): вернуть
+            // ей прежние файлы, а не те, что пришли в содержимом с сервера.
+            let mut restore = acc.item.clone();
+            let mut idx = Vec::new();
+            if let Content::Files(files) = &mut restore.content {
+                for u in acc
+                    .uploads
+                    .iter()
+                    .filter(|u| failed.iter().any(|(x, _)| *x == u.job.blob))
+                {
+                    if let Some(l) = &u.local_original {
+                        files[u.idx] = l.clone();
+                        idx.push(u.idx);
+                    }
+                }
+            }
+            if !idx.is_empty() {
+                self.emit(Event::PinFiles {
+                    hash,
+                    item: restore,
+                    own: Some(idx),
+                });
+            }
         }
         if !changed {
             return Ok(());

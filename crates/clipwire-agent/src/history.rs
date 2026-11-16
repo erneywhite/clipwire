@@ -2041,16 +2041,18 @@ impl History {
     /// закреплении, `sync::pin_engine`): у записи с этим хэшем взять у
     /// файлов `blob`, `blob_size` и `p2p` из `files` (по порядку; путь и
     /// размер у них те же — хэш совпадает) и места файлов
-    /// (`ext::BLOB_PLACES`) из `places`. Свою запись (`local`) — только с
-    /// `allow_local`: её файлы меняет лишь правка этого устройства. Возвращает
-    /// пары «было, стало» у файлов с другим `blob`; пусто — записи нет или
-    /// ничего не поменялось.
+    /// (`ext::BLOB_PLACES`) из `places`. Своя запись (`local`) берёт только
+    /// файлы с номерами из `own` — те, что это устройство само залило (или
+    /// вернуло прежними) своей правкой; `None` — правка чужая, своя запись не
+    /// меняется вовсе. Так ни чужой `blob`, ни прямая передача из содержимого
+    /// закрепа в свою запись не попадают. Возвращает пары «было, стало» у
+    /// файлов с другим `blob`; пусто — записи нет или ничего не поменялось.
     pub fn set_pin_files(
         &mut self,
         hash: &[u8; 32],
         files: &[FileRef],
         places: &clipwire_core::storage::BlobPlaces,
-        allow_local: bool,
+        own: Option<&[usize]>,
     ) -> Result<Vec<(FileRef, FileRef)>> {
         let tx = self.tx()?;
         let Some(id) = self.id_by_hkey(&self.hkey(hash))? else {
@@ -2062,9 +2064,11 @@ impl History {
         let Some(mut e) = self.body(id)? else {
             return Ok(Vec::new());
         };
-        if e.local && !allow_local {
-            return Ok(Vec::new());
-        }
+        let only: Option<&[usize]> = match (e.local, own) {
+            (false, _) => None,
+            (true, None) => return Ok(Vec::new()),
+            (true, Some(list)) => Some(list),
+        };
         let Content::Files(old) = &mut e.content else {
             return Ok(Vec::new());
         };
@@ -2078,9 +2082,16 @@ impl History {
         }
         let mut moved = Vec::new();
         let mut changed = false;
-        for (a, b) in old.iter_mut().zip(files) {
+        let mut dropped = Vec::new();
+        for (i, (a, b)) in old.iter_mut().zip(files).enumerate() {
+            if only.is_some_and(|l| !l.contains(&i)) {
+                continue;
+            }
             if (a.blob, a.blob_size, a.p2p) == (b.blob, b.blob_size, b.p2p) {
                 continue;
+            }
+            if let Some(ob) = a.blob {
+                dropped.push(ob);
             }
             if a.blob != b.blob {
                 moved.push((a.clone(), b.clone()));
@@ -2091,12 +2102,23 @@ impl History {
             changed = true;
         }
         let had = crate::storage::external::places(&e.ext);
-        if had != *places {
+        // Своя запись: места только у взятых файлов.
+        let places = match only {
+            None => places.clone(),
+            Some(l) => {
+                let mine: Vec<BlobId> = l.iter().filter_map(|i| files.get(*i)?.blob).collect();
+                let mut p = had.clone();
+                p.retain(|(b, _)| !dropped.contains(b) && !mine.contains(b));
+                p.extend(places.iter().filter(|(b, _)| mine.contains(b)).copied());
+                p
+            }
+        };
+        if had != places {
             if places.is_empty() {
                 e.ext
                     .retain(|x| x.tag != clipwire_core::item::ext::BLOB_PLACES);
             } else {
-                e.ext_set(clipwire_core::item::ext::BLOB_PLACES, places);
+                e.ext_set(clipwire_core::item::ext::BLOB_PLACES, &places);
             }
             changed = true;
         }
@@ -2796,7 +2818,7 @@ mod tests {
             ..f.clone()
         };
         assert!(
-            h.set_pin_files(&hash, std::slice::from_ref(&forged), &Vec::new(), false)
+            h.set_pin_files(&hash, std::slice::from_ref(&forged), &Vec::new(), None)
                 .unwrap()
                 .is_empty()
         );
@@ -2804,7 +2826,7 @@ mod tests {
         assert_eq!(e.content, Content::Files(vec![f.clone()]));
         // Своя правка — меняет.
         let pairs = h
-            .set_pin_files(&hash, std::slice::from_ref(&moved), &places, true)
+            .set_pin_files(&hash, std::slice::from_ref(&moved), &places, Some(&[0]))
             .unwrap();
         assert_eq!(pairs, vec![(f.clone(), moved.clone())]);
         let e = h.get(h.id_by_hash(&hash).unwrap()).unwrap();
@@ -2813,7 +2835,7 @@ mod tests {
         assert_eq!(h.blobs_of(&hash), vec![BlobId([2; 16])], "карточка тоже");
         // Повтор — без изменений; чужие файлы (другой путь) не принимаются.
         assert!(
-            h.set_pin_files(&hash, std::slice::from_ref(&moved), &places, true)
+            h.set_pin_files(&hash, std::slice::from_ref(&moved), &places, Some(&[0]))
                 .unwrap()
                 .is_empty()
         );
@@ -2821,9 +2843,12 @@ mod tests {
             path: "/y".into(),
             ..moved
         };
-        assert!(h.set_pin_files(&hash, &[other], &places, true).is_err());
         assert!(
-            h.set_pin_files(&[9; 32], &[f], &Vec::new(), true)
+            h.set_pin_files(&hash, &[other], &places, Some(&[0]))
+                .is_err()
+        );
+        assert!(
+            h.set_pin_files(&[9; 32], &[f], &Vec::new(), Some(&[0]))
                 .unwrap()
                 .is_empty()
         );

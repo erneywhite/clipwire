@@ -251,7 +251,16 @@ changed the key does it as soon as it connects with the new key; files it does n
 uploaded a few minutes later by the devices that have them on disk or in the cache. If a pin
 ends up without its file for another reason (the server lost it, an upload failed), a device that
 has the file repairs it the same way. Clipwire 0.7 apps keep the old location after such a
-repair and report the file as missing until they are updated. A device that was off
+repair and report the file as missing until they are updated. One run of the app repairs at
+most 1 GiB and 50 files; if pins hold more, the rest is repaired after the next start.
+
+Known rough edges. A file over the limit that was uploaded for a pin is deleted from the server
+right after the pin is removed, while the entry keeps its new location without direct transfer:
+other devices can no longer get it until the file is copied again. If you unpin and quickly pin
+again, the app may think the file is still on the server, and the pin stays without its file until
+some device tries to download it and gets "not found"; then a device that has the file repairs it.
+
+A device that was off
 during the key change does not upload pins that other devices removed in the meantime. If the
 server database was lost or restored from an old backup, devices notice it, fetch the pins from
 the start and upload their live pins again.

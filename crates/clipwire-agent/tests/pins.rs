@@ -145,12 +145,26 @@ impl Mem {
 
     /// Как сервис: `History::set_pin_files` — файлы записи из содержимого
     /// закрепа.
-    fn set_files(&self, hash: &[u8; 32], item: &Item, own_write: bool) {
-        if let Some(r) = self.rows.lock().unwrap().get_mut(hash)
-            && (own_write || !r.local)
-        {
+    fn set_files(&self, hash: &[u8; 32], item: &Item, own: Option<&[usize]>) {
+        let mut rows = self.rows.lock().unwrap();
+        let Some(r) = rows.get_mut(hash) else { return };
+        if !r.local {
             r.item.content = item.content.clone();
             r.item.ext = item.ext.clone();
+            return;
+        }
+        // Своя запись — только файлы, которые устройство само залило.
+        let (Some(own), Content::Files(mine), Content::Files(new)) =
+            (own, &mut r.item.content, &item.content)
+        else {
+            return;
+        };
+        for &i in own {
+            if let (Some(a), Some(b)) = (mine.get_mut(i), new.get(i)) {
+                a.blob = b.blob;
+                a.blob_size = b.blob_size;
+                a.p2p = b.p2p;
+            }
         }
     }
 
@@ -325,11 +339,7 @@ impl Dev {
         match e {
             Event::KnownDevices(cards) => self.known = cards.clone(),
             Event::Pin(p) => self.mem.apply(p),
-            Event::PinFiles {
-                hash,
-                item,
-                own_write,
-            } => self.mem.set_files(hash, item, *own_write),
+            Event::PinFiles { hash, item, own } => self.mem.set_files(hash, item, own.as_deref()),
             Event::PinFailed(why) => self.failed.push(why.clone()),
             _ => {}
         }
@@ -1375,6 +1385,60 @@ async fn foreign_pin_respects_owner_limit() -> Result<()> {
     })
     .await?;
     never_uploaded(&mut b, &mut a, &h).await?;
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Чужое содержимое закрепа не попадает в свою запись и через свою же
+/// починку: у большого файла (больше порога, не заливался) атакующий ставит
+/// чужой `blob` с прямой передачей, владелец чинит маленький файл — в его
+/// запись уходит только залитое им самим, большой остаётся как был.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_repair_keeps_foreign_blobs_out_of_own_record() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    // Порог 1 МБ: маленький файл в нём, большой — нет.
+    a.mem
+        .limit_mb
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    let dir = a.dir.join("src");
+    let small = disk_file(&dir, "small.bin", 1000)?;
+    let big = disk_file(&dir, "big.bin", 2 * 1024 * 1024)?;
+    let h = a
+        .mem
+        .add_content(Content::Files(vec![small, big.clone()]), false, "");
+    // B закрепляет ту же запись, подсунув большому файлу свой `blob` и
+    // прямую передачу.
+    let mut forged = a.mem.item(&h).context("нет записи")?;
+    let x = BlobId::random()?;
+    if let Content::Files(f) = &mut forged.content {
+        f[1].blob = Some(x);
+        f[1].blob_size = f[1].size;
+        f[1].p2p = true;
+    }
+    b.mem.add_foreign(forged, true);
+    b.pins.pin(h, "");
+    // A чинит маленький файл: у него появляется свой `blob`.
+    a.until("маленький файл залит", |m, _| {
+        m.files(&h)
+            .first()
+            .is_some_and(|f| f.blob.is_some() && !f.p2p)
+    })
+    .await?;
+    let files = a.mem.files(&h);
+    assert_eq!(
+        (files[1].blob, files[1].p2p),
+        (big.blob, big.p2p),
+        "в свою запись попал чужой blob: {files:?}"
+    );
     a.stop().await?;
     b.stop().await?;
     server.shutdown().await

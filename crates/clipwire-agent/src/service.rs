@@ -665,16 +665,18 @@ impl Service {
                                 Err(e) => tracing::warn!("закреп не применился: {e}"),
                             }
                         }
-                        Event::PinFiles {
-                            hash,
-                            item,
-                            own_write,
-                        } => {
+                        Event::PinFiles { hash, item, own } => {
                             let res = tokio::task::spawn_blocking({
                                 let history = history.clone();
                                 let files_dir = crate::blobs::files_dir(&paths.dir);
                                 move || {
-                                    apply_pin_files(&history, &files_dir, &hash, &item, own_write)
+                                    apply_pin_files(
+                                        &history,
+                                        &files_dir,
+                                        &hash,
+                                        &item,
+                                        own.as_deref(),
+                                    )
                                 }
                             })
                             .await;
@@ -928,16 +930,16 @@ fn apply_pin_event(
 
 /// Файлы закреплённой записи переехали (`sync::Event::PinFiles`): новые
 /// `blob` и места — в историю. Своя запись меняется только по своей правке
-/// (`own_write`): иначе чужое содержимое подсунуло бы ей `blob` и прямую
-/// передачу, и `local_p2p_file` отдал бы файл по чужому `blob`. Скачанная
-/// копия переезжает в каталог кэша нового `blob` тоже только по своей
-/// правке. `true` — запись поменялась.
+/// и только в файлах, которые устройство само залило (`own`): иначе чужое
+/// содержимое подсунуло бы ей `blob` и прямую передачу, и `local_p2p_file`
+/// отдал бы файл по чужому `blob`. Скачанная копия переезжает в каталог кэша
+/// нового `blob` тоже только по своей правке. `true` — запись поменялась.
 fn apply_pin_files(
     history: &Mutex<History>,
     files_dir: &Path,
     hash: &[u8; 32],
     item: &Item,
-    own_write: bool,
+    own: Option<&[usize]>,
 ) -> Result<bool> {
     let Content::Files(files) = &item.content else {
         return Ok(false);
@@ -946,8 +948,8 @@ fn apply_pin_files(
     let moved = history
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .set_pin_files(hash, files, &places, own_write)?;
-    if !own_write {
+        .set_pin_files(hash, files, &places, own)?;
+    if own.is_none() {
         return Ok(!moved.is_empty());
     }
     for (old, new) in &moved {
