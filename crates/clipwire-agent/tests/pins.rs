@@ -136,6 +136,29 @@ impl Mem {
             .map(|r| (r.pinned, r.note.clone()))
     }
 
+    /// Как сервис: `History::set_pin_files` — файлы записи из содержимого
+    /// закрепа.
+    fn set_files(&self, hash: &[u8; 32], item: &Item) {
+        if let Some(r) = self.rows.lock().unwrap().get_mut(hash) {
+            r.item.content = item.content.clone();
+            r.item.ext = item.ext.clone();
+        }
+    }
+
+    /// Файлы записи.
+    fn files(&self, hash: &[u8; 32]) -> Vec<clipwire_core::FileRef> {
+        match self
+            .rows
+            .lock()
+            .unwrap()
+            .get(hash)
+            .map(|r| r.item.content.clone())
+        {
+            Some(Content::Files(f)) => f,
+            _ => Vec::new(),
+        }
+    }
+
     fn set(&self, hash: &[u8; 32], pinned: bool, note: &str) {
         let mut rows = self.rows.lock().unwrap();
         let r = rows.get_mut(hash).unwrap();
@@ -184,6 +207,10 @@ struct Dev {
     ctl: Controller,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     failed: Vec<String>,
+    /// С передачей файлов (`Engine::with_blobs`): заводится заново при
+    /// каждом запуске, под текущий ключ группы.
+    files: bool,
+    blobs: Option<Arc<clipwire_agent::blobs::Blobs>>,
 }
 
 impl Dev {
@@ -208,6 +235,8 @@ impl Dev {
             ctl: Controller::new(ctx, key.clone(), device_id(&device_key)),
             task: None,
             failed: Vec::new(),
+            files: false,
+            blobs: None,
         })
     }
 
@@ -231,11 +260,19 @@ impl Dev {
         let (etx, events) = mpsc::unbounded_channel();
         let (local, lrx) = mpsc::channel(16);
         let (ctx, crx) = mpsc::channel::<Control>(4);
-        let engine = Engine::new(state, self.name.into(), None, etx, Arc::new(|| {}))
+        let mut engine = Engine::new(state, self.name.into(), None, etx, Arc::new(|| {}))
             .with_admin_key(Some(TEST_ADMIN))
             .with_control(crx)
             .with_known_devices(self.known.clone())
             .with_pins(self.pins.clone(), self.mem.clone());
+        if self.files {
+            let b =
+                clipwire_agent::blobs::Blobs::new(self.key.clone(), &self.dir, Arc::new(|_| {}));
+            engine = engine
+                .with_blobs(b.clone())
+                .with_repair_delay(Duration::from_millis(200), Duration::from_millis(400));
+            self.blobs = Some(b);
+        }
         self.ctl = Controller::new(ctx, self.key.clone(), engine.device());
         self.task = Some(tokio::spawn(engine.run(lrx)));
         self.events = events;
@@ -257,6 +294,7 @@ impl Dev {
         match e {
             Event::KnownDevices(cards) => self.known = cards.clone(),
             Event::Pin(p) => self.mem.apply(p),
+            Event::PinFiles { hash, item } => self.mem.set_files(hash, item),
             Event::PinFailed(why) => self.failed.push(why.clone()),
             _ => {}
         }
@@ -1013,5 +1051,178 @@ async fn rekey_reports_pins_refused_by_quota() -> Result<()> {
         .await?;
     assert!(why.contains("1"), "{why}");
     a.stop().await?;
+    server.shutdown().await
+}
+
+/// Скачать файлы записи через передачу файлов устройства (из кэша или с
+/// сервера) и вернуть их байты.
+async fn fetch(d: &Dev, hash: &[u8; 32]) -> Result<Vec<Vec<u8>>> {
+    let b = d.blobs.clone().context("без передачи файлов")?;
+    let origin = d.mem.item(hash).context("записи нет")?.origin;
+    let mut out = Vec::new();
+    for f in d.mem.files(hash) {
+        let p = b.download(&f, origin).await?;
+        out.push(std::fs::read(p)?);
+    }
+    Ok(out)
+}
+
+/// Файл, у которого нет `blob` (скопирован без группы), закреп всё равно
+/// заливает, другое устройство его скачивает. После смены ключа файлы
+/// старой группы удалены: закреп чинит устройство, у которого есть файл.
+/// Если это инициатор (автор перешифрованного закрепа) — сразу, иначе —
+/// после паузы. Другое устройство скачивает файл уже из новой группы.
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_file_repaired_after_rekey_by_owner() -> Result<()> {
+    repaired_after_rekey(false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_file_repaired_after_rekey_by_initiator() -> Result<()> {
+    repaired_after_rekey(true).await
+}
+
+/// `initiator_owns` — файл у того, кто меняет ключ (A), иначе у B.
+async fn repaired_after_rekey(initiator_owns: bool) -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    b.files = true;
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    a.devices_with_cards(2).await?;
+    b.devices_with_cards(2).await?;
+    let (owner, other) = if initiator_owns {
+        (&mut a, &mut b)
+    } else {
+        (&mut b, &mut a)
+    };
+
+    let src = owner.dir.join("src");
+    std::fs::create_dir_all(&src)?;
+    let path = src.join("отчёт.bin");
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &bytes)?;
+    let (size, modified_ms) = clipwire_agent::blobs::file_stamp(&path)?;
+    let file = clipwire_core::FileRef {
+        name: "отчёт.bin".into(),
+        path: path.to_string_lossy().into_owned(),
+        size,
+        is_dir: false,
+        width: 0,
+        height: 0,
+        modified_ms,
+        blob: None,
+        blob_size: 0,
+        p2p: false,
+    };
+    let h = owner.mem.add_content(Content::Files(vec![file]), true, "");
+    owner.pins.pin(h, "файл");
+    other
+        .until("закреп с файлом пришёл", |m, _| {
+            m.state(&h) == Some((true, "файл".into()))
+                && m.files(&h)
+                    .first()
+                    .is_some_and(|f| f.blob.is_some() && !f.p2p)
+        })
+        .await?;
+    assert_eq!(fetch(other, &h).await?, vec![bytes.clone()]);
+    let before = other.mem.files(&h)[0].blob;
+    // Скачанная копия у другого устройства — под старым `blob`: убрать,
+    // чтобы чинил только владелец файла.
+    let _ = std::fs::remove_dir_all(clipwire_agent::blobs::files_dir(&other.dir));
+
+    let k2 = a.rekey_all().await.map_err(anyhow::Error::msg)?.key;
+    b.wait(|e| matches!(e, Event::RekeyOffered(_)).then_some(()))
+        .await?;
+    for d in [&mut a, &mut b] {
+        d.stop().await?;
+        d.key = k2.clone();
+        d.start();
+        d.online().await?;
+    }
+    let (owner, other) = if initiator_owns {
+        (&mut a, &mut b)
+    } else {
+        (&mut b, &mut a)
+    };
+    other
+        .until(
+            "закреп починили, у файла новый blob",
+            |m, _| {
+                m.files(&h)
+                    .first()
+                    .is_some_and(|f| f.blob.is_some() && f.blob != before && !f.p2p)
+            },
+        )
+        .await?;
+    assert_eq!(fetch(other, &h).await?, vec![bytes.clone()]);
+    owner
+        .until("у владельца закреп тот же", |m, p| {
+            m.state(&h) == Some((true, "файл".into())) && p.read(|bk| bk.live(&h).len()) == 1
+        })
+        .await?;
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Место закрепов кончилось: файл закрепа не резервируется, устройство
+/// говорит об этом и возвращает файл в содержимое прежним (без `blob`), а
+/// запись остаётся закреплённой везде.
+#[tokio::test(flavor = "multi_thread")]
+async fn pin_file_over_pin_space_is_refused_and_restored() -> Result<()> {
+    let (server, info) = start_server(Guards {
+        pin_bytes: 100 * 1024,
+        ..Guards::default()
+    })
+    .await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    std::fs::create_dir_all(&a.dir)?;
+    let path = a.dir.join("большой.bin");
+    std::fs::write(&path, vec![7u8; 300_000])?;
+    let (size, modified_ms) = clipwire_agent::blobs::file_stamp(&path)?;
+    let file = clipwire_core::FileRef {
+        name: "большой.bin".into(),
+        path: path.to_string_lossy().into_owned(),
+        size,
+        is_dir: false,
+        width: 0,
+        height: 0,
+        modified_ms,
+        blob: None,
+        blob_size: 0,
+        p2p: false,
+    };
+    let h = a.mem.add_content(Content::Files(vec![file]), true, "");
+    a.pins.pin(h, "");
+    let why = a
+        .wait(|e| match e {
+            Event::PinFailed(w) if w.contains("большой.bin") => Some(w.clone()),
+            _ => None,
+        })
+        .await?;
+    assert!(why.contains("закреп"), "{why}");
+    b.until(
+        "закреп есть, файл вернулся без blob",
+        |m, _| {
+            m.state(&h).is_some_and(|(p, _)| p)
+                && m.files(&h).first().is_some_and(|f| f.blob.is_none())
+        },
+    )
+    .await?;
+    a.stop().await?;
+    b.stop().await?;
     server.shutdown().await
 }

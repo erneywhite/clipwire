@@ -636,6 +636,7 @@ pub fn run() {
             commands::history_list,
             commands::history_get,
             commands::history_pin,
+            commands::history_pin_size,
             commands::history_note,
             commands::history_delete_pinned,
             commands::history_delete,

@@ -756,6 +756,14 @@ pub static EN: &[(&str, &str)] = &[
         "The item is too large for a group pin: pinned on this device only",
     ),
     (
+        "на сервере не хватило места под закрепы группы",
+        "the server ran out of space for the group's pins",
+    ),
+    (
+        "Файл закрепа «{name}» не залился в хранилище группы ({why}): его можно взять, только пока это устройство в сети",
+        "The pinned file “{name}” was not uploaded to the group's storage ({why}): it is available only while this device is online",
+    ),
+    (
         "После смены ключа сервер не принял закрепов: {n}. {why}",
         "After the key change the server refused {n} pins. {why}",
     ),

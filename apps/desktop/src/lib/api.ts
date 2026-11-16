@@ -476,6 +476,8 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   get: (id: string) => invoke<Entry>('history_get', { id }),
   /** В группе закреп уходит на все устройства; открепление стирает подпись. */
   pin: (id: string, pinned: boolean) => invoke<void>('history_pin', { id, pinned }),
+  /** Сколько байт файлов закреп зальёт в хранилище группы, если это больше порога «сразу заливать»; 0 — спрашивать не нужно. */
+  pinSize: (id: string) => invoke<number>('history_pin_size', { id }),
   /** Подпись закреплённой записи (пустая — убрать). Возвращает сохранённую: до 80 символов, без переводов строк. */
   note: (id: string, note: string) => invoke<string>('history_note', { id, note }),
   /** Del на закрепе. Отказ сервера по квоте приходит событием clipwire://pin-failed (строка). */

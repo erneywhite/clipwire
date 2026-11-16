@@ -2037,6 +2037,70 @@ impl History {
         Ok(changed)
     }
 
+    /// Файлы закреплённой записи переехали (закреп починили или залили при
+    /// закреплении, `sync::pin_engine`): у записи с этим хэшем взять у
+    /// файлов `blob`, `blob_size` и `p2p` из `files` (по порядку; путь и
+    /// размер у них те же — хэш совпадает) и места файлов
+    /// (`ext::BLOB_PLACES`) из `places`. Возвращает пары «было, стало» у
+    /// файлов с другим `blob`; пусто — записи нет или ничего не поменялось.
+    pub fn set_pin_files(
+        &mut self,
+        hash: &[u8; 32],
+        files: &[FileRef],
+        places: &clipwire_core::storage::BlobPlaces,
+    ) -> Result<Vec<(FileRef, FileRef)>> {
+        let tx = self.tx()?;
+        let Some(id) = self.id_by_hkey(&self.hkey(hash))? else {
+            return Ok(Vec::new());
+        };
+        let Some((_, _, card)) = self.meta(id)? else {
+            return Ok(Vec::new());
+        };
+        let Some(mut e) = self.body(id)? else {
+            return Ok(Vec::new());
+        };
+        let Content::Files(old) = &mut e.content else {
+            return Ok(Vec::new());
+        };
+        if old.len() != files.len()
+            || old
+                .iter()
+                .zip(files)
+                .any(|(a, b)| a.path != b.path || a.size != b.size)
+        {
+            anyhow::bail!("файлы закрепа не совпадают с записью");
+        }
+        let mut moved = Vec::new();
+        let mut changed = false;
+        for (a, b) in old.iter_mut().zip(files) {
+            if (a.blob, a.blob_size, a.p2p) == (b.blob, b.blob_size, b.p2p) {
+                continue;
+            }
+            if a.blob != b.blob {
+                moved.push((a.clone(), b.clone()));
+            }
+            a.blob = b.blob;
+            a.blob_size = b.blob_size;
+            a.p2p = b.p2p;
+            changed = true;
+        }
+        let had = crate::storage::external::places(&e.ext);
+        if had != *places {
+            if places.is_empty() {
+                e.ext
+                    .retain(|x| x.tag != clipwire_core::item::ext::BLOB_PLACES);
+            } else {
+                e.ext_set(clipwire_core::item::ext::BLOB_PLACES, places);
+            }
+            changed = true;
+        }
+        if changed {
+            self.write(&e, card.icon, Thumb::Keep)?;
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
     /// Самая свежая запись с этим простым хэшем (`Content::hash`).
     pub fn id_by_hash(&self, hash: &[u8; 32]) -> Option<ItemId> {
         self.id_by_hkey(&self.hkey(hash)).ok().flatten()
@@ -2054,6 +2118,17 @@ impl History {
             tracing::warn!("история не прочиталась: {err:#}");
         }
         out
+    }
+
+    /// Запись с файлами с этим простым хэшем: тело читается, только если в
+    /// карточке есть файлы (проверка закрепов не тянет тексты и картинки).
+    pub fn files_entry(&self, hash: &[u8; 32]) -> Option<Entry> {
+        let id = self.id_by_hash(hash)?;
+        let (_, _, card) = self.meta(id).ok().flatten()?;
+        if card.files.is_empty() {
+            return None;
+        }
+        self.get(id)
     }
 
     /// Блобы файлов записи с этим простым хэшем (по карточке, без тела).
@@ -2680,6 +2755,58 @@ mod tests {
         let id = e.id;
         h.add(e).unwrap();
         id
+    }
+
+    #[test]
+    fn set_pin_files_moves_blobs_and_places() {
+        use clipwire_core::storage::BlobPlace;
+        let mut h = History::in_memory();
+        let f = FileRef {
+            name: "a.bin".into(),
+            path: "/x/a.bin".into(),
+            size: 5,
+            is_dir: false,
+            width: 0,
+            height: 0,
+            modified_ms: 1,
+            blob: Some(BlobId([1; 16])),
+            blob_size: 5,
+            p2p: true,
+        };
+        let content = Content::Files(vec![f.clone()]);
+        let hash = content.hash();
+        h.add(local_entry(DeviceId([1; 32]), "ПК", content))
+            .unwrap();
+        let moved = FileRef {
+            blob: Some(BlobId([2; 16])),
+            p2p: false,
+            ..f.clone()
+        };
+        let places = vec![(BlobId([2; 16]), BlobPlace::External { config_version: 3 })];
+        let pairs = h
+            .set_pin_files(&hash, std::slice::from_ref(&moved), &places)
+            .unwrap();
+        assert_eq!(pairs, vec![(f.clone(), moved.clone())]);
+        let e = h.get(h.id_by_hash(&hash).unwrap()).unwrap();
+        assert_eq!(e.content, Content::Files(vec![moved.clone()]));
+        assert_eq!(crate::storage::external::places(&e.ext), places);
+        assert_eq!(h.blobs_of(&hash), vec![BlobId([2; 16])], "карточка тоже");
+        // Повтор — без изменений; чужие файлы (другой путь) не принимаются.
+        assert!(
+            h.set_pin_files(&hash, std::slice::from_ref(&moved), &places)
+                .unwrap()
+                .is_empty()
+        );
+        let other = FileRef {
+            path: "/y".into(),
+            ..moved
+        };
+        assert!(h.set_pin_files(&hash, &[other], &places).is_err());
+        assert!(
+            h.set_pin_files(&[9; 32], &[f], &Vec::new())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn texts(v: Vec<Row>) -> Vec<String> {

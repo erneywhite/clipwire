@@ -623,10 +623,49 @@
     }
   }
 
-  async function togglePin(entry: Entry | undefined) {
+  /**
+   * Ctrl+P, пункт меню и кнопки предпросмотра. Закреп заливает файлы записи в
+   * хранилище группы независимо от порога «сразу заливать»: если их больше
+   * порога, сначала спросить (меню 'pin' с размером).
+   */
+  async function togglePin(entry: Entry | undefined, at?: Anchor) {
     if (!entry) return
+    if (!entry.pinned && entry.kind === 'files') {
+      let size = 0
+      try {
+        size = await api.pinSize(entry.id)
+      } catch (e) {
+        error = String(e)
+        return
+      }
+      if (size > 0) return askPin(entry, size, at)
+    }
     await api.pin(entry.id, !entry.pinned)
     await load()
+  }
+
+  /** Сколько байт уйдёт при закреплении (для вопроса в меню 'pin'). */
+  let pinBytes = $state(0)
+
+  async function askPin(entry: Entry, bytes: number, at?: Anchor) {
+    if (!at) {
+      if (entry.id === current?.id) await scrollToSel()
+      const r = listEl?.querySelector<HTMLElement>(`[data-i="${sel}"]`)?.getBoundingClientRect()
+      at = { x: r ? r.left + 24 : 24, y: r ? r.bottom - 6 : 60 }
+    }
+    pinBytes = bytes
+    openMenu(entry, at.x, at.y, true, 'pin', at.top)
+  }
+
+  async function confirmPin(entry: Entry) {
+    closeMenu()
+    try {
+      await api.pin(entry.id, true)
+    } catch (e) {
+      error = String(e)
+    }
+    await load()
+    await refreshPreview()
   }
 
   async function remove(entry: Entry | undefined) {
@@ -725,10 +764,10 @@
 
   // Меню по правому клику: координаты в окне и запись, к которой оно.
   // 'delete' — выбор, как убрать закреплённую запись.
-  let menu = $state<{ x: number; y: number; entry: Entry; kind: 'actions' | 'delete' } | null>(null)
+  let menu = $state<{ x: number; y: number; entry: Entry; kind: 'actions' | 'delete' | 'pin' } | null>(null)
   let menuEl: HTMLElement | undefined = $state()
 
-  async function openMenu(entry: Entry, x: number, y: number, keyboard = false, kind: 'actions' | 'delete' = 'actions', top = y) {
+  async function openMenu(entry: Entry, x: number, y: number, keyboard = false, kind: 'actions' | 'delete' | 'pin' = 'actions', top = y) {
     menu = { entry, x, y, kind }
     await tick()
     if (!menuEl) return
@@ -1130,7 +1169,7 @@
         <div class="actions">
           <button class="primary" onclick={() => paste(preview?.entry)}>{t('Вставить')}</button>
           <button onclick={() => edit(preview?.entry)}>{t('Изменить')}</button>
-          <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
+          <button onclick={(e) => togglePin(preview?.entry, below(e.currentTarget)).then(openPreview)}>
             {preview.entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
           <button class="danger" onclick={(e) => askRemove(preview?.entry, below(e.currentTarget))}>{t('Удалить')}</button>
@@ -1200,7 +1239,7 @@
           {#if isHere(entry.files[0])}
             <button onclick={() => showInFolder(entry.files[0])}>{t('Показать в папке')}</button>
           {/if}
-          <button onclick={() => togglePin(entry).then(openPreview)}>
+          <button onclick={(e) => togglePin(entry, below(e.currentTarget)).then(openPreview)}>
             {entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
           <button class="danger" onclick={(e) => askRemove(entry, below(e.currentTarget))}>{t('Удалить')}</button>
@@ -1246,7 +1285,7 @@
           {:else if preview.entry.rich}
             <button onclick={() => paste(preview?.entry, undefined, true)}>{t('Без форматирования')}</button>
           {/if}
-          <button onclick={() => togglePin(preview?.entry).then(openPreview)}>
+          <button onclick={(e) => togglePin(preview?.entry, below(e.currentTarget)).then(openPreview)}>
             {preview.entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
           <button class="danger" onclick={(e) => askRemove(preview?.entry, below(e.currentTarget))}>{t('Удалить')}</button>
@@ -1273,13 +1312,22 @@
     class="menu"
     role="menu"
     tabindex="-1"
-    aria-label={menu.kind === 'delete' ? t('Убрать закреплённую запись') : undefined}
+    aria-label={menu.kind === 'delete' ? t('Убрать закреплённую запись') : menu.kind === 'pin' ? t('Закрепить и залить') : undefined}
     bind:this={menuEl}
     style:left="{menu.x}px"
     style:top="{menu.y}px"
     onkeydown={menuKey}
   >
-    {#if menu.kind === 'delete'}
+    {#if menu.kind === 'pin'}
+      <!-- Закреп заливает файлы в хранилище группы: большие — только с согласия. -->
+      <p class="menu-head">{t('Закрепить и залить {size} в хранилище?', { size: bytesLabel(pinBytes) })}</p>
+      <button role="menuitem" class="choice" onclick={() => confirmPin(m)}>
+        <span>{t('Закрепить и залить')}</span><small>{t('файлы будут доступны на всех устройствах группы')}</small>
+      </button>
+      <button role="menuitem" class="choice" onclick={closeMenu}>
+        <span>{t('Не закреплять')}</span><small>{t('запись останется как есть')}</small>
+      </button>
+    {:else if menu.kind === 'delete'}
       <!-- Закреп живёт на всех устройствах группы: что именно убрать. -->
       <p class="menu-head">{t('Закреплённая запись')}</p>
       {#each deleteChoices() as c (c.mode)}

@@ -102,6 +102,11 @@ const en: Record<string, string> = {
   'Изменить подпись ({keys})': 'Edit note ({keys})',
   '+ подпись': '+ note',
   'Убрать закреплённую запись': 'Remove pinned item',
+  'Закрепить и залить {size} в хранилище?': 'Pin and upload {size} to storage?',
+  'Закрепить и залить': 'Pin and upload',
+  'файлы будут доступны на всех устройствах группы': 'the files will be available on every device in the group',
+  'Не закреплять': "Don't pin",
+  'запись останется как есть': 'the item stays as it is',
   'Закреплённая запись': 'Pinned item',
   'Подписать…': 'Edit note…',
 }

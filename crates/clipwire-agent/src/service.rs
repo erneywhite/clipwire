@@ -160,6 +160,16 @@ impl PinSource for HistorySource {
     fn upload_limit_mb(&self) -> u64 {
         self.limit_mb.load(Ordering::Relaxed)
     }
+
+    fn file_item(&self, hash: &[u8; 32]) -> Option<Item> {
+        let e = self.lock().files_entry(hash)?;
+        let local = e.local;
+        let mut item = item_of(e);
+        if local {
+            item.origin = self.device;
+        }
+        Some(item)
+    }
 }
 
 /// Запись истории как элемент группы (содержимое закрепа): без подписи,
@@ -648,6 +658,20 @@ impl Service {
                                 Err(e) => tracing::warn!("закреп не применился: {e}"),
                             }
                         }
+                        Event::PinFiles { hash, item } => {
+                            let res = tokio::task::spawn_blocking({
+                                let history = history.clone();
+                                let files_dir = crate::blobs::files_dir(&paths.dir);
+                                move || apply_pin_files(&history, &files_dir, &hash, &item)
+                            })
+                            .await;
+                            match res {
+                                Ok(Ok(true)) => on_event(UiEvent::PinsChanged),
+                                Ok(Ok(false)) => {}
+                                Ok(Err(e)) => tracing::warn!("файлы закрепа не записались: {e:#}"),
+                                Err(e) => tracing::warn!("файлы закрепа не записались: {e}"),
+                            }
+                        }
                         Event::PinFailed(why) => on_event(UiEvent::PinFailed(why)),
                         // Ключ уже не подходит серверу: на диске он только
                         // заставлял бы каждый запуск сначала пробовать его.
@@ -886,6 +910,38 @@ fn apply_pin_event(
         return Ok(false);
     }
     h.apply_pin(&p.hash, p.pinned, &p.note, entry)
+}
+
+/// Файлы закреплённой записи переехали (`sync::Event::PinFiles`): новые
+/// `blob` и места — в историю, скачанная копия — в каталог кэша нового
+/// `blob`, чтобы не качать её заново. `true` — запись поменялась.
+fn apply_pin_files(
+    history: &Mutex<History>,
+    files_dir: &Path,
+    hash: &[u8; 32],
+    item: &Item,
+) -> Result<bool> {
+    let Content::Files(files) = &item.content else {
+        return Ok(false);
+    };
+    let places = crate::storage::external::places(&item.ext);
+    let moved = history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_pin_files(hash, files, &places)?;
+    for (old, new) in &moved {
+        let (Some(a), Some(b)) = (old.blob, new.blob) else {
+            continue;
+        };
+        let (from, to) = (files_dir.join(a.hex()), files_dir.join(b.hex()));
+        if from.is_dir()
+            && !to.exists()
+            && let Err(e) = std::fs::rename(&from, &to)
+        {
+            tracing::info!("скачанная копия файла закрепа не переехала: {e}");
+        }
+    }
+    Ok(!moved.is_empty())
 }
 
 /// Сведения элемента без подписи: подпись не ходит внутри элементов.

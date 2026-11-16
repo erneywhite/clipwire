@@ -524,6 +524,55 @@ impl UploadJob {
     }
 }
 
+/// Задание заливки файла закрепа под новым `blob` из байтов этого
+/// устройства (`crate::pin_files::local_bytes`). Исходный файл грузится с
+/// места; копия из кэша — через жёсткую ссылку в outbox (не вышло — копией):
+/// кэш при смене `blob` переименовывается, и задание не должно от него
+/// зависеть; папка — архивом в outbox. Размер задания — то, что уйдёт
+/// (`FileRef::blob_size`). Папка, которая изменилась (другой размер
+/// содержимого), — ошибка. Блокирующая.
+pub fn pin_job(
+    outbox: &Path,
+    blob: BlobId,
+    f: &FileRef,
+    bytes: &crate::pin_files::Bytes,
+) -> Result<UploadJob> {
+    let job = |path: &Path, outbox: bool| -> Result<UploadJob> {
+        let (size, modified_ms) = file_stamp(path)?;
+        Ok(UploadJob {
+            blob,
+            path: path.to_string_lossy().into_owned(),
+            size,
+            modified_ms,
+            group: String::new(),
+            queued_ms: 0,
+            outbox,
+            external: None,
+        })
+    };
+    let dest = outbox_path(outbox, blob);
+    if f.is_dir {
+        let scan = crate::folder::scan_dir(bytes.path()).map_err(|e| anyhow!("{e}"))?;
+        ensure!(
+            scan.bytes == f.size,
+            tr("папка изменилась после копирования")
+        );
+        crate::folder::build_archive(&scan.entries, &dest)?;
+        return job(&dest, true);
+    }
+    match bytes {
+        crate::pin_files::Bytes::Source(p) => job(p, false),
+        crate::pin_files::Bytes::Cache(p) => {
+            std::fs::create_dir_all(outbox)?;
+            let _ = std::fs::remove_file(&dest);
+            if std::fs::hard_link(p, &dest).is_err() {
+                std::fs::copy(p, &dest)?;
+            }
+            job(&dest, true)
+        }
+    }
+}
+
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1234,7 +1283,13 @@ pub struct Blobs {
     uploaded: Mutex<crate::uploaded::UploadedLog>,
     /// Настройки группы: куда грузить файлы (сервер или внешнее хранилище).
     storage: Arc<crate::group_config::GroupStorage>,
+    /// Файлы, которых сервер не нашёл при скачивании: движок проверяет по
+    /// ним закрепы ([`Blobs::take_missing`]). Не больше [`MAX_MISSING`].
+    missing: Mutex<HashSet<BlobId>>,
 }
+
+/// Сколько потерянных файлов помнить до того, как движок их заберёт.
+const MAX_MISSING: usize = 1024;
 
 /// Поиск файла для прямой отдачи по `blob`: локальная запись истории, у
 /// файла которой `p2p = true`. Сервис ищет в своей истории.
@@ -1302,6 +1357,7 @@ impl Blobs {
             endpoint: watch::Sender::new(None),
             p2p_conns: tokio::sync::Mutex::new(HashMap::new()),
             building: Mutex::new(HashMap::new()),
+            missing: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1854,7 +1910,18 @@ impl Blobs {
                     .wait_conn(WAIT_CONN)
                     .await
                     .ok_or_else(|| anyhow!(tr("нет связи с сервером")))?;
-                download_blob(&conn, &self.key, blob, size, &target, progress).await?
+                match download_blob(&conn, &self.key, blob, size, &target, progress).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if e.downcast_ref::<BlobFail>() == Some(&BlobFail::NotFound) {
+                            let mut m = self.missing.lock().unwrap_or_else(|e| e.into_inner());
+                            if m.len() < MAX_MISSING {
+                                m.insert(blob);
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
             };
             // Файл с другого устройства — как скачанный из интернета: метка
             // ставится до того, как путь уйдёт в буфер или в «Открыть».
@@ -1887,6 +1954,115 @@ impl Blobs {
         blob_lock(&self.downloads, blob)
     }
 
+    /// Зарезервировать задания параллельно, каждое с тайм-аутом
+    /// [`CONTROL_TIMEOUT`]: во внешнем хранилище группы, если оно выбрано
+    /// (`external`), иначе — или если хранилище не ответило — на сервере.
+    /// Задание из внешнего хранилища возвращается с `external`. Число в
+    /// паре — номер файла у вызывающего, имя — для предупреждения.
+    fn reserve_each(
+        &self,
+        conn: &Connection,
+        external: Option<(u64, Arc<dyn crate::storage::ObjectStore>)>,
+        jobs: Vec<(usize, UploadJob, String)>,
+    ) -> tokio::task::JoinSet<(usize, UploadJob, Result<(), UploadError>)> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (i, job, name) in jobs {
+            let conn = conn.clone();
+            let external = external.clone();
+            let storage = self.storage.clone();
+            let key = self.key.clone();
+            tasks.spawn(async move {
+                // Во внешнем хранилище резерв — `meta` с `complete = false`.
+                // Не вышло — файл идёт через сервер, как раньше.
+                if let Some((version, store)) = external {
+                    let res = tokio::time::timeout(
+                        CONTROL_TIMEOUT,
+                        crate::storage::external::reserve(
+                            store.as_ref(),
+                            &key,
+                            job.blob,
+                            job.size,
+                        ),
+                    )
+                    .await
+                    .unwrap_or(Err(crate::storage::StoreError::Timeout));
+                    match res {
+                        Ok(()) => {
+                            let job = UploadJob {
+                                external: Some(version),
+                                ..job
+                            };
+                            return (i, job, Ok(()));
+                        }
+                        Err(e) => storage.warn(trf(
+                            "Внешнее хранилище недоступно ({e}), «{name}» отправлен через сервер Clipwire",
+                            &[("e", &e), ("name", &name)],
+                        )),
+                    }
+                }
+                let res = reserve_blob(&conn, job.blob, job.size).await;
+                (i, job, res)
+            });
+        }
+        tasks
+    }
+
+    /// Зарезервировать файлы закрепа, которые уже числятся в его записи на
+    /// сервере (`PinSet` ушёл раньше): сервер считает их в месте закрепов.
+    /// Возвращает принятые задания (их ставят в очередь, [`Blobs::enqueue`])
+    /// и отказы — `blob` с причиной для человека. Обрыв связи или временная
+    /// ошибка — `Err`: повторить всё позже (повторный резерв — как докачка).
+    pub async fn reserve_pin_jobs(
+        &self,
+        conn: &Connection,
+        jobs: Vec<(UploadJob, String)>,
+    ) -> Result<(Vec<UploadJob>, Vec<(BlobId, String)>), UploadError> {
+        let external = self.storage.external();
+        let wanted = jobs
+            .into_iter()
+            .enumerate()
+            .map(|(i, (j, name))| (i, j, name))
+            .collect();
+        let mut tasks = self.reserve_each(conn, external, wanted);
+        let (mut ok, mut failed, mut retry) = (Vec::new(), Vec::new(), None);
+        while let Some(r) = tasks.join_next().await {
+            let Ok((i, job, res)) = r else { continue };
+            match (reserve_verdict(&res, false), res) {
+                (Verdict::Keep, _) => ok.push((i, job)),
+                (Verdict::Retry, Err(e)) => {
+                    retry.get_or_insert(e);
+                }
+                (_, res) => {
+                    let why = match res {
+                        Err(UploadError::Rejected(BlobFail::QuotaExceeded)) => {
+                            tr("на сервере не хватило места под закрепы группы").to_string()
+                        }
+                        Err(e) => e.to_string(),
+                        Ok(()) => String::new(),
+                    };
+                    tracing::warn!(path = %job.path, "файл закрепа не зальётся: {why}");
+                    if job.outbox {
+                        let _ = std::fs::remove_file(&job.path);
+                    }
+                    self.transfers
+                        .finish(job.blob, Direction::Up, job.size, Err(why.clone()));
+                    failed.push((job.blob, why));
+                }
+            }
+        }
+        if let Some(e) = retry {
+            return Err(e);
+        }
+        ok.sort_by_key(|(i, _)| *i);
+        Ok((ok.into_iter().map(|(_, j)| j).collect(), failed))
+    }
+
+    /// Файлы, которых сервер не нашёл при скачивании (для починки закрепов):
+    /// забрать накопленное.
+    pub fn take_missing(&self) -> HashSet<BlobId> {
+        std::mem::take(&mut *self.missing.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// Перед отправкой элемента с файлами: зарезервировать на сервере все его
     /// файлы с `blob` (параллельно, каждый с тайм-аутом [`CONTROL_TIMEOUT`]).
     ///
@@ -1915,48 +2091,12 @@ impl Blobs {
             return Ok((content, Vec::new(), Vec::new()));
         };
         let external = self.storage.external();
-        let mut tasks = tokio::task::JoinSet::new();
-        for (i, f) in files.iter().enumerate() {
-            if let Some(job) = self.upload_job(f) {
-                let conn = conn.clone();
-                let external = external.clone();
-                let name = f.name.clone();
-                let storage = self.storage.clone();
-                let key = self.key.clone();
-                tasks.spawn(async move {
-                    // Во внешнем хранилище резерв — `meta` с `complete = false`.
-                    // Не вышло — файл идёт через сервер, как раньше.
-                    if let Some((version, store)) = external {
-                        let res = tokio::time::timeout(
-                            CONTROL_TIMEOUT,
-                            crate::storage::external::reserve(
-                                store.as_ref(),
-                                &key,
-                                job.blob,
-                                job.size,
-                            ),
-                        )
-                        .await
-                        .unwrap_or(Err(crate::storage::StoreError::Timeout));
-                        match res {
-                            Ok(()) => {
-                                let job = UploadJob {
-                                    external: Some(version),
-                                    ..job
-                                };
-                                return (i, job, Ok(()));
-                            }
-                            Err(e) => storage.warn(trf(
-                                "Внешнее хранилище недоступно ({e}), «{name}» отправлен через сервер Clipwire",
-                                &[("e", &e), ("name", &name)],
-                            )),
-                        }
-                    }
-                    let res = reserve_blob(&conn, job.blob, job.size).await;
-                    (i, job, res)
-                });
-            }
-        }
+        let wanted = files
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| self.upload_job(f).map(|j| (i, j, f.name.clone())))
+            .collect();
+        let mut tasks = self.reserve_each(conn, external.clone(), wanted);
         let mut jobs = Vec::new();
         let mut retry = None;
         while let Some(r) = tasks.join_next().await {

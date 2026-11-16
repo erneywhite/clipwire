@@ -288,7 +288,7 @@ fn headless(state: AgentState, paths: &Paths, send: Option<String>) -> Result<()
                     "сервер старше клиента, обновите образ сервера"
                 ),
                 // Без книги закрепов движок их не синхронизирует.
-                Event::Pin(_) => {}
+                Event::Pin(_) | Event::PinFiles { .. } => {}
                 Event::PinFailed(why) => eprintln!("{why}"),
                 Event::AdminKeyStale => eprintln!(
                     "ключ администратора сервера устарел: нужен новый код (clipwire-agent admin cwserver2-…)"
