@@ -775,9 +775,11 @@ commands that count Clipwire together with its WebView processes), is described 
 
 A release is built by GitHub Actions on a `vX.Y.Z` tag ([release.yml](.github/workflows/release.yml)):
 installers for Windows, macOS and Linux, signed update files and `latest.json`. The version comes
-from the workspace `Cargo.toml`. The signing keys live in the GitHub environment `release`, which
-accepts only `v*` tags and waits for the owner to approve each build, so a workflow from any other
-branch cannot read them.
+from the workspace `Cargo.toml`. The three builds run in parallel into a draft release, a final
+job assembles `latest.json` from their signatures, and only then is the release published. The
+signing keys live in the GitHub environment `release`, which accepts only `v*` tags and waits for
+the owner to approve the release (one approval covers all three builds), so a workflow from any
+other branch cannot read them.
 
 Icons, installer images and the logo in this README are generated from the sources in
 `docs/brand/` with `node apps/desktop/scripts/icons.mjs`, then

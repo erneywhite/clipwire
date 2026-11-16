@@ -229,8 +229,8 @@ API на своём потоке async-io; атрибуты `application=io.gith
   в `.deb` секция `utils` и рекомендация проигрывателя звука. Ярлык — свой шаблон
   `linux/clipwire.desktop` (английский `Comment` и русский `Comment[ru]`, ключевые слова,
   `StartupWMClass=clipwire`). Общий `longDescription` в `tauri.conf.json`.
-- `release.yml`: задание `linux` на ubuntu-22.04 (старый glibc), после `macos`, файлы
-  `Clipwire_*_linux_amd64.deb` / `.AppImage`; `latest.json` получает `linux-x86_64`
+- `release.yml`: задание `linux` на ubuntu-22.04 (старый glibc), параллельно с остальными, файлы
+  `Clipwire_*_linux_amd64.deb` / `.AppImage`; `latest.json` (задание `publish`) получает `linux-x86_64`
   (AppImage) и `linux-x86_64-deb`. `APPIMAGE_EXTRACT_AND_RUN=1` — FUSE на раннерах нет.
 - Обновления: AppImage — тихо, как на других ОС; `.deb` плагин ставит через `pkexec dpkg -i`
   с паролем, поэтому только по кнопке (`updates::silent_install_possible`).
