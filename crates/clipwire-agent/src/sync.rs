@@ -15,7 +15,7 @@ use clipwire_core::p2p::P2P_ALPN;
 use clipwire_core::proto::io::{read_msg, write_msg};
 use clipwire_core::proto::{
     ALPNS, ClientMsg, DeviceEntry, GroupStats, PinStats, ServerMsg, alpn_version, knows_admin,
-    knows_deletes, knows_pins, knows_server_info, knows_stats, version_older,
+    knows_deletes, knows_pins, knows_server_info, knows_stats, server_outdated,
 };
 use clipwire_core::{Content, DeviceId, Ext, ExtList, GroupId, GroupKey, Item, ItemId, SourceApp};
 use iroh::endpoint::{Connection, presets};
@@ -240,8 +240,9 @@ pub enum Event {
     /// Устройство группы подключилось, отключилось или обновило карточку
     /// (сервер по `clipwire/6`): открытый список устройств стоит перечитать.
     DevicesChanged,
-    /// Сервер старше этого клиента: образ сервера пора обновить. `None` —
-    /// сервер не сообщает версию (до `clipwire/7`, то есть старше 0.4.0).
+    /// Протокол сервера старше протокола клиента (`proto::server_outdated`):
+    /// образ сервера пора обновить. `None` — сервер не сообщает версию (до
+    /// `clipwire/7`, то есть старше 0.4.0).
     ServerOutdated(Option<String>),
     /// Закреп группы изменился (с другого устройства, при входе или после
     /// разбора дублей): поставить в истории закреп и подпись, добавить запись
@@ -929,8 +930,8 @@ impl Engine {
             ));
         }
         // Версию сообщает только сервер по `clipwire/7`; старее — сразу ясно,
-        // что он отстал.
-        if !knows_server_info(alpn) {
+        // что он отстал. Новее — сообщим вместе с версией (`ServerInfo`).
+        if !knows_server_info(alpn) && server_outdated(self.server_protocol) {
             self.emit(Event::ServerOutdated(None));
         }
         // Вошли в старую группу как обычно: `Rekey`, на который не пришёл
@@ -1241,7 +1242,7 @@ impl Engine {
             },
             ServerMsg::DevicesChanged => self.emit(Event::DevicesChanged),
             ServerMsg::ServerInfo { version } => {
-                if version_older(&version, CLIENT_VERSION) {
+                if server_outdated(self.server_protocol) {
                     self.emit(Event::ServerOutdated(Some(version.clone())));
                 }
                 self.server_version = Some(version);
