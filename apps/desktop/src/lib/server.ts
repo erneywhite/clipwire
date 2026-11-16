@@ -311,7 +311,8 @@ export function groupLabel(g: Pick<ServerGroup, 'name' | 'fingerprint'>): string
 }
 
 /** Управляющие символы и символы направления текста: те же, что отклоняет сервер. */
-const BAD_NAME_CHARS = /[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/
+// Управляющие и невидимые символы, как `is_invisible_char` в clipwire-core.
+const BAD_NAME_CHARS = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff]/
 
 /**
  * Проверка имени до отправки, по правилам сервера (`normalize_group_name`):

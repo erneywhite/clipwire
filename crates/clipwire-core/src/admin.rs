@@ -367,13 +367,31 @@ pub fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
+/// Невидимые символы, которыми имя можно сделать похожим на другое:
+/// направление текста, нулевой ширины, разделители строк и абзацев, мягкий
+/// перенос, BOM. Тот же набор, что `is_format_char` у имён файлов в агенте,
+/// плюс U+2028/2029.
+pub fn is_invisible_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
+}
+
 /// Имя группы для `SetGroupName`: пробелы по краям убираются, пустое —
-/// снять имя. Управляющие символы и символы направления текста — отказ, а не
-/// тихая замена: имя набирает человек, пусть он увидит, что не так. Длиннее
-/// [`MAX_GROUP_NAME`] символов — тоже отказ, без обрезки.
+/// снять имя. Управляющие и невидимые символы ([`is_invisible_char`]) — отказ,
+/// а не тихая замена: имя набирает человек, пусть он увидит, что не так.
+/// Длиннее [`MAX_GROUP_NAME`] символов — тоже отказ, без обрезки.
 pub fn normalize_group_name(name: &str) -> Result<String, AdminFail> {
     let name = name.trim();
-    let bad = name.chars().any(|c| c.is_control() || is_bidi_control(c));
+    let bad = name.chars().any(|c| c.is_control() || is_invisible_char(c));
     if bad || name.chars().count() > MAX_GROUP_NAME {
         return Err(AdminFail::BadGroupName {
             max: MAX_GROUP_NAME as u64,
@@ -512,6 +530,11 @@ mod tests {
         assert_eq!(normalize_group_name("а\nб"), bad);
         assert_eq!(normalize_group_name("\u{202E}анаМ"), bad);
         assert_eq!(normalize_group_name("а\u{2066}б"), bad);
+        for c in [
+            '\u{200B}', '\u{200E}', '\u{2028}', '\u{2029}', '\u{061C}', '\u{FEFF}', '\u{00AD}',
+        ] {
+            assert_eq!(normalize_group_name(&format!("а{c}б")), bad, "{:?}", c);
+        }
         // Эмодзи и обычные знаки можно.
         assert_eq!(normalize_group_name("Офис 🏢 (2)").unwrap(), "Офис 🏢 (2)");
     }

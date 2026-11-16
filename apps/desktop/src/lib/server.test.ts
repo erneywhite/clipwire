@@ -129,11 +129,11 @@ check(deleteGroupText(group({ name: 'Семья' }))[0].includes('«Семья»
 check(groupNameError('  Семья ') === '', 'пробелы по краям можно')
 check(groupNameError('') === '' && groupNameError('   ') === '', 'пустое — снять имя')
 check(groupNameError('я'.repeat(GROUP_NAME_MAX)) === '', 'ровно предел')
+check([0x200b, 0x200e, 0x2028, 0xfeff, 0xad].every((c) => groupNameError('а' + String.fromCharCode(c) + 'б') !== ''), 'невидимые символы — ошибка')
 check(groupNameError('я'.repeat(GROUP_NAME_MAX + 1)) !== '', 'длиннее предела')
 check(groupNameError('😀'.repeat(GROUP_NAME_MAX)) === '', 'эмодзи считаются символами, а не половинками')
 check(groupNameError('а\nб') !== '' && groupNameError('а\u0007б') !== '', 'управляющие символы')
 check(groupNameError('‮анам') !== '', 'символы направления текста')
-check(groupNameError('а​б') === '', 'остальные невидимые сервер пропускает — и мы')
 
 // Коды создания группы.
 const { creationKind, inviteIssuedText, inviteLabel, inviteState, inviteStateText, inviteTtlText, sortInvites, timeLeftText, DEFAULT_INVITE_TTL, INVITE_TTLS } =

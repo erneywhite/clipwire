@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use clipwire_core::admin::{GroupEntry, GroupInfo, GroupState, MAX_GROUP_NAME, is_bidi_control};
+use clipwire_core::admin::{GroupEntry, GroupInfo, GroupState, MAX_GROUP_NAME, is_invisible_char};
 use clipwire_core::blob::{CHUNK, OVERHEAD};
 use clipwire_core::{BlobId, DeviceId, GroupId};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -56,7 +56,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
 pub(super) fn name_from_invite(label: &str) -> String {
     label
         .chars()
-        .filter(|c| !c.is_control() && !is_bidi_control(*c))
+        .filter(|c| !c.is_control() && !is_invisible_char(*c))
         .collect::<String>()
         .trim()
         .chars()
