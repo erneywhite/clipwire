@@ -63,6 +63,18 @@ export interface GroupDevice {
   online: boolean
   /** Последний вход в группу, мс; 0 — неизвестно. */
   last_seen_ms: number
+  /** Когда это устройство впервые увидело карточку (по своим записям), мс; 0 — давно. */
+  first_seen_ms: number
+}
+
+/** Смена ключа другим устройством, которая ждёт ответа (`group_rekey_offer`). */
+export interface RekeyOffer {
+  /** Имя, ОС и отпечаток устройства, сменившего ключ. */
+  name: string
+  os: string
+  fingerprint: string
+  /** Когда новый ключ пришёл на это устройство, мс. */
+  received_ms: number
 }
 
 /** Что лежит у группы на сервере. */
@@ -243,6 +255,8 @@ export type Status =
    * `deleted` — группу удалил администратор сервера.
    */
   | { kind: 'excluded'; detail: { deleted: boolean } }
+  /** Ключ группы сменило другое устройство: синхронизация стоит, пока человек не ответит. */
+  | { kind: 'awaiting' }
 
 /** События группы, которые окно настроек забирает у Rust (`group_notices_take`). */
 export interface GroupNotices {
@@ -251,6 +265,8 @@ export interface GroupNotices {
   rekey_failed: string | null
   /** Сервер исключил устройство. */
   excluded: boolean
+  /** Другое устройство сменило ключ, нужен ответ (`group_rekey_offer`). */
+  offered: boolean
 }
 
 /** Для списка устройств: итог смены ключа, пришедший событием. */
@@ -466,8 +482,17 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   groupNoticesTake: () => invoke<GroupNotices>('group_notices_take'),
   devicesList: () => invoke<GroupDevice[]>('devices_list'),
   statsOverview: () => invoke<StatsOverview>('stats_overview'),
-  deviceRemove: (deviceId: string) => invoke<RekeyResult>('device_remove', { deviceId }),
-  groupRekey: () => invoke<RekeyResult>('group_rekey'),
+  /** `confirmed` — получатели нового ключа, которых человек видел в диалоге;
+   *  `alsoRemove` — те, с кого он снял галочку. */
+  deviceRemove: (deviceId: string, confirmed: string[], alsoRemove: string[]) =>
+    invoke<RekeyResult>('device_remove', { deviceId, confirmed, alsoRemove }),
+  groupRekey: (confirmed: string[], remove: string[]) => invoke<RekeyResult>('group_rekey', { confirmed, remove }),
+  /** Смена ключа другим устройством, которая ждёт ответа; null — такой нет. */
+  groupRekeyOffer: () => invoke<RekeyOffer | null>('group_rekey_offer'),
+  /** «Перейти»: принять новый ключ. */
+  groupRekeyAccept: () => invoke<void>('group_rekey_accept'),
+  /** «Это не я»: не переходить, устройство помечается исключённым. */
+  groupRekeyDecline: () => invoke<void>('group_rekey_decline'),
   /** После исключения: снять отметку и снова запустить синхронизацию. */
   groupRetry: () => invoke<void>('group_retry'),
   copyQuietly: (text: string) => invoke<void>('copy_quietly', { text }),

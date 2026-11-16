@@ -1,14 +1,14 @@
 <script lang="ts">
   import { isLinux, isMac, keys } from '../lib/platform'
   import { onMount } from 'svelte'
-  import { t } from '../lib/i18n'
+  import { lang, t } from '../lib/i18n'
   import { listen } from '@tauri-apps/api/event'
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import { enable, disable, isEnabled } from '@tauri-apps/plugin-autostart'
   import { check, type Update } from '@tauri-apps/plugin-updater'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { api, type DeviceInfo, type DevicesIncoming, type GroupDevice, type GroupNotices, type Retention, type Settings, type StatsOverview, type Status, type StorageState, type Theme } from '../lib/api'
-  import { rekeyedBy } from '../lib/devices'
+  import { api, type DeviceInfo, type DevicesIncoming, type GroupDevice, type GroupNotices, type RekeyOffer, type Retention, type Settings, type StatsOverview, type Status, type StorageState, type Theme } from '../lib/api'
+  import { offerText, rekeyedBy } from '../lib/devices'
   import { applyTheme } from '../lib/theme'
   import * as fmt from '../lib/format'
   import { bytesLabel } from '../lib/format'
@@ -92,7 +92,7 @@
   let adminError = $state('')
   /** Сервер не принял ключ администратора (сменили): нужен новый код. */
   let adminStale = $state(false)
-  const showServer = $derived(adminKey && configured && status.kind !== 'excluded')
+  const showServer = $derived(adminKey && configured && status.kind !== 'excluded' && status.kind !== 'awaiting')
   const sections = $derived(allSections.filter((x) => x.id !== 'server' || showServer))
 
   async function loadAdmin() {
@@ -169,6 +169,45 @@
     }
   }
 
+  /** Ключ группы сменило другое устройство, новый ключ ждёт ответа. */
+  let offer = $state<RekeyOffer | null>(null)
+  let offerBusy = $state(false)
+  const offerLines = $derived(
+    offer ? offerText(offer, new Date(offer.received_ms).toLocaleString(lang() === 'en' ? 'en-GB' : 'ru-RU', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })) : [],
+  )
+
+  async function loadOffer() {
+    try {
+      offer = await api.groupRekeyOffer()
+    } catch {
+      offer = null
+    }
+  }
+
+  // Вопрос лежит на диске: показать его, как только статус о нём сказал
+  // (в том числе при открытии настроек после перезапуска).
+  $effect(() => {
+    if (status.kind === 'awaiting') loadOffer()
+    else offer = null
+  })
+
+  /** «Перейти» или «Это не я». */
+  async function answerOffer(accept: boolean) {
+    offerBusy = true
+    error = ''
+    try {
+      if (accept) await api.groupRekeyAccept()
+      else await api.groupRekeyDecline()
+      invite = ''
+      createdInvite = ''
+      await refresh()
+    } catch (e) {
+      error = String(e)
+    } finally {
+      offerBusy = false
+    }
+  }
+
   function flash(msg: string) {
     notice = msg
     setTimeout(() => (notice === msg ? (notice = '') : null), 2500)
@@ -210,7 +249,7 @@
     } catch {
       return
     }
-    if (n.excluded) {
+    if (n.excluded || n.offered) {
       invite = ''
       createdInvite = ''
       section = 'sync'
@@ -223,7 +262,7 @@
     }
     const result = n.rekeyed?.by_me ? n.rekeyed.result : null
     if (result || n.rekey_failed) devicesIncoming = { result, error: n.rekey_failed }
-    if (n.excluded || n.rekeyed) refresh()
+    if (n.excluded || n.rekeyed || n.offered) refresh()
   }
 
   async function refresh() {
@@ -480,6 +519,8 @@
         return t('Синхронизация не запустилась')
       case 'excluded':
         return st.detail?.deleted ? t('Группу удалил администратор сервера') : t('Устройство исключено из группы')
+      case 'awaiting':
+        return t('Ключ группы сменён: нужен ваш ответ')
     }
   }
 
@@ -535,6 +576,7 @@
       listen('clipwire://group-rekeyed', pullGroupNotices),
       listen('clipwire://group-rekey-failed', pullGroupNotices),
       listen('clipwire://group-excluded', pullGroupNotices),
+      listen('clipwire://group-rekey-offered', pullGroupNotices),
       // Ключ администратора устарел: раздел «Сервер» пропадает, здесь — подсказка.
       listen('clipwire://admin-changed', () => loadAdmin()),
       listen('settings://close-blocked', () => {
@@ -710,6 +752,23 @@
             <div class="buttons">
               <button class="danger" disabled={retrying} onclick={leave}>{t('Выйти из группы')}</button>
             </div>
+          </div>
+        {:else if status.kind === 'awaiting'}
+          <div class="card pad" role="alertdialog" aria-labelledby="offer-title">
+            <h2 class="in-card" id="offer-title">{t('Ключ группы сменён на другом устройстве')}</h2>
+            {#each offerLines as line (line)}
+              <p class="hint">{line}</p>
+            {/each}
+            {#if !offer}
+              <p class="hint">{t('Синхронизация остановлена, пока вы не ответите.')}</p>
+            {/if}
+            <div class="buttons">
+              <button class="primary" disabled={offerBusy || !offer} onclick={() => answerOffer(true)}>{t('Перейти на новый ключ')}</button>
+              <button class="danger" disabled={offerBusy} onclick={() => answerOffer(false)}>{t('Это не я, не переходить')}</button>
+            </div>
+            <p class="hint">
+              {t('После отказа устройство останется со старым ключом и без синхронизации: дальше можно выйти из группы или попробовать снова.')}
+            </p>
           </div>
         {:else if status.kind === 'excluded'}
           <div class="card pad">
@@ -1271,6 +1330,7 @@
   }
   .status[data-kind='offline'] .dot,
   .status[data-kind='excluded'] .dot,
+  .status[data-kind='awaiting'] .dot,
   .status[data-kind='unconfigured'] .dot {
     background: var(--st-error);
   }

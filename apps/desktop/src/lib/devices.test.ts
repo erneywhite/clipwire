@@ -3,7 +3,7 @@
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
 import type { GroupDevice } from './api'
 
-const { canClaimAdmin, canManage, confirmText, deviceTitle, exposedAccessText, isAdmin, leftOut, rekeyedBy, rolesText, seenLabel } = (await import('./devices' + '.ts')) as typeof import('./devices')
+const { FRESH_MS, canClaimAdmin, canManage, confirmText, deviceTitle, exposedAccessText, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, leftOut, offerText, recipients, rekeyChoice, rekeyedBy, rolesText, sameName, seenLabel, staying } = (await import('./devices' + '.ts')) as typeof import('./devices')
 const fmt = (await import('./format' + '.ts')) as typeof import('./format')
 
 function check(cond: boolean, msg: string) {
@@ -11,7 +11,7 @@ function check(cond: boolean, msg: string) {
 }
 
 function d(id: string, over: Partial<GroupDevice>): GroupDevice {
-  return { id, fingerprint: id.slice(0, 4), name: id, os: 'Windows', known: true, me: false, online: false, last_seen_ms: 0, ...over }
+  return { id, fingerprint: id.slice(0, 4), name: id, os: 'Windows', known: true, me: false, online: false, last_seen_ms: 0, first_seen_ms: 0, ...over }
 }
 
 const now = Date.parse('2026-11-13T12:00:00Z')
@@ -58,6 +58,67 @@ const rekey = confirmText([me, work, phone], null, fmt)
 check(!rekey.some((s) => s.includes('потеряет доступ')), 'без удаления никто не теряет доступ')
 check(rekey.some((s) => s.startsWith('2 устройства получат')), 'двое получат ключ')
 check(!rekey.some((s) => s.startsWith('Внимание')), 'без неизвестных нет предупреждения')
+
+// Получатели нового ключа: с карточкой, без этого устройства и без удаляемого.
+const ids = (l: GroupDevice[]) => l.map((x) => x.id).join()
+check(ids(recipients(list, null)) === 'bbbb,cccc', 'получатели: все с карточкой, кроме своего')
+check(ids(recipients(list, 'cccc')) === 'bbbb', 'удаляемое ключ не получает')
+check(ids(recipients(list, 'dddd')) === 'bbbb,cccc', 'удаляют устройство без карточки — получатели те же')
+
+// В команду уходит то, что человек видел: отмеченные — получатели, без галочки — исключаются.
+const all = rekeyChoice(list, 'cccc', [])
+check(all.confirmed.join() === 'bbbb' && all.remove.length === 0, 'подтверждены все показанные получатели')
+check(!all.confirmed.includes('aaaa') && !all.confirmed.includes('cccc') && !all.confirmed.includes('dddd'), 'ни своё, ни удаляемое, ни без карточки')
+const twin = d('eeee', { name: 'Рабочий', first_seen_ms: now - 60 * 60_000 })
+const withTwin = [...list, twin]
+const picked = rekeyChoice(withTwin, 'cccc', ['eeee'])
+check(picked.confirmed.join() === 'bbbb' && picked.remove.join() === 'eeee', 'без галочки — в исключаемые')
+check(rekeyChoice(withTwin, 'cccc', ['cccc', 'aaaa', 'zzzz']).remove.length === 0, 'лишние id в исключаемые не попадают')
+// Диалог показывал список без двойника: его id в подтверждённых нет, движок смену отменит.
+check(!rekeyChoice(list, 'cccc', []).confirmed.includes('eeee'), 'устройство, которого не было в диалоге, не подтверждено')
+
+// Недавно появившиеся устройства выделяются.
+check(isFresh(twin, now), 'час назад — недавнее')
+check(!isFresh(d('f', { first_seen_ms: now - FRESH_MS - 1 }), now), 'больше суток — нет')
+check(!isFresh(work, now), 'время 0 — устройство в группе давно')
+check(!isFresh(d('g', { me: true, first_seen_ms: now }), now), 'своё не выделяется')
+check(!isFresh(d('h', { known: false, first_seen_ms: now }), now), 'без карточки не получатель')
+check(firstSeenLabel(work, fmt, now) === 'в группе давно', 'подпись: давно')
+check(firstSeenLabel(twin, fmt, now) === 'появилось: 1 ч', 'подпись: час назад')
+check(firstSeenLabel(d('i', { first_seen_ms: now - 5_000 }), fmt, now) === 'появилось только что', 'подпись: только что')
+check(freshWarning(withTwin, 'cccc', [], now).startsWith('Внимание'), 'предупреждение про недавние')
+check(freshWarning(withTwin, 'cccc', ['eeee'], now) === '', 'галочку сняли — предупреждать не о чем')
+check(freshWarning(list, 'cccc', [], now) === '', 'недавних нет')
+check(freshWarning(withTwin, 'eeee', [], now) === '', 'недавнее и есть удаляемое')
+
+// Двойник по имени виден и без «недавно»: он мог войти в группу заранее.
+const oldTwin = d('ffff', { name: 'рабочий ' })
+check(sameName([...list, oldTwin], work) && sameName([...list, oldTwin], oldTwin), 'одинаковое имя без учёта регистра и пробелов')
+check(!sameName(list, work) && !sameName(list, unknown), 'имя одно; без карточки не сравнивается')
+check(freshWarning([...list, oldTwin], 'cccc', [], now).includes('одинаковым именем'), 'предупреждение про одинаковые имена')
+check(freshWarning([...list, oldTwin], 'cccc', ['ffff'], now) === '', 'с двойника галочку сняли — имя снова одно')
+check(ids(staying([...list, oldTwin], 'cccc', ['ffff'])) === 'aaaa,bbbb', 'остаются своё и получатели с галочкой')
+check(freshWarning([me, d('gggg', { name: 'Ноутбук' })], null, [], now).includes('одинаковым именем'), 'двойник этого устройства')
+
+// Текст подтверждения учитывает снятые галочки.
+const dropTwin = confirmText(withTwin, 'cccc', fmt, 's3', ['eeee'])
+check(dropTwin.some((s) => s.startsWith('Без галочки: «Рабочий» (eeee)')), 'кто без галочки')
+check(dropTwin.some((s) => s.startsWith('1 устройство получит')), 'получателей на одного меньше')
+const dropOnly = confirmText([me, work, phone], null, fmt, 's3', ['cccc'])
+check(dropOnly.some((s) => s.startsWith('Внимание: у исключённого устройства остались')), 'смена ключа со снятой галочкой: доступы к хранилищу')
+check(dropOnly.some((s) => s.startsWith('Токен доступа')), 'и токен сервера')
+check(dropOnly.some((s) => s.startsWith('1 устройство получит')), 'один получатель')
+
+check(isNewDeviceError('В группе появилось новое устройство. Проверьте список получателей и подтвердите смену ключа заново'), 'отмена смены: новое устройство')
+check(isNewDeviceError('A new device has joined the group. Check the list'), 'то же по-английски')
+check(!isNewDeviceError('Нет связи с сервером'), 'другая ошибка')
+
+// Вопрос на устройстве, которому новый ключ прислали.
+const offer = offerText({ name: 'MacBook', os: 'macOS', fingerprint: 'ab12cd34ef', received_ms: now }, 'в 12:00')
+check(offer[0].includes('«MacBook»') && offer[0].includes('macOS') && offer[0].includes('ab12cd34ef') && offer[0].includes('в 12:00'), 'кто сменил ключ: имя, ОС, отпечаток, время')
+check(offer[0].endsWith('Перейти на него?'), 'вопрос')
+check(offer.some((s) => s.includes('синхронизация стоит')) && offer.some((s) => s.includes('не переходите')), 'что происходит и когда отказаться')
+check(offerText({ name: ' ', os: '', fingerprint: 'ff', received_ms: 0 }, '')[0].includes('«Неизвестное устройство» (?'), 'без имени и ОС')
 
 // Админ группы.
 check(canManage(null, list) && canManage({ supported: false, admin: null }, list), 'не знаем или старый сервер — можно')

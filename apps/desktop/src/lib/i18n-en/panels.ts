@@ -136,6 +136,10 @@ const en: Record<string, string> = {
   'Ключ группы сменён. Новый код приглашения:': 'The group key was rotated. New invite code:',
   'Скопировано': 'Copied',
   'Скопировать код': 'Copy code',
+  'Новый ключ получат:': 'These devices will get the new key:',
+  'Кроме этого устройства, новый ключ не получит никто.': 'No device other than this one will get the new key.',
+  'недавно': 'new',
+  'имя повторяется': 'duplicate name',
   'Не получили новый ключ: {names}. Подключите их заново по этому коду.': 'Did not receive the new key: {names}. Reconnect them with this code.',
 }
 

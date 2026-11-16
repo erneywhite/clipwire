@@ -99,6 +99,7 @@ impl Paths {
         let uploads = self.dir.join(crate::blobs::UPLOADS_FILE);
         let known = self.dir.join(crate::devices::KNOWN_FILE);
         let excluded = self.dir.join(crate::devices::EXCLUDED_FILE);
+        let offer = self.dir.join(crate::devices::OFFER_FILE);
         let config = self.dir.join(crate::group_config::CONFIG_FILE);
         let cleaned = self.dir.join(crate::group_config::CLEANED_FILE);
         let pins = self.dir.join(crate::pins::PINS_FILE);
@@ -109,6 +110,7 @@ impl Paths {
             uploads,
             known,
             excluded,
+            offer,
             config,
             cleaned,
             pins,

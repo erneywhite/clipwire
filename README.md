@@ -404,13 +404,29 @@ Clipwire version shows up as "unknown device". The list updates by itself when a
 connects, disconnects or is renamed (server 0.1.4 or newer).
 
 **Removing a device.** A lost or sold computer can be removed with **Remove**. The group key is
-replaced, the remaining devices get the new key on their own (switched-off ones when they come
-online, within 30 days), and the removed device loses access to the server, the files and direct
+replaced, the remaining devices are sent the new key (switched-off ones when they come online,
+within 30 days), and the removed device loses access to the server, the files and direct
 transfer. On it, syncing stops and Sync offers **Leave group** and **Try again**. Its key and
 history are not wiped automatically, because the server can say "you were removed" without a key
-change, and what was already on the device stays there. A new key is accepted only if it was
-issued by a device that this computer has already seen in the list; after the change, settings
-say which device changed it. The removed device keeps the relay token from the invitation code:
+change, and what was already on the device stays there.
+
+Before the key changes, Clipwire shows who will get the new one: name, OS, fingerprint and when
+the device joined the group. Devices this computer first saw less than a day ago are
+highlighted. Check the list: the device being removed knows the old key and may have joined
+again under another name beforehand. Untick a device you do not recognise and it is removed
+together with the first one. The new key goes only to the devices you saw in that list. If
+another device joins the group in the meantime, the change is cancelled and you review the list
+again.
+
+The other devices do not take the new key on their own. Syncing stops, a notification arrives,
+and Sync asks: which device changed the key (name, OS, fingerprint), when the new key arrived,
+and whether to switch to it. If you changed the key yourself, compare the fingerprint with the
+one that device shows under **Group devices** and press **Switch to the new key**. If you did
+not, press **Not me, do not switch**: such a key may have come from someone who was removed from
+the group, and your clipboard would go to them. Nothing is sent to the group until you answer,
+and the question survives a restart. Only a key changed by this very device is accepted without
+asking. A new key from a device this computer has never seen in the list is not accepted at
+all. The removed device keeps the relay token from the invitation code:
 it can no longer create groups (that needs the administrator code since server 0.5.0), but it
 can still reach the relay. If the computer may have fallen into the wrong hands, the server
 administrator changes the relay token (the app calls it the **access token**, in the **Server**
@@ -746,7 +762,9 @@ Icons, installer images and the logo in this README are generated from the sourc
   several clients through it.
 - Agent tests in `crates/clipwire-agent/tests` also use a real server. `sync.rs` covers the sync
   engine; `devices.rs` covers device cards and group key changes (removing a device, a switched-off
-  device signing in after a change, a change without removal, a change by an unknown device);
+  device signing in after a change and answering "switch" or "not me", a change without removal,
+  a change by an unknown device, a change cancelled because a device joined after the list was
+  confirmed);
   `files.rs` covers file transfer (upload and download into the cache, resuming after a drop,
   downloading during an upload, server refusal, direct transfer from a device, folders through
   the server and directly); `storage.rs` covers group settings through the server and files

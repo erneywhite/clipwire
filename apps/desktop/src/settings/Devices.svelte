@@ -5,7 +5,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, type DevicesIncoming, type GroupDevice, type RekeyResult, type Status, type StorageKind } from '../lib/api'
   import { ago, plural } from '../lib/format'
-  import { CHECKING, canClaimAdmin, canManage, checking as checkingText, confirmText, deviceTitle, isAdmin, rolesText, seenLabel, type Roles } from '../lib/devices'
+  import { CHECKING, canClaimAdmin, canManage, checking as checkingText, confirmText, deviceTitle, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, recipients, rekeyChoice, rolesText, sameName, seenLabel, staying, type Roles } from '../lib/devices'
 
   // `incoming` — итог смены ключа, пришедший событием (его забирает окно
   // настроек: раздел мог быть закрыт). Принятый сообщается `onIncomingTaken`.
@@ -31,6 +31,14 @@
   let busy = $state(false)
   /** Что подтверждаем: id удаляемого устройства, '' — смена ключа без удаления. */
   let confirming = $state<string | null>(null)
+  /** Список устройств на момент открытия подтверждения. Человек подтверждает
+   *  именно его: `list` за это время может обновиться, а новый ключ должны
+   *  получить только те, кого он видел. */
+  let shown = $state<GroupDevice[]>([])
+  /** Получатели, с которых сняли галочку: они исключаются вместе с удаляемым. */
+  let unticked = $state<string[]>([])
+  /** Когда открыли подтверждение: от этого момента считается «недавно появилось». */
+  let shownAt = $state(0)
   let result = $state<RekeyResult | null>(null)
   let copied = $state(false)
   /** Ответ на смену ключа потерялся, ждём, что скажет сервер при повторном входе. */
@@ -66,7 +74,14 @@
     }
   }
 
-  const explain = $derived(confirming === null ? [] : confirmText(list, confirming || null, fmt, storageKind))
+  const explain = $derived(confirming === null ? [] : confirmText(shown, confirming || null, fmt, storageKind, unticked))
+  const keyTo = $derived(confirming === null ? [] : recipients(shown, confirming || null))
+  const stay = $derived(confirming === null ? [] : staying(shown, confirming || null, unticked))
+  const freshNote = $derived(confirming === null ? '' : freshWarning(shown, confirming || null, unticked, shownAt))
+
+  function toggle(id: string, on: boolean) {
+    unticked = on ? unticked.filter((x) => x !== id) : [...unticked, id]
+  }
 
   async function loadStorage() {
     try {
@@ -76,10 +91,17 @@
     }
   }
 
-  /** Спросить подтверждение удаления: вид хранилища к этому моменту мог смениться. */
-  function askRemove(id: string) {
-    confirming = id
+  /** Спросить подтверждение удаления (`id`) или смены ключа (`''`). Список
+   *  перечитывается и запоминается: человек подтверждает то, что видит.
+   *  Вид хранилища к этому моменту тоже мог смениться. */
+  async function ask(id: string) {
     result = null
+    await load()
+    if (error) return
+    shown = list
+    unticked = []
+    shownAt = Date.now()
+    confirming = id
     loadStorage()
   }
 
@@ -122,7 +144,10 @@
     checking = false
     try {
       const id = confirming
-      done(id ? await api.deviceRemove(id) : await api.groupRekey())
+      // В команду уходит показанный список, а не свежий: устройство, которого
+      // в диалоге не было, движок заметит и смену отменит.
+      const pick = rekeyChoice(shown, id || null, unticked)
+      done(id ? await api.deviceRemove(id, pick.confirmed, pick.remove) : await api.groupRekey(pick.confirmed, pick.remove))
     } catch (e) {
       const msg = String(e)
       // Текст приходит из Rust на языке интерфейса; русский — на случай старых сообщений.
@@ -131,6 +156,11 @@
         confirming = null
       } else {
         error = msg
+        // Состав группы изменился: закрыть вопрос и показать новый список.
+        if (isNewDeviceError(msg)) {
+          confirming = null
+          load().then(() => (error = msg))
+        }
       }
     } finally {
       busy = false
@@ -209,7 +239,7 @@
         <button disabled={busy || handBusy} onclick={() => (handing = d.id)}>{t('Сделать админом')}</button>
       {/if}
       {#if !d.me && manage}
-        <button class="danger" disabled={busy} onclick={() => askRemove(d.id)}>{t('Удалить')}</button>
+        <button class="danger" disabled={busy} onclick={() => ask(d.id)}>{t('Удалить')}</button>
       {/if}
     </div>
     {#if handing === d.id}
@@ -256,6 +286,19 @@
       {#each explain as line (line)}
         <p class="hint" class:warn={line.startsWith('Внимание') || line.startsWith('Warning')}>{line}</p>
       {/each}
+      <div class="keyto">
+        <span class="hint">{keyTo.length > 0 ? t('Новый ключ получат:') : t('Кроме этого устройства, новый ключ не получит никто.')}</span>
+        {#each keyTo as d (d.id)}
+          <label class="pick" class:fresh={isFresh(d, shownAt) || sameName(stay, d)}>
+            <input type="checkbox" checked={!unticked.includes(d.id)} disabled={busy} onchange={(e) => toggle(d.id, e.currentTarget.checked)} />
+            <span class="who">
+              <span class="name">{deviceTitle(d)}{#if isFresh(d, shownAt)}<span class="badge new">{t('недавно')}</span>{/if}{#if sameName(stay, d)}<span class="badge new">{t('имя повторяется')}</span>{/if}</span>
+              <span class="meta mono">{d.os ?? '?'} · {d.fingerprint} · {firstSeenLabel(d, fmt, shownAt)}</span>
+            </span>
+          </label>
+        {/each}
+        {#if freshNote}<p class="hint warn">{freshNote}</p>{/if}
+      </div>
       <div class="buttons">
         <button class="danger" disabled={busy} onclick={run}>
           {busy ? t('Меняю ключ…') : confirming ? t('Удалить устройство') : t('Сменить ключ')}
@@ -267,7 +310,7 @@
     <p class="hint">
       {t('Новый ключ получат все устройства группы, а старый код приглашения перестанет работать. Пригодится, если код приглашения попал не туда.')}
     </p>
-    <button disabled={busy || !loaded || list.length === 0 || !manage} onclick={() => ((confirming = ''), (result = null))}>
+    <button disabled={busy || !loaded || list.length === 0 || !manage} onclick={() => ask('')}>
       {t('Сменить ключ группы')}
     </button>
   {/if}
@@ -369,6 +412,32 @@
   .meta {
     color: var(--c-muted);
     overflow-wrap: anywhere;
+  }
+  .keyto {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .pick {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: 6px var(--space-3);
+    border: 1px solid var(--c-border);
+    border-radius: var(--radius-m);
+    cursor: pointer;
+  }
+  .pick.fresh {
+    border-color: var(--c-danger);
+  }
+  .pick input {
+    flex: none;
+    margin: 0;
+    accent-color: var(--c-accent);
+  }
+  .badge.new {
+    border-color: var(--c-danger);
+    color: var(--c-danger);
   }
   .hint {
     font-size: var(--text-s);

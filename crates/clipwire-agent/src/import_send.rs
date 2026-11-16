@@ -361,7 +361,7 @@ pub async fn send_all(
             Event::Flush(tx) => {
                 let _ = tx.send(());
             }
-            Event::Rekeyed(_) => break Some("ключ группы сменён".into()),
+            Event::Rekeyed(_) | Event::RekeyOffered(_) => break Some("ключ группы сменён".into()),
             Event::Excluded { .. } => break Some("устройство исключено из группы".into()),
             Event::GroupDeleted { .. } => break Some("группу удалил администратор".into()),
             _ => {}

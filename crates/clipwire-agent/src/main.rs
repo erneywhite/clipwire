@@ -23,6 +23,10 @@ clipwire-agent — общий буфер обмена Clipwire
   reset                       забыть группу и ключи на этом устройстве
   retry                       снять отметку «исключено» и снова пробовать
                               синхронизацию (ключ группы не менялся)
+  rekey-accept                перейти на новый ключ группы, который прислало
+                              другое устройство (run спросит об этом сам)
+  rekey-decline               не переходить: ключ сменили не вы. Устройство
+                              помечается исключённым, ключ и история остаются
 
 Отладка, без буфера и трея:
   listen                      печатать всё, что приходит в группу
@@ -134,11 +138,39 @@ fn main() -> Result<()> {
             clipwire_agent::devices::clear_excluded(&paths)?;
             println!("Отметка об исключении снята. Запуск синхронизации: clipwire-agent run");
         }
+        "rekey-accept" => match clipwire_agent::devices::accept_offer(&paths)? {
+            Some(o) => println!(
+                "Новый ключ группы от устройства «{}» ({}) принят. Запуск синхронизации: \
+                 clipwire-agent run",
+                o.initiator_name,
+                clipwire_agent::devices::fingerprint(o.initiator)
+            ),
+            None => println!("Смены ключа, которая ждёт подтверждения, нет."),
+        },
+        "rekey-decline" => {
+            if clipwire_agent::devices::decline_offer(&paths)? {
+                println!(
+                    "Новый ключ отброшен, устройство помечено исключённым. Выйти из группы — \
+                     clipwire-agent reset, попробовать снова — clipwire-agent retry"
+                );
+            } else {
+                println!("Смены ключа, которая ждёт подтверждения, нет.");
+            }
+        }
         "run" => {
             let state = paths
                 .load()?
                 .context("устройство ещё не в группе: сначала create или join")?;
             let group = state.invite.group_key.group_id();
+            if let Some(o) = clipwire_agent::devices::load_offer(&paths, group) {
+                bail!(
+                    "устройство «{}» ({}, отпечаток {}) сменило ключ группы. Если это сделали \
+                     вы — clipwire-agent rekey-accept, если нет — clipwire-agent rekey-decline",
+                    o.initiator_name,
+                    o.initiator_os,
+                    clipwire_agent::devices::fingerprint(o.initiator)
+                );
+            }
             if clipwire_agent::devices::is_group_deleted(&paths, group) {
                 bail!(
                     "группу удалил администратор сервера. Выйти из группы — clipwire-agent reset"
@@ -221,7 +253,7 @@ fn headless(state: AgentState, paths: &Paths, send: Option<String>) -> Result<()
                     let _ = done.send(());
                 }
                 // Отладочный режим ничего не сохраняет: только сообщает.
-                Event::Rekeyed(n) => {
+                Event::Rekeyed(n) | Event::RekeyOffered(n) => {
                     eprintln!("ключ группы сменило устройство «{}»", n.initiator_name)
                 }
                 Event::Excluded { .. } => eprintln!("сервер сообщил, что устройство исключено"),
@@ -324,6 +356,23 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
                         "ключ группы сменило устройство «{who}», перезапустите clipwire-agent run"
                     ),
                     Err(e) => eprintln!("новый ключ группы не сохранился: {e:#}"),
+                }
+            }
+            // Чужой ключ сам не принимается: решает человек.
+            UiEvent::RekeyOffered(n) => {
+                let now = clipwire_agent::history::now_ms();
+                match Paths::resolve()
+                    .and_then(|p| clipwire_agent::devices::save_offer(&p, &n, now))
+                {
+                    Ok(_) => eprintln!(
+                        "устройство «{}» ({}, отпечаток {}) сменило ключ группы. Синхронизация \
+                         остановлена. Если это сделали вы — clipwire-agent rekey-accept, если \
+                         нет — clipwire-agent rekey-decline",
+                        n.initiator_name,
+                        n.initiator_os,
+                        clipwire_agent::devices::fingerprint(n.initiator)
+                    ),
+                    Err(e) => eprintln!("смена ключа не запомнилась: {e:#}"),
                 }
             }
             UiEvent::Excluded { old } => {

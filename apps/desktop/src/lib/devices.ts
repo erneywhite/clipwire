@@ -1,5 +1,5 @@
 // Подписи и тексты подтверждений для раздела «Устройства группы».
-import type { GroupAdmin, GroupDevice, StorageKind } from './api'
+import type { GroupAdmin, GroupDevice, RekeyOffer, StorageKind } from './api'
 import type * as format from './format'
 import { t, tn, lang } from './i18n.ts'
 import { deviceName } from './platform.ts'
@@ -40,6 +40,87 @@ export function seenLabel(d: GroupDevice, { ago }: Fmt, now = Date.now()): strin
 /** Устройства, которые не получат новый ключ: без карточки и не удаляемое. */
 export function leftOut(list: GroupDevice[], removeId: string | null): GroupDevice[] {
   return list.filter((d) => !d.me && !d.known && d.id !== removeId)
+}
+
+/** Кому можно передать новый ключ: устройства с карточкой, кроме этого и удаляемого. */
+export function recipients(list: GroupDevice[], removeId: string | null): GroupDevice[] {
+  return list.filter((d) => !d.me && d.known && d.id !== removeId)
+}
+
+/** Сутки: устройство, которое здесь впервые увидели позже, в списке получателей выделено. */
+export const FRESH_MS = 24 * 60 * 60 * 1000
+
+/** Карточку устройства здесь впервые увидели меньше суток назад. */
+export function isFresh(d: GroupDevice, now = Date.now()): boolean {
+  return !d.me && d.known && d.first_seen_ms > 0 && now - d.first_seen_ms < FRESH_MS
+}
+
+/** В списке есть другое устройство с таким же именем. Имя устройство выбирает
+ *  само, так что исключаемое могло войти ещё раз под именем соседнего:
+ *  различает их только отпечаток. */
+export function sameName(list: GroupDevice[], d: GroupDevice): boolean {
+  if (!d.known) return false
+  const name = deviceTitle(d).toLowerCase()
+  return list.some((x) => x.id !== d.id && x.known && deviceTitle(x).toLowerCase() === name)
+}
+
+/** Кто останется в группе с новым ключом: это устройство и получатели с галочкой. */
+export function staying(list: GroupDevice[], removeId: string | null, unticked: string[]): GroupDevice[] {
+  return list.filter((d) => d.me || (d.known && d.id !== removeId && !unticked.includes(d.id)))
+}
+
+/** «в группе давно», «появилось: 5 мин назад». Время — по записям этого устройства. */
+export function firstSeenLabel(d: GroupDevice, { ago }: Fmt, now = Date.now()): string {
+  if (!d.first_seen_ms) return t('в группе давно')
+  const a = ago(d.first_seen_ms, now)
+  if (a === t('сейчас')) return t('появилось только что')
+  return lang() === 'en' && /^\d/.test(a) ? t('появилось: {a} назад', { a }) : t('появилось: {a}', { a })
+}
+
+/**
+ * Что уходит в команду смены ключа: `confirmed` — получатели, которых человек
+ * видел и оставил с галочкой; `remove` — получатели, с которых он галочку снял
+ * (они исключаются вместе с удаляемым). `list` — список, показанный в диалоге,
+ * а не свежий: если к моменту смены в группе окажется кто-то ещё, движок
+ * смену отменит.
+ */
+export function rekeyChoice(list: GroupDevice[], removeId: string | null, unticked: string[]): { confirmed: string[]; remove: string[] } {
+  const all = recipients(list, removeId)
+  return {
+    confirmed: all.filter((d) => !unticked.includes(d.id)).map((d) => d.id),
+    remove: all.filter((d) => unticked.includes(d.id)).map((d) => d.id),
+  }
+}
+
+/** Предупреждение над списком получателей, если среди отмеченных есть недавние. */
+export function freshWarning(list: GroupDevice[], removeId: string | null, unticked: string[], now = Date.now()): string {
+  const stay = staying(list, removeId, unticked)
+  const fresh = stay.some((d) => isFresh(d, now))
+  const twins = stay.some((d) => !d.me && sameName(stay, d))
+  if (!fresh && !twins) return ''
+  return fresh
+    ? t('Внимание: выделенные устройства появились в группе меньше суток назад. Если вы их не подключали, снимите с них галочку: новый ключ они не получат.')
+    : t('Внимание: в группе есть устройства с одинаковым именем. Сверьте отпечатки и снимите галочку с того, которое не ваше.')
+}
+
+/** Сервер отменил бы смену ключа: в группе появилось устройство, которого не было в диалоге. */
+export function isNewDeviceError(msg: string): boolean {
+  return msg.includes('В группе появилось новое устройство') || msg.includes('A new device has joined the group')
+}
+
+/** Вопрос на устройстве, которое получило новый ключ от другого устройства. */
+export function offerText(o: RekeyOffer, when: string): string[] {
+  const name = deviceName(o.name) || t('Неизвестное устройство')
+  return [
+    t('Устройство «{name}» ({os}, отпечаток {fp}) сменило ключ группы. Новый ключ пришёл сюда {when}. Перейти на него?', {
+      name,
+      os: o.os || '?',
+      fp: o.fingerprint,
+      when,
+    }),
+    t('Пока вы не ответили, синхронизация стоит: скопированное в группу не уходит. Если ключ меняли вы, сверьте отпечаток с тем, что показывает то устройство в разделе «Устройства группы», и переходите.'),
+    t('Если вы ключ не меняли, не переходите. Новый ключ мог прислать тот, кого удалили из группы, и тогда всё скопированное уйдёт к нему.'),
+  ]
 }
 
 /**
@@ -101,9 +182,11 @@ export function rolesText(roles: Roles, list: GroupDevice[]): string {
  * Объяснение перед подтверждением: что будет с удаляемым и с остальными.
  * `storage` — вид хранилища файлов группы (`null` — не знаем).
  */
-export function confirmText(list: GroupDevice[], removeId: string | null, _fmt: Fmt, storage: StorageKind | null = null): string[] {
+export function confirmText(list: GroupDevice[], removeId: string | null, _fmt: Fmt, storage: StorageKind | null = null, unticked: string[] = []): string[] {
   const out: string[] = []
   const target = list.find((d) => d.id === removeId)
+  // Получатели, с которых сняли галочку: исключаются вместе с удаляемым.
+  const dropped = recipients(list, removeId).filter((d) => unticked.includes(d.id))
   if (target) {
     out.push(
       t('«{name}» потеряет доступ к группе: не получит новые элементы и файлы и не сможет вернуться по старому коду приглашения. То, что уже есть на нём, останется.', {
@@ -111,15 +194,23 @@ export function confirmText(list: GroupDevice[], removeId: string | null, _fmt: 
       }),
     )
   }
+  if (dropped.length > 0) {
+    out.push(
+      t('Без галочки: {names}. Они тоже потеряют доступ к группе.', {
+        names: dropped.map((d) => `«${deviceTitle(d)}» (${d.fingerprint})`).join(', '),
+      }),
+    )
+  }
   const lost = leftOut(list, removeId)
   // Доступы к внешнему хранилищу остаются у всех, кто окажется вне группы:
   // и у исключаемого, и у тех, кому новый ключ не передать.
-  const exposed = exposedAccessText(storage, !!target, lost.length)
+  const removing = !!target || dropped.length > 0
+  const exposed = exposedAccessText(storage, removing, lost.length)
   if (exposed) out.push(exposed)
   // Токен сервера из приглашения у исключённого остаётся: с ним можно создавать
   // группы и занимать квоту файлов. Сменить его можно только на сервере.
-  if (target) out.push(serverTokenText())
-  const others = list.filter((d) => !d.me && d.known && d.id !== removeId)
+  if (removing) out.push(serverTokenText())
+  const others = recipients(list, removeId).filter((d) => !unticked.includes(d.id))
   if (others.length > 0) {
     out.push(
       tn(

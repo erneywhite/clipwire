@@ -40,10 +40,14 @@ pub enum UiEvent {
     /// Прогресс загрузки или скачивания файла (не чаще раза в 200 мс на файл
     /// плюс финальное).
     Transfer(Transfer),
-    /// Ключ группы сменили (кто — в `initiator_name`, или это устройство,
-    /// если ответ на свой `Rekey` потерялся). Сервис больше не
-    /// синхронизируется: сохранить ключ (`devices::adopt_key`) и перезапустить.
+    /// Ключ группы сменило это устройство, а ответ на свой `Rekey`
+    /// потерялся. Сервис больше не синхронизируется: сохранить ключ
+    /// (`devices::adopt_key`) и перезапустить.
     Rekeyed(crate::devices::RekeyNotice),
+    /// Ключ группы сменило другое устройство (кто — в `initiator_name`).
+    /// Сервис больше не синхронизируется и на новый ключ сам не переходит:
+    /// запомнить (`devices::save_offer`) и спросить человека.
+    RekeyOffered(crate::devices::RekeyNotice),
     /// Сервер сообщил, что устройство исключено из группы `old`: пометить
     /// (`devices::mark_excluded`), ключ и история остаются.
     Excluded {
@@ -610,6 +614,7 @@ impl Service {
                             let _ = done.send(());
                         }
                         Event::Rekeyed(n) => on_event(UiEvent::Rekeyed(n)),
+                        Event::RekeyOffered(n) => on_event(UiEvent::RekeyOffered(n)),
                         Event::Excluded { old } => on_event(UiEvent::Excluded { old }),
                         Event::GroupDeleted { old } => on_event(UiEvent::GroupDeleted { old }),
                         Event::RekeyLost(why) => on_event(UiEvent::RekeyLost(why)),

@@ -104,20 +104,33 @@ impl RekeyPlan {
     /// Окажется ли после смены ключа вне группы хоть одно устройство,
     /// кроме этого: исключаемое (`remove`) или без карточки (`skipped`).
     /// У таких остаются доступы к внешнему хранилищу группы.
-    pub fn leaves_out_any(&self, remove: Option<DeviceId>) -> bool {
-        remove.is_some() || !self.skipped.is_empty()
+    pub fn leaves_out_any(&self, remove: &[DeviceId]) -> bool {
+        !remove.is_empty() || !self.skipped.is_empty()
     }
 }
 
-/// Решить, кто получает новый ключ: все устройства с карточкой, кроме
-/// `remove`, и это устройство (`me`, `my_rekey_pub`).
+/// Решить, кто получает новый ключ: это устройство (`me`, `my_rekey_pub`) и
+/// устройства с карточкой из `confirmed`, кроме `remove`. Исключить можно
+/// несколько устройств разом: иначе участник с двумя идентификаторами
+/// всегда оставался бы в группе хотя бы одним.
+///
+/// `devices` — свежий список сервера, `confirmed` — получатели, которых
+/// человек видел в диалоге и подтвердил. Список сервера с тех пор мог
+/// измениться, и верить ему нельзя: исключаемое устройство могло войти
+/// вторым идентификатором, сервер мог подмешать устройство только в этот
+/// ответ. Поэтому устройство с карточкой вне `confirmed` отменяет смену
+/// целиком: ключ не уходит никому, человек смотрит список заново.
+/// Подтверждённое устройство, которого в свежем списке нет, ключ не
+/// получает: передать его не на что. Устройства без карточки, как и
+/// раньше, попадают в `skipped`: ключ им не передать при любом списке.
 pub fn plan_rekey(
     devices: &[DeviceView],
     me: DeviceId,
     my_rekey_pub: [u8; 32],
-    remove: Option<DeviceId>,
+    remove: &[DeviceId],
+    confirmed: &[DeviceId],
 ) -> Result<RekeyPlan> {
-    if let Some(r) = remove {
+    for &r in remove {
         if r == me {
             bail!(tr(
                 "Это устройство так не удалить. Чтобы выйти, отключитесь от группы"
@@ -132,11 +145,23 @@ pub fn plan_rekey(
         skipped: Vec::new(),
     };
     for d in devices {
-        if d.device == me || Some(d.device) == remove {
+        if d.device == me || remove.contains(&d.device) {
             continue;
         }
         match &d.card {
-            Some(c) => plan.recipients.push((d.device, c.rekey_pub)),
+            Some(c) if confirmed.contains(&d.device) => {
+                plan.recipients.push((d.device, c.rekey_pub))
+            }
+            Some(c) => {
+                tracing::warn!(
+                    device = %fingerprint(d.device),
+                    name = %c.name,
+                    "в списке сервера устройство, которого не было при подтверждении: смена ключа отменена"
+                );
+                bail!(tr(
+                    "В группе появилось новое устройство. Проверьте список получателей и подтвердите смену ключа заново"
+                ));
+            }
             None => plan.skipped.push(d.device),
         }
     }
@@ -191,12 +216,15 @@ pub fn adopt_key(paths: &Paths, old: GroupId, new_key: GroupKey) -> Result<bool>
     if let Err(e) = paths.forget_uploads() {
         tracing::warn!("очередь загрузок старой группы не удалилась: {e:#}");
     }
-    let known = load_known(paths, old);
-    if let Err(e) = save_known(paths, new, &known) {
+    let known = read_known(paths, old);
+    if let Err(e) = write_known(paths, new, &known) {
         tracing::warn!("карточки устройств не перенеслись в новую группу: {e:#}");
     }
     if let Err(e) = clear_excluded(paths) {
         tracing::warn!("отметка об исключении не удалилась: {e:#}");
+    }
+    if let Err(e) = clear_offer(paths) {
+        tracing::warn!("{e:#}");
     }
     Ok(true)
 }
@@ -279,11 +307,58 @@ pub fn clear_excluded(paths: &Paths) -> Result<()> {
 /// Файл проверенных карточек устройств группы.
 pub const KNOWN_FILE: &str = "devices.bin";
 
-/// Проверенные карточки на диске: для какой группы и сами карточки.
+/// Проверенные карточки на диске: для какой группы, сами карточки и когда
+/// этот клиент увидел каждое устройство впервые (мс Unix, по порядку
+/// карточек). Времена дописаны в конец: старая версия читает файл как
+/// раньше, а файл старой версии читается через [`KnownOnDiskV1`].
 #[derive(serde::Serialize, serde::Deserialize)]
 struct KnownOnDisk {
     group: [u8; 32],
     cards: Vec<DeviceCard>,
+    first_seen_ms: Vec<i64>,
+}
+
+/// Файл до появления `first_seen_ms`.
+#[derive(serde::Deserialize)]
+struct KnownOnDiskV1 {
+    group: [u8; 32],
+    cards: Vec<DeviceCard>,
+}
+
+/// Карточки группы `group` с временем первого появления. У карточек из
+/// файла старой версии время 0: устройство видели давно.
+fn read_known(paths: &Paths, group: GroupId) -> Vec<(DeviceCard, i64)> {
+    let Ok(raw) = std::fs::read(paths.dir.join(KNOWN_FILE)) else {
+        return Vec::new();
+    };
+    let (g, cards, seen) = match postcard::from_bytes::<KnownOnDisk>(&raw) {
+        Ok(k) => (k.group, k.cards, k.first_seen_ms),
+        Err(_) => match postcard::from_bytes::<KnownOnDiskV1>(&raw) {
+            Ok(k) => (k.group, k.cards, Vec::new()),
+            Err(e) => {
+                tracing::warn!("devices.bin не разобрался: {e}");
+                return Vec::new();
+            }
+        },
+    };
+    if g != group.0 {
+        return Vec::new();
+    }
+    cards
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| (c, seen.get(i).copied().unwrap_or(0)))
+        .collect()
+}
+
+fn write_known(paths: &Paths, group: GroupId, known: &[(DeviceCard, i64)]) -> Result<()> {
+    std::fs::create_dir_all(&paths.dir)?;
+    let raw = postcard::to_stdvec(&KnownOnDisk {
+        group: group.0,
+        cards: known.iter().map(|k| k.0.clone()).collect(),
+        first_seen_ms: known.iter().map(|k| k.1).collect(),
+    })?;
+    crate::state::write_atomic(&paths.dir.join(KNOWN_FILE), &raw)
 }
 
 /// Карточки устройств группы `group`, которые этот клиент уже видел и
@@ -292,30 +367,150 @@ struct KnownOnDisk {
 /// списка устройств у него в этот момент уже не спросить. Файл другой
 /// группы или битый — пусто.
 pub fn load_known(paths: &Paths, group: GroupId) -> Vec<DeviceCard> {
-    let Ok(raw) = std::fs::read(paths.dir.join(KNOWN_FILE)) else {
-        return Vec::new();
+    read_known(paths, group).into_iter().map(|k| k.0).collect()
+}
+
+/// Когда этот клиент впервые увидел карточку каждого устройства группы
+/// `group` (мс Unix; 0 — давно, до того как время стали записывать).
+/// Времени сервера и времени из карточки здесь нет: первое может подделать
+/// сервер, второе — само устройство.
+pub fn first_seen(paths: &Paths, group: GroupId) -> std::collections::HashMap<DeviceId, i64> {
+    read_known(paths, group)
+        .into_iter()
+        .map(|(c, at)| (c.device, at))
+        .collect()
+}
+
+/// Сохранить проверенные карточки группы `group`. Устройство, которого в
+/// файле ещё не было, получает время первого появления «сейчас».
+pub fn save_known(paths: &Paths, group: GroupId, cards: &[DeviceCard]) -> Result<()> {
+    save_known_at(paths, group, cards, crate::history::now_ms())
+}
+
+/// [`save_known`] с заданным «сейчас».
+pub fn save_known_at(
+    paths: &Paths,
+    group: GroupId,
+    cards: &[DeviceCard],
+    now_ms: i64,
+) -> Result<()> {
+    let seen = first_seen(paths, group);
+    let known: Vec<_> = cards
+        .iter()
+        .map(|c| (c.clone(), seen.get(&c.device).copied().unwrap_or(now_ms)))
+        .collect();
+    write_known(paths, group, &known)
+}
+
+/// Файл смены ключа, которая ждёт решения человека.
+pub const OFFER_FILE: &str = "rekey-offer.bin";
+
+/// Новый ключ группы от другого устройства, который ждёт решения человека
+/// (`docs/devices.md`, «Подтверждение на остальных устройствах»). Лежит на
+/// диске защищённым так же, как ключ группы (`state.bin`): вопрос переживает
+/// перезапуск, а ответить «Перейти» можно и без связи с сервером.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RekeyOffer {
+    /// Группа, ключ которой сменили.
+    pub old: GroupId,
+    /// Предложенный ключ. Пока человек не ответил, им ничего не шифруется.
+    pub key: GroupKey,
+    /// Кто сменил ключ: подпись пакета проверена, карточка известна.
+    pub initiator: DeviceId,
+    pub initiator_name: String,
+    pub initiator_os: String,
+    /// Когда пакет пришёл на это устройство (мс Unix). Времени самой смены
+    /// в пакете нет, а серверу здесь верить нельзя.
+    pub received_ms: i64,
+}
+
+/// Запомнить смену ключа до решения человека. Если на диске уже другая
+/// группа, ничего не делает и возвращает `false`.
+pub fn save_offer(paths: &Paths, n: &RekeyNotice, now_ms: i64) -> Result<bool> {
+    match paths.load()? {
+        Some(s) if s.invite.group_key.group_id() == n.old => {}
+        _ => return Ok(false),
+    }
+    let offer = RekeyOffer {
+        old: n.old,
+        key: n.key.clone(),
+        initiator: n.initiator,
+        initiator_name: n.initiator_name.clone(),
+        initiator_os: n.initiator_os.clone(),
+        received_ms: now_ms,
     };
-    match postcard::from_bytes::<KnownOnDisk>(&raw) {
-        Ok(k) if k.group == group.0 => k.cards,
-        Ok(_) => Vec::new(),
+    let plain = postcard::to_stdvec(&offer)?;
+    crate::state::write_atomic(
+        &paths.dir.join(OFFER_FILE),
+        &crate::secret::protect(&plain)?,
+    )?;
+    Ok(true)
+}
+
+/// Смена ключа группы `group`, которая ждёт решения. Файл другой группы
+/// или битый — `None`.
+pub fn load_offer(paths: &Paths, group: GroupId) -> Option<RekeyOffer> {
+    let path = paths.dir.join(OFFER_FILE);
+    let raw = std::fs::read(&path).ok()?;
+    let plain = match crate::secret::unprotect_file(&path, &raw) {
+        Ok(p) => p,
         Err(e) => {
-            tracing::warn!("devices.bin не разобрался: {e}");
-            Vec::new()
+            tracing::warn!("rekey-offer.bin не открылся: {e:#}");
+            return None;
         }
+    };
+    let offer: RekeyOffer = postcard::from_bytes(&plain)
+        .map_err(|e| tracing::warn!("rekey-offer.bin не разобрался: {e}"))
+        .ok()?;
+    (offer.old == group).then_some(offer)
+}
+
+/// Забыть смену ключа, ждавшую решения.
+pub fn clear_offer(paths: &Paths) -> Result<()> {
+    match std::fs::remove_file(paths.dir.join(OFFER_FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).context("не удалился файл ожидающей смены ключа"),
     }
 }
 
-/// Сохранить проверенные карточки группы `group`.
-pub fn save_known(paths: &Paths, group: GroupId, cards: &[DeviceCard]) -> Result<()> {
-    std::fs::create_dir_all(&paths.dir)?;
-    let raw = postcard::to_stdvec(&KnownOnDisk {
-        group: group.0,
-        cards: cards.to_vec(),
-    })?;
-    crate::state::write_atomic(&paths.dir.join(KNOWN_FILE), &raw)
+/// «Перейти»: человек подтвердил, что ключ сменило его устройство. Новый
+/// ключ сохраняется ([`adopt_key`]), ожидание снимается. `None` — ждать
+/// было нечего (или группа на диске уже другая).
+pub fn accept_offer(paths: &Paths) -> Result<Option<RekeyOffer>> {
+    let Some(state) = paths.load()? else {
+        return Ok(None);
+    };
+    let Some(offer) = load_offer(paths, state.invite.group_key.group_id()) else {
+        return Ok(None);
+    };
+    if !adopt_key(paths, offer.old, offer.key.clone())? {
+        return Ok(None);
+    }
+    Ok(Some(offer))
 }
 
-/// Ключ группы сменился, и движок принял новый ключ (`sync::Event::Rekeyed`).
+/// «Это не я»: предложенный ключ выбрасывается, устройство помечается
+/// исключённым ([`mark_excluded`]) и не синхронизируется, пока человек не
+/// выйдет из группы или не попробует снова. `false` — ждать было нечего.
+pub fn decline_offer(paths: &Paths) -> Result<bool> {
+    let Some(state) = paths.load()? else {
+        return Ok(false);
+    };
+    let group = state.invite.group_key.group_id();
+    if load_offer(paths, group).is_none() {
+        return Ok(false);
+    }
+    // Сначала отметка: если она не запишется, вопрос останется на экране.
+    mark_excluded(paths, group)?;
+    clear_offer(paths)?;
+    Ok(true)
+}
+
+/// Ключ группы сменился, пакет нового ключа открылся. Если ключ сменило это
+/// устройство, движок сообщает `sync::Event::Rekeyed`, и ключ принимается
+/// сразу. Пакет от другого устройства — `sync::Event::RekeyOffered`: ключ
+/// ждёт решения человека ([`save_offer`]).
 #[derive(Debug, Clone)]
 pub struct RekeyNotice {
     pub old: GroupId,
@@ -324,6 +519,8 @@ pub struct RekeyNotice {
     pub initiator: DeviceId,
     /// Имя инициатора из проверенной карточки.
     pub initiator_name: String,
+    /// ОС инициатора из той же карточки.
+    pub initiator_os: String,
     /// Ключ сменило это устройство: ответ сервера на `Rekey` потерялся, и
     /// свой пакет пришёл при повторном входе в старую группу.
     pub by_me: bool,
@@ -343,10 +540,12 @@ pub fn rekeyed_state(old: &AgentState, new_key: GroupKey) -> AgentState {
 pub enum Control {
     /// Список устройств группы (`ListDevices`).
     ListDevices(oneshot::Sender<Result<Vec<DeviceEntry>, String>>),
-    /// Сменить ключ группы; `remove` — кого исключить. Ответ — новый ключ и
-    /// устройства без карточки, которым он не достался.
+    /// Сменить ключ группы; `remove` — кого исключить, `confirmed` — кому
+    /// человек подтвердил передачу нового ключа ([`plan_rekey`]). Ответ —
+    /// новый ключ и устройства без карточки, которым он не достался.
     Rekey {
-        remove: Option<DeviceId>,
+        remove: Vec<DeviceId>,
+        confirmed: Vec<DeviceId>,
         reply: oneshot::Sender<Result<Rekeyed, String>>,
     },
     /// Сохранить настройки группы (`SetGroupConfig`): `sealed` — они же,
@@ -526,11 +725,22 @@ impl Controller {
         Ok(open_entries(&self.key, entries))
     }
 
-    /// Сменить ключ группы, исключив `remove` (или никого).
-    pub async fn rekey(&self, remove: Option<DeviceId>) -> Result<Rekeyed, String> {
+    /// Сменить ключ группы, исключив `remove` (можно никого). Новый ключ
+    /// получат только устройства из `confirmed` — те, кого человек видел в
+    /// списке получателей. Если к этому моменту в группе есть другое
+    /// устройство с карточкой, смена отменяется ([`plan_rekey`]).
+    pub async fn rekey(
+        &self,
+        remove: Vec<DeviceId>,
+        confirmed: Vec<DeviceId>,
+    ) -> Result<Rekeyed, String> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Control::Rekey { remove, reply })
+            .send(Control::Rekey {
+                remove,
+                confirmed,
+                reply,
+            })
             .await
             .map_err(|_| offline().to_string())?;
         rx.await.map_err(|_| offline().to_string())?
@@ -605,28 +815,98 @@ mod tests {
         ];
         // Своей карточки в списке может не быть (не успела опубликоваться).
         let views = open_entries(&key, list.clone());
-        let plan = plan_rekey(&views, me, rekey_public(&dev(1)), Some(device_id(&dev(3)))).unwrap();
+        let confirmed = [device_id(&dev(2))];
+        let plan = plan_rekey(
+            &views,
+            me,
+            rekey_public(&dev(1)),
+            &[device_id(&dev(3))],
+            &confirmed,
+        )
+        .unwrap();
         let to: Vec<_> = plan.recipients.iter().map(|r| r.0).collect();
         assert_eq!(to, vec![me, device_id(&dev(2))]);
         assert_eq!(plan.skipped, vec![device_id(&dev(4))]);
         // Устройство без карточки окажется вне группы и без исключения.
-        assert!(plan.leaves_out_any(None));
+        assert!(plan.leaves_out_any(&[]));
         let all_known = RekeyPlan {
             recipients: plan.recipients.clone(),
             skipped: Vec::new(),
         };
-        assert!(!all_known.leaves_out_any(None));
-        assert!(all_known.leaves_out_any(Some(device_id(&dev(3)))));
+        assert!(!all_known.leaves_out_any(&[]));
+        assert!(all_known.leaves_out_any(&[device_id(&dev(3))]));
 
         // Своя карточка в списке не даёт второй пакет себе.
         list.push(entry(&key, dev(1), "A"));
         let views = open_entries(&key, list);
-        let plan = plan_rekey(&views, me, rekey_public(&dev(1)), None).unwrap();
+        let both = [device_id(&dev(2)), device_id(&dev(3))];
+        let plan = plan_rekey(&views, me, rekey_public(&dev(1)), &[], &both).unwrap();
         assert_eq!(plan.recipients.len(), 3);
         assert_eq!(plan.recipients.iter().filter(|r| r.0 == me).count(), 1);
 
-        assert!(plan_rekey(&views, me, [0; 32], Some(me)).is_err());
-        assert!(plan_rekey(&views, me, [0; 32], Some(device_id(&dev(9)))).is_err());
+        assert!(plan_rekey(&views, me, [0; 32], &[me], &both).is_err());
+        assert!(plan_rekey(&views, me, [0; 32], &[device_id(&dev(9))], &both).is_err());
+    }
+
+    /// Новый ключ получают только те, кого человек подтвердил. Устройство с
+    /// карточкой, которого в подтверждённом наборе нет, отменяет смену.
+    #[test]
+    fn plan_refuses_devices_outside_the_confirmed_set() {
+        let key = GroupKey([7; 32]);
+        let me = device_id(&dev(1));
+        let my_pub = rekey_public(&dev(1));
+        let (b, c, e2) = (device_id(&dev(2)), device_id(&dev(3)), device_id(&dev(8)));
+        let seen = open_entries(
+            &key,
+            vec![
+                entry(&key, dev(1), "A"),
+                entry(&key, dev(2), "B"),
+                entry(&key, dev(3), "C"),
+            ],
+        );
+        // Человек видел B и удаляет C.
+        let plan = plan_rekey(&seen, me, my_pub, &[c], &[b]).unwrap();
+        let to: Vec<_> = plan.recipients.iter().map(|r| r.0).collect();
+        assert_eq!(to, vec![me, b]);
+
+        // К моменту смены в списке сервера второе устройство под именем B.
+        let mut fresh = seen.clone();
+        fresh.extend(open_entries(&key, vec![entry(&key, dev(8), "B")]));
+        let err = plan_rekey(&fresh, me, my_pub, &[c], &[b]).unwrap_err();
+        assert!(err.to_string().contains("новое устройство"), "{err}");
+        // То же без удаления и с пустым подтверждением.
+        assert!(plan_rekey(&fresh, me, my_pub, &[], &[b, c]).is_err());
+        assert!(plan_rekey(&seen, me, my_pub, &[], &[]).is_err());
+        // Подтвердили и его — ключ уходит всем подтверждённым.
+        let plan = plan_rekey(&fresh, me, my_pub, &[c], &[b, e2]).unwrap();
+        assert_eq!(plan.recipients.len(), 3);
+        // Человек снял с него галочку: исключаются оба, ключ только у A и B.
+        let plan = plan_rekey(&fresh, me, my_pub, &[c, e2], &[b]).unwrap();
+        let to: Vec<_> = plan.recipients.iter().map(|r| r.0).collect();
+        assert_eq!(to, vec![me, b]);
+        assert!(plan.skipped.is_empty());
+
+        // Подтверждённое устройство, которого в свежем списке уже нет, ключ
+        // не получает и смену не отменяет. Удаляемое в подтверждённом
+        // наборе ключ тоже не получает.
+        let gone = DeviceId([0x55; 32]);
+        let plan = plan_rekey(&seen, me, my_pub, &[c], &[b, c, gone]).unwrap();
+        let to: Vec<_> = plan.recipients.iter().map(|r| r.0).collect();
+        assert_eq!(to, vec![me, b]);
+
+        // Устройство без карточки в свежем списке — как раньше, пропущено:
+        // ключ ему не передать, отменять нечего.
+        let mut no_card = seen.clone();
+        no_card.push(DeviceView {
+            device: e2,
+            card: None,
+            last_seen_ms: 0,
+            online: true,
+        });
+        let plan = plan_rekey(&no_card, me, my_pub, &[c], &[b]).unwrap();
+        assert_eq!(plan.skipped, vec![e2]);
+        // У него появилась карточка, а человек видел его без карточки.
+        assert!(plan_rekey(&fresh, me, my_pub, &[c], &[b]).is_err());
     }
 
     #[test]
@@ -771,6 +1051,122 @@ mod tests {
         // Битый файл — просто пусто.
         std::fs::write(paths.dir.join(KNOWN_FILE), [0xffu8]).unwrap();
         assert!(load_known(&paths, g5.group_id()).is_empty());
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// Время первого появления устройства ставит этот клиент, оно не
+    /// сдвигается при повторном сохранении и переходит в новую группу.
+    #[test]
+    fn first_seen_is_kept_per_device() {
+        let paths = tmp();
+        let (g2, g5) = (GroupKey([2; 32]), GroupKey([5; 32]));
+        let card = |n: u8, name: &str| {
+            open_entries(&g2, vec![entry(&g2, dev(n), name)])
+                .remove(0)
+                .card
+                .unwrap()
+        };
+        let (a, b) = (card(1, "A"), card(2, "B"));
+        save_known_at(&paths, g2.group_id(), std::slice::from_ref(&a), 100).unwrap();
+        // B появился позже; A переименовали — время A прежнее.
+        let a2 = card(1, "A новый");
+        save_known_at(&paths, g2.group_id(), &[a2.clone(), b.clone()], 500).unwrap();
+        let seen = first_seen(&paths, g2.group_id());
+        assert_eq!((seen[&a.device], seen[&b.device]), (100, 500));
+        assert!(first_seen(&paths, g5.group_id()).is_empty(), "чужая группа");
+
+        paths.save(&state(2)).unwrap();
+        assert!(adopt_key(&paths, g2.group_id(), g5.clone()).unwrap());
+        let seen = first_seen(&paths, g5.group_id());
+        assert_eq!((seen[&a.device], seen[&b.device]), (100, 500));
+
+        // Файл прежней версии (без времён): карточки читаются, время 0.
+        #[derive(serde::Serialize)]
+        struct V1 {
+            group: [u8; 32],
+            cards: Vec<DeviceCard>,
+        }
+        let raw = postcard::to_stdvec(&V1 {
+            group: g5.group_id().0,
+            cards: vec![a2.clone(), b.clone()],
+        })
+        .unwrap();
+        std::fs::write(paths.dir.join(KNOWN_FILE), raw).unwrap();
+        assert_eq!(load_known(&paths, g5.group_id()), vec![a2, b.clone()]);
+        assert_eq!(first_seen(&paths, g5.group_id())[&b.device], 0);
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    fn notice(old: &GroupKey, new: &GroupKey) -> RekeyNotice {
+        RekeyNotice {
+            old: old.group_id(),
+            key: new.clone(),
+            initiator: device_id(&dev(4)),
+            initiator_name: "MacBook".into(),
+            initiator_os: "macOS".into(),
+            by_me: false,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// Чужая смена ключа ждёт на диске: «Перейти» сохраняет новый ключ,
+    /// до ответа ключ на диске прежний.
+    #[test]
+    fn offer_waits_on_disk_and_accept_adopts_the_key() {
+        let paths = tmp();
+        let (old, new) = (GroupKey([2; 32]), GroupKey([5; 32]));
+        // Устройство не в группе или уже в другой — запоминать нечего.
+        assert!(!save_offer(&paths, &notice(&old, &new), 7).unwrap());
+        paths.save(&state(9)).unwrap();
+        assert!(!save_offer(&paths, &notice(&old, &new), 7).unwrap());
+        assert!(accept_offer(&paths).unwrap().is_none());
+
+        paths.save(&state(2)).unwrap();
+        assert!(save_offer(&paths, &notice(&old, &new), 7).unwrap());
+        let offer = load_offer(&paths, old.group_id()).expect("ждёт");
+        assert_eq!(
+            (offer.initiator_name.as_str(), offer.initiator_os.as_str()),
+            ("MacBook", "macOS")
+        );
+        assert_eq!(
+            (offer.initiator, offer.received_ms),
+            (device_id(&dev(4)), 7)
+        );
+        assert!(load_offer(&paths, new.group_id()).is_none(), "чужая группа");
+        // До ответа на диске прежний ключ.
+        assert_eq!(paths.load().unwrap().unwrap().invite.group_key, old);
+
+        let got = accept_offer(&paths).unwrap().expect("принято");
+        assert_eq!(got.key, new);
+        assert_eq!(paths.load().unwrap().unwrap().invite.group_key, new);
+        assert!(load_offer(&paths, old.group_id()).is_none());
+        assert!(!paths.dir.join(OFFER_FILE).exists());
+        assert!(accept_offer(&paths).unwrap().is_none(), "второй раз нечего");
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    /// «Это не я»: ключ прежний, устройство помечено исключённым. Выход из
+    /// группы стирает и ожидающую смену.
+    #[test]
+    fn declined_offer_marks_excluded_and_reset_forgets_it() {
+        let paths = tmp();
+        let (old, new) = (GroupKey([2; 32]), GroupKey([5; 32]));
+        paths.save(&state(2)).unwrap();
+        assert!(!decline_offer(&paths).unwrap(), "ждать нечего");
+        assert!(!is_excluded(&paths, old.group_id()));
+        save_offer(&paths, &notice(&old, &new), 7).unwrap();
+        assert!(decline_offer(&paths).unwrap());
+        assert_eq!(paths.load().unwrap().unwrap().invite.group_key, old);
+        assert!(is_excluded(&paths, old.group_id()));
+        assert!(load_offer(&paths, old.group_id()).is_none());
+
+        save_offer(&paths, &notice(&old, &new), 7).unwrap();
+        paths.reset().unwrap();
+        assert!(!paths.dir.join(OFFER_FILE).exists());
+        // Битый файл — ждать нечего.
+        paths.save(&state(2)).unwrap();
+        std::fs::write(paths.dir.join(OFFER_FILE), [0xffu8; 40]).unwrap();
+        assert!(load_offer(&paths, old.group_id()).is_none());
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 

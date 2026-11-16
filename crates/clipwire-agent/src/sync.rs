@@ -208,10 +208,19 @@ pub enum Event {
     /// Агент увидел элемент с этим id; сохранить, чтобы после перезапуска не
     /// применять старое повторно.
     Cursor(ItemId),
-    /// Ключ группы сменили, пакет открылся, инициатор проверен по
-    /// карточкам. Движок дальше не подключается: сохранить новое состояние и
-    /// запустить новый движок (`devices::adopt_key`).
+    /// Ключ группы сменило это устройство (пакет подписан его ключом): ответ
+    /// на свой `Rekey` потерялся, и пакет пришёл при повторном входе. Движок
+    /// дальше не подключается: сохранить новое состояние и запустить новый
+    /// движок (`devices::adopt_key`).
     Rekeyed(RekeyNotice),
+    /// Ключ группы сменило другое устройство: пакет открылся, инициатор
+    /// известен по карточке. Сам движок на такой ключ не переходит: пакет
+    /// мог собрать исключённый участник в сговоре с сервером (старый ключ
+    /// он знает), и тогда буфер ушёл бы в его группу. Движок дальше не
+    /// подключается и ничего не отправляет; новый ключ ждёт решения
+    /// человека (`devices::save_offer`, потом `accept_offer` или
+    /// `decline_offer`).
+    RekeyOffered(RekeyNotice),
     /// Сервер сообщил, что устройство исключено из группы `old` (или пакету
     /// нового ключа нельзя верить). Движок дальше не подключается
     /// (`devices::mark_excluded`).
@@ -705,7 +714,8 @@ impl Engine {
     }
 
     /// Ключ группы сменён: ждать, пока движок снимут (закроют `local`).
-    /// Копирования за это время в группу не уходят: старой группы больше нет.
+    /// Копирования за это время в группу не уходят: старой группы больше
+    /// нет, а на новый ключ от другого устройства человек ещё не согласился.
     async fn idle(
         &mut self,
         local: &mut mpsc::Receiver<Outgoing>,
@@ -730,6 +740,11 @@ impl Engine {
     /// ключа нет или ему нельзя верить. Так сервер может остановить
     /// синхронизацию устройства, но это не больше, чем отказ в обслуживании,
     /// и ключ с историей при этом не стираются (`devices::mark_excluded`).
+    ///
+    /// Сам движок переходит только на ключ, который выпустило это же
+    /// устройство. Пакет от другого устройства — вопрос человеку
+    /// ([`Event::RekeyOffered`]), придёт ли он при входе или посреди живого
+    /// соединения: и то и другое присылает сервер, и момент выбирает он.
     fn rotated(&mut self, envelope: Option<Vec<u8>>) -> anyhow::Error {
         let old = self.state.invite.group_key.group_id();
         self.terminal = true;
@@ -745,10 +760,18 @@ impl Engine {
             })
             .and_then(|k| self.check_initiator(old, k, pending));
         match notice {
-            Some(n) => {
-                tracing::info!(by_me = n.by_me, "ключ группы сменён, перехожу на новый");
+            Some(n) if n.by_me => {
+                tracing::info!("ключ группы сменён этим устройством, перехожу на новый");
                 self.emit(Event::Rekeyed(n));
                 anyhow!(tr("ключ группы сменён"))
+            }
+            Some(n) => {
+                tracing::info!(
+                    initiator = %crate::devices::fingerprint(n.initiator),
+                    "ключ группы сменило другое устройство, жду подтверждения"
+                );
+                self.emit(Event::RekeyOffered(n));
+                anyhow!(tr("ключ группы сменён, нужно подтверждение"))
             }
             None => {
                 tracing::info!("устройство исключили из группы");
@@ -769,9 +792,11 @@ impl Engine {
         anyhow!(tr("группу удалил администратор сервера"))
     }
 
-    /// Можно ли верить пакету: его выпустило это устройство (ответ на свой
-    /// `Rekey` потерялся) или устройство группы, карточку которого этот
-    /// клиент проверял. `None` — инициатор неизвестен.
+    /// Кто выпустил пакет: это устройство (ответ на свой `Rekey` потерялся,
+    /// `by_me`) или устройство группы, карточку которого этот клиент
+    /// проверял. `None` — инициатор неизвестен. Известная карточка ещё не
+    /// повод перейти на ключ: она есть и у исключённого устройства
+    /// ([`Engine::rotated`]).
     fn check_initiator(
         &self,
         old: GroupId,
@@ -788,6 +813,7 @@ impl Engine {
                 key: k.key,
                 initiator: self.device,
                 initiator_name: self.device_name.clone(),
+                initiator_os: crate::devices::os_name().to_string(),
                 by_me: true,
                 skipped,
             });
@@ -809,6 +835,7 @@ impl Engine {
             key: k.key,
             initiator: k.initiator,
             initiator_name: card.name.clone(),
+            initiator_os: card.os.clone(),
             by_me: false,
             skipped: Vec::new(),
         })
@@ -1119,9 +1146,9 @@ impl Engine {
                             let _ = reply.send(Ok(()));
                         }
                     }
-                    Control::Rekey { remove, reply } => {
+                    Control::Rekey { remove, confirmed, reply } => {
                         match self
-                            .rekey(ep, server_addr.clone(), &mut send, &mut recv, remove)
+                            .rekey(ep, server_addr.clone(), &mut send, &mut recv, &remove, &confirmed)
                             .await
                         {
                             Ok(Ok(done)) => {
@@ -1349,13 +1376,20 @@ impl Engine {
     ///
     /// Свой пакет тоже кладётся: если ответ сервера потеряется, при
     /// следующем входе в старую группу устройство получит свой `Rekeyed`.
+    ///
+    /// `confirmed` — получатели, которых человек подтвердил. Список
+    /// устройств запрашивается заново, но только чтобы взять свежие
+    /// карточки и заметить чужих: устройство с карточкой вне `confirmed`
+    /// отменяет смену до того, как собран хоть один пакет
+    /// (`devices::plan_rekey`).
     async fn rekey(
         &mut self,
         ep: &Endpoint,
         addr: EndpointAddr,
         send: &mut iroh::endpoint::SendStream,
         recv: &mut iroh::endpoint::RecvStream,
-        remove: Option<DeviceId>,
+        remove: &[DeviceId],
+        confirmed: &[DeviceId],
     ) -> Result<Result<Rekeyed, String>> {
         let old_key = self.state.invite.group_key.clone();
         let old = old_key.group_id();
@@ -1367,6 +1401,7 @@ impl Engine {
             self.device,
             rekey_public(&self.state.device_key),
             remove,
+            confirmed,
         ) {
             Ok(p) => p,
             Err(e) => return Ok(Err(e.to_string())),
@@ -2401,11 +2436,13 @@ mod tests {
         assert_eq!(clip, texts(&[now - 300_000]));
     }
 
-    /// Что движок сделал с пакетом: новый ключ (с инициатором) или исключение.
-    fn rotation(rx: &mut mpsc::UnboundedReceiver<Event>) -> Option<RekeyNotice> {
+    /// Что движок сделал с пакетом: новый ключ (с инициатором; `true` — ждёт
+    /// подтверждения человека) или исключение.
+    fn rotation(rx: &mut mpsc::UnboundedReceiver<Event>) -> Option<(RekeyNotice, bool)> {
         while let Ok(e) = rx.try_recv() {
             match e {
-                Event::Rekeyed(n) => return Some(n),
+                Event::Rekeyed(n) => return Some((n, false)),
+                Event::RekeyOffered(n) => return Some((n, true)),
                 Event::Excluded { .. } => return None,
                 _ => {}
             }
@@ -2413,8 +2450,11 @@ mod tests {
         panic!("движок ничего не сообщил о смене ключа");
     }
 
+    /// Сам движок переходит только на ключ, выпущенный этим же устройством.
+    /// Пакет от известного устройства ждёт подтверждения, от неизвестного —
+    /// исключение.
     #[test]
-    fn rekey_is_trusted_only_from_known_device_or_self() {
+    fn rekey_is_adopted_only_from_self_and_offered_from_known_device() {
         use clipwire_core::device::{device_id, seal_rekey};
         let (mut e, mut rx) = engine(None);
         let (me, me_key, other) = (e.device(), [9u8; 32], [5u8; 32]);
@@ -2434,10 +2474,16 @@ mod tests {
         };
         e.known.insert(card.device, card);
         e.rotated(Some(env(&other)));
-        let n = rotation(&mut rx).expect("известное устройство");
+        let (n, offered) = rotation(&mut rx).expect("известное устройство");
+        assert!(offered, "чужой ключ сам не принимается");
         assert_eq!(n.key, new);
-        assert_eq!(n.initiator_name, "Рабочий");
+        assert_eq!(n.initiator, device_id(&other));
+        assert_eq!(
+            (n.initiator_name.as_str(), n.initiator_os.as_str()),
+            ("Рабочий", "Windows")
+        );
         assert!(!n.by_me);
+        assert!(e.terminal, "до ответа человека движок не подключается");
 
         // Свой пакет после потерянного ответа: успех этого устройства с теми
         // же пропущенными устройствами, что были в плане.
@@ -2446,14 +2492,14 @@ mod tests {
             skipped: vec![DeviceId([7; 32])],
         });
         e.rotated(Some(env(&me_key)));
-        let n = rotation(&mut rx).expect("свой пакет");
-        assert!(n.by_me);
+        let (n, offered) = rotation(&mut rx).expect("свой пакет");
+        assert!(n.by_me && !offered, "своя смена подтверждения не требует");
         assert_eq!(n.skipped, vec![DeviceId([7; 32])]);
         assert!(e.pending_rekey.is_none());
         // Свой пакет без плана в памяти (приложение перезапускалось) — тоже свой.
         e.rotated(Some(env(&me_key)));
-        let n = rotation(&mut rx).expect("свой пакет");
-        assert!(n.by_me && n.skipped.is_empty());
+        let (n, offered) = rotation(&mut rx).expect("свой пакет");
+        assert!(n.by_me && !offered && n.skipped.is_empty());
 
         // Испорченный пакет и Excluded — исключение.
         let mut bad = env(&other);

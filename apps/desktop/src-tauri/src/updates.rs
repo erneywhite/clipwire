@@ -427,7 +427,7 @@ fn server_notice_key(server: Option<&str>, client: &str) -> String {
     format!("{}|{client}", server.unwrap_or("?"))
 }
 
-fn notify(app: &AppHandle, text: &str) {
+pub(crate) fn notify(app: &AppHandle, text: &str) {
     use tauri_plugin_notification::NotificationExt;
     if let Err(e) = app.notification().builder().title(text).show() {
         tracing::warn!("уведомление не показалось: {e}");
