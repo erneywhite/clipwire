@@ -370,9 +370,13 @@ async fn long_history_arrives_in_batches() -> Result<()> {
     // не получит всё, — проверяется сам вход пачками, а не скорость отправки.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     let (hist, batches, clip) = loop {
-        let got = join_and_count(&info, &key, before).await?;
-        if got.0 + got.2.len() >= MISSED || tokio::time::Instant::now() >= deadline {
-            break got;
+        // Пока сервер разбирает поток отправленного, вход может не уложиться
+        // в своё время ожидания: это не то, что проверяет тест, — пробуем ещё.
+        match join_and_count(&info, &key, before).await {
+            Ok(got) if got.0 + got.2.len() >= MISSED => break got,
+            Ok(got) if tokio::time::Instant::now() >= deadline => break got,
+            Err(e) if tokio::time::Instant::now() >= deadline => return Err(e),
+            Ok(_) | Err(_) => {}
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
