@@ -163,10 +163,9 @@ pub async fn stats_overview(app: AppHandle) -> StatsDto {
             LinkDto {
                 direct: l.direct,
                 rtt_ms: l.rtt_ms,
-                server_outdated: l
-                    .server_version
-                    .as_deref()
-                    .is_none_or(|v| clipwire_core::proto::version_older(v, client)),
+                // По протоколу, а не по версии: выпуск без изменений сервера
+                // плашку «обновите образ» не вызывает.
+                server_outdated: clipwire_core::proto::server_outdated(l.server_protocol),
                 server_version: l.server_version,
                 client_version: client,
             }
