@@ -16,7 +16,7 @@
 //! База открывается только на чтение. Файлы (ссылки на них) и помеченное
 //! приватным не переносятся, картинки — по флагу.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -24,9 +24,7 @@ use base64::Engine as _;
 use clipwire_core::Content;
 
 use crate::clipboard::mac::{Kind, classify};
-
-/// Секунды между 1970-01-01 и 2001-01-01 (эпоха Core Data).
-const CORE_DATA_EPOCH: f64 = 978_307_200.0;
+use crate::import_send::paste_seen_ms;
 
 /// Запись Paste, готовая к переносу.
 pub struct Imported {
@@ -79,13 +77,7 @@ pub fn read(
     images: bool,
     mut each: impl FnMut(Imported) -> Result<()>,
 ) -> Result<Summary> {
-    let db_path = dir.join("db.sqlite");
-    anyhow::ensure!(db_path.exists(), "нет базы Paste: {}", db_path.display());
-    let db = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .context("база Paste не открылась")?;
+    let db = open(dir)?;
     let external = dir.join(".db_SUPPORT").join("_EXTERNAL_DATA");
 
     let mut apps: HashMap<i64, PasteApp> = HashMap::new();
@@ -111,29 +103,50 @@ pub fn read(
     } else {
         "NULL"
     };
-    let mut st = db.prepare(&format!(
-        "SELECT d.ZRAWPASTEBOARDITEMS, i.ZCREATEDAT, i.ZTIMESTAMP, i.ZSOURCEAPPLICATION, i.ZLIST,
-                {title}
-         FROM ZITEMENTITY i JOIN ZITEMDATAENTITY d ON d.ZITEM = i.Z_PK
-         ORDER BY max(coalesce(i.ZCREATEDAT, 0), coalesce(i.ZTIMESTAMP, 0))"
-    ))?;
-    let rows = st.query_map([], |r| {
-        Ok((
-            r.get::<_, Option<Vec<u8>>>(0)?,
-            r.get::<_, Option<f64>>(1)?,
-            r.get::<_, Option<f64>>(2)?,
-            r.get::<_, Option<i64>>(3)?,
-            r.get::<_, Option<i64>>(4)?,
-            // Тип колонки в Core Data — строка, но SQLite отдаст и иное:
-            // нестроковое название просто не берём.
-            r.get::<_, Option<String>>(5).ok().flatten(),
-        ))
-    })?;
+    // Сначала только сведения о записях, без содержимого: сортировка с
+    // блобами держала бы во временном индексе SQLite весь архив картинок.
+    // Содержимое потом читается по одной записи по ключу.
+    struct Meta {
+        data_pk: i64,
+        seen_ms: i64,
+        app: Option<i64>,
+        list: Option<i64>,
+        title: Option<String>,
+    }
+    let metas: Vec<Meta> = {
+        let mut st = db.prepare(&format!(
+            "SELECT d.Z_PK, i.ZCREATEDAT, i.ZTIMESTAMP, i.ZSOURCEAPPLICATION, i.ZLIST, {title}
+             FROM ZITEMENTITY i JOIN ZITEMDATAENTITY d ON d.ZITEM = i.Z_PK
+             ORDER BY max(coalesce(i.ZCREATEDAT, 0), coalesce(i.ZTIMESTAMP, 0))"
+        ))?;
+        let rows = st.query_map([], |r| {
+            Ok(Meta {
+                data_pk: r.get::<_, i64>(0)?,
+                seen_ms: paste_seen_ms(r.get::<_, Option<f64>>(1)?, r.get::<_, Option<f64>>(2)?),
+                app: r.get::<_, Option<i64>>(3)?,
+                list: r.get::<_, Option<i64>>(4)?,
+                // Тип колонки в Core Data — строка, но SQLite отдаст и иное:
+                // нестроковое название просто не берём.
+                title: r.get::<_, Option<String>>(5).ok().flatten(),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<Meta>>>()?
+    };
+    let mut body = db.prepare("SELECT ZRAWPASTEBOARDITEMS FROM ZITEMDATAENTITY WHERE Z_PK = ?1")?;
 
     let mut sum = Summary::default();
-    for row in rows {
-        let (raw, created, used, app, list, title) = row?;
+    for m in metas {
+        let Meta {
+            data_pk,
+            seen_ms,
+            app,
+            list,
+            title,
+        } = m;
         sum.total += 1;
+        let raw: Option<Vec<u8>> = body
+            .query_row([data_pk], |r| r.get::<_, Option<Vec<u8>>>(0))
+            .context("содержимое записи Paste")?;
         let data = match raw.as_deref().map(|r| load(r, &external)) {
             Some(Ok(d)) => d,
             Some(Err(e)) => {
@@ -146,7 +159,11 @@ pub fn read(
                 continue;
             }
         };
-        let content = match to_content(&data, images) {
+        // Сжатые байты больше не нужны: в памяти — только одна запись.
+        drop(raw);
+        let content = to_content(&data, images);
+        drop(data);
+        let content = match content {
             Ok(Some(c)) => c,
             Ok(None) => {
                 sum.skipped_empty += 1;
@@ -171,18 +188,47 @@ pub fn read(
             Content::Image { .. } => sum.images += 1,
             _ => {}
         }
-        let secs = created.unwrap_or(0.0).max(used.unwrap_or(0.0)) + CORE_DATA_EPOCH;
         let pinned = list.is_some();
         sum.pinned += pinned as usize;
         each(Imported {
             content,
-            seen_ms: (secs * 1000.0) as i64,
+            seen_ms,
             app: app.and_then(|pk| apps.get(&pk).cloned()),
             pinned,
             title: title.filter(|t| !t.trim().is_empty()),
         })?;
     }
     Ok(sum)
+}
+
+/// Открыть базу Paste только на чтение.
+fn open(dir: &Path) -> Result<rusqlite::Connection> {
+    let db_path = dir.join("db.sqlite");
+    anyhow::ensure!(db_path.exists(), "нет базы Paste: {}", db_path.display());
+    rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .context("база Paste не открылась")
+}
+
+/// Время всех записей Paste (`import_send::paste_seen_ms`), без
+/// содержимого: по нему `--resend` находит в истории перенесённое (импорт
+/// ставит записи id с этим временем).
+pub fn timestamps(dir: &Path) -> Result<HashSet<i64>> {
+    let db = open(dir)?;
+    let mut st = db.prepare("SELECT ZCREATEDAT, ZTIMESTAMP FROM ZITEMENTITY")?;
+    let rows = st.query_map([], |r| {
+        Ok(paste_seen_ms(
+            r.get::<_, Option<f64>>(0)?,
+            r.get::<_, Option<f64>>(1)?,
+        ))
+    })?;
+    let mut out = HashSet::new();
+    for ms in rows {
+        out.insert(ms?);
+    }
+    Ok(out)
 }
 
 /// Есть ли у таблицы колонка (`PRAGMA table_info`).
@@ -351,9 +397,11 @@ fn decompress(data: &[u8], algorithm: i32) -> Result<Vec<u8>> {
         ) -> usize;
     }
     // Размер распакованного заранее не известен: пробуем всё больший буфер.
-    // Заполненный до конца буфер значит «могло не влезть».
-    let mut cap = (data.len() * 8).max(4096);
-    for _ in 0..8 {
+    // Заполненный до конца буфер значит «могло не влезть». Растёт вдвое, а не
+    // вчетверо, и не больше `MAX_UNPACKED`: с картинками (TIFF жмётся в
+    // десятки раз) прежний рост выделял сотни мегабайт на одну запись.
+    let mut cap = data.len().saturating_mul(8).clamp(4096, MAX_UNPACKED);
+    loop {
         let mut out = vec![0u8; cap];
         // SAFETY: буферы живут до конца вызова, размеры верные.
         let n = unsafe {
@@ -371,12 +419,21 @@ fn decompress(data: &[u8], algorithm: i32) -> Result<Vec<u8>> {
         }
         if n < cap {
             out.truncate(n);
+            out.shrink_to_fit();
             return Ok(out);
         }
-        cap *= 4;
+        if cap >= MAX_UNPACKED {
+            bail!("данные Paste распаковываются в слишком большой объём");
+        }
+        drop(out);
+        cap = cap.saturating_mul(2).min(MAX_UNPACKED);
     }
-    bail!("данные Paste распаковываются в слишком большой объём")
 }
+
+/// Больше этого одна запись Paste не распаковывается: в Clipwire элемент всё
+/// равно не больше `sync::MAX_ITEM_BYTES`, а картинка 8K в TIFF без сжатия —
+/// около 130 МБ.
+const MAX_UNPACKED: usize = 256 << 20;
 
 #[cfg(test)]
 mod tests {

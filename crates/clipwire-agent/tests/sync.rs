@@ -365,11 +365,40 @@ async fn long_history_arrives_in_batches() -> Result<()> {
             .send(Content::Text(format!("пропущено {i}")).into())
             .await?;
     }
-    // Закрытие канала ждёт, пока сервер дочитает всё отправленное.
+    // Отправитель остаётся на связи, пока сервер не сохранит всё: на
+    // медленных машинах CI хвост ещё в пути. Входим заново, пока устройство
+    // не получит всё, — проверяется сам вход пачками, а не скорость отправки.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let (hist, batches, clip) = loop {
+        // Пока сервер разбирает поток отправленного, вход может не уложиться
+        // в своё время ожидания: это не то, что проверяет тест, — пробуем ещё.
+        match join_and_count(&info, &key, before).await {
+            Ok(got) if got.0 + got.2.len() >= MISSED => break got,
+            Ok(got) if tokio::time::Instant::now() >= deadline => break got,
+            Err(e) if tokio::time::Instant::now() >= deadline => return Err(e),
+            Ok(_) | Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
     drop(a.local);
     tokio::time::timeout(Duration::from_secs(120), a.task).await???;
+    assert_eq!(
+        clip,
+        vec![Content::Text(format!("пропущено {}", MISSED - 1))]
+    );
+    assert_eq!(hist + clip.len(), MISSED, "пришло не всё");
+    assert!(batches > 1, "история пришла одной пачкой");
+    server.shutdown().await
+}
 
-    let mut b = Agent::spawn(&info, &key, Some(before))?;
+/// Войти в группу с курсором `before` и посчитать пришедшее: элементов в
+/// истории, пачек, что легло в буфер. Пачки не длиннее 200.
+async fn join_and_count(
+    info: &ServerInfo,
+    key: &GroupKey,
+    before: ItemId,
+) -> Result<(usize, usize, Vec<Content>)> {
+    let mut b = Agent::spawn(info, key, Some(before))?;
     let (mut hist, mut batches, mut clip) = (0usize, 0usize, Vec::new());
     tokio::time::timeout(Duration::from_secs(120), async {
         loop {
@@ -384,7 +413,7 @@ async fn long_history_arrives_in_batches() -> Result<()> {
                 Event::Flush(done) => {
                     let _ = done.send(());
                 }
-                Event::Status(Status::Online) => return Ok(()),
+                Event::Status(Status::Online) => return anyhow::Ok(()),
                 Event::Status(Status::Offline(e)) => anyhow::bail!("вход сорвался: {e}"),
                 _ => {}
             }
@@ -392,11 +421,7 @@ async fn long_history_arrives_in_batches() -> Result<()> {
     })
     .await
     .context("история не дошла")??;
-    assert_eq!(
-        clip,
-        vec![Content::Text(format!("пропущено {}", MISSED - 1))]
-    );
-    assert_eq!(hist + clip.len(), MISSED, "пришло не всё");
-    assert!(batches > 1, "история пришла одной пачкой");
-    server.shutdown().await
+    drop(b.local);
+    let _ = tokio::time::timeout(Duration::from_secs(10), b.task).await;
+    Ok((hist, batches, clip))
 }

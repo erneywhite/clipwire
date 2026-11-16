@@ -33,6 +33,12 @@ clipwire-agent — общий буфер обмена Clipwire
                               перенести историю из Paste: --dry-run — только
                               посчитать, --send — отправить и в группу,
                               --images — с картинками. Clipwire должен быть закрыт
+  import-paste --resend [--images] [--since <ГГГГ-ММ-ДД|мс>] [--skip N] [--limit N]
+                              отправить в группу уже перенесённое из Paste (если
+                              прошлая отправка оборвалась); --skip — пропустить
+                              N самых старых. С --send и --resend ждёт связи до
+                              --wait <минут> (по умолчанию 10), потом выходит с
+                              кодом 2 и печатает, как дослать остаток
 
 Код сервера администратора (cwserver2-…) печатает сервер при запуске и команда
 clipwire-server info. В нём ключ администратора: с ним создают группы.
@@ -220,7 +226,7 @@ fn headless(state: AgentState, paths: &Paths, send: Option<String>) -> Result<()
                 }
                 Event::Excluded { .. } => eprintln!("сервер сообщил, что устройство исключено"),
                 Event::GroupDeleted { .. } => eprintln!("группу удалил администратор сервера"),
-                Event::KnownDevices(_) => {}
+                Event::KnownDevices(_) | Event::Backfill(_) => {}
                 Event::RekeyLost(why) => eprintln!("{why}"),
                 Event::Deleted(n) => eprintln!("удалено на другом устройстве: {}", n.hashes.len()),
                 Event::DevicesChanged => tracing::debug!("устройства группы изменились"),
@@ -350,23 +356,20 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
 }
 
 /// Импорт истории из Paste (`paste_import.rs`): в локальную историю и, с
-/// `--send`, в группу. Повторный запуск пропускает уже перенесённое.
+/// `--send`, в группу. Повторный запуск пропускает уже перенесённое; с
+/// `--resend` уже перенесённое отправляется в группу ещё раз.
 #[cfg(target_os = "macos")]
 fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
     use clipwire_agent::history::{Entry, History};
+    use clipwire_agent::import_send;
     use clipwire_agent::settings::{Retention, Settings};
-    use clipwire_agent::sync::{Engine, Event, Outgoing, Status};
     use clipwire_core::{DeviceId, ItemId};
     use std::collections::HashMap;
-    use std::sync::Arc;
 
-    let flag = |f: &str| args.iter().any(|a| a == f);
-    let (dry_run, send, images) = (flag("--dry-run"), flag("--send"), flag("--images"));
-    let dir = args
-        .iter()
-        .position(|a| a == "--from")
-        .and_then(|i| args.get(i + 1))
-        .map(std::path::PathBuf::from)
+    let a = import_send::parse_args(args)?;
+    let dir = a
+        .from
+        .clone()
         .unwrap_or_else(clipwire_agent::paste_import::default_dir);
 
     let report = |sum: &clipwire_agent::paste_import::Summary| {
@@ -387,8 +390,8 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
         )
     };
     eprintln!("читаю Paste: {}", dir.display());
-    if dry_run {
-        report(&clipwire_agent::paste_import::read(&dir, images, |_| {
+    if a.dry_run && !a.resend {
+        report(&clipwire_agent::paste_import::read(&dir, a.images, |_| {
             Ok(())
         })?);
         return Ok(());
@@ -396,26 +399,21 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
 
     // Приложение и импорт пишут в одну базу истории; перенос тысяч записей
     // под работающим приложением шёл бы вперемешку с его записями и долго
-    // держал бы базу. С отдельной папкой (`CLIPWIRE_HOME`, проверки) рабочее
-    // приложение не мешает.
+    // держал бы базу. К тому же с тем же ключом устройства в группу
+    // подключилось бы второе соединение. С отдельной папкой (`CLIPWIRE_HOME`,
+    // проверки) рабочее приложение не мешает.
     let running = std::env::var_os("CLIPWIRE_HOME").is_none()
         && std::process::Command::new("pgrep")
             .args(["-f", "Clipwire.app/Contents/MacOS/clipwire-desktop"])
             .output()
             .is_ok_and(|o| o.status.success());
-    if running {
+    if running && !a.dry_run {
         bail!("Clipwire запущен: закройте его (значок в строке меню → «Выход») и повторите");
     }
     let settings = Settings::load(&paths.dir);
-    if settings.retention != Retention::Forever {
-        bail!(
-            "срок хранения истории не «всегда»: старые записи удалятся при запуске. \
-             Поставьте «всегда» в настройках Clipwire и повторите"
-        );
-    }
     let state = paths.load()?;
-    if send && state.is_none() {
-        bail!("--send: устройство не в группе");
+    if (a.send || a.resend) && !a.dry_run && state.is_none() {
+        bail!("отправка в группу: устройство не в группе");
     }
     let device = state.as_ref().map_or(DeviceId([0; 32]), |s| {
         DeviceId(
@@ -425,35 +423,69 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
         )
     });
 
+    if a.resend {
+        // Перенесённое импортом — свои записи, чьё время в id совпало с
+        // временем записи Paste. Содержимое Paste для этого не читается.
+        let paste_ms = clipwire_agent::paste_import::timestamps(&dir)?;
+        let history = History::open(&paths.dir)?;
+        let ids = import_send::select_resend(
+            import_send::resend_candidates(&history, device, a.images),
+            &paste_ms,
+            &import_send::Selection {
+                since_ms: a.since_ms,
+                skip: a.skip,
+                limit: a.limit,
+            },
+        );
+        eprintln!(
+            "в истории перенесённых из Paste записей для отправки: {}{}",
+            ids.len(),
+            if a.images {
+                ""
+            } else {
+                " (без картинок: добавьте --images)"
+            }
+        );
+        let Some(state) = state.filter(|_| !a.dry_run && !ids.is_empty()) else {
+            return Ok(());
+        };
+        return send_imported(paths, state, settings.device_name, history, ids, &a);
+    }
+
+    if settings.retention != Retention::Forever {
+        bail!(
+            "срок хранения истории не «всегда»: старые записи удалятся при запуске. \
+             Поставьте «всегда» в настройках Clipwire и повторите"
+        );
+    }
     let mut history = History::open(&paths.dir)?;
     let mut apps: HashMap<(Option<String>, Option<String>), Option<clipwire_core::SourceApp>> =
         HashMap::new();
-    // shortcut: с --send отправляемое копится в памяти целиком (движку нужен
-    // список); с картинками это много. Переделать на чтение тел из истории
-    // по мере отправки, если --send --images понадобится на больших архивах.
-    let (mut added, mut outgoing, mut repinned) = (0usize, Vec::new(), 0usize);
+    // Для отправки копятся только id новых записей, тела потом читаются из
+    // истории порциями (`import_send::HistorySource`).
+    let (mut added, mut new_ids, mut repinned) = (0usize, Vec::<ItemId>::new(), 0usize);
     let mut to_pin = Vec::new();
     let pins = state
         .as_ref()
         .map(|s| clipwire_agent::pins::Pins::open(&paths.dir, s.invite.group_key.group_id()));
-    let sum = clipwire_agent::paste_import::read(&dir, images, |it| {
-        let app = it.app.and_then(|a| {
-            apps.entry((a.bundle_id.clone(), a.name.clone()))
+    let sum = clipwire_agent::paste_import::read(&dir, a.images, |it| {
+        let app = it.app.and_then(|p| {
+            apps.entry((p.bundle_id.clone(), p.name.clone()))
                 .or_insert_with(|| {
                     clipwire_agent::source_app::by_bundle_id(
-                        a.bundle_id.as_deref(),
-                        a.name.as_deref(),
+                        p.bundle_id.as_deref(),
+                        p.name.as_deref(),
                     )
                 })
                 .clone()
         });
-        let sent = send.then(|| it.content.clone());
         let hash = it.content.hash();
         // Название записи в Paste — подпись; подпись бывает только у
         // закреплённого.
         let note = it.title.filter(|_| it.pinned).unwrap_or_default();
+        let id = ItemId::at_ms(it.seen_ms.max(0) as u64);
         let mut entry = Entry {
-            id: ItemId::at_ms(it.seen_ms.max(0) as u64),
+            id,
             origin: device,
             device_name: settings.device_name.clone(),
             local: true,
@@ -484,11 +516,8 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
         }
         if new {
             added += 1;
-            if let Some(content) = sent {
-                outgoing.push((
-                    Outgoing::new(content, app.as_ref()),
-                    it.seen_ms.max(0) as u64,
-                ));
+            if a.send {
+                new_ids.push(id);
             }
         }
         Ok(())
@@ -521,36 +550,69 @@ fn import_paste(paths: &Paths, args: &[String]) -> Result<()> {
         });
         eprintln!("закрепы уйдут в группу при следующем запуске Clipwire");
     }
-    drop(history);
-    let Some(state) = state.filter(|_| send && !outgoing.is_empty()) else {
+    drop(pins);
+    let Some(state) = state.filter(|_| a.send && !new_ids.is_empty()) else {
         return Ok(());
     };
+    send_imported(paths, state, settings.device_name, history, new_ids, &a)
+}
 
+/// Отправить записи истории `ids` (от старых к новым) в группу и дождаться,
+/// пока сервер примет всё (`import_send::send_all`). Не дождались — код
+/// выхода 2 и команда, которой дослать остаток.
+#[cfg(target_os = "macos")]
+fn send_imported(
+    paths: &Paths,
+    state: AgentState,
+    device_name: String,
+    history: clipwire_agent::history::History,
+    ids: Vec<clipwire_core::ItemId>,
+    a: &clipwire_agent::import_send::ImportArgs,
+) -> Result<()> {
+    use clipwire_agent::import_send::{HistorySource, Incomplete, ProgressLog, resume_command};
+
+    let total = ids.len();
     eprintln!(
-        "отправляю в группу: {} записей. Другие устройства должны быть на связи",
-        outgoing.len()
+        "отправляю в группу: {total} записей. Другие устройства должны быть на связи всё \
+         время отправки: сервер хранит лишь последние записи группы, и кто не в сети, \
+         перенесённого не получит. Картинки идут медленно, около 1 МБ/с"
     );
+    // Для подсказки после обрыва нужно время записей, а сами id уходят в
+    // источник.
+    let order = ids.clone();
+    let admin = paths.load_admin_key(state.invite.server.server_id);
+    let source = Box::new(HistorySource::new(history, ids));
+    let mut log = ProgressLog::new(total);
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
-        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-        let (ltx, lrx) = tokio::sync::mpsc::channel(4);
-        let admin = paths.load_admin_key(state.invite.server.server_id);
-        let engine = Engine::new(state, settings.device_name, None, etx, Arc::new(|| {}))
-            .with_admin_key(admin)
-            .with_backfill(outgoing);
-        let task = tokio::spawn(engine.run(lrx));
-        // Движок шлёт историю сразу после входа; закрытый канал — сигнал
-        // завершиться, когда отправит.
-        let mut ltx = Some(ltx);
-        while let Some(ev) = erx.recv().await {
-            match ev {
-                Event::Status(Status::Online) => drop(ltx.take()),
-                Event::Status(Status::Offline(e)) => eprintln!("нет связи: {e}"),
-                _ => {}
+    let res = rt.block_on(clipwire_agent::import_send::send_all(
+        state,
+        device_name,
+        admin,
+        source,
+        a.wait,
+        |n| {
+            if let Some(line) = log.line(&n) {
+                eprintln!("{line}");
             }
+        },
+    ));
+    match res {
+        Ok(n) => {
+            eprintln!("готово: сервер принял {n} из {total}");
+            if n < total {
+                eprintln!("остальных записей уже нет в истории (удалены)");
+            }
+            Ok(())
         }
-        task.await??;
-        eprintln!("готово");
-        anyhow::Ok(())
-    })
+        Err(e) => {
+            let Some(inc) = e.downcast_ref::<Incomplete>() else {
+                return Err(e);
+            };
+            eprintln!("{inc} из {total}");
+            if let Some(cmd) = resume_command(a.images, &order, inc.confirmed) {
+                eprintln!("дослать остаток: {cmd}");
+            }
+            std::process::exit(2);
+        }
+    }
 }

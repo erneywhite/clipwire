@@ -122,10 +122,8 @@ command-line tool for now; a button in Settings is planned. Text and formatted t
 their dates and source apps, pinboard entries become pinned and their titles become notes. A
 repeated run pins and labels entries that were moved before; in a group the pins reach the other
 devices the next time Clipwire starts. Files are skipped (Paste keeps only
-links to them). Images are moved with `--images`; with `--send` everything being sent is held in
-memory until it is sent, so a large image archive is better moved without `--send`. Quit
-Clipwire, set history retention to "forever", keep your other devices online if you add `--send`,
-then run from the repository:
+links to them); images are moved with `--images`. Quit Clipwire, set history retention to
+"forever", then run from the repository:
 
 ```
 cargo run --release -p clipwire-agent -- import-paste --dry-run   # only count
@@ -134,6 +132,24 @@ cargo run --release -p clipwire-agent -- import-paste --send      # move and sen
 
 macOS asks once for access to the Clipwire key in the Keychain. Running it again skips what was
 already moved.
+
+With `--send` the moved entries also go to the group. Keep your other devices online for the whole
+time: the server keeps only the latest entries of a group (50 by default, `CLIPWIRE_HISTORY_LEN`),
+and old Paste entries don't make it into that history, so a device that is offline won't get them
+later. Entries go out in batches so the receivers keep up: text is quick, images take about 1 MB/s,
+and an archive of a few gigabytes takes hours. The tool prints its progress every hundred entries.
+If the connection drops, it reconnects and continues from the last entry the server confirmed. If
+there is no connection for longer than `--wait` minutes (10 by default), it exits with code 2 and
+prints the command that sends the rest, for example:
+
+```
+cargo run --release -p clipwire-agent -- import-paste --resend --images --since 1731700000000
+```
+
+`--resend` sends entries already moved from Paste to the group without touching the history; it
+finds them by their copy time. `--since` takes a date (`YYYY-MM-DD`) or the milliseconds from the
+hint, `--skip N` skips the N oldest entries, `--limit N` caps the count. Sending something twice is
+harmless: receivers drop entries they already have.
 
 ## Paste window
 

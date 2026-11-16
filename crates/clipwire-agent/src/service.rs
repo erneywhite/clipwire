@@ -615,6 +615,8 @@ impl Service {
                             }
                             on_event(UiEvent::AdminKeyStale);
                         }
+                        // Ход отправки локальной истории интерфейсу не нужен.
+                        Event::Backfill(_) => {}
                         Event::KnownDevices(cards) => {
                             if let Some(g) = group
                                 && let Err(e) = crate::devices::save_known(&paths, g, &cards)
