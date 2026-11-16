@@ -246,6 +246,10 @@ About → Status, in the **Pins on the server** row.
 
 ## What gets synced
 
+Without a connection the latest copy waits and goes out as soon as the server is reachable. If
+Clipwire is closed or the computer shuts down before that, the copy is sent on the next start
+(text, formatted text and images; files copied offline stay on this device).
+
 ### Text and formatting
 
 Copying from a browser, Word or a mail client keeps HTML and RTF along with the text. Pasting

@@ -240,6 +240,9 @@ pub enum Event {
     /// канале. Не ответить (просто выбросить) тоже можно: движок перестанет
     /// ждать.
     Flush(tokio::sync::oneshot::Sender<()>),
+    /// Своё копирование ушло на сервер: хэш содержимого (`Content::hash`).
+    /// Сервис снимает пометку «не отправлено» (`push_mark`).
+    Pushed([u8; 32]),
 }
 
 /// Своя версия: сервер младше неё — подсказка обновить образ.
@@ -1701,6 +1704,7 @@ impl Engine {
         out: Outgoing,
     ) -> Result<()> {
         let Outgoing { content: c, ext } = out;
+        let hash = c.hash();
         // Огромный HTML из Word не повод не отправить сам текст.
         let c = c.fit(MAX_ITEM_BYTES);
         if c.len() > MAX_ITEM_BYTES {
@@ -1759,6 +1763,7 @@ impl Engine {
         }
         // Свой элемент тоже двигает курсор: он новее всего, что было в истории.
         self.set_cursor(item.id);
+        self.emit(Event::Pushed(hash));
         Ok(())
     }
 }

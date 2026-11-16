@@ -206,6 +206,8 @@ struct Copier {
     /// Настройка `file_upload_limit_mb`, меняется без перезапуска.
     limit_mb: Arc<AtomicU64>,
     rt: tokio::runtime::Handle,
+    /// Пометка «последнее скопированное ещё не ушло в группу» (в группе).
+    mark: Option<crate::push_mark::PushMark>,
 }
 
 impl Copier {
@@ -307,13 +309,18 @@ impl Copier {
                 discard_outbox(self.blobs.as_deref(), &content);
                 return;
             }
-            if let Some(tx) = tx.as_ref()
-                && tx
+            if let Some(tx) = tx.as_ref() {
+                if tx
                     .try_send(Outgoing::new(content.clone(), source.as_ref()))
                     .is_err()
-            {
-                tracing::warn!("очередь отправки переполнена, копирование не ушло в группу");
-                discard_outbox(self.blobs.as_deref(), &content);
+                {
+                    tracing::warn!("очередь отправки переполнена, копирование не ушло в группу");
+                    discard_outbox(self.blobs.as_deref(), &content);
+                } else if let Some(mark) = &self.mark
+                    && resendable(&content)
+                {
+                    mark.set(&content.hash());
+                }
             }
         } else if self.is_cancelled() {
             return;
@@ -462,7 +469,34 @@ impl Service {
             blobs: blobs.clone(),
             limit_mb: upload_limit_mb,
             rt: rt.clone(),
+            mark: synced.then(|| crate::push_mark::PushMark::new(&paths_dir)),
         };
+        // Прошлый раз программу закрыли, пока последнее копирование ждало
+        // связи: дослать его первым.
+        if let Some(mark) = &copier.mark
+            && let Some(hash) = mark.get()
+        {
+            let entry = {
+                let h = history.lock().unwrap_or_else(|e| e.into_inner());
+                h.id_by_hash(&hash).and_then(|id| h.get(id))
+            };
+            match entry {
+                Some(e) if e.local && resendable(&e.content) => {
+                    let out = Outgoing {
+                        content: e.content,
+                        ext: without_note(&e.ext),
+                    };
+                    let tx = copier.tx.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(tx) = tx.as_ref()
+                        && tx.try_send(out).is_ok()
+                    {
+                        tracing::info!("досылаю копирование, не ушедшее до выхода");
+                    }
+                }
+                // Записи больше нет (удалили) — и досылать нечего.
+                _ => mark.clear(),
+            }
+        }
 
         // События движка.
         {
@@ -580,6 +614,9 @@ impl Service {
                         Event::GroupDeleted { old } => on_event(UiEvent::GroupDeleted { old }),
                         Event::RekeyLost(why) => on_event(UiEvent::RekeyLost(why)),
                         Event::DevicesChanged => on_event(UiEvent::DevicesChanged),
+                        Event::Pushed(hash) => {
+                            crate::push_mark::PushMark::new(&paths.dir).clear_if(&hash)
+                        }
                         Event::ServerOutdated(v) => on_event(UiEvent::ServerOutdated(v)),
                         Event::Deleted(note) => {
                             let removed = history
@@ -869,6 +906,14 @@ fn local_backfill(h: &History) -> Vec<(Outgoing, u64)> {
         .collect();
     out.reverse();
     out
+}
+
+/// Досылать ли неотправленное копирование после перезапуска. Файлы — нет:
+/// их части лежат в очереди загрузки, которая после перезапуска уже другая.
+// shortcut: файлы, скопированные без связи и не ушедшие до выхода, в группу
+// не попадут; если попросят — досылать их через тот же резерв, что backfill.
+fn resendable(c: &Content) -> bool {
+    !matches!(c, Content::Files(_))
 }
 
 /// Уходит ли элемент локальной истории в группу при подключении.
@@ -1269,6 +1314,7 @@ mod tests {
             blobs: None,
             limit_mb: Arc::new(AtomicU64::new(1)),
             rt: tokio::runtime::Handle::current(),
+            mark: None,
         };
         let app = SourceApp {
             name: "Блокнот".into(),
@@ -1321,6 +1367,7 @@ mod tests {
             blobs: None,
             limit_mb: Arc::new(AtomicU64::new(1)),
             rt: tokio::runtime::Handle::current(),
+            mark: None,
         };
         let app = SourceApp {
             name: "Блокнот".into(),
@@ -1365,6 +1412,7 @@ mod tests {
             blobs: None,
             limit_mb: Arc::new(AtomicU64::new(1)),
             rt: tokio::runtime::Handle::current(),
+            mark: None,
         };
         let started = now_ms() - 5_000;
         history
