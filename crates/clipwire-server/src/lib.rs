@@ -263,6 +263,17 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
         .context("не поднялся iroh-эндпоинт")?;
 
     let store = Store::open(&config.data_dir.join("clipwire.db"))?;
+    // Токен relay мог смениться мимо клиента (переменная окружения, правка
+    // файла): коды создания группы со старым токеном отзываются. Входу они
+    // и так не годятся (отпечаток токена не тот), отзыв — чтобы список не
+    // показывал их действующими.
+    let stale = store.revoke_stale_invites(&admin.token_fingerprint(), session::now_ms())?;
+    if stale > 0 {
+        tracing::info!(
+            stale,
+            "коды создания группы со старым токеном relay отозваны"
+        );
+    }
     let base_limits = Limits::new(config, guards);
     let shared = Arc::new(Shared {
         limits: std::sync::RwLock::new(Arc::new(base_limits.clone())),
@@ -311,6 +322,12 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("удалено брошенных групп смены ключа: {n}"),
                     Err(e) => tracing::warn!("очистка групп смены ключа не удалась: {e:#}"),
+                }
+                let invites_before = session::now_ms() - store::INVITE_KEEP.as_millis() as i64;
+                match shared.store.purge_invites(invites_before) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("удалено старых кодов создания группы: {n}"),
+                    Err(e) => tracing::warn!("очистка кодов создания группы не удалась: {e:#}"),
                 }
                 match devices::purge_rotated(&shared) {
                     Ok(0) => {}

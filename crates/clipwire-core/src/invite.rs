@@ -10,6 +10,12 @@
 //!   входят остальные устройства. Передавать только по надёжному каналу: кто
 //!   видел код, тот знает ключ. На этапе 6 его заменит pairing по PIN/QR.
 //!
+//! - **Код создания группы** (`cwgroup1-…`, `clipwire/11`) — код сервера без
+//!   ключа администратора, зато с одноразовым секретом создания
+//!   ([`GroupInviteCode`]). Его выпускает администратор сервера для другого
+//!   человека: тот создаёт одну свою группу и становится её админом, но не
+//!   администратором сервера.
+//!
 //! Формат: префикс + base32 (без паддинга, строчными) от postcard-сериализации.
 //! Base32 не зависит от регистра и не содержит символов, которые ломаются при
 //! копировании из мессенджеров.
@@ -18,12 +24,38 @@ use data_encoding::BASE32_NOPAD;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::admin::AdminKey;
+use crate::admin::{AdminKey, GroupInviteSecret};
 use crate::crypto::GroupKey;
 
 const SERVER_PREFIX: &str = "cwserver1-";
 const ADMIN_SERVER_PREFIX: &str = "cwserver2-";
 const INVITE_PREFIX: &str = "clipwire1-";
+/// Префикс кода создания группы ([`GroupInviteCode`]).
+pub const GROUP_INVITE_PREFIX: &str = "cwgroup1-";
+
+/// Код создания группы (`cwgroup1-…`): сервер и одноразовый секрет.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupInviteCode {
+    pub server: ServerInfo,
+    pub secret: GroupInviteSecret,
+}
+
+impl GroupInviteCode {
+    pub fn encode(&self) -> String {
+        encode(GROUP_INVITE_PREFIX, self)
+    }
+
+    pub fn decode(s: &str) -> Result<Self, InviteError> {
+        decode(GROUP_INVITE_PREFIX, s)
+    }
+
+    /// Похожа ли строка на код создания группы (по префиксу, без разбора).
+    pub fn looks_like(s: &str) -> bool {
+        let s = s.trim();
+        s.get(..GROUP_INVITE_PREFIX.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(GROUP_INVITE_PREFIX))
+    }
+}
 
 /// Как достучаться до сервера.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +276,35 @@ mod tests {
         ));
         // Ключ администратора в отладочном выводе не печатается.
         assert!(!format!("{:?}", admin()).contains("7, 7"));
+    }
+
+    #[test]
+    fn group_invite_code_roundtrip_and_not_interchangeable() {
+        let c = GroupInviteCode {
+            server: server(),
+            secret: GroupInviteSecret([5; 32]),
+        };
+        let code = c.encode();
+        assert!(code.starts_with(GROUP_INVITE_PREFIX));
+        assert!(GroupInviteCode::looks_like(&format!(
+            "  {}",
+            code.to_uppercase()
+        )));
+        assert_eq!(
+            GroupInviteCode::decode(&format!(" {}\n", code.to_uppercase())).unwrap(),
+            c
+        );
+        // С другими кодами не путается.
+        assert!(!GroupInviteCode::looks_like(&admin().encode()));
+        assert!(GroupInviteCode::decode(&admin().encode()).is_err());
+        assert!(ServerCode::decode(&code).is_err());
+        assert!(Invite::decode(&code).is_err());
+        assert!(matches!(
+            GroupInviteCode::decode("cwgroup1-!!!"),
+            Err(InviteError::Corrupt)
+        ));
+        // Секрет в отладочном выводе не печатается.
+        assert!(!format!("{c:?}").contains("5, 5"));
     }
 
     #[test]

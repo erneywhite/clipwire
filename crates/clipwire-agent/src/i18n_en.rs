@@ -762,6 +762,10 @@ pub static EN: &[(&str, &str)] = &[
     ),
     ("Код не сохранился: {e}", "The code was not saved: {e}"),
     (
+        "Не записался черновик группы: {e}",
+        "Could not save the group draft: {e}",
+    ),
+    (
         "Код приглашения не разобрался ({e}). Он начинается с clipwire1-.",
         "Could not read the invite code ({e}). It starts with clipwire1-.",
     ),
@@ -853,6 +857,47 @@ pub static EN: &[(&str, &str)] = &[
         "The server administrator deleted the group",
     ),
     ("Неверный id группы", "Invalid group id"),
+    // Коды создания группы (`clipwire/11`).
+    (
+        "Код создания группы не разобрался ({e}). Скопируйте его целиком, он начинается с cwgroup1-.",
+        "The group creation code could not be read ({e}). Copy it whole, it starts with cwgroup1-.",
+    ),
+    (
+        "Код не разобрался ({e}). Группу создают по коду администратора сервера (cwserver2-…) или по одноразовому коду создания группы (cwgroup1-…).",
+        "The code could not be read ({e}). A group is created with the server administrator code (cwserver2-…) or with a one-time group creation code (cwgroup1-…).",
+    ),
+    (
+        "Сервер не знает этот код создания группы. Проверьте, что код скопирован целиком и выпущен на этом сервере.",
+        "The server does not know this group creation code. Check that the code is copied whole and was issued on this server.",
+    ),
+    (
+        "По этому коду уже создали группу. Код одноразовый: попросите администратора сервера выпустить новый.",
+        "A group has already been created with this code. The code works once: ask the server administrator for a new one.",
+    ),
+    (
+        "Срок действия кода истёк. Попросите администратора сервера выпустить новый.",
+        "The code has expired. Ask the server administrator for a new one.",
+    ),
+    (
+        "Администратор сервера отозвал этот код. Попросите у него новый.",
+        "The server administrator revoked this code. Ask them for a new one.",
+    ),
+    (
+        "Действующих кодов уже {max}. Отзовите ненужные или дождитесь, пока их используют.",
+        "There are already {max} active codes. Revoke the ones you no longer need or wait until they are used.",
+    ),
+    (
+        "Этот код уже использован или отозван",
+        "This code has already been used or revoked",
+    ),
+    (
+        "Сервер не знает одноразовых кодов создания группы: попросите администратора обновить образ сервера Clipwire",
+        "The server does not support one-time group creation codes: ask the administrator to update the Clipwire server image",
+    ),
+    (
+        "Срок действия — от 1 до {max} часов",
+        "The validity period must be from 1 to {max} hours",
+    ),
     // Картинка как файл (image_file.rs, окно вставки).
     ("Снимок {stamp}.png", "Image {stamp}.png"),
     (

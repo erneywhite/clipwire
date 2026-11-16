@@ -20,10 +20,12 @@ mod config;
 mod deletes;
 mod devices;
 mod groups;
+mod invites;
 mod pins;
 pub use admin::{Create, PENDING_KEEP};
 pub use devices::{RekeyLimits, RekeyOutcome, Rotation};
 pub use groups::DeleteOutcome;
+pub use invites::{INVITE_KEEP, InviteCheck, MAX_ACTIVE_INVITES};
 use pins::KEPT_BY_PIN;
 pub use pins::{PinOutcome, PinQuota, PinWrite};
 
@@ -82,6 +84,10 @@ pub enum JoinOutcome {
     /// Секрет совпал, но ключ группы сменён: устройству отдаётся только
     /// его пакет нового ключа или «исключено» (`docs/devices.md`).
     Rotated(Rotation),
+    /// Код создания (`Create::Invite`) не годится: группы нет, а код не
+    /// найден, использован, истёк или отозван; или группа есть, а это не
+    /// повтор входа тем кодом, которым её создали.
+    InviteRefused(clipwire_core::admin::AdminFail),
 }
 
 /// Условие «группа `g` заброшена» для [`Store::idle_groups`] и
@@ -211,6 +217,7 @@ impl Store {
         deletes::migrate(&conn)?;
         pins::migrate(&conn)?;
         groups::migrate(&conn)?;
+        invites::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -254,6 +261,15 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        // С кодом в существующую группу — только повтор после потерянного
+        // ответа на создание. Проверка раньше секрета группы: она смотрит
+        // только на код, о группе отказ ничего не говорит.
+        if let (Some(_), Create::Invite(check)) = (&existing, &create) {
+            let rotated = admin::relay_rotated_ms(&tx)?;
+            if let Err(f) = invites::check_retry(&tx, check, group, rotated)? {
+                return Ok(JoinOutcome::InviteRefused(f));
+            }
+        }
         let outcome = match existing {
             None if create == Create::No => return Ok(JoinOutcome::NoGroup),
             None if create == Create::ForRekey && !admin::may_rekey_any(&tx, device)? => {
@@ -268,6 +284,14 @@ impl Store {
                     if admin::pending_count(&tx, device)? > 0 {
                         return Ok(JoinOutcome::TooManyGroups);
                     }
+                }
+                // Код гасится в этой же транзакции: любой отказ ниже (предел
+                // групп) откатывает и его, а второй вход с тем же кодом ждёт
+                // замка базы и видит код уже использованным.
+                if let Create::Invite(check) = &create
+                    && let Err(f) = invites::consume(&tx, check, group, now_ms)?
+                {
+                    return Ok(JoinOutcome::InviteRefused(f));
                 }
                 // Надгробия и группы со сменённым ключом (`store/devices.rs`),
                 // заброшенные группы места не занимают.

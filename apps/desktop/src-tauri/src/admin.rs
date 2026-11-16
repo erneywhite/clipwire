@@ -1,6 +1,6 @@
 //! Администратор сервера и админ группы (`clipwire/9`): команды раздела
 //! «Сервер» в настройках (с `clipwire/10` — и список групп сервера с
-//! удалением), «Я администратор сервера» в «Синхронизации» и роли в списке
+//! удалением, с `clipwire/11` — одноразовые коды создания группы), «Я администратор сервера» в «Синхронизации» и роли в списке
 //! устройств. Запросы идут через движок (`clipwire_agent::admin`),
 //! ключ администратора лежит в `admin.bin`.
 
@@ -10,7 +10,8 @@ use clipwire_agent::admin::{adopt_server_code, check_admin_code, claim_code, fai
 use clipwire_agent::i18n::{tr, trf};
 use clipwire_core::GroupId;
 use clipwire_core::admin::{
-    GroupInfo, GroupState, SETTINGS, ServerSettings, ServerSummary, SettingUnit, check_setting,
+    GroupInfo, GroupInviteInfo, GroupState, MAX_INVITE_TTL_HOURS, SETTINGS, ServerSettings,
+    ServerSummary, SettingUnit, check_setting,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
@@ -453,9 +454,131 @@ pub async fn server_group_delete(
     Ok(groups_dto(&list, &app))
 }
 
+/// Код создания группы для карточки «Приглашения на создание группы». Секрета
+/// здесь нет: сервер хранит только хэш, код показывается один раз при выпуске.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupInviteDto {
+    pub id: u64,
+    pub label: String,
+    pub created_ms: i64,
+    pub expires_ms: i64,
+    pub used_ms: Option<i64>,
+    /// Отпечаток созданной группы (10 hex, как в «Группах»).
+    pub used_group: Option<String>,
+    pub revoked_ms: Option<i64>,
+}
+
+fn invite_dto(i: &GroupInviteInfo) -> GroupInviteDto {
+    GroupInviteDto {
+        id: i.id,
+        label: i.label.clone(),
+        created_ms: i.created_ms,
+        expires_ms: i.expires_ms,
+        used_ms: i.used_ms,
+        used_group: i
+            .used_group
+            .map(|g| data_encoding::HEXLOWER.encode(&g.0[..5])),
+        revoked_ms: i.revoked_ms,
+    }
+}
+
+/// Ответ `server_invites`.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupInvitesDto {
+    /// Сервер знает коды создания группы (`clipwire/11`). Нет — список
+    /// пустой, в карточке пояснение «обновите сервер».
+    pub supported: bool,
+    pub invites: Vec<GroupInviteDto>,
+}
+
+#[tauri::command]
+pub async fn server_invites(window: WebviewWindow, app: AppHandle) -> CmdResult<GroupInvitesDto> {
+    only_settings(&window)?;
+    let ctl = controller(&app)?;
+    // Старому серверу запрос не шлём: он оборвал бы соединение.
+    if ctl.link().await?.server_protocol < 11 {
+        return Ok(GroupInvitesDto {
+            supported: false,
+            invites: Vec::new(),
+        });
+    }
+    let list = ctl.group_invites().await?;
+    Ok(GroupInvitesDto {
+        supported: true,
+        invites: list.iter().map(invite_dto).collect(),
+    })
+}
+
+/// Выпущенный код: весь `cwgroup1-…` (больше его не узнать) и список после
+/// выпуска. В отладочном выводе кода нет: в нём секрет.
+#[derive(Clone, Serialize)]
+pub struct InviteCreatedDto {
+    pub code: String,
+    pub id: u64,
+    pub invites: Vec<GroupInviteDto>,
+}
+
+impl std::fmt::Debug for InviteCreatedDto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteCreatedDto")
+            .field("code", &"..")
+            .field("id", &self.id)
+            .field("invites", &self.invites)
+            .finish()
+    }
+}
+
+#[tauri::command]
+pub async fn server_invite_create(
+    window: WebviewWindow,
+    app: AppHandle,
+    label: String,
+    ttl_hours: u32,
+) -> CmdResult<InviteCreatedDto> {
+    only_settings(&window)?;
+    if ttl_hours == 0 || ttl_hours > MAX_INVITE_TTL_HOURS {
+        return Err(trf(
+            "Срок действия — от 1 до {max} часов",
+            &[("max", &MAX_INVITE_TTL_HOURS)],
+        ));
+    }
+    let ctl = controller(&app)?;
+    let (code, id) = ctl.create_group_invite(label, ttl_hours).await?;
+    // Список — отдельным запросом; если он не придёт, код всё равно показать.
+    let invites = ctl
+        .group_invites()
+        .await
+        .map(|l| l.iter().map(invite_dto).collect())
+        .unwrap_or_default();
+    Ok(InviteCreatedDto { code, id, invites })
+}
+
+/// Отозвать неиспользованный код. Возвращает список после отзыва.
+#[tauri::command]
+pub async fn server_invite_revoke(
+    window: WebviewWindow,
+    app: AppHandle,
+    id: u64,
+) -> CmdResult<Vec<GroupInviteDto>> {
+    only_settings(&window)?;
+    let list = controller(&app)?.revoke_group_invite(id).await?;
+    Ok(list.iter().map(invite_dto).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invite_created_debug_hides_code() {
+        let dto = InviteCreatedDto {
+            code: "cwgroup1-секрет".into(),
+            id: 7,
+            invites: Vec::new(),
+        };
+        let s = format!("{dto:?}");
+        assert!(!s.contains("секрет") && s.contains('7'), "{s}");
+    }
 
     #[test]
     fn group_dto_marks_mine_and_state() {
@@ -488,6 +611,27 @@ mod tests {
         );
         assert!(!other.mine);
         assert_eq!((other.state, other.days_left), ("idle", None));
+    }
+
+    #[test]
+    fn invite_dto_has_fingerprint_and_no_secret() {
+        let i = GroupInviteInfo {
+            id: 3,
+            label: "Маше".into(),
+            created_ms: 1,
+            expires_ms: 2,
+            used_ms: Some(5),
+            used_group: Some(GroupId([0xcd; 32])),
+            revoked_ms: None,
+        };
+        let d = invite_dto(&i);
+        assert_eq!(d.used_group.as_deref(), Some("cdcdcdcdcd"));
+        assert_eq!((d.id, d.used_ms, d.revoked_ms), (3, Some(5), None));
+        let none = invite_dto(&GroupInviteInfo {
+            used_group: None,
+            ..i
+        });
+        assert_eq!(none.used_group, None);
     }
 
     #[test]

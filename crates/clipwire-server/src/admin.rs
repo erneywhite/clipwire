@@ -1,18 +1,20 @@
 //! Администратор сервера (`clipwire/9`, `docs/architecture.md`): секреты
 //! сервера, которые можно сменить из клиента, настройки сервера поверх
 //! переменных окружения и обработка запросов администратора. С
-//! `clipwire/10` — список групп сервера и удаление группы.
+//! `clipwire/10` — список групп сервера и удаление группы, с `clipwire/11` —
+//! одноразовые коды создания группы.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clipwire_core::admin::{
-    AdminFail, AdminKey, SETTINGS, SecretCode, ServerSettings, check_setting,
+    AdminFail, AdminKey, GroupInviteSecret, MAX_INVITE_LABEL, MAX_INVITE_TTL_HOURS, SETTINGS,
+    SecretCode, ServerSettings, check_setting,
 };
 use clipwire_core::proto::{ClientMsg, ServerMsg};
-use clipwire_core::{AdminServerInfo, DeviceId, GroupId, ServerInfo};
+use clipwire_core::{AdminServerInfo, DeviceId, GroupId, GroupInviteCode, ServerInfo};
 use tokio::sync::watch;
 
 use crate::session::{Limits, Shared, now_ms};
@@ -55,6 +57,12 @@ impl AdminState {
         read(&self.relay_token).clone()
     }
 
+    /// Отпечаток текущего токена relay
+    /// ([`clipwire_core::admin::relay_token_fingerprint`]).
+    pub fn token_fingerprint(&self) -> [u8; 32] {
+        clipwire_core::admin::relay_token_fingerprint(&read(&self.relay_token))
+    }
+
     /// Совпадает ли токен с текущим токеном relay (за постоянное время).
     pub fn token_matches(&self, token: &str) -> bool {
         crate::store::constant_time_eq(token.as_bytes(), read(&self.relay_token).as_bytes())
@@ -79,33 +87,53 @@ impl AdminState {
     /// Код сервера `cwserver2-…` с текущими секретами.
     pub fn server_code(&self) -> String {
         AdminServerInfo {
-            server: ServerInfo {
-                server_id: self.server_id,
-                relay_url: self.public_url.clone(),
-                relay_token: self.relay_token(),
-            },
+            server: self.server_info(),
             admin_key: self.admin_key(),
         }
         .encode()
     }
 
-    /// Новый токен relay: в файл, потом в память. Закрыть соединения —
-    /// дело вызывающего ([`Shared::close_all`]).
-    fn rotate_relay_token(&self) -> Result<Result<String, AdminFail>> {
+    /// Сервер с текущим токеном relay.
+    fn server_info(&self) -> ServerInfo {
+        ServerInfo {
+            server_id: self.server_id,
+            relay_url: self.public_url.clone(),
+            relay_token: self.relay_token(),
+        }
+    }
+
+    /// Код создания группы `cwgroup1-…` с этим секретом и текущим токеном.
+    pub fn group_invite_code(&self, secret: GroupInviteSecret) -> String {
+        GroupInviteCode {
+            server: self.server_info(),
+            secret,
+        }
+        .encode()
+    }
+
+    /// Можно ли сменить токен relay из клиента.
+    fn may_rotate_relay_token(&self) -> Result<(), AdminFail> {
         if self.token_from_env {
-            return Ok(Err(AdminFail::Unavailable(
+            return Err(AdminFail::Unavailable(
                 "токен relay задан переменной CLIPWIRE_RELAY_TOKEN: смените её в \
                  настройках контейнера"
                     .into(),
-            )));
+            ));
         }
+        Ok(())
+    }
+
+    /// Новый токен relay: в файл, потом в память. Проверить
+    /// [`Self::may_rotate_relay_token`] и закрыть соединения — дело
+    /// вызывающего ([`Shared::close_all`]).
+    fn rotate_relay_token(&self) -> Result<String> {
         let token = crate::new_relay_token()?;
         crate::write_private(
             &self.data_dir.join(crate::RELAY_TOKEN_FILE),
             token.as_bytes(),
         )?;
         *write(&self.relay_token) = token;
-        Ok(Ok(self.server_code()))
+        Ok(self.server_code())
     }
 
     /// Новый ключ администратора: в файл, потом в память.
@@ -242,6 +270,9 @@ pub fn is_admin_msg(msg: &ClientMsg) -> bool {
             | ClientMsg::RotateAdminKey
             | ClientMsg::ListGroups
             | ClientMsg::DeleteGroup { .. }
+            | ClientMsg::CreateGroupInvite { .. }
+            | ClientMsg::ListGroupInvites
+            | ClientMsg::RevokeGroupInvite { .. }
     )
 }
 
@@ -251,6 +282,18 @@ pub struct AdminCtx {
     pub device: DeviceId,
     /// Соединение по `clipwire/10`: знает группы сервера.
     pub groups: bool,
+    /// Соединение по `clipwire/11`: знает коды создания группы.
+    pub invites: bool,
+}
+
+impl AdminCtx {
+    pub fn new(device: DeviceId, alpn: &[u8]) -> Self {
+        Self {
+            device,
+            groups: clipwire_core::proto::knows_server_groups(alpn),
+            invites: clipwire_core::proto::knows_group_invites(alpn),
+        }
+    }
 }
 
 /// Группы сервера для `Groups`: из базы, кто на связи — из hub.
@@ -285,6 +328,69 @@ fn delete_group(shared: &Arc<Shared>, ctx: &AdminCtx, group: &GroupId) -> Result
     groups_msg(shared)
 }
 
+/// Символы управления направлением текста (U+202A–U+202E, U+2066–U+2069):
+/// ими подпись в списке можно развернуть задом наперёд и выдать за другую.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Подпись кода: без управляющих символов (и символов направления текста),
+/// по краям без пробелов, не длиннее [`MAX_INVITE_LABEL`] символов.
+fn clean_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| {
+            if c.is_control() || is_bidi_control(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MAX_INVITE_LABEL)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+/// `CreateGroupInvite`: новый секрет, в базу — только его хэш, в ответ —
+/// весь код. Сам код в лог не пишется.
+fn create_invite(
+    shared: &Shared,
+    label: &str,
+    ttl_hours: u32,
+) -> Result<Result<ServerMsg, AdminFail>> {
+    if ttl_hours == 0 || ttl_hours > MAX_INVITE_TTL_HOURS {
+        return Ok(Err(AdminFail::OutOfRange {
+            key: "ttl_hours".into(),
+            min: 1,
+            max: MAX_INVITE_TTL_HOURS.into(),
+        }));
+    }
+    let secret = GroupInviteSecret::generate().context("нет случайных байтов")?;
+    let now = now_ms();
+    let expires = now + i64::from(ttl_hours) * 3_600_000;
+    let label = clean_label(label);
+    let id = match shared.store.create_invite(
+        &secret.digest(),
+        &label,
+        &shared.admin.token_fingerprint(),
+        now,
+        expires,
+        crate::store::MAX_ACTIVE_INVITES,
+    )? {
+        Ok(id) => id,
+        Err(f) => return Ok(Err(f)),
+    };
+    tracing::info!(id, ttl_hours, "выпущен код создания группы");
+    Ok(Ok(ServerMsg::GroupInviteCreated {
+        code_secret: SecretCode(shared.admin.group_invite_code(secret)),
+        id,
+    }))
+}
+
 /// Запрос администратора сервера (`GetServerSettings` … `RotateAdminKey`,
 /// `ListGroups`, `DeleteGroup`). `None` — это не запрос администратора.
 /// Ошибка — сбой сервера или нарушение протокола (сообщение `clipwire/10`
@@ -300,6 +406,15 @@ pub fn handle(
     }
     if matches!(msg, ClientMsg::ListGroups | ClientMsg::DeleteGroup { .. }) && !ctx.groups {
         anyhow::bail!("сообщение clipwire/10 по старому протоколу");
+    }
+    if matches!(
+        msg,
+        ClientMsg::CreateGroupInvite { .. }
+            | ClientMsg::ListGroupInvites
+            | ClientMsg::RevokeGroupInvite { .. }
+    ) && !ctx.invites
+    {
+        anyhow::bail!("сообщение clipwire/11 по старому протоколу");
     }
     let fail = |f| Ok(Some(AdminReply::Send(ServerMsg::AdminFailed(f))));
     if !session.authorized(shared) {
@@ -333,23 +448,50 @@ pub fn handle(
             s.version = env!("CARGO_PKG_VERSION").to_string();
             ServerMsg::ServerSummary(s)
         }
-        ClientMsg::RotateRelayToken => match shared.admin.rotate_relay_token()? {
+        ClientMsg::RotateRelayToken => {
+            if let Err(f) = shared.admin.may_rotate_relay_token() {
+                return fail(f);
+            }
+            // Отметка смены и отзыв кодов — до записи нового токена: иначе в
+            // промежутке старый код приглашения или создания группы ещё
+            // работал бы. Если запись не удастся, коды останутся отозванными,
+            // а администратор повторит смену.
+            shared.store.mark_relay_rotated(now_ms())?;
+            let revoked = shared.store.revoke_all_invites(now_ms())?;
             // Новый код в лог не пишется: его получает клиент в ответе, а
             // лог контейнера часто видят больше людей, чем нужно. При
             // запуске код печатается (`main.rs`): без SSH это единственный
             // способ его узнать.
-            Ok(server_code) => {
-                shared.store.mark_relay_rotated(now_ms())?;
-                tracing::info!("токен relay сменён из клиента, все соединения закрываются");
-                return Ok(Some(AdminReply::SendAndCloseAll(
-                    ServerMsg::RelayTokenRotated {
-                        server_code: SecretCode(server_code),
-                    },
-                )));
+            let server_code = shared.admin.rotate_relay_token()?;
+            // Коды, выпущенные, пока токен записывался, — со старым
+            // отпечатком. Войти по ним и так нельзя, отзыв — для списка.
+            let revoked = revoked
+                + shared
+                    .store
+                    .revoke_stale_invites(&shared.admin.token_fingerprint(), now_ms())?;
+            if revoked > 0 {
+                tracing::info!(
+                    revoked,
+                    "коды создания группы отозваны вместе со старым токеном"
+                );
             }
-            Err(f) => return fail(f),
-        },
+            tracing::info!("токен relay сменён из клиента, все соединения закрываются");
+            return Ok(Some(AdminReply::SendAndCloseAll(
+                ServerMsg::RelayTokenRotated {
+                    server_code: SecretCode(server_code),
+                },
+            )));
+        }
         ClientMsg::RotateAdminKey => {
+            // Ключ меняют, когда он мог утечь: тогда и выпущенные с ним коды
+            // создания группы ненадёжны. Отзыв — до смены ключа.
+            let revoked = shared.store.revoke_all_invites(now_ms())?;
+            if revoked > 0 {
+                tracing::info!(
+                    revoked,
+                    "коды создания группы отозваны вместе со старым ключом администратора"
+                );
+            }
             let server_code = shared.admin.rotate_admin_key()?;
             tracing::info!("ключ администратора сменён из клиента");
             ServerMsg::AdminKeyRotated {
@@ -358,6 +500,20 @@ pub fn handle(
         }
         ClientMsg::ListGroups => groups_msg(shared)?,
         ClientMsg::DeleteGroup { group } => delete_group(shared, ctx, group)?,
+        ClientMsg::CreateGroupInvite { label, ttl_hours } => {
+            match create_invite(shared, label, *ttl_hours)? {
+                Ok(reply) => reply,
+                Err(f) => return fail(f),
+            }
+        }
+        ClientMsg::ListGroupInvites => ServerMsg::GroupInvites(shared.store.list_invites()?),
+        ClientMsg::RevokeGroupInvite { id } => {
+            if !shared.store.revoke_invite(*id, now_ms())? {
+                return fail(AdminFail::NoSuchInvite);
+            }
+            tracing::info!(id, "код создания группы отозван");
+            ServerMsg::GroupInvites(shared.store.list_invites()?)
+        }
         _ => unreachable!("проверено выше"),
     };
     Ok(Some(AdminReply::Send(reply)))
@@ -366,6 +522,21 @@ pub fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invite_label_is_cleaned() {
+        assert_eq!(clean_label("  Маше\n\t"), "Маше");
+        assert_eq!(clean_label("а\u{7}б"), "а б");
+        let long = "я".repeat(MAX_INVITE_LABEL + 5);
+        assert_eq!(clean_label(&long).chars().count(), MAX_INVITE_LABEL);
+        assert_eq!(clean_label(""), "");
+        // Символы направления текста убираются, как управляющие.
+        assert_eq!(clean_label("\u{202E}анаМ\u{202C}"), "анаМ");
+        assert_eq!(clean_label("а\u{2066}б\u{2069}"), "а б");
+        for c in ['\u{202A}', '\u{202B}', '\u{202D}', '\u{2067}', '\u{2068}'] {
+            assert_eq!(clean_label(&format!("x{c}y")), "x y");
+        }
+    }
 
     #[test]
     fn every_setting_maps_to_a_limit() {

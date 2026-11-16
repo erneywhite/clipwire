@@ -19,7 +19,7 @@ pub mod storage;
 pub use admin::AdminKey;
 pub use blob::BlobId;
 pub use crypto::{GroupId, GroupKey, JoinSecret, SealedItem};
-pub use invite::{AdminServerInfo, Invite, ServerCode, ServerInfo};
+pub use invite::{AdminServerInfo, GroupInviteCode, Invite, ServerCode, ServerInfo};
 pub use item::{Content, DeviceId, Ext, ExtList, FileRef, Item, ItemId, SourceApp};
 pub use pin::{PinId, PinState};
 pub use storage::{GroupConfig, StorageConfig};

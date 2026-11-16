@@ -65,6 +65,12 @@ pub enum Create {
     ForRekey,
     /// Можно, устройство станет админом группы (`JoinAsAdmin`).
     Admin,
+    /// Можно по одноразовому коду (`JoinWithInvite`, `clipwire/11`): хэш
+    /// секрета и отпечаток текущего токена relay. Код гасится в транзакции
+    /// создания, устройство становится админом группы, но не
+    /// администратором сервера. В существующую группу — только повтор
+    /// (`invites::check_retry`).
+    Invite(super::InviteCheck),
 }
 
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
@@ -98,6 +104,17 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Когда токен relay последний раз меняли из клиента (мс), `None` — не меняли.
+pub(super) fn relay_rotated_ms(conn: &Connection) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![RELAY_ROTATED],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// Сколько групп считается в пределе `max_groups` ([`COUNTED_GROUP`]).
@@ -178,7 +195,7 @@ pub(super) fn mark_created(
 ) -> Result<()> {
     match create {
         Create::No => {}
-        Create::Admin => {
+        Create::Admin | Create::Invite(_) => {
             conn.execute(
                 "UPDATE groups SET admin_device = ?2 WHERE group_id = ?1",
                 params![&group.0[..], &device.0[..]],
