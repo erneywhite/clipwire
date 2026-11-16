@@ -286,6 +286,7 @@ fn load_state() -> anyhow::Result<AppState> {
     });
     let settings = Settings::load(&paths.dir);
     clipwire_agent::i18n::set_language(&settings.language);
+    clipwire_agent::clipboard::set_image_as_file(settings.image_as_file);
     // Связка ключей заперта и человек не открыл её (или служба не ответила):
     // без ключа истории работать нельзя, поэтому ждём и спрашиваем снова.
     let history = loop {

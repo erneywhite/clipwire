@@ -837,4 +837,10 @@ pub static EN: &[(&str, &str)] = &[
         "The server administrator deleted the group",
     ),
     ("Неверный id группы", "Invalid group id"),
+    // Картинка как файл (image_file.rs, окно вставки).
+    ("Снимок {stamp}.png", "Image {stamp}.png"),
+    (
+        "Картинка не записалась файлом: {e}",
+        "Could not save the image as a file: {e}",
+    ),
 ];

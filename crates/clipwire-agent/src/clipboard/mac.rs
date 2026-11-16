@@ -122,7 +122,7 @@ impl Watcher {
                         let owner = frontmost_exe();
                         tracing::debug!(?owner, "буфер сменился");
                         let seq = || pb.changeCount() as u32;
-                        match super::read_consistent(seq, || read(&pb)) {
+                        match super::read_consistent(seq, || read(&pb)).map(|(r, _)| r) {
                             Some(Ok(Some(content))) => on_change(content, owner),
                             Some(Ok(None)) => {}
                             Some(Err(Skip::Excluded)) => {

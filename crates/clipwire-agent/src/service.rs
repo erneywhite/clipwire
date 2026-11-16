@@ -687,7 +687,7 @@ impl Service {
                     limit_mb: copier.limit_mb.clone(),
                     // Пауза и игнорируемые программы проверяются ещё раз в
                     // колбэке, здесь — чтобы не писать файлы на диск зря.
-                    accept_virtual: Box::new(move |owner| {
+                    accept_owner: Box::new(move |owner| {
                         if paused.load(Ordering::Relaxed) {
                             return false;
                         }

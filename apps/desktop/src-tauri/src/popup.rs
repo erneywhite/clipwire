@@ -404,6 +404,32 @@ pub async fn popup_paste(
         return_and_paste(&app, "popup", paste).await;
         return Ok(());
     }
+    // Картинка в Проводник, Finder или файловый менеджер Linux: картинку из
+    // буфера они не вставляют, поэтому кладём её PNG-файлом. Тихо, как файлы
+    // из кэша: в историю и группу уходит не файл, а поднимается сама запись.
+    if let clipwire_core::Content::Image { png, .. } = &entry.content
+        && into_active.unwrap_or_else(|| paste_into_active(&app))
+        && prev_is_file_manager(&app)
+    {
+        let dir = app.state::<AppState>().paths.dir.clone();
+        let png = png.clone();
+        let file = tauri::async_runtime::spawn_blocking(move || {
+            clipwire_agent::image_file::write_png(&dir, &png)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| {
+            trf(
+                "Картинка не записалась файлом: {e}",
+                &[("e", &format!("{e:#}"))],
+            )
+        })?;
+        tracing::debug!(path = %file.path, "картинка вставляется файлом");
+        put_quietly(&app, &clipwire_core::Content::Files(vec![file]))?;
+        crate::files::bump(&app, &full);
+        return_and_paste(&app, "popup", true).await;
+        return Ok(());
+    }
     // Источник остаётся тем же: элемент уходит в группу с ним.
     let source = entry.source_app();
     let content = if plain {
@@ -438,6 +464,28 @@ fn select_files(
     });
     let partial = all.len() < total;
     Ok((entry, partial))
+}
+
+/// Окно, которое было активным до показа окна вставки, — файловый менеджер:
+/// Проводник или рабочий стол (Windows), Finder (macOS), файловый менеджер
+/// по `WM_CLASS` (Linux, Xorg). На Wayland активное окно не узнать — `false`.
+fn prev_is_file_manager(app: &AppHandle) -> bool {
+    let state = app.state::<PopupState>();
+    #[cfg(windows)]
+    {
+        let prev = *state.prev_window.lock().unwrap_or_else(|e| e.into_inner());
+        clipwire_agent::image_file::window_is_file_manager(prev)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let prev = *state.prev_pid.lock().unwrap_or_else(|e| e.into_inner());
+        mac::is_finder(prev)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let prev = *state.prev_x11.lock().unwrap_or_else(|e| e.into_inner());
+        prev.is_some_and(linux::is_file_manager)
+    }
 }
 
 /// Окно вставки всё ещё на экране и в фокусе: пользователь ждёт вставку.
@@ -702,6 +750,13 @@ mod mac {
         }
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         send_paste();
+    }
+
+    /// Программа с этим PID — Finder.
+    pub fn is_finder(pid: Option<i32>) -> bool {
+        pid.and_then(NSRunningApplication::runningApplicationWithProcessIdentifier)
+            .and_then(|a| a.bundleIdentifier())
+            .is_some_and(|b| clipwire_agent::image_file::is_mac_file_manager(&b.to_string()))
     }
 
     fn activate(pid: i32) -> bool {

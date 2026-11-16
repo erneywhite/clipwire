@@ -32,6 +32,8 @@ export interface Settings {
   language: 'system' | 'ru' | 'en'
   /** Wayland: вставлять через портал удалённого управления. */
   portal_paste: boolean
+  /** Windows: картинка из буфера вставляется в Проводник PNG-файлом. */
+  image_as_file: boolean
 }
 
 export interface DeviceInfo {

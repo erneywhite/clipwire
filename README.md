@@ -283,6 +283,22 @@ in full. If the clipboard holds both text and an image (Excel and some editors d
 text is synced. Images over about 7.5 MB as PNG are not sent; the server limit for one item is
 8 MiB by default.
 
+An image can be pasted into a folder as a file. If the paste window was opened over File
+Explorer (or the desktop), Finder or a Linux file manager (Nautilus, Dolphin, Nemo, Thunar, Caja,
+PCManFM), Clipwire puts a file named "Image 2026-11-16 14-05-09.png" on the clipboard instead of
+the image. The file lives in Clipwire's temporary folder and is removed after a day; the history
+entry stays an image. On Wayland the app cannot tell which window was active, so the image is
+pasted as usual.
+
+On Windows this also works without the Clipwire window: when an image lands on the clipboard (a
+screenshot, "Copy image" in a browser, or an image from another device), Clipwire adds a PNG
+file to it, so a plain Ctrl+V in File Explorer creates a file. Other apps, messengers included,
+still receive the image. The clipboard is left alone if it holds text, files or an app's own
+formats besides the image (image editors and Office copy like that), if it was copied in an app
+from the "don't sync" list, and while sync is paused. After you quit Clipwire the image stays on
+the clipboard, without the file. Turn it off in Settings → General → "Paste clipboard images
+into File Explorer as files".
+
 ### Files and folders
 
 Files and folders copied in Explorer appear in the history as a card with name, size and path.
