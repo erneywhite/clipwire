@@ -558,8 +558,9 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
 
 The **About** page shows the version and the update check, and below it a status block: the
 connection to the server and how it runs (direct over UDP or through the relay, with latency),
-the server version (highlighted, with a one-time notification, when the server is older than the
-app and its image should be updated),
+the server version (highlighted, with a one-time notification, when the server lacks a protocol
+feature the app needs and its image should be updated; a release that changed only the app does
+not ask for that),
 when an item last went out and came in, the group's file storage, how many entries the history
 has on this device and how much space downloaded files take, how many items and files of the
 group sit on the server, how much of the server's quota for files is used
@@ -594,8 +595,8 @@ version number: `ghcr.io/erneywhite/clipwire-server:0.6.2`.
    container log can create groups and change limits. Do not show the log to others and do not
    paste it whole into chats or issues.
 
-**Updating:** pull the new image and recreate the container. When the app is newer than the
-server, About shows it next to the server version and you get a notification once.
+**Updating:** pull the new image and recreate the container. When the app needs a newer
+server protocol, About shows it next to the server version and you get a notification once.
 
 **Checking from outside:** `cargo run -p clipwire-server --example probe -- cwserver2-…` connects
 two clients through the relay, sends an encrypted item between them and shows which path the

@@ -128,6 +128,19 @@ pub fn knows_group_invites(alpn: &[u8]) -> bool {
     alpn_version(alpn) >= 11
 }
 
+/// Новейший протокол, который знает этот код (первый в [`ALPNS`]).
+pub fn newest_protocol() -> u32 {
+    alpn_version(ALPNS[0])
+}
+
+/// Сервер с этим протоколом отстал от клиента: какие-то возможности
+/// клиента ему незнакомы, образ стоит обновить. Версия программы тут ни при
+/// чём: выпуски, где сервер не менялся, протокол не поднимают, и сервер
+/// младшей версии с тем же протоколом полностью подходит.
+pub fn server_outdated(protocol: u32) -> bool {
+    protocol < newest_protocol()
+}
+
 /// Версия `a` младше `b` («0.3.0» < «0.3.1» < «0.10.0»). Части сравниваются
 /// числами; нечисловой хвост («-beta») отбрасывается, неразборная версия
 /// считается младше любой.
@@ -861,6 +874,15 @@ mod tests {
         assert!(postcard::to_stdvec(&inv).unwrap().len() < 128);
         // Вход администратора влезает в предел первого кадра сервера (512).
         assert!(postcard::to_stdvec(&join).unwrap().len() < 128);
+    }
+
+    #[test]
+    fn outdated_by_protocol_not_version() {
+        assert!(!server_outdated(newest_protocol()));
+        assert!(server_outdated(newest_protocol() - 1));
+        assert!(server_outdated(0));
+        // Сервер новее клиента — тоже не «отстал».
+        assert!(!server_outdated(newest_protocol() + 1));
     }
 
     #[test]
