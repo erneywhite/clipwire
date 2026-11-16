@@ -2,7 +2,15 @@
 # подписывает файлы обновления и публикует релиз с latest.json, который читает
 # автообновление.
 #
-# Нужны секреты репозитория:
+# Порядок: draft создаёт черновик релиза; три сборки идут параллельно и
+# заливают в него установщики с подписями (одно подтверждение окружения
+# release на все три); publish собирает latest.json из .sig
+# (.github/scripts/latest_json.py), ставит метку рекомендуемого выпуска и
+# публикует черновик. До публикации «последний релиз» остаётся прежним, так
+# что клиенты не видят выпуск без части платформ. Упала сборка — черновик
+# остаётся, его можно перезапустить или удалить.
+#
+# Нужны секреты окружения release:
 #   TAURI_SIGNING_PRIVATE_KEY          — приватный ключ подписи обновлений
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD — пароль к нему
 #   APPLE_CERTIFICATE                  — base64 от .p12 сертификата «Clipwire Self-Signed»
@@ -18,13 +26,39 @@ on:
 permissions:
   contents: write
 
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  TAG: ${{ github.ref_name }}
+  REPO: ${{ github.repository }}
+
 jobs:
-  windows:
+  draft:
     # Ручной запуск с ветки не должен публиковать релиз: нужен тег vX.Y.Z.
-    # macos и linux ждут это задание и без него тоже пропускаются.
+    # Остальные задания ждут это и без него тоже пропускаются.
     if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.r.outputs.id }}
+    steps:
+      - id: r
+        name: Черновик релиза
+        env:
+          BODY: Windows — файл Clipwire_*_windows_x64-setup.exe. macOS (13 и новее, Apple Silicon и Intel) — Clipwire_*_macos_universal.dmg, первый запуск описан в README. Linux — Clipwire_*_linux_amd64.deb (Ubuntu, Debian, Mint) или Clipwire_*_linux_amd64.AppImage (остальные). Уже установленные копии обновятся сами (.deb — по кнопке, с паролем).
+        run: |
+          set -euo pipefail
+          # Перезапуск: черновик или релиз с этим тегом уже есть — берём его.
+          ID="$(gh api "repos/$REPO/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n1)"
+          if [ -z "$ID" ]; then
+            ID="$(gh api "repos/$REPO/releases" -f tag_name="$TAG" -f name="Clipwire $TAG" \
+              -f body="$BODY" -F draft=true --jq .id)"
+          fi
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: draft
     # Секреты подписи лежат в окружении release: оно пускает только теги v*
-    # и ждёт подтверждения выпуска на странице запуска.
+    # и ждёт подтверждения выпуска. Три сборки стартуют вместе, поэтому
+    # подтверждение одно на все.
     environment: release
     runs-on: windows-latest
     steps:
@@ -46,20 +80,15 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/desktop
-          tagName: ${{ github.ref_name }}
-          releaseName: Clipwire ${{ github.ref_name }}
-          releaseBody: |
-            Windows — файл Clipwire_*_windows_x64-setup.exe. macOS (13 и новее, Apple Silicon и Intel) — Clipwire_*_macos_universal.dmg, первый запуск описан в README. Linux — Clipwire_*_linux_amd64.deb (Ubuntu, Debian, Mint) или Clipwire_*_linux_amd64.AppImage (остальные). Уже установленные копии обновятся сами (.deb — по кнопке, с паролем).
-          releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
+          releaseId: ${{ needs.draft.outputs.id }}
+          # latest.json собирает задание publish.
+          includeUpdaterJson: false
           # ОС в имени файла: в списке файлов выпуска сразу видно, что качать.
+          # Имена должны совпадать с PLATFORMS в latest_json.py.
           assetNamePattern: '[name]_[version]_windows_[arch][setup][ext]'
 
-  # После Windows, а не параллельно: tauri-action дописывает свою платформу в
-  # latest.json релиза, и два задания разом затёрли бы запись друг друга.
   macos:
-    needs: windows
+    needs: draft
     environment: release
     runs-on: macos-latest
     steps:
@@ -107,11 +136,8 @@ jobs:
         with:
           projectPath: apps/desktop
           args: --target universal-apple-darwin
-          tagName: ${{ github.ref_name }}
-          releaseName: Clipwire ${{ github.ref_name }}
-          releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
+          releaseId: ${{ needs.draft.outputs.id }}
+          includeUpdaterJson: false
           assetNamePattern: '[name]_[version]_macos_[arch][ext]'
 
       # Подпись должна быть сертификатом, а не ad-hoc: у ad-hoc требование —
@@ -124,10 +150,9 @@ jobs:
           echo "$REQ"
           echo "$REQ" | grep -q 'certificate root = H"'
 
-  # После macOS по той же причине: latest.json дописывается по очереди.
   # Ubuntu 22.04 — старый glibc: пакеты запускаются и на более старых системах.
   linux:
-    needs: macos
+    needs: draft
     environment: release
     runs-on: ubuntu-22.04
     steps:
@@ -156,49 +181,51 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: 1
         with:
           projectPath: apps/desktop
-          tagName: ${{ github.ref_name }}
-          releaseName: Clipwire ${{ github.ref_name }}
-          releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
+          releaseId: ${{ needs.draft.outputs.id }}
+          includeUpdaterJson: false
           assetNamePattern: '[name]_[version]_linux_[arch][ext]'
 
-  # Рекомендуемый выпуск: в сообщении аннотированного тега есть строка
-  # «recommended» или «recommended: причина». Тогда в latest.json добавляется
-  # поле recommended (true или причина), и клиенты показывают уведомление.
-  # Последним: tauri-action в каждом задании переписывает latest.json.
-  # Сообщение тега — через API: checkout превращает аннотированный тег в лёгкий.
-  recommended:
-    needs: linux
+  # latest.json, метка рекомендуемого выпуска и публикация. Секреты не нужны:
+  # подписи уже лежат в черновике файлами .sig.
+  publish:
+    needs: [draft, windows, macos, linux]
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ github.ref_name }}
-      REPO: ${{ github.repository }}
+      ID: ${{ needs.draft.outputs.id }}
     steps:
-      - name: Метка в latest.json
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: latest.json и публикация
         run: |
           set -euo pipefail
+          W="$RUNNER_TEMP/rel"; mkdir -p "$W/sigs"
+          # Черновик не находится по тегу обычными запросами — файлы по id.
+          gh api "repos/$REPO/releases/$ID/assets" --paginate \
+            --jq '.[] | select(.name | endswith(".sig")) | "\(.id) \(.name)"' |
+          while read -r AID NAME; do
+            gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$AID" > "$W/sigs/$NAME"
+          done
+          ls -l "$W/sigs"
+          # Сообщение тега — через API: checkout превращает аннотированный тег в лёгкий.
+          : > "$W/msg.txt"
           REF="$(gh api "repos/$REPO/git/ref/tags/$TAG")"
-          if [ "$(jq -r .object.type <<<"$REF")" != "tag" ]; then
-            echo "лёгкий тег — обычный выпуск"; exit 0
+          if [ "$(jq -r .object.type <<<"$REF")" = "tag" ]; then
+            gh api "repos/$REPO/git/tags/$(jq -r .object.sha <<<"$REF")" --jq .message > "$W/msg.txt"
           fi
-          MSG="$(gh api "repos/$REPO/git/tags/$(jq -r .object.sha <<<"$REF")" --jq .message)"
-          LINE="$(grep -m1 -iE '^[[:space:]]*recommended([[:space:]]*:.*)?[[:space:]]*$' <<<"$MSG" || true)"
-          if [ -z "$LINE" ]; then
-            echo "в сообщении тега нет recommended — обычный выпуск"; exit 0
+          python3 .github/scripts/latest_json.py --version "${TAG#v}" \
+            --base-url "https://github.com/$REPO/releases/download/$TAG" \
+            --sigs "$W/sigs" --tag-message "$W/msg.txt" \
+            --out "$W/latest.json" --note "$W/note.txt"
+          cat "$W/latest.json"
+          # Перезапуск: старый latest.json в черновике заменяется.
+          OLD="$(gh api "repos/$REPO/releases/$ID/assets" --paginate --jq '.[] | select(.name == "latest.json") | .id')"
+          [ -z "$OLD" ] || gh api -X DELETE "repos/$REPO/releases/assets/$OLD"
+          UPLOAD="$(gh api "repos/$REPO/releases/$ID" --jq .upload_url | sed 's/{.*}//')"
+          curl -sSf -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
+            --data-binary "@$W/latest.json" "$UPLOAD?name=latest.json" > /dev/null
+          BODY="$(gh api "repos/$REPO/releases/$ID" --jq .body)"
+          NOTE="$(cat "$W/note.txt")"
+          if [ -n "$NOTE" ] && [[ "$BODY" != "$NOTE"* ]]; then
+            BODY="$NOTE"$'\n\n'"$BODY"
           fi
-          REASON="$(sed -E 's/^[[:space:]]*[Rr][Ee][Cc][Oo][Mm][Mm][Ee][Nn][Dd][Ee][Dd][[:space:]]*:?[[:space:]]*//; s/[[:space:]]+$//' <<<"$LINE")"
-          cd "$RUNNER_TEMP"
-          gh release download "$TAG" -R "$REPO" -p latest.json --clobber
-          if [ -n "$REASON" ]; then
-            jq --arg r "$REASON" '.recommended = $r' latest.json > out.json
-          else
-            jq '.recommended = true' latest.json > out.json
-          fi
-          mv out.json latest.json
-          cat latest.json
-          gh release upload "$TAG" -R "$REPO" latest.json --clobber
-          BODY="$(gh release view "$TAG" -R "$REPO" --json body --jq .body)"
-          NOTE="Рекомендуемое обновление.${REASON:+ $REASON}"
-          gh release edit "$TAG" -R "$REPO" --notes "$NOTE"$'\n\n'"$BODY"
+          gh api -X PATCH "repos/$REPO/releases/$ID" -f body="$BODY" -F draft=false -f make_latest=true > /dev/null
+          echo "опубликован $TAG"

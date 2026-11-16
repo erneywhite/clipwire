@@ -245,17 +245,16 @@ Clipwire в список (системный запрос macOS показыва
   сетевые тесты упираются в предел 256 открытых файлов.
 - Выпуск (`release.yml`): задание для macOS, `tauri-action` с `--target universal-apple-darwin`,
   подпись постоянным самоподписанным сертификатом (ниже), `.dmg` и файлы обновления
-  (`Clipwire.app.tar.gz` + `.sig`). `latest.json`
-  должен содержать и `windows-x86_64`, и `darwin-aarch64` / `darwin-x86_64`: задания
-  выпуска собирают его вместе (`tauri-action` дописывает платформы в общий файл выпуска).
+  (`Clipwire.app.tar.gz` + `.sig`). `latest.json` с `darwin-aarch64` / `darwin-x86_64`
+  собирает из подписей задание `publish` (`docs/updates.md`).
 - README и README.ru.md: установка на macOS, первый запуск без нотаризации, разрешение
   «Универсальный доступ».
 
 **Состояние:** сделано, проверится первым выпуском.
 - `ci.yml`: `macos-latest` в матрице; тесты через bash с `ulimit -n 10240` на macOS;
   добавлены тесты фронтенда (`node src/lib/*.test.ts`) на всех ОС.
-- `release.yml`: задание `macos` после `windows` (оба дописывают `latest.json`, параллельно
-  затёрли бы друг друга). Сертификат из секретов импортируется во временную связку
+- `release.yml`: задание `macos` параллельно с остальными сборками, `latest.json` собирает
+  задание `publish`. Сертификат из секретов импортируется во временную связку
   (пароль — случайный `uuidgen`, секрет `KEYCHAIN_PASSWORD` не нужен), `tauri-action` с
   `--target universal-apple-darwin` и `APPLE_SIGNING_IDENTITY=Clipwire Self-Signed`
   подписывает им. Проверено локально на dev-сертификате: сборщик Tauri подписывает и
