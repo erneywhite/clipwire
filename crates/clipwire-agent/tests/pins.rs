@@ -1443,3 +1443,64 @@ async fn own_repair_keeps_foreign_blobs_out_of_own_record() -> Result<()> {
     b.stop().await?;
     server.shutdown().await
 }
+
+/// «Снял и сразу закрепил снова»: сервер удаляет файл закрепа при снятии,
+/// поэтому журнал загрузок владельца его забывает, и повторное закрепление
+/// заливает файл заново — второе устройство его скачивает.
+#[tokio::test(flavor = "multi_thread")]
+async fn unpin_then_pin_again_uploads_file_again() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    b.files = true;
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    let file = disk_file(&a.dir.join("src"), "doc.bin", 200_000)?;
+    let bytes = std::fs::read(&file.path)?;
+    let h = a.mem.add_content(Content::Files(vec![file]), true, "");
+    a.pins.pin(h, "");
+    b.until("закреп с файлом пришёл", |m, _| {
+        m.state(&h).is_some_and(|(p, _)| p)
+            && m.files(&h)
+                .first()
+                .is_some_and(|f| f.blob.is_some() && !f.p2p)
+    })
+    .await?;
+    assert_eq!(fetch(&b, &h).await?, vec![bytes.clone()]);
+    let first = b.mem.files(&h)[0].blob;
+
+    a.mem.set(&h, false, "");
+    a.pins.unpin(h);
+    b.until("закреп снят", |m, _| {
+        m.state(&h).is_some_and(|(p, _)| !p)
+    })
+    .await?;
+    a.synced().await?;
+    // Как сервис: файлы своей записи уже переехали на залитый `blob`.
+    a.until(
+        "своя запись знает залитый blob",
+        |m, _| m.files(&h).first().is_some_and(|f| f.blob.is_some()),
+    )
+    .await?;
+    a.mem.set(&h, true, "");
+    a.pins.pin(h, "");
+    b.until(
+        "закреп снова с файлом под новым blob",
+        |m, _| {
+            m.state(&h).is_some_and(|(p, _)| p)
+                && m.files(&h)
+                    .first()
+                    .is_some_and(|f| f.blob.is_some() && f.blob != first)
+        },
+    )
+    .await?;
+    let _ = std::fs::remove_dir_all(clipwire_agent::blobs::files_dir(&b.dir));
+    assert_eq!(fetch(&b, &h).await?, vec![bytes]);
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}

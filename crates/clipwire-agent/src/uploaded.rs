@@ -66,6 +66,18 @@ impl UploadedLog {
         self.save()
     }
 
+    /// Забыть, что эти файлы загружены: закреп с ними сняли, и сервер мог
+    /// уже их удалить (файлы, заведённые как файлы закрепа, удаляются сразу).
+    /// Повторное закрепление зальёт их заново.
+    pub fn forget(&mut self, blobs: &[BlobId]) -> Result<()> {
+        let before = self.blobs.len();
+        self.blobs.retain(|b, _| !blobs.contains(b));
+        if self.blobs.len() == before {
+            return Ok(());
+        }
+        self.save()
+    }
+
     /// Файл на сервере по журналу (загружен не больше суток назад).
     pub fn contains(&self, blob: BlobId, now_ms: i64) -> bool {
         self.blobs.get(&blob).is_some_and(|&at| fresh(at, now_ms))

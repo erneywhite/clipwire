@@ -1727,6 +1727,22 @@ impl Blobs {
             .contains(blob, crate::history::now_ms())
     }
 
+    /// Закреп с этими файлами сняли: забыть, что они загружены
+    /// ([`crate::uploaded::UploadedLog::forget`]).
+    pub fn forget_uploaded(&self, blobs: &[BlobId]) {
+        if blobs.is_empty() {
+            return;
+        }
+        if let Err(e) = self
+            .uploaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget(blobs)
+        {
+            tracing::warn!("журнал загрузок не сохранился: {e:#}");
+        }
+    }
+
     /// Файлы, которые качаются в кэш прямо сейчас (или ждут своей очереди).
     pub fn downloading(&self) -> std::collections::HashSet<BlobId> {
         self.downloads

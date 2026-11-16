@@ -402,15 +402,27 @@ impl Engine {
             }
             prepared.push((rec.pin_id, rec.rev, rec.pinned, state, item, rec.blobs));
         }
-        let touched: Vec<([u8; 32], Option<Item>)> = pins.update_later(|b| {
-            let mut touched = Vec::new();
+        let (touched, released) = pins.update_later(|b| {
+            let (mut touched, mut released) = (Vec::new(), Vec::new());
             for (id, rev, pinned, state, item, blobs) in prepared {
-                for h in b.apply(id, rev, pinned, state, blobs) {
+                // Файлы снятого закрепа (до правки).
+                let before = b
+                    .records
+                    .get(&id)
+                    .filter(|r| r.pinned)
+                    .map(|r| r.blobs.clone())
+                    .unwrap_or_default();
+                let hashes = b.apply(id, rev, pinned, state, blobs);
+                if !hashes.is_empty() && !pinned {
+                    released.extend(before);
+                }
+                for h in hashes {
                     touched.push((h, item.clone()));
                 }
             }
-            touched
+            (touched, released)
         });
+        self.forget_released(&released);
         for (h, item) in touched {
             let files = item
                 .as_ref()
@@ -502,7 +514,17 @@ impl Engine {
         };
         let hash = inf.w.state.hash;
         if let Some(pins) = &self.pins {
-            pins.update_later(|b| b.accepted(&inf.w, rev, inf.blobs.clone()));
+            let released = pins.update_later(|b| {
+                let before = b
+                    .records
+                    .get(&pin_id)
+                    .filter(|r| r.pinned && !inf.w.state.pinned)
+                    .map(|r| r.blobs.clone())
+                    .unwrap_or_default();
+                b.accepted(&inf.w, rev, inf.blobs.clone());
+                before
+            });
+            self.forget_released(&released);
         }
         if let Some(item) = inf
             .item
@@ -632,6 +654,17 @@ impl Engine {
             self.pin_effect(hash, None).await;
         }
         self.ps.dirty = true;
+    }
+
+    /// Закреп сняли (здесь или на другом устройстве): забыть в журнале
+    /// загрузок, что его файлы залиты. Сервер удаляет файлы, заведённые как
+    /// файлы закрепа, сразу при снятии, и без этого повторное закрепление
+    /// сочло бы их залитыми, а закреп остался бы без файлов. Обычные файлы
+    /// при повторном закреплении просто зальются ещё раз.
+    fn forget_released(&self, blobs: &[BlobId]) {
+        if let Some(b) = &self.blobs {
+            b.forget_uploaded(blobs);
+        }
     }
 
     /// Ответов по хэшу больше не ждём — новые правки по нему можно слать.
