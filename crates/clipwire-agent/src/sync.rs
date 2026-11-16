@@ -47,7 +47,11 @@ fn backfill_pause(batch_bytes: usize) -> Duration {
 /// отправленное до запроса принято. После обрыва повторяется только
 /// неподтверждённое, а не вся история и не ничего.
 const BACKFILL_CHECK_ITEMS: usize = 128;
-const BACKFILL_CHECK_BYTES: usize = 8 << 20;
+const BACKFILL_CHECK_BYTES: usize = 4 << 20;
+/// Сколько ждать ответа на контрольный запрос. Дольше [`CONNECT_TIMEOUT`]:
+/// перед ответом сервер дочитывает всё, что ещё в пути, а на медленном канале
+/// это несколько мегабайт картинок.
+const BACKFILL_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Пора ли контрольный запрос после `items` элементов и `bytes` байт.
 fn backfill_check_due(items: usize, bytes: usize) -> bool {
@@ -1319,9 +1323,10 @@ impl Engine {
         &mut self,
         key: &GroupKey,
         recv: &mut iroh::endpoint::RecvStream,
+        wait: Duration,
     ) -> Result<Vec<DeviceEntry>> {
         loop {
-            let msg = tokio::time::timeout(CONNECT_TIMEOUT, read_msg::<_, ServerMsg>(recv))
+            let msg = tokio::time::timeout(wait, read_msg::<_, ServerMsg>(recv))
                 .await
                 .context(tr("сервер не прислал список устройств"))??;
             match msg {
@@ -1352,7 +1357,7 @@ impl Engine {
         let old_key = self.state.invite.group_key.clone();
         let old = old_key.group_id();
         write_msg(send, &ClientMsg::ListDevices).await?;
-        let entries = self.await_devices(&old_key, recv).await?;
+        let entries = self.await_devices(&old_key, recv, CONNECT_TIMEOUT).await?;
         let views = crate::devices::open_entries(&old_key, entries);
         let plan = match crate::devices::plan_rekey(
             &views,
@@ -1705,7 +1710,8 @@ impl Engine {
             return Ok(());
         }
         write_msg(send, &ClientMsg::ListDevices).await?;
-        self.await_devices(key, recv).await?;
+        self.await_devices(key, recv, BACKFILL_CHECK_TIMEOUT)
+            .await?;
         self.backfill_confirmed += self.backfill_unconfirmed.len();
         self.backfill_unconfirmed.clear();
         tracing::debug!(confirmed = self.backfill_confirmed, "история подтверждена");
@@ -2133,6 +2139,15 @@ mod tests {
         // Мелкие элементы — минимальная пауза, крупные — по 1 МБ/с.
         assert_eq!(super::backfill_pause(1000), Duration::from_millis(400));
         assert_eq!(super::backfill_pause(3 << 20), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn backfill_check_by_count_or_bytes() {
+        // Текст — по числу элементов, картинки — раньше, по объёму.
+        assert!(!super::backfill_check_due(127, 1000));
+        assert!(super::backfill_check_due(128, 1000));
+        assert!(super::backfill_check_due(3, 4 << 20));
+        assert!(!super::backfill_check_due(3, (4 << 20) - 1));
     }
 
     /// Элемент с шифротекстом заданного размера (для нарезки содержимое не
