@@ -13,6 +13,7 @@ pub mod history;
 pub mod i18n;
 pub mod i18n_en;
 pub mod image;
+pub mod import_send;
 pub mod loopguard;
 pub mod p2p;
 #[cfg(target_os = "macos")]

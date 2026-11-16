@@ -41,6 +41,19 @@ fn backfill_pause(batch_bytes: usize) -> Duration {
     ))
 }
 
+/// После стольких элементов истории (или байт шифротекста, что раньше)
+/// движок спрашивает сервер список устройств и ждёт ответа. Сервер
+/// обрабатывает сообщения соединения по порядку, так что ответ значит: всё
+/// отправленное до запроса принято. После обрыва повторяется только
+/// неподтверждённое, а не вся история и не ничего.
+const BACKFILL_CHECK_ITEMS: usize = 128;
+const BACKFILL_CHECK_BYTES: usize = 8 << 20;
+
+/// Пора ли контрольный запрос после `items` элементов и `bytes` байт.
+fn backfill_check_due(items: usize, bytes: usize) -> bool {
+    items >= BACKFILL_CHECK_ITEMS || bytes >= BACKFILL_CHECK_BYTES
+}
+
 /// Больше этого не отправляем: сервер по умолчанию принимает до 8 МиБ
 /// шифротекста, а postcard и AEAD добавляют немного сверху. Картинки в PNG
 /// обычно сотни килобайт — пара мегабайт.
@@ -240,6 +253,29 @@ pub enum Event {
     /// канале. Не ответить (просто выбросить) тоже можно: движок перестанет
     /// ждать.
     Flush(tokio::sync::oneshot::Sender<()>),
+    /// Локальная история ([`Engine::with_backfill`],
+    /// [`Engine::with_backfill_source`]) отправляется в группу: сколько
+    /// элементов сервер уже обработал. `done` — отправлено всё.
+    Backfill(BackfillProgress),
+}
+
+/// Как идёт отправка локальной истории в группу.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackfillProgress {
+    /// Сколько элементов сервер точно обработал (ответил на контрольный
+    /// запрос после них). Не уменьшается и после обрыва.
+    pub confirmed: usize,
+    /// Отправлено и подтверждено всё.
+    pub done: bool,
+}
+
+/// Откуда движок берёт локальную историю для отправки порциями: большой
+/// архив (импорт из Paste с картинками) целиком в память не помещается.
+pub trait BackfillSource: Send {
+    /// Следующие элементы, не больше `max`, от старых к новым: содержимое и
+    /// когда скопировано (мс Unix). Пусто — источник кончился. Нечитаемое
+    /// источник пропускает сам.
+    fn next_batch(&mut self, max: usize) -> Vec<(Outgoing, u64)>;
 }
 
 /// Своя версия: сервер младше неё — подсказка обновить образ.
@@ -297,6 +333,15 @@ pub struct Engine {
     /// Локальная история, которую надо отправить в группу (устройство только
     /// что подключилось): содержимое и когда скопировано, от старых к новым.
     backfill: std::collections::VecDeque<(Outgoing, u64)>,
+    /// Остаток локальной истории, который ещё не взят в `backfill`.
+    /// В `Mutex`, чтобы движок оставался `Sync` (история на SQLite — нет).
+    backfill_source: Option<std::sync::Mutex<Box<dyn BackfillSource>>>,
+    /// Отправлено, но сервер ещё не подтвердил ([`BACKFILL_CHECK_ITEMS`]).
+    /// После обрыва уходит снова первым: повтор получатели отбрасывают по
+    /// содержимому.
+    backfill_unconfirmed: std::collections::VecDeque<(Outgoing, u64)>,
+    /// Сколько элементов локальной истории сервер уже подтвердил.
+    backfill_confirmed: usize,
     /// Передача файлов: загрузчик живёт здесь, соединение отдаётся ему на
     /// время сессии.
     blobs: Option<Arc<Blobs>>,
@@ -399,6 +444,9 @@ impl Engine {
             notify,
             went_online: false,
             backfill: std::collections::VecDeque::new(),
+            backfill_source: None,
+            backfill_unconfirmed: std::collections::VecDeque::new(),
+            backfill_confirmed: 0,
             blobs: None,
             pending: None,
             pending_reserved: false,
@@ -470,6 +518,13 @@ impl Engine {
     /// Отправить в группу эту локальную историю после входа.
     pub fn with_backfill(mut self, items: Vec<(Outgoing, u64)>) -> Self {
         self.backfill = items.into();
+        self
+    }
+
+    /// Отправить в группу локальную историю из `source` после входа, беря её
+    /// порциями ([`BackfillSource`]). Ход отправки — [`Event::Backfill`].
+    pub fn with_backfill_source(mut self, source: Box<dyn BackfillSource>) -> Self {
+        self.backfill_source = Some(std::sync::Mutex::new(source));
         self
     }
 
@@ -911,7 +966,7 @@ impl Engine {
         if let Some(c) = self.pending.take() {
             self.push(&conn, &mut send, c).await?;
         }
-        self.send_backfill(&mut send).await?;
+        self.send_backfill(&key, &mut send, &mut recv).await?;
         self.send_deletes(&key, &mut send).await?;
         // Закрепы: страницы с курсора, потом свои правки из очереди.
         self.pins_start(knows_pins(alpn));
@@ -1544,41 +1599,120 @@ impl Engine {
         self.state.invite.server.relay_token.clone()
     }
 
-    /// Отправить локальную историю в группу. Отправленное убирается из очереди
-    /// сразу, так что после обрыва досылается только остаток.
-    async fn send_backfill(&mut self, send: &mut iroh::endpoint::SendStream) -> Result<()> {
-        if self.backfill.is_empty() {
+    /// Есть ли ещё локальная история для отправки (в очереди, в источнике
+    /// или без подтверждения сервера).
+    fn backfill_pending(&self) -> bool {
+        !self.backfill.is_empty()
+            || self.backfill_source.is_some()
+            || !self.backfill_unconfirmed.is_empty()
+    }
+
+    /// Следующий элемент локальной истории: из очереди, а когда она пуста —
+    /// следующая порция из источника.
+    fn next_backfill(&mut self) -> Option<(Outgoing, u64)> {
+        if self.backfill.is_empty()
+            && let Some(src) = self.backfill_source.as_mut()
+        {
+            let part = src
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .next_batch(BACKFILL_BATCH);
+            if part.is_empty() {
+                self.backfill_source = None;
+            }
+            self.backfill.extend(part);
+        }
+        self.backfill.pop_front()
+    }
+
+    /// Отправить локальную историю в группу. Через каждые
+    /// [`BACKFILL_CHECK_ITEMS`] элементов движок ждёт подтверждения сервера
+    /// ([`Engine::backfill_check`]); после обрыва неподтверждённое уходит
+    /// снова, подтверждённое — нет.
+    async fn send_backfill(
+        &mut self,
+        key: &GroupKey,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Result<()> {
+        if !self.backfill_pending() {
             return Ok(());
         }
-        let total = self.backfill.len();
-        tracing::info!(n = total, "отправляю локальную историю в группу");
+        // Прошлая сессия оборвалась до подтверждения: это — в начало очереди.
+        let mut again = std::mem::take(&mut self.backfill_unconfirmed);
+        if !again.is_empty() {
+            tracing::info!(n = again.len(), "повторяю неподтверждённую историю");
+        }
+        again.extend(self.backfill.drain(..));
+        self.backfill = again;
+        tracing::info!(
+            confirmed = self.backfill_confirmed,
+            "отправляю локальную историю в группу"
+        );
         // Сервер пересылает элементы устройствам на связи через короткую
         // очередь (64) и при переполнении теряет: большую историю (импорт)
         // отправляем пачками с паузой, чтобы получатели успевали.
-        let (mut in_batch, mut batch_bytes, mut sent) = (0usize, 0usize, 0usize);
-        while let Some((out, ms)) = self.backfill.front().cloned() {
+        let (mut in_batch, mut batch_bytes) = (0usize, 0usize);
+        let (mut check_items, mut check_bytes) = (0usize, 0usize);
+        while let Some((out, ms)) = self.next_backfill() {
             if in_batch == BACKFILL_BATCH {
                 tokio::time::sleep(backfill_pause(batch_bytes)).await;
                 (in_batch, batch_bytes) = (0, 0);
-                if sent % (BACKFILL_BATCH * 32) == 0 {
-                    tracing::info!(sent, total, "история отправляется");
-                }
             }
-            let content = out.content.fit(MAX_ITEM_BYTES);
+            let content = out.content.clone().fit(MAX_ITEM_BYTES);
             if content.len() <= MAX_ITEM_BYTES {
                 let mut item = Item::backdated(self.device, content, ms)
                     .with_device_name(self.device_name.clone());
-                item.ext = out.ext;
+                item.ext = out.ext.clone();
                 let sealed = self.state.invite.group_key.seal(&item)?;
-                batch_bytes += sealed.ciphertext.len();
+                let len = sealed.ciphertext.len();
+                // Элемент — в неподтверждённые до записи: если запись
+                // оборвётся, он уйдёт снова в следующей сессии.
+                self.backfill_unconfirmed.push_back((out, ms));
                 write_msg(send, &ClientMsg::Backfill(sealed)).await?;
+                (batch_bytes, check_bytes) = (batch_bytes + len, check_bytes + len);
+            } else {
+                // Не влезает и после урезания: не отправляется никогда, но в
+                // счёт идёт, чтобы ход отправки сошёлся с числом записей.
+                self.backfill_unconfirmed.push_back((out, ms));
             }
-            self.backfill.pop_front();
-            (in_batch, sent) = (in_batch + 1, sent + 1);
+            (in_batch, check_items) = (in_batch + 1, check_items + 1);
+            if backfill_check_due(check_items, check_bytes) {
+                self.backfill_check(key, send, recv).await?;
+                (check_items, check_bytes) = (0, 0);
+            }
         }
-        if total > BACKFILL_BATCH {
-            tracing::info!(sent, "история отправлена");
+        self.backfill_check(key, send, recv).await?;
+        tracing::info!(n = self.backfill_confirmed, "локальная история отправлена");
+        self.emit(Event::Backfill(BackfillProgress {
+            confirmed: self.backfill_confirmed,
+            done: true,
+        }));
+        Ok(())
+    }
+
+    /// Контрольный запрос: `ListDevices` и ожидание ответа. Сервер
+    /// обрабатывает сообщения соединения по порядку, поэтому ответ значит,
+    /// что отправленные до него элементы приняты. Заодно читается всё, что
+    /// сервер прислал за время отправки.
+    async fn backfill_check(
+        &mut self,
+        key: &GroupKey,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Result<()> {
+        if self.backfill_unconfirmed.is_empty() {
+            return Ok(());
         }
+        write_msg(send, &ClientMsg::ListDevices).await?;
+        self.await_devices(key, recv).await?;
+        self.backfill_confirmed += self.backfill_unconfirmed.len();
+        self.backfill_unconfirmed.clear();
+        tracing::debug!(confirmed = self.backfill_confirmed, "история подтверждена");
+        self.emit(Event::Backfill(BackfillProgress {
+            confirmed: self.backfill_confirmed,
+            done: false,
+        }));
         Ok(())
     }
 
