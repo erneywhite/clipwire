@@ -651,8 +651,8 @@ default, and **Reset** returns a limit set from the app to it. Sizes are entered
 durations in hours; the app does not send a value outside the allowed range.
 
 The **Groups** card of the **Server** section lists every group on the server, most recently
-active first. Groups have no names (the server only knows their ids), so a group is shown by its
-id fingerprint, and this device's group is marked **your group**. Each row shows how many devices
+active first. A group is shown by its name if you have given it one, with the id fingerprint
+next to it, or by the fingerprint alone. This device's group is marked **your group**. Each row shows how many devices
 the group has and how many are online, when any device last signed in, how much space history,
 files and pins take on the server, and the state when it is not the usual one (key change not
 finished, key changed, abandoned). Empty groups and tombstones are dimmed. **Delete**, after a
@@ -663,6 +663,14 @@ Your own group cannot be deleted this way: leave it first or delete it from anot
 device. The group list needs a server with protocol `clipwire/10`; on an older server the card
 asks you to update the image. Devices running older versions treat a deleted group as being
 removed from the group.
+
+A group name is your own note, so you do not have to remember fingerprints. Click the pencil next
+to the title, type a name (up to 64 characters) and press Enter or **Save**; Esc cancels, and an
+empty field removes the name. The name is stored on the server as plain text and only the server
+administrator sees it: group members do not, and the group's content stays encrypted. A group
+created with a group creation code gets the code's label as its name. When the group key is
+changed, the name moves to the new group. Names came with protocol `clipwire/12`, so they need a
+fresh server image; on an older server there is no pencil.
 
 ### Group creation codes
 

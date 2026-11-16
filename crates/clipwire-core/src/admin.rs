@@ -2,7 +2,8 @@
 //! настройки сервера, которые админ меняет из клиента. С `clipwire/10` —
 //! список групп сервера и удаление группы ([`GroupInfo`]). С `clipwire/11` —
 //! одноразовые приглашения на создание группы ([`GroupInviteSecret`],
-//! [`GroupInviteInfo`]).
+//! [`GroupInviteInfo`]). С `clipwire/12` — имена групп ([`GroupEntry`],
+//! [`normalize_group_name`]).
 //!
 //! Ключ администратора — 32 случайных байта, сервер создаёт его при первом
 //! запуске и кладёт в каталог данных. Он есть только в коде сервера
@@ -327,8 +328,10 @@ pub enum GroupState {
     Idle,
 }
 
-/// Группа сервера в списке администратора (`ServerMsg::Groups`). Имён у
-/// групп нет: сервер знает только id. Объёмы — шифротекст, как в
+/// Группа сервера в списке администратора (`ServerMsg::Groups`, внутри
+/// [`GroupEntry`] — `ServerMsg::GroupList`). Полей сюда не добавлять: кадр
+/// postcard без версий, и клиенты `clipwire/10`–`11` перестали бы разбирать
+/// `Groups`. Новое кладётся рядом, в [`GroupEntry`]. Объёмы — шифротекст, как в
 /// [`ServerSummary`], и по всем группам складываются в неё.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupInfo {
@@ -353,6 +356,57 @@ pub struct GroupInfo {
     /// У группы есть админ (у групп до 0.5.0 его может не быть).
     pub has_admin: bool,
     pub state: GroupState,
+}
+
+/// Наибольшая длина имени группы, символов.
+pub const MAX_GROUP_NAME: usize = 64;
+
+/// Символы управления направлением текста (U+202A–U+202E, U+2066–U+2069):
+/// ими подпись в списке можно развернуть задом наперёд и выдать за другую.
+pub fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Невидимые символы, которыми имя можно сделать похожим на другое:
+/// направление текста, нулевой ширины, разделители строк и абзацев, мягкий
+/// перенос, BOM. Тот же набор, что `is_format_char` у имён файлов в агенте,
+/// плюс U+2028/2029.
+pub fn is_invisible_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Имя группы для `SetGroupName`: пробелы по краям убираются, пустое —
+/// снять имя. Управляющие и невидимые символы ([`is_invisible_char`]) — отказ,
+/// а не тихая замена: имя набирает человек, пусть он увидит, что не так.
+/// Длиннее [`MAX_GROUP_NAME`] символов — тоже отказ, без обрезки.
+pub fn normalize_group_name(name: &str) -> Result<String, AdminFail> {
+    let name = name.trim();
+    let bad = name.chars().any(|c| c.is_control() || is_invisible_char(c));
+    if bad || name.chars().count() > MAX_GROUP_NAME {
+        return Err(AdminFail::BadGroupName {
+            max: MAX_GROUP_NAME as u64,
+        });
+    }
+    Ok(name.to_string())
+}
+
+/// Группа сервера с именем (`ServerMsg::GroupList`, `clipwire/12`). Имя —
+/// заметка администратора сервера, сервер хранит её открытым текстом;
+/// пустое — имени нет. Устройствам группы имя не показывается.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupEntry {
+    pub info: GroupInfo,
+    pub name: String,
 }
 
 /// Почему сервер не выполнил запрос администратора или админа группы.
@@ -411,6 +465,10 @@ pub enum AdminFail {
     /// Отозвать нечего: кода нет, он уже использован или отозван.
     #[error("такого действующего кода нет")]
     NoSuchInvite,
+    /// Только по `clipwire/12`: имя группы длиннее `max` символов или с
+    /// управляющими символами (`SetGroupName`).
+    #[error("имя группы — до {max} символов, без управляющих символов")]
+    BadGroupName { max: u64 },
 }
 
 #[cfg(test)]
@@ -455,6 +513,30 @@ mod tests {
         assert_eq!(a, relay_token_fingerprint("token-a"));
         assert_ne!(a, relay_token_fingerprint("token-b"));
         assert_ne!(a, relay_token_fingerprint(""));
+    }
+
+    #[test]
+    fn group_name_is_trimmed_and_checked() {
+        assert_eq!(normalize_group_name("  Семья \n").unwrap(), "Семья");
+        assert_eq!(normalize_group_name("   ").unwrap(), "");
+        assert_eq!(normalize_group_name("").unwrap(), "");
+        let max = "я".repeat(MAX_GROUP_NAME);
+        assert_eq!(normalize_group_name(&max).unwrap(), max);
+        let bad = Err(AdminFail::BadGroupName {
+            max: MAX_GROUP_NAME as u64,
+        });
+        assert_eq!(normalize_group_name(&format!("{max}я")), bad);
+        assert_eq!(normalize_group_name("а\u{7}б"), bad);
+        assert_eq!(normalize_group_name("а\nб"), bad);
+        assert_eq!(normalize_group_name("\u{202E}анаМ"), bad);
+        assert_eq!(normalize_group_name("а\u{2066}б"), bad);
+        for c in [
+            '\u{200B}', '\u{200E}', '\u{2028}', '\u{2029}', '\u{061C}', '\u{FEFF}', '\u{00AD}',
+        ] {
+            assert_eq!(normalize_group_name(&format!("а{c}б")), bad, "{:?}", c);
+        }
+        // Эмодзи и обычные знаки можно.
+        assert_eq!(normalize_group_name("Офис 🏢 (2)").unwrap(), "Офис 🏢 (2)");
     }
 
     #[test]

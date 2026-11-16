@@ -303,6 +303,12 @@ impl Store {
                     params![&group.0[..], &digest[..], now_ms],
                 )?;
                 admin::mark_created(&tx, group, device, create, now_ms)?;
+                // Группа по коду приглашения получает имя из подписи кода:
+                // администратор сервера видит, для кого её создали.
+                if let Create::Invite(check) = &create {
+                    let label = invites::label_of(&tx, &check.hash)?;
+                    groups::set_name_in(&tx, group, &groups::name_from_invite(&label))?;
+                }
                 JoinOutcome::Created
             }
             // Заброшенная группа (`bury_idle_group`): верный секрет создаёт её

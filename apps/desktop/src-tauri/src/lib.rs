@@ -696,6 +696,7 @@ pub fn run() {
             admin::group_admin_claim,
             admin::server_groups,
             admin::server_group_delete,
+            admin::set_server_group_name,
             admin::server_invites,
             admin::server_invite_create,
             admin::server_invite_revoke,
