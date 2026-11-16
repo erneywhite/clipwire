@@ -17,6 +17,10 @@ use tokio::sync::mpsc;
 const T: Duration = Duration::from_secs(20);
 
 async fn start_server() -> Result<(clipwire_server::Running, ServerInfo)> {
+    start_server_with(10).await
+}
+
+async fn start_server_with(history_len: usize) -> Result<(clipwire_server::Running, ServerInfo)> {
     let config = Config {
         data_dir: std::env::temp_dir()
             .join(format!("clipwire-agent-test-{}", uuid::Uuid::now_v7())),
@@ -26,7 +30,7 @@ async fn start_server() -> Result<(clipwire_server::Running, ServerInfo)> {
         quic_bind: "127.0.0.1:0".parse()?,
         relay_token: Some("tok".into()),
         max_item_bytes: 1024 * 1024,
-        history_len: 10,
+        history_len,
         ttl: Duration::from_secs(3600),
         max_file_bytes: 8 * 1024 * 1024,
         blob_quota: 64 * 1024 * 1024,
@@ -342,5 +346,57 @@ async fn source_app_travels_with_item() -> Result<()> {
         })
         .await?;
     assert_eq!(item.source_app(), None);
+    server.shutdown().await
+}
+
+/// История длиннее прежнего предела (1000 элементов) приходит при входе
+/// целиком, пачками: вход не срывается, в буфер идёт только самое свежее.
+#[tokio::test(flavor = "multi_thread")]
+async fn long_history_arrives_in_batches() -> Result<()> {
+    const MISSED: usize = 2500;
+    let (server, info) = start_server_with(3000).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key, None)?;
+    a.online().await?;
+    // Курсор устройства, которое было на связи до этих элементов.
+    let before = ItemId::new();
+    for i in 0..MISSED {
+        a.local
+            .send(Content::Text(format!("пропущено {i}")).into())
+            .await?;
+    }
+    // Закрытие канала ждёт, пока сервер дочитает всё отправленное.
+    drop(a.local);
+    tokio::time::timeout(Duration::from_secs(120), a.task).await???;
+
+    let mut b = Agent::spawn(&info, &key, Some(before))?;
+    let (mut hist, mut batches, mut clip) = (0usize, 0usize, Vec::new());
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            match b.events.recv().await.context("движок остановился")? {
+                Event::History(items) => {
+                    assert!(items.len() <= 200, "пачка {} элементов", items.len());
+                    hist += items.len();
+                    batches += 1;
+                }
+                Event::Incoming(item) => clip.push(item.content),
+                // Как сервис: всё до `Flush` уже записано.
+                Event::Flush(done) => {
+                    let _ = done.send(());
+                }
+                Event::Status(Status::Online) => return Ok(()),
+                Event::Status(Status::Offline(e)) => anyhow::bail!("вход сорвался: {e}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("история не дошла")??;
+    assert_eq!(
+        clip,
+        vec![Content::Text(format!("пропущено {}", MISSED - 1))]
+    );
+    assert_eq!(hist + clip.len(), MISSED, "пришло не всё");
+    assert!(batches > 1, "история пришла одной пачкой");
     server.shutdown().await
 }

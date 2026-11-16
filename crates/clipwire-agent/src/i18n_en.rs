@@ -439,10 +439,6 @@ pub static EN: &[(&str, &str)] = &[
         "Settings were not saved: {e}",
     ),
     (
-        "сервер прислал слишком много истории",
-        "the server sent too much history",
-    ),
-    (
         "Версия настроек группы на пределе, новее сохранить нельзя",
         "The group settings version is at its limit, a newer one cannot be saved",
     ),

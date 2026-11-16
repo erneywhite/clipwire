@@ -211,6 +211,9 @@ fn headless(state: AgentState, paths: &Paths, send: Option<String>) -> Result<()
                     eprintln!("в истории группы новых элементов: {}", items.len())
                 }
                 Event::Cursor(_) => {}
+                Event::Flush(done) => {
+                    let _ = done.send(());
+                }
                 // Отладочный режим ничего не сохраняет: только сообщает.
                 Event::Rekeyed(n) => {
                     eprintln!("ключ группы сменило устройство «{}»", n.initiator_name)

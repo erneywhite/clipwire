@@ -536,8 +536,9 @@ impl Service {
                                 })
                                 .collect();
                             // Миниатюры — без замка истории и только новым
-                            // записям: в пачке до тысячи элементов, часть
-                            // картинки, и большинство обычно уже знакомо.
+                            // записям: в пачке до двухсот элементов
+                            // (`sync::HISTORY_BATCH_ITEMS`), часть картинки,
+                            // и большинство обычно уже знакомо.
                             let fresh: Vec<bool> = {
                                 let h = history.lock().unwrap_or_else(|e| e.into_inner());
                                 entries.iter().map(|e| !h.knows(e)).collect()
@@ -568,6 +569,11 @@ impl Service {
                             if added > 0 {
                                 on_event(UiEvent::HistoryMerged(added));
                             }
+                        }
+                        // События обрабатываются по порядку: всё до `Flush`
+                        // (пачка истории при входе) уже записано.
+                        Event::Flush(done) => {
+                            let _ = done.send(());
                         }
                         Event::Rekeyed(n) => on_event(UiEvent::Rekeyed(n)),
                         Event::Excluded { old } => on_event(UiEvent::Excluded { old }),

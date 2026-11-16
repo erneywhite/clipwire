@@ -647,6 +647,8 @@ app without restarting the container.
 
 - Encrypted items, for the retention period `CLIPWIRE_TTL_HOURS`, up to `CLIPWIRE_HISTORY_LEN`
   per group.
+  A device that was offline gets all of it when it joins, in batches of 200 items, so a long
+  history is never held in memory at once.
 - Encrypted files in `<CLIPWIRE_DATA_DIR>/blobs`, removed after the same period.
 - If a group chose its own storage (S3 or SFTP), only its encrypted settings, up to 16 KB, which
   the server hands out to the group's devices. They are deleted on a key change and together with
