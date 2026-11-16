@@ -162,3 +162,43 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
           assetNamePattern: '[name]_[version]_linux_[arch][ext]'
+
+  # Рекомендуемый выпуск: в сообщении аннотированного тега есть строка
+  # «recommended» или «recommended: причина». Тогда в latest.json добавляется
+  # поле recommended (true или причина), и клиенты показывают уведомление.
+  # Последним: tauri-action в каждом задании переписывает latest.json.
+  # Сообщение тега — через API: checkout превращает аннотированный тег в лёгкий.
+  recommended:
+    needs: linux
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Метка в latest.json
+        run: |
+          set -euo pipefail
+          REF="$(gh api "repos/$REPO/git/ref/tags/$TAG")"
+          if [ "$(jq -r .object.type <<<"$REF")" != "tag" ]; then
+            echo "лёгкий тег — обычный выпуск"; exit 0
+          fi
+          MSG="$(gh api "repos/$REPO/git/tags/$(jq -r .object.sha <<<"$REF")" --jq .message)"
+          LINE="$(grep -m1 -iE '^[[:space:]]*recommended([[:space:]]*:.*)?[[:space:]]*$' <<<"$MSG" || true)"
+          if [ -z "$LINE" ]; then
+            echo "в сообщении тега нет recommended — обычный выпуск"; exit 0
+          fi
+          REASON="$(sed -E 's/^[[:space:]]*[Rr][Ee][Cc][Oo][Mm][Mm][Ee][Nn][Dd][Ee][Dd][[:space:]]*:?[[:space:]]*//; s/[[:space:]]+$//' <<<"$LINE")"
+          cd "$RUNNER_TEMP"
+          gh release download "$TAG" -R "$REPO" -p latest.json --clobber
+          if [ -n "$REASON" ]; then
+            jq --arg r "$REASON" '.recommended = $r' latest.json > out.json
+          else
+            jq '.recommended = true' latest.json > out.json
+          fi
+          mv out.json latest.json
+          cat latest.json
+          gh release upload "$TAG" -R "$REPO" latest.json --clobber
+          BODY="$(gh release view "$TAG" -R "$REPO" --json body --jq .body)"
+          NOTE="Рекомендуемое обновление.${REASON:+ $REASON}"
+          gh release edit "$TAG" -R "$REPO" --notes "$NOTE"$'\n\n'"$BODY"

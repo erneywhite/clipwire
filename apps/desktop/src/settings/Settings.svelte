@@ -477,6 +477,16 @@
     newApp = ''
   }
 
+  /** Метка «рекомендуемое» из latest.json (как `updates::recommendation`):
+   *  `true` без причины, строка с причиной, `false` — обычный выпуск. */
+  function recommended(u: Update): true | string | false {
+    const r = (u.rawJson as Record<string, unknown> | undefined)?.recommended
+    if (r === true) return true
+    if (typeof r !== 'string') return false
+    const reason = (r.split('\n')[0] ?? '').trim().slice(0, 200)
+    return reason || true
+  }
+
   async function checkUpdates() {
     updateState = 'checking'
     updateError = ''
@@ -1066,6 +1076,9 @@
               <p class="version">Clipwire <span class="mono">{info?.version ?? '—'}</span></p>
               {#if updateState === 'available' && update}
                 <p class="accent-text">{t('Доступна версия {version}', { version: update.version })}</p>
+                {#if recommended(update)}
+                  <p class="hint">{recommended(update) === true ? t('Рекомендуемое обновление') : t('Рекомендуемое обновление: {reason}', { reason: recommended(update) as string })}</p>
+                {/if}
               {:else if updateState === 'installing'}
                 <p class="hint">{t('Скачивание и установка…')}</p>
               {:else if updateState === 'none'}

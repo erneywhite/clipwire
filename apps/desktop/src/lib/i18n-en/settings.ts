@@ -154,6 +154,8 @@ const en: Record<string, string> = {
   "Удалено не всё: {failed} — файлы открыты в другой программе": "Some files were not deleted ({failed}): they are open in another program",
   "{who}. Старый код приглашения больше не действует.": "{who}. The old invite code no longer works.",
   "Доступна версия {version}": "Version {version} is available",
+  "Рекомендуемое обновление": "Recommended update",
+  "Рекомендуемое обновление: {reason}": "Recommended update: {reason}",
   "Не удалось проверить обновления: {error}": "Couldn't check for updates: {error}",
   "Свернуть": "Minimize",
   "Закрыть": "Close",

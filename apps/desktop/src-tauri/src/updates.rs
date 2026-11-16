@@ -1,6 +1,8 @@
 //! Обновления клиента.
 //!
-//! Проверка — через 20 секунд после запуска и дальше раз в 6 часов. Что
+//! Проверка — через 20 секунд после запуска и дальше раз в час. Выпуск,
+//! помеченный рекомендуемым (поле `recommended` в `latest.json`, см.
+//! [`recommendation`]), один раз показывает системное уведомление. Что
 //! происходит с найденной версией, решает настройка «Обновляться
 //! автоматически»:
 //!
@@ -42,7 +44,7 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use crate::AppState;
 
 const FIRST_CHECK: Duration = Duration::from_secs(20);
-const EVERY: Duration = Duration::from_secs(6 * 3600);
+const EVERY: Duration = Duration::from_secs(3600);
 /// Сколько программой не должны пользоваться, чтобы поставить обновление.
 pub const IDLE: Duration = Duration::from_secs(120);
 /// Как часто смотреть, не пора ли ставить.
@@ -422,6 +424,71 @@ pub fn server_outdated(app: &AppHandle, server: Option<&str>) {
     let _ = std::fs::write(&path, key);
 }
 
+/// Помечен ли выпуск рекомендуемым. Метку ставит `release.yml` по сообщению
+/// тега: в `latest.json` появляется `"recommended": true` или строка с
+/// причиной. `Some("")` — рекомендуемый без причины, `None` — обычный.
+///
+/// `latest.json` не подписан, так что метка ничего не доказывает: подменив
+/// файл, можно лишь показать лишнее уведомление. Сам установщик по-прежнему
+/// проверяется подписью.
+pub fn recommendation(raw: &serde_json::Value) -> Option<String> {
+    match raw.get("recommended")? {
+        serde_json::Value::Bool(true) => Some(String::new()),
+        serde_json::Value::String(s) => {
+            // Причина идёт в заголовок уведомления: одна строка, коротко.
+            let s: String = s
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(200)
+                .collect();
+            Some(s)
+        }
+        _ => None,
+    }
+}
+
+/// Текст уведомления о рекомендуемом обновлении. `itself` — поставится само
+/// (автообновление включено и эта версия не падала).
+fn recommended_text(version: &str, itself: bool) -> String {
+    if itself {
+        trf(
+            "Рекомендуется обновить Clipwire до {version}. Обновление поставится само, когда программа не нужна.",
+            &[("version", &version)],
+        )
+    } else {
+        trf(
+            "Рекомендуется обновить Clipwire до {version}. Поставить его можно из меню в трее.",
+            &[("version", &version)],
+        )
+    }
+}
+
+/// Показать уведомление о рекомендуемом обновлении, один раз на версию
+/// (что показано, помнит `update/recommended`).
+fn notify_recommended(app: &AppHandle, version: &str, reason: &str, itself: bool) {
+    let path = dir(app).join("recommended");
+    if std::fs::read_to_string(&path).is_ok_and(|v| norm(&v) == norm(version)) {
+        return;
+    }
+    use tauri_plugin_notification::NotificationExt;
+    let mut b = app
+        .notification()
+        .builder()
+        .title(recommended_text(version, itself));
+    // Причина — телом уведомления: заголовок система обрезает.
+    if !reason.is_empty() {
+        b = b.body(reason);
+    }
+    if let Err(e) = b.show() {
+        tracing::warn!("уведомление не показалось: {e}");
+    }
+    let _ = std::fs::create_dir_all(dir(app));
+    let _ = std::fs::write(&path, version);
+}
+
 /// Ключ показанного уведомления: «сервер|клиент», «?|клиент» без версии.
 fn server_notice_key(server: Option<&str>, client: &str) -> String {
     format!("{}|{client}", server.unwrap_or("?"))
@@ -590,10 +657,15 @@ async fn check_once(app: &AppHandle) {
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(v.clone());
     let _ = app.emit("clipwire://update-available", &v);
+    let auto_ok = may_auto_install(&v, read_failed(&dir(app)).as_ref());
+    if let Some(reason) = recommendation(&update.raw_json) {
+        let itself = auto_enabled(app) && auto_ok && silent_install_possible();
+        notify_recommended(app, &v, &reason, itself);
+    }
     if !auto_enabled(app) || ready_version(app).as_deref() == Some(v.as_str()) {
         return;
     }
-    if !may_auto_install(&v, read_failed(&dir(app)).as_ref()) {
+    if !auto_ok {
         tracing::info!("обновление {v} в прошлый раз не установилось, ставится только по кнопке");
         return;
     }
@@ -783,6 +855,27 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn recommendation_from_latest_json() {
+        use serde_json::json;
+        assert_eq!(recommendation(&json!({"version": "0.7.0"})), None);
+        assert_eq!(recommendation(&json!({"recommended": false})), None);
+        assert_eq!(recommendation(&json!({"recommended": 1})), None);
+        assert_eq!(
+            recommendation(&json!({"recommended": true})),
+            Some(String::new())
+        );
+        assert_eq!(
+            recommendation(&json!({"recommended": "  чинит синхронизацию \nвторая строка"})),
+            Some("чинит синхронизацию".into())
+        );
+        let long = "я".repeat(500);
+        assert_eq!(
+            recommendation(&json!({ "recommended": long })).map(|s| s.chars().count()),
+            Some(200)
+        );
+    }
 
     fn m(window_open: bool, busy: bool, idle_secs: u64) -> Moment {
         Moment {
