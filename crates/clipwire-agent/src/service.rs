@@ -234,10 +234,8 @@ struct Copier {
 impl Copier {
     /// `send` — отправить в группу (не пауза). Папки обходятся и
     /// архивируются в фоне: обработчик буфера ОС ждать этого не должен.
-    /// Такой элемент попадает в историю и в группу, когда архив готов.
-    // shortcut: элемент с папкой встаёт в историю, когда готов архив, а не
-    // в момент копирования; скопированное за это время может оказаться ниже.
-    // Если станет заметно — заводить запись сразу и обновлять её по id.
+    /// Запись с папкой появляется в истории сразу, без размера, а в группу
+    /// уходит, когда обход и архив готовы; тогда же запись обновляется.
     /// `source` — приложение, из которого скопировано.
     fn dispatch(&self, content: Content, send: bool, source: Option<SourceApp>) {
         if self.is_cancelled() {
@@ -247,10 +245,12 @@ impl Copier {
         let prepare = send && self.blobs.is_some();
         let limit = self.limit_mb.load(Ordering::Relaxed);
         if prepare && needs_scan(&content, limit) {
+            let early = self.record_local(content.clone(), source.as_ref());
             let me = self.clone();
             self.rt.spawn_blocking(move || {
                 if let Some(content) = me.prepare(content, limit) {
-                    me.finish(content, true, source);
+                    me.send(&content, true, source.as_ref());
+                    me.update_local(early, content, source.as_ref());
                 }
             });
             return;
@@ -321,40 +321,104 @@ impl Copier {
     }
 
     fn finish(&self, content: Content, send: bool, source: Option<SourceApp>) {
+        if !self.send(&content, send, source.as_ref()) {
+            return;
+        }
+        self.record_local(content, source.as_ref());
+    }
+
+    /// Записать своё копирование в историю и сообщить окнам. Возвращает id и
+    /// время записи (для [`Copier::update_local`]).
+    fn record_local(
+        &self,
+        content: Content,
+        source: Option<&SourceApp>,
+    ) -> (clipwire_core::ItemId, i64) {
+        let started = std::time::Instant::now();
+        let mut entry = local_entry(self.device, &self.device_name, content.clone());
+        if let Some(app) = source {
+            entry.set_source_app(app);
+        }
+        let key = (entry.id, entry.seen_ms);
+        let new = record(&self.history, entry);
+        let took = started.elapsed();
+        if took > SLOW_RECORD {
+            tracing::warn!(
+                ms = took.as_millis() as u64,
+                "запись в историю заняла долго"
+            );
+        }
+        (self.on_event)(UiEvent::Copied(content));
+        if new {
+            (self.on_event)(UiEvent::NewEntry);
+        }
+        key
+    }
+
+    /// Папка дообошлась: обновить её запись на месте, с размером и
+    /// маршрутом. Запись успели удалить — не возвращать. Такое же
+    /// содержимое уже есть отдельной записью (ту же папку копировали
+    /// раньше) — черновая строка убирается, а прежняя поднимается.
+    fn update_local(
+        &self,
+        (id, seen_ms): (clipwire_core::ItemId, i64),
+        content: Content,
+        source: Option<&SourceApp>,
+    ) {
+        if self.is_cancelled() {
+            return;
+        }
+        let mut entry = local_entry(self.device, &self.device_name, content);
+        if let Some(app) = source {
+            entry.set_source_app(app);
+        }
+        {
+            let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            if h.get(id).is_none() {
+                return;
+            }
+            match h.id_by_hash(&entry.content.hash()) {
+                Some(other) if other != id => {
+                    if let Err(e) = h.delete(id) {
+                        tracing::warn!("черновая запись папки не удалилась: {e:#}");
+                    }
+                }
+                _ => {
+                    entry.id = id;
+                    entry.seen_ms = seen_ms;
+                }
+            }
+        }
+        record(&self.history, entry);
+        (self.on_event)(UiEvent::HistoryMerged(1));
+    }
+
+    /// Отправить в группу (`send`). `false` — сервис снимается, дальше
+    /// ничего не делать.
+    fn send(&self, content: &Content, send: bool, source: Option<&SourceApp>) -> bool {
         if send {
             let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
             // Отмена проверяется под тем же замком, которым её берёт `cancel`:
             // после снятия сервиса ничего не уходит и не пишется в историю.
             if self.is_cancelled() {
                 drop(tx);
-                discard_outbox(self.blobs.as_deref(), &content);
-                return;
+                discard_outbox(self.blobs.as_deref(), content);
+                return false;
             }
             if let Some(tx) = tx.as_ref() {
-                if tx
-                    .try_send(Outgoing::new(content.clone(), source.as_ref()))
-                    .is_err()
-                {
+                if tx.try_send(Outgoing::new(content.clone(), source)).is_err() {
                     tracing::warn!("очередь отправки переполнена, копирование не ушло в группу");
-                    discard_outbox(self.blobs.as_deref(), &content);
+                    discard_outbox(self.blobs.as_deref(), content);
                 } else if let Some(mark) = &self.mark
-                    && resendable(&content)
+                    && resendable(content)
                 {
                     mark.set(&content.hash());
                 }
             }
         } else if self.is_cancelled() {
-            return;
+            return false;
         }
-        let mut entry = local_entry(self.device, &self.device_name, content.clone());
-        if let Some(app) = &source {
-            entry.set_source_app(app);
-        }
-        let new = record(&self.history, entry);
-        (self.on_event)(UiEvent::Copied(content));
-        if new {
-            (self.on_event)(UiEvent::NewEntry);
-        }
+        true
     }
 }
 
@@ -1174,6 +1238,9 @@ fn thumb_if_new(history: &Mutex<History>, e: &Entry) -> Option<Vec<u8>> {
     if known { None } else { make_thumb(e) }
 }
 
+/// Дольше этого запись в историю считается медленной и попадает в журнал.
+const SLOW_RECORD: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Записать в историю. `true` — появилась новая запись.
 fn record(history: &Mutex<History>, entry: Entry) -> bool {
     let thumb = thumb_if_new(history, &entry);
@@ -1425,6 +1492,84 @@ mod tests {
         assert!(h.find(&Content::Text("после".into())).is_none());
         assert_eq!(events.load(Ordering::SeqCst), 1);
         drop(h);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Папка: запись сразу, без размера; после обхода — та же запись с
+    /// размером. Ту же папку уже копировали — черновая строка исчезает.
+    /// Черновую удалили до конца обхода — она не возвращается.
+    #[tokio::test]
+    async fn folder_entry_appears_at_once_and_updates_in_place() {
+        let d = tmp("folder-early");
+        let history = Arc::new(Mutex::new(History::open(&d).unwrap()));
+        let new = Arc::new(AtomicU64::new(0));
+        let n2 = new.clone();
+        let c = Copier {
+            tx: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            history: history.clone(),
+            device: DeviceId([1; 32]),
+            device_name: "тест".into(),
+            on_event: Arc::new(move |e| {
+                if matches!(e, UiEvent::NewEntry) {
+                    n2.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+            blobs: None,
+            limit_mb: Arc::new(AtomicU64::new(1)),
+            rt: tokio::runtime::Handle::current(),
+            mark: None,
+        };
+        let folder = |path: &str, size: u64| {
+            Content::Files(vec![FileRef {
+                name: "папка".into(),
+                path: path.into(),
+                size,
+                is_dir: true,
+                width: 0,
+                height: 0,
+                modified_ms: 0,
+                blob: None,
+                blob_size: 0,
+                p2p: false,
+            }])
+        };
+        let size_of = |h: &History, id| match h.get(id).map(|e| e.content) {
+            Some(Content::Files(f)) => Some(f[0].size),
+            _ => None,
+        };
+
+        let early = c.record_local(folder("C:/a", 0), None);
+        assert_eq!(size_of(&history.lock().unwrap(), early.0), Some(0));
+        c.record_local(Content::Text("позже".into()), None);
+        c.update_local(early, folder("C:/a", 500), None);
+        {
+            let h = history.lock().unwrap();
+            assert_eq!(h.len(), 2);
+            assert_eq!(size_of(&h, early.0), Some(500), "та же запись, с размером");
+            assert_eq!(
+                h.get(early.0).unwrap().seen_ms,
+                early.1,
+                "место не сменилось"
+            );
+        }
+        assert_eq!(new.load(Ordering::SeqCst), 2, "обновление звука не даёт");
+
+        // Ту же папку скопировали снова: черновая строка не дублирует прежнюю.
+        let again = c.record_local(folder("C:/a", 0), None);
+        c.update_local(again, folder("C:/a", 500), None);
+        {
+            let h = history.lock().unwrap();
+            assert_eq!(h.len(), 2);
+            assert!(h.get(again.0).is_none());
+            assert!(h.get(early.0).is_some());
+        }
+
+        // Черновую удалили, пока шёл обход.
+        let gone = c.record_local(folder("C:/b", 0), None);
+        history.lock().unwrap().delete(gone.0).unwrap();
+        c.update_local(gone, folder("C:/b", 7), None);
+        assert_eq!(history.lock().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(d);
     }
 
