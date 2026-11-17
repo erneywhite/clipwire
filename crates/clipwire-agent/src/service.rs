@@ -230,7 +230,13 @@ struct Copier {
     rt: tokio::runtime::Handle,
     /// Пометка «последнее скопированное ещё не ушло в группу» (в группе).
     mark: Option<crate::push_mark::PushMark>,
+    /// Отпечатки папок, отправленных с этого запуска (`blob` → отпечаток):
+    /// по ним повторное копирование той же папки берёт прежний архив.
+    fingerprints: Arc<Mutex<std::collections::HashMap<BlobId, [u8; 32]>>>,
 }
+
+/// Больше отпечатков папок не помним: дальше память чистится целиком.
+const MAX_FINGERPRINTS: usize = 4096;
 
 impl Copier {
     /// `send` — отправить в группу (не пауза). Папки обходятся и
@@ -249,22 +255,25 @@ impl Copier {
             let early = self.record_local(content.clone(), source.as_ref());
             let me = self.clone();
             self.rt.spawn_blocking(move || {
-                if let Some(content) = me.prepare(content, limit) {
-                    me.send(&content, true, source.as_ref());
+                if let Some((content, reused)) = me.prepare(content, limit) {
+                    me.send(&content, true, reused, source.as_ref());
                     me.update_local(early, content, source.as_ref());
                 }
             });
             return;
         }
-        let content = if prepare {
+        let (content, reused) = if prepare {
             match self.prepare(content, limit) {
                 Some(c) => c,
                 None => return,
             }
         } else {
-            content
+            (content, false)
         };
-        self.finish(content, send, source);
+        if !self.send(&content, send, reused, source.as_ref()) {
+            return;
+        }
+        self.record_local(content, source.as_ref());
     }
 
     /// Виртуальные файлы, дочитанные после того, как буфер сменился: в
@@ -308,21 +317,91 @@ impl Copier {
         drop(self.tx.lock().unwrap_or_else(|e| e.into_inner()).take());
     }
 
-    /// `None` — сервис сняли, пока обходилась папка.
-    fn prepare(&self, content: Content, limit_mb: u64) -> Option<Content> {
+    /// `None` — сервис сняли, пока обходилась папка. Второе — файлы взяты
+    /// у прежней записи ([`Copier::reusable`]).
+    fn prepare(&self, content: Content, limit_mb: u64) -> Option<(Content, bool)> {
         let Some(b) = &self.blobs else {
-            return Some(content);
+            return Some((content, false));
         };
-        let p = assign_blobs_until(content, limit_mb, b.outbox(), &self.cancelled)?;
+        let reuse =
+            |files: &[FileRef], fps: &[(usize, [u8; 32])]| self.reusable(b, files, fps, limit_mb);
+        let p = assign_blobs_until(content, limit_mb, b.outbox(), &self.cancelled, Some(&reuse))?;
         for (blob, reason) in p.failed {
             tracing::warn!("папка не отправится: {reason}");
             b.report_failed(blob, 0, reason);
         }
-        Some(p.content)
+        if p.reused {
+            tracing::info!("те же файлы уже отправлены, беру прежнюю загрузку");
+        }
+        if !p.fingerprints.is_empty() {
+            let mut fp = self.fingerprints.lock().unwrap_or_else(|e| e.into_inner());
+            // shortcut: при переполнении память отпечатков чистится целиком;
+            // если повторы после этого станут заметны — вытеснять старые.
+            if fp.len() + p.fingerprints.len() > MAX_FINGERPRINTS {
+                fp.clear();
+            }
+            fp.extend(p.fingerprints);
+        }
+        Some((p.content, p.reused))
     }
 
+    /// Прежняя своя запись с теми же файлами, чьи загрузки можно не
+    /// повторять: те же пути, размеры и время изменения, у папок — тот же
+    /// отпечаток; маршрут при нынешнем пороге тот же; всё, что шло на сервер,
+    /// загружено (за сутки, см. [`Blobs::is_uploaded`]) или ещё в очереди.
+    /// Закреплённые записи не берутся: их файлы живут по своим правилам.
+    fn reusable(
+        &self,
+        b: &Blobs,
+        files: &[FileRef],
+        fps: &[(usize, [u8; 32])],
+        limit_mb: u64,
+    ) -> Option<Content> {
+        let probe = Content::Files(files.to_vec());
+        let old = self
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files_entry(&probe.hash())?;
+        if !old.local || old.pinned {
+            return None;
+        }
+        let Content::Files(prev) = &old.content else {
+            return None;
+        };
+        if prev.len() != files.len() {
+            return None;
+        }
+        let queued: std::collections::HashSet<BlobId> = b.queued().iter().map(|j| j.blob).collect();
+        let known = self.fingerprints.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, (o, n)) in prev.iter().zip(files).enumerate() {
+            if o.path != n.path || o.size != n.size || o.is_dir != n.is_dir {
+                return None;
+            }
+            if !n.is_dir && o.modified_ms != n.modified_ms {
+                return None;
+            }
+            let blob = o.blob?;
+            if o.p2p != (route(o.blob_size, limit_mb) == Route::Direct) {
+                return None;
+            }
+            if n.is_dir {
+                let fp = fps.iter().find(|(j, _)| *j == i)?.1;
+                if known.get(&blob) != Some(&fp) {
+                    return None;
+                }
+            }
+            if !o.p2p && !b.is_uploaded(blob) && !queued.contains(&blob) {
+                return None;
+            }
+        }
+        Some(old.content.clone())
+    }
+
+    /// Отправить и записать без подготовки файлов (тесты: готовое содержимое).
+    #[cfg(test)]
     fn finish(&self, content: Content, send: bool, source: Option<SourceApp>) {
-        if !self.send(&content, send, source.as_ref()) {
+        if !self.send(&content, send, false, source.as_ref()) {
             return;
         }
         self.record_local(content, source.as_ref());
@@ -392,22 +471,36 @@ impl Copier {
         (self.on_event)(UiEvent::HistoryMerged(1));
     }
 
-    /// Отправить в группу (`send`). `false` — сервис снимается, дальше
-    /// ничего не делать.
-    fn send(&self, content: &Content, send: bool, source: Option<&SourceApp>) -> bool {
+    /// Отправить в группу (`send`). `reused` — файлы прежней записи (см.
+    /// [`Outgoing::reused`]): их архивы не удалять. `false` — сервис
+    /// снимается, дальше ничего не делать.
+    fn send(
+        &self,
+        content: &Content,
+        send: bool,
+        reused: bool,
+        source: Option<&SourceApp>,
+    ) -> bool {
         if send {
             let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
             // Отмена проверяется под тем же замком, которым её берёт `cancel`:
             // после снятия сервиса ничего не уходит и не пишется в историю.
+            let discard = |c: &Content| {
+                if !reused {
+                    discard_outbox(self.blobs.as_deref(), c);
+                }
+            };
             if self.is_cancelled() {
                 drop(tx);
-                discard_outbox(self.blobs.as_deref(), content);
+                discard(content);
                 return false;
             }
             if let Some(tx) = tx.as_ref() {
-                if tx.try_send(Outgoing::new(content.clone(), source)).is_err() {
+                let mut out = Outgoing::new(content.clone(), source);
+                out.reused = reused;
+                if tx.try_send(out).is_err() {
                     tracing::warn!("очередь отправки переполнена, копирование не ушло в группу");
-                    discard_outbox(self.blobs.as_deref(), content);
+                    discard(content);
                 } else if let Some(mark) = &self.mark
                     && resendable(content)
                 {
@@ -554,6 +647,7 @@ impl Service {
             limit_mb: upload_limit_mb,
             rt: rt.clone(),
             mark: synced.then(|| crate::push_mark::PushMark::new(&paths_dir)),
+            fingerprints: Default::default(),
         };
         // Прошлый раз программу закрыли, пока последнее копирование ждало
         // связи: дослать его первым.
@@ -569,6 +663,7 @@ impl Service {
                     let out = Outgoing {
                         content: e.content,
                         ext: without_note(&e.ext),
+                        reused: false,
                     };
                     let tx = copier.tx.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(tx) = tx.as_ref()
@@ -1050,6 +1145,7 @@ fn local_backfill(h: &History) -> Vec<(Outgoing, u64)> {
             let out = Outgoing {
                 content: e.content,
                 ext: without_note(&e.ext),
+                reused: false,
             };
             (out, seen)
         })
@@ -1108,7 +1204,17 @@ fn needs_scan(content: &Content, limit_mb: u64) -> bool {
 pub struct Prepared {
     pub content: Content,
     pub failed: Vec<(BlobId, String)>,
+    /// Файлы взяты у прежней записи ([`Reuse`]): ничего не собрано и не
+    /// резервируется.
+    pub reused: bool,
+    /// Отпечатки папок с назначенным `blob` ([`crate::folder::fingerprint`]).
+    pub fingerprints: Vec<(BlobId, [u8; 32])>,
 }
+
+/// Найти прежнюю запись, чьи файлы можно отправить вместо новых. Получает
+/// файлы с посчитанными размерами папок (ещё без `blob`) и отпечатки папок
+/// (индекс файла → отпечаток); возвращает содержимое прежней записи.
+pub type Reuse<'a> = &'a dyn Fn(&[FileRef], &[(usize, [u8; 32])]) -> Option<Content>;
 
 /// Решить для каждого файла и папки, как он передаётся ([`route`]), и
 /// назначить новый случайный `blob`. Папка обходится с пределами, ей
@@ -1117,12 +1223,13 @@ pub struct Prepared {
 /// `outbox`. Не прошла по пределам или архив не собрался — папка не
 /// передаётся и попадает в `failed`.
 ///
-/// Прежний `blob` (из истории или прошлого копирования тех же файлов)
-/// никогда не переиспользуется: файл мог измениться так, что размер и время
-/// изменения остались прежними, и тогда докачка склеила бы старые части на
-/// сервере с новыми. Блокирующая для папок: звать не из потока буфера ОС.
+/// Новый `blob` для уже бывшего файла здесь не назначается никогда: файл
+/// мог измениться так, что размер и время изменения остались прежними, и
+/// докачка склеила бы старые части на сервере с новыми. Прежние файлы целиком
+/// берёт только [`Reuse`], без новой загрузки. Блокирующая для папок: звать
+/// не из потока буфера ОС.
 pub fn assign_blobs(content: Content, limit_mb: u64, outbox: &Path) -> Prepared {
-    assign_blobs_until(content, limit_mb, outbox, &AtomicBool::new(false))
+    assign_blobs_until(content, limit_mb, outbox, &AtomicBool::new(false), None)
         .expect("без отмены результат есть всегда")
 }
 
@@ -1134,16 +1241,53 @@ fn assign_blobs_until(
     limit_mb: u64,
     outbox: &Path,
     cancel: &AtomicBool,
+    reuse: Option<Reuse>,
 ) -> Option<Prepared> {
     let Content::Files(mut files) = content else {
         return Some(Prepared {
             content,
             failed: Vec::new(),
+            reused: false,
+            fingerprints: Vec::new(),
         });
     };
+    // Сначала обход папок: размеры и отпечатки нужны, чтобы узнать прежнюю
+    // запись до сборки архивов.
+    let mut scans: Vec<Option<FolderScan>> = vec![None; files.len()];
+    let mut scan_failed: Vec<(usize, String)> = Vec::new();
+    if limit_mb > 0 {
+        for (i, f) in files.iter_mut().enumerate().filter(|(_, f)| f.is_dir) {
+            if cancel.load(Ordering::SeqCst) {
+                return None;
+            }
+            match scan_folder(f) {
+                Ok(sc) => scans[i] = Some(sc),
+                Err(e) => scan_failed.push((i, e.to_string())),
+            }
+        }
+    }
+    if limit_mb > 0
+        && scan_failed.is_empty()
+        && let Some(reuse) = reuse
+    {
+        let fps: Vec<(usize, [u8; 32])> = scans
+            .iter()
+            .enumerate()
+            .filter_map(|(i, sc)| sc.as_ref().map(|sc| (i, sc.fingerprint)))
+            .collect();
+        if let Some(old) = reuse(&files, &fps) {
+            return Some(Prepared {
+                content: old,
+                failed: Vec::new(),
+                reused: true,
+                fingerprints: Vec::new(),
+            });
+        }
+    }
     let mut failed = Vec::new();
     let mut built = Vec::new();
-    for f in &mut files {
+    let mut fingerprints = Vec::new();
+    for (i, f) in files.iter_mut().enumerate() {
         if cancel.load(Ordering::SeqCst) {
             for b in built {
                 let _ = std::fs::remove_file(crate::blobs::outbox_path(outbox, b));
@@ -1165,7 +1309,20 @@ fn assign_blobs_until(
             f.blob_size = f.size;
             continue;
         }
-        match prepare_folder(f, blob, limit_mb, outbox, cancel) {
+        let res = match (scans[i].take(), scan_failed.iter().find(|(j, _)| *j == i)) {
+            (_, Some((_, reason))) => Err(reason.clone()),
+            (Some(sc), None) => {
+                let fp = sc.fingerprint;
+                let r =
+                    build_folder(f, blob, sc, limit_mb, outbox, cancel).map_err(|e| e.to_string());
+                if r.is_ok() && f.blob.is_some() {
+                    fingerprints.push((blob, fp));
+                }
+                r
+            }
+            (None, None) => continue,
+        };
+        match res {
             Ok(true) => built.push(blob),
             Ok(false) => {}
             Err(reason) => failed.push((
@@ -1186,28 +1343,52 @@ fn assign_blobs_until(
     Some(Prepared {
         content: Content::Files(files),
         failed,
+        reused: false,
+        fingerprints,
     })
 }
 
-/// Папка: обход, размер архива и для папки до порога — сам архив.
-/// `Ok(true)` — архив собран в outbox. Отмена между обходом и сборкой —
-/// `Ok(false)` без архива (вызывающий сам увидит отмену).
-fn prepare_folder(
+/// Обход папки: записи, размер архива и отпечаток.
+#[derive(Clone)]
+struct FolderScan {
+    scan: crate::folder::DirScan,
+    tar: u64,
+    fingerprint: [u8; 32],
+}
+
+/// Обойти папку и поставить ей размер содержимого.
+fn scan_folder(f: &mut FileRef) -> Result<FolderScan> {
+    let scan = crate::folder::scan_dir(Path::new(&f.path)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    f.size = scan.bytes;
+    let tar = crate::folder::tar_size(&scan.entries)?;
+    let fingerprint = crate::folder::fingerprint(&scan.entries);
+    Ok(FolderScan {
+        scan,
+        tar,
+        fingerprint,
+    })
+}
+
+/// Папка после обхода: маршрут по размеру архива и для папки до порога —
+/// сам архив в outbox. `Ok(true)` — архив собран. Отмена между обходом и
+/// сборкой — `Ok(false)` без архива (вызывающий сам увидит отмену).
+fn build_folder(
     f: &mut FileRef,
     blob: BlobId,
+    sc: FolderScan,
     limit_mb: u64,
     outbox: &Path,
     cancel: &AtomicBool,
 ) -> Result<bool> {
-    let scan = crate::folder::scan_dir(Path::new(&f.path)).map_err(|e| anyhow::anyhow!("{e}"))?;
-    f.size = scan.bytes;
-    let tar = crate::folder::tar_size(&scan.entries)?;
+    let tar = sc.tar;
     // По размеру архива: его сервер резервирует и с ним сравнивает предел.
     let r = route(tar, limit_mb);
     let mut built = false;
     if r == Route::Server && !cancel.load(Ordering::SeqCst) {
-        let len =
-            crate::folder::build_archive(&scan.entries, &crate::blobs::outbox_path(outbox, blob))?;
+        let len = crate::folder::build_archive(
+            &sc.scan.entries,
+            &crate::blobs::outbox_path(outbox, blob),
+        )?;
         built = true;
         if len != tar {
             let _ = std::fs::remove_file(crate::blobs::outbox_path(outbox, blob));
@@ -1433,7 +1614,9 @@ mod tests {
         // Отмена: ничего не возвращается, собранные архивы удалены.
         let stop = AtomicBool::new(true);
         let before = std::fs::read_dir(&outbox).unwrap().count();
-        assert!(assign_blobs_until(Content::Files(vec![p(&small)]), 1, &outbox, &stop).is_none());
+        assert!(
+            assign_blobs_until(Content::Files(vec![p(&small)]), 1, &outbox, &stop, None).is_none()
+        );
         assert_eq!(std::fs::read_dir(&outbox).unwrap().count(), before);
 
         // Порог 0 — папки даже не обходятся.
@@ -1468,6 +1651,7 @@ mod tests {
             limit_mb: Arc::new(AtomicU64::new(1)),
             rt: tokio::runtime::Handle::current(),
             mark: None,
+            fingerprints: Default::default(),
         };
         let app = SourceApp {
             name: "Блокнот".into(),
@@ -1518,6 +1702,7 @@ mod tests {
             limit_mb: Arc::new(AtomicU64::new(1)),
             rt: tokio::runtime::Handle::current(),
             mark: None,
+            fingerprints: Default::default(),
         };
         let folder = |path: &str, size: u64| {
             Content::Files(vec![FileRef {
@@ -1572,6 +1757,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
+    /// Повторное копирование тех же файлов и той же папки берёт прежнюю
+    /// загрузку, если она ещё в очереди (или уже на сервере). Изменённый
+    /// файл, файл папки, закреплённая запись или загрузка, которой нет, —
+    /// новая загрузка.
+    #[tokio::test]
+    async fn same_files_reuse_previous_upload() {
+        let d = tmp("reuse");
+        let history = Arc::new(Mutex::new(History::open(&d.join("h")).unwrap()));
+        let blobs = Blobs::new(
+            clipwire_core::GroupKey([3; 32]),
+            &d.join("state"),
+            Arc::new(|_| {}),
+        );
+        let c = Copier {
+            tx: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            history: history.clone(),
+            device: DeviceId([1; 32]),
+            device_name: "тест".into(),
+            on_event: Arc::new(|_| {}),
+            blobs: Some(blobs.clone()),
+            limit_mb: Arc::new(AtomicU64::new(1)),
+            rt: tokio::runtime::Handle::current(),
+            mark: None,
+            fingerprints: Default::default(),
+        };
+        let dir = d.join("папка");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"0123456789").unwrap();
+        let file = d.join("one.txt");
+        std::fs::write(&file, b"abc").unwrap();
+        let copy =
+            |path: &std::path::Path| Content::Files(vec![crate::clipboard::local_file_ref(path)]);
+        let blob_of = |c: &Content| match c {
+            Content::Files(f) => f[0].blob.unwrap(),
+            _ => unreachable!(),
+        };
+        // Первое копирование: запись в истории и загрузка в очереди.
+        let first = |path: &std::path::Path| {
+            let (got, reused) = c.prepare(copy(path), 1).unwrap();
+            assert!(!reused);
+            c.record_local(got.clone(), None);
+            let Content::Files(f) = &got else {
+                unreachable!()
+            };
+            blobs.enqueue(vec![blobs.upload_job(&f[0]).unwrap()]);
+            got
+        };
+
+        for path in [&dir, &file] {
+            let got = first(path);
+            let (again, reused) = c.prepare(copy(path), 1).unwrap();
+            assert!(reused, "{}: те же файлы — прежняя загрузка", path.display());
+            assert_eq!(again, got);
+        }
+
+        // Файл внутри папки перезаписан (время изменения другое).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(dir.join("a.txt"), b"9876543210").unwrap();
+        let (changed, reused) = c.prepare(copy(&dir), 1).unwrap();
+        assert!(!reused, "папка изменилась");
+        // Сам файл изменился.
+        std::fs::write(&file, b"xyz").unwrap();
+        let (changed_file, reused) = c.prepare(copy(&file), 1).unwrap();
+        assert!(!reused, "файл изменился");
+
+        // Закреплённую запись не берём.
+        c.record_local(changed_file.clone(), None);
+        blobs.enqueue(vec![
+            blobs
+                .upload_job(match &changed_file {
+                    Content::Files(f) => &f[0],
+                    _ => unreachable!(),
+                })
+                .unwrap(),
+        ]);
+        {
+            let mut h = history.lock().unwrap();
+            let id = h.id_by_hash(&changed_file.hash()).unwrap();
+            h.set_pinned(id, true).unwrap();
+        }
+        assert!(!c.prepare(copy(&file), 1).unwrap().1, "закреп");
+
+        // Загрузки нет ни в очереди, ни на сервере.
+        c.record_local(changed.clone(), None);
+        assert!(blobs.queued().iter().all(|j| j.blob != blob_of(&changed)));
+        assert!(!c.prepare(copy(&dir), 1).unwrap().1, "загрузки нет");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     /// Звук на каждое своё копирование, и на повтор того, что уже есть в
     /// истории: человек скопировал ещё раз и ждёт отклика.
     #[tokio::test]
@@ -1599,6 +1874,7 @@ mod tests {
             limit_mb: Arc::new(AtomicU64::new(1)),
             rt: tokio::runtime::Handle::current(),
             mark: None,
+            fingerprints: Default::default(),
         };
         let app = SourceApp {
             name: "Блокнот".into(),
@@ -1649,6 +1925,7 @@ mod tests {
             limit_mb: Arc::new(AtomicU64::new(1)),
             rt: tokio::runtime::Handle::current(),
             mark: None,
+            fingerprints: Default::default(),
         };
         let started = now_ms() - 5_000;
         history

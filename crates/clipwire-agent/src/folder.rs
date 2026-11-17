@@ -257,6 +257,27 @@ fn write_tar<W: Write>(entries: &[DirEntry], w: W, real: bool) -> Result<W> {
     Ok(b.into_inner()?)
 }
 
+/// Отпечаток содержимого папки по обходу: пути, вид, размеры и время
+/// изменения файлов. Совпал — папку можно считать прежней (как robocopy и
+/// rsync по умолчанию). Само содержимое файлов не читается.
+pub fn fingerprint(entries: &[DirEntry]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for e in entries {
+        h.update(e.rel.as_bytes());
+        h.update([0]);
+        match e.kind {
+            EntryKind::Dir => h.update(b"d"),
+            EntryKind::File { size, mtime } => {
+                h.update(b"f");
+                h.update(size.to_le_bytes());
+                h.update(mtime.to_le_bytes());
+            }
+        }
+    }
+    h.finalize().into()
+}
+
 /// Размер архива этих записей в байтах.
 pub fn tar_size(entries: &[DirEntry]) -> Result<u64> {
     Ok(write_tar(entries, Counter(0), false)?.0)
