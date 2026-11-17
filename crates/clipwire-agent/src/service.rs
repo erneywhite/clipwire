@@ -918,9 +918,18 @@ impl Service {
                     return;
                 }
                 drop(list);
-                if !guard.should_send(&content) {
-                    tracing::info!("совпадает с последним скопированным или полученным, пропускаю");
-                    return;
+                match guard.check(&content) {
+                    crate::loopguard::Verdict::New => {}
+                    crate::loopguard::Verdict::Repeat => {
+                        // Человек жмёт Ctrl+C ещё раз: записывать нечего,
+                        // но звук нужен — иначе кажется, что не скопировалось.
+                        (copier.on_event)(UiEvent::NewEntry);
+                        return;
+                    }
+                    crate::loopguard::Verdict::Echo => {
+                        tracing::info!("своя запись в буфер, пропускаю");
+                        return;
+                    }
                 }
                 let source = owner.as_deref().and_then(crate::source_app::lookup);
                 // Загрузки в очередь ставит движок, когда элемент на самом деле
