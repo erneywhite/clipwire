@@ -273,6 +273,33 @@ impl From<EntryV3> for Entry {
     }
 }
 
+/// `Entry` с самым первым видом файлов (`clipwire_core::item::legacy::ContentV1`).
+#[derive(Deserialize)]
+struct EntryV1 {
+    id: ItemId,
+    origin: DeviceId,
+    device_name: String,
+    local: bool,
+    content: clipwire_core::item::legacy::ContentV1,
+    seen_ms: i64,
+    pinned: bool,
+}
+
+impl From<EntryV1> for Entry {
+    fn from(e: EntryV1) -> Self {
+        Entry {
+            id: e.id,
+            origin: e.origin,
+            device_name: e.device_name,
+            local: e.local,
+            content: e.content.into(),
+            seen_ms: e.seen_ms,
+            pinned: e.pinned,
+            ext: Vec::new(),
+        }
+    }
+}
+
 /// `Entry` с содержимым прошлой версии (см. `clipwire_core::item::legacy`).
 #[derive(Deserialize)]
 struct EntryV2 {
@@ -1142,7 +1169,10 @@ impl History {
         if let Ok((e, [])) = postcard::take_from_bytes::<EntryV3>(&plain) {
             return Ok(e.into());
         }
-        match postcard::take_from_bytes::<EntryV2>(&plain) {
+        if let Ok((e, [])) = postcard::take_from_bytes::<EntryV2>(&plain) {
+            return Ok(e.into());
+        }
+        match postcard::take_from_bytes::<EntryV1>(&plain) {
             Ok((e, [])) => Ok(e.into()),
             _ => Err(err.into()),
         }
@@ -3117,6 +3147,78 @@ mod tests {
             .seal_blob(&postcard::to_stdvec(&new).unwrap(), b"")
             .unwrap();
         assert_eq!(h.decrypt(&nonce, &data).unwrap(), new);
+    }
+
+    /// Запись с файлами самого первого вида (без времени изменения и
+    /// передачи) читается: такие лежали нечитаемыми с «Hit the end of buffer».
+    #[test]
+    fn first_files_format_is_read() {
+        #[derive(Serialize)]
+        struct FileV1 {
+            name: String,
+            path: String,
+            size: u64,
+            is_dir: bool,
+            width: u32,
+            height: u32,
+        }
+        #[derive(Serialize)]
+        enum ContentV1Out {
+            _Text(String),
+            _Image {
+                width: u32,
+                height: u32,
+                png: Vec<u8>,
+            },
+            _Rich {
+                text: String,
+                html: Option<String>,
+                rtf: Option<Vec<u8>>,
+            },
+            Files(Vec<FileV1>),
+        }
+        #[derive(Serialize)]
+        struct EntryV1Out {
+            id: ItemId,
+            origin: DeviceId,
+            device_name: String,
+            local: bool,
+            content: ContentV1Out,
+            seen_ms: i64,
+            pinned: bool,
+        }
+        let old = EntryV1Out {
+            id: ItemId::new(),
+            origin: DeviceId([3; 32]),
+            device_name: "ПК".into(),
+            local: true,
+            content: ContentV1Out::Files(vec![FileV1 {
+                name: "отчёт.png".into(),
+                path: "C:/отчёт.png".into(),
+                size: 1234,
+                is_dir: false,
+                width: 10,
+                height: 20,
+            }]),
+            seen_ms: 5,
+            pinned: false,
+        };
+        let h = History::in_memory();
+        let (nonce, data) = h
+            .seal_blob(&postcard::to_stdvec(&old).unwrap(), b"")
+            .unwrap();
+        let e = h
+            .decrypt(&nonce, &data)
+            .expect("первая запись с файлами прочиталась");
+        assert_eq!(e.id, old.id);
+        let Content::Files(f) = &e.content else {
+            panic!("не файлы: {:?}", e.content)
+        };
+        assert_eq!(
+            (f[0].name.as_str(), f[0].size, f[0].width),
+            ("отчёт.png", 1234, 10)
+        );
+        assert!(f[0].blob.is_none() && f[0].modified_ms == 0 && !f[0].p2p);
     }
 
     fn app(name: &str) -> SourceApp {
