@@ -215,6 +215,11 @@ Devices that are switched off apply it when they connect, within the server's re
 Entries pinned on another device are not deleted. The server does not know what was deleted: the
 deletion note is encrypted with the group key. This needs server 0.1.3 or newer.
 
+**What to send.** Under Sync you can turn off sending text, images, files or folders. Turned-off
+items stay in this device's history but are not sent to other devices. What arrives here is
+decided by the other devices' settings. If a copy includes something turned off, such as a folder
+next to files, nothing is sent.
+
 **Pins and notes.** Pinned entries are the same on every device of the group, including devices
 that joined later or were off for a long time. A pinned entry can have a note of up to 80
 characters, and search looks at it too. Unpinning removes the pin everywhere and erases the note;
@@ -614,7 +619,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.8.6`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.8.7`.
 
 **Through a Docker control panel or plain `docker compose`:**
 

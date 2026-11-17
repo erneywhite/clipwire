@@ -248,7 +248,13 @@ impl Copier {
         if self.is_cancelled() {
             return;
         }
-        let send = send && self.tx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let allowed = may_send(send_kinds(), &content);
+        if send && !allowed {
+            tracing::info!(
+                "этот вид не отправляется на другие устройства (настройка), только в историю"
+            );
+        }
+        let send = send && allowed && self.tx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
         let prepare = send && self.blobs.is_some();
         let limit = self.limit_mb.load(Ordering::Relaxed);
         if prepare && needs_scan(&content, limit) {
@@ -659,7 +665,9 @@ impl Service {
                 h.id_by_hash(&hash).and_then(|id| h.get(id))
             };
             match entry {
-                Some(e) if e.local && resendable(&e.content) => {
+                Some(e)
+                    if e.local && resendable(&e.content) && may_send(send_kinds(), &e.content) =>
+                {
                     let out = Outgoing {
                         content: e.content,
                         ext: without_note(&e.ext),
@@ -1146,7 +1154,9 @@ fn without_note(ext: &[clipwire_core::Ext]) -> Vec<clipwire_core::Ext> {
 /// Отбор по карточкам, тела читаются только у отобранных.
 fn local_backfill(h: &History) -> Vec<(Outgoing, u64)> {
     let mut out: Vec<(Outgoing, u64)> = h
-        .ids_where(BACKFILL_MAX, |c| c.local && sendable_backfill(c.kind))
+        .ids_where(BACKFILL_MAX, |c| {
+            c.local && sendable_backfill(c.kind) && may_send_card(send_kinds(), c.kind)
+        })
         .into_iter()
         .filter_map(|id| h.get(id))
         .map(|e| {
@@ -1169,6 +1179,56 @@ fn local_backfill(h: &History) -> Vec<(Outgoing, u64)> {
 // не попадут; если попросят — досылать их через тот же резерв, что backfill.
 fn resendable(c: &Content) -> bool {
     !matches!(c, Content::Files(_))
+}
+
+/// Виды содержимого для [`set_send_kinds`].
+pub const SEND_TEXT: u8 = 1;
+pub const SEND_IMAGES: u8 = 2;
+pub const SEND_FILES: u8 = 4;
+pub const SEND_FOLDERS: u8 = 8;
+const SEND_ALL: u8 = SEND_TEXT | SEND_IMAGES | SEND_FILES | SEND_FOLDERS;
+
+/// Настройка «Что отправлять на другие устройства», меняется без перезапуска.
+static SEND_KINDS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SEND_ALL);
+
+/// Задать, что скопированное здесь уходит в группу (биты `SEND_*`).
+pub fn set_send_kinds(bits: u8) {
+    SEND_KINDS.store(bits, Ordering::Relaxed);
+}
+
+fn send_kinds() -> u8 {
+    SEND_KINDS.load(Ordering::Relaxed)
+}
+
+/// Какие виды есть в содержимом. Файлы вместе с папками — оба вида.
+fn kinds_of(c: &Content) -> u8 {
+    match c {
+        Content::Text(_) | Content::Rich { .. } => SEND_TEXT,
+        Content::Image { .. } => SEND_IMAGES,
+        Content::Files(files) => files.iter().fold(0, |acc, f| {
+            acc | if f.is_dir { SEND_FOLDERS } else { SEND_FILES }
+        }),
+        _ => 0,
+    }
+}
+
+/// Можно ли отправить содержимое при наборе `bits`: разрешены все его виды.
+/// Среди скопированного есть выключенное (папка рядом с файлами) — не
+/// отправляется ничего: делить одно копирование на части неожиданно.
+fn may_send(bits: u8, c: &Content) -> bool {
+    let k = kinds_of(c);
+    k != 0 && k & bits == k
+}
+
+/// То же для карточки истории (досылка старой истории при входе в группу).
+fn may_send_card(bits: u8, kind: CardKind) -> bool {
+    let k = match kind {
+        CardKind::Text | CardKind::Rich => SEND_TEXT,
+        CardKind::Image => SEND_IMAGES,
+        CardKind::Files => SEND_FILES,
+        CardKind::Other => return false,
+    };
+    k & bits == k
 }
 
 /// Уходит ли элемент локальной истории в группу при подключении.
@@ -1518,6 +1578,51 @@ mod tests {
             Content::Files(f) => f,
             other => panic!("ждали файлы, пришло {other:?}"),
         }
+    }
+
+    /// Отправляется только то, все виды чего разрешены; файлы с папкой —
+    /// оба вида. Досылка старой истории — по виду карточки.
+    #[test]
+    fn send_kinds_filter_by_content() {
+        let f = |is_dir| FileRef {
+            name: "x".into(),
+            path: "C:/x".into(),
+            size: 1,
+            is_dir,
+            width: 0,
+            height: 0,
+            modified_ms: 0,
+            blob: None,
+            blob_size: 0,
+            p2p: false,
+        };
+        let text = Content::Text("a".into());
+        let img = Content::Image {
+            width: 1,
+            height: 1,
+            png: vec![1],
+        };
+        let files = Content::Files(vec![f(false)]);
+        let mixed = Content::Files(vec![f(false), f(true)]);
+        assert!(may_send(SEND_ALL, &text) && may_send(SEND_ALL, &mixed));
+        let no_folders = SEND_ALL & !SEND_FOLDERS;
+        assert!(may_send(no_folders, &files));
+        assert!(
+            !may_send(no_folders, &mixed),
+            "папка рядом с файлами — ничего"
+        );
+        assert!(may_send(no_folders, &img) && may_send(no_folders, &text));
+        assert!(!may_send(SEND_ALL & !SEND_IMAGES, &img));
+        assert!(!may_send(0, &text));
+        assert!(may_send_card(SEND_TEXT, CardKind::Rich));
+        assert!(!may_send_card(SEND_FILES, CardKind::Image));
+        let all = crate::settings::SendKinds::default().bits();
+        assert_eq!(all, SEND_ALL);
+        let k = crate::settings::SendKinds {
+            folders: false,
+            ..Default::default()
+        };
+        assert_eq!(k.bits(), no_folders);
     }
 
     #[test]
