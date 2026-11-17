@@ -761,6 +761,7 @@ impl Service {
                 }
                 drop(list);
                 if !guard.should_send(&content) {
+                    tracing::info!("совпадает с последним скопированным или полученным, пропускаю");
                     return;
                 }
                 let source = owner.as_deref().and_then(crate::source_app::lookup);
