@@ -10,8 +10,8 @@ use clipwire_core::admin::AdminFail;
 use clipwire_core::delete::MAX_DELETE_BYTES;
 use clipwire_core::proto::io::{IoError, read_msg, read_msg_limited, write_msg};
 use clipwire_core::proto::{
-    ClientMsg, ServerMsg, knows_admin, knows_deletes, knows_devices_changed, knows_group_invites,
-    knows_pins, knows_server_info,
+    ClientMsg, ServerMsg, knows_admin, knows_deletes, knows_devices_changed, knows_group_admins,
+    knows_group_invites, knows_pins, knows_server_info,
 };
 use clipwire_core::storage::MAX_CONFIG_BYTES;
 use clipwire_core::{DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
@@ -387,7 +387,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
     tracing::info!(group = %short(&group), ?outcome, "вход в группу");
     // Группа без админа (до 0.5.0) получает админом первое устройство,
     // вошедшее с ключом администратора сервера.
-    if create == Create::Admin && shared.store.claim_group_admin(&group, &device)? {
+    if create == Create::Admin && shared.store.claim_group_admin(&group, &device, now_ms())? {
         tracing::info!(group = %short(&group), "у группы появился админ");
     }
 
@@ -483,7 +483,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     Some(ClientMsg::AdminAuth { key }) => {
                         need_admin_alpn(conn)?;
                         let reply = if admin.auth(shared, &key) {
-                            if shared.store.claim_group_admin(&group, &device)? {
+                            if shared.store.claim_group_admin(&group, &device, now_ms())? {
                                 tracing::info!(group = %short(&group), "у группы появился админ");
                                 shared.hub.devices_changed(&group, reg.id);
                             }
@@ -496,7 +496,9 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     }
                     Some(ClientMsg::TransferGroupAdmin { device: to }) => {
                         need_admin_alpn(conn)?;
-                        let reply = match shared.store.transfer_group_admin(&group, &device, &to)? {
+                        // С несколькими админами (`clipwire/13`) это «сделать
+                        // `to` админом и снять себя» одной транзакцией.
+                        let reply = match shared.store.transfer_group_admin(&group, &device, &to, now_ms())? {
                             Ok(()) => {
                                 tracing::info!(group = %short(&group), "админ группы передан");
                                 shared.hub.devices_changed(&group, reg.id);
@@ -508,8 +510,39 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     }
                     Some(ClientMsg::GetGroupAdmin) => {
                         need_admin_alpn(conn)?;
-                        let admin = shared.store.group_admin(&group)?;
+                        // Старый вопрос про одного админа: само устройство,
+                        // если оно админ, иначе самый ранний.
+                        let admin = shared.store.group_admin_for(&group, &device)?;
                         write_msg(&mut send, &ServerMsg::GroupAdmin { admin }).await?;
+                    }
+                    Some(ClientMsg::GetGroupAdmins) => {
+                        need_admins_alpn(conn)?;
+                        let admins = shared.store.group_admins(&group)?;
+                        write_msg(&mut send, &ServerMsg::GroupAdmins { admins }).await?;
+                    }
+                    Some(ClientMsg::GrantGroupAdmin { device: to }) => {
+                        need_admins_alpn(conn)?;
+                        let reply = match shared.store.grant_group_admin(&group, &device, &to, now_ms())? {
+                            Ok(()) => {
+                                tracing::info!(group = %short(&group), "у группы новый админ");
+                                shared.hub.devices_changed(&group, reg.id);
+                                ServerMsg::GroupAdmins { admins: shared.store.group_admins(&group)? }
+                            }
+                            Err(f) => ServerMsg::AdminFailed(f),
+                        };
+                        write_msg(&mut send, &reply).await?;
+                    }
+                    Some(ClientMsg::RevokeGroupAdmin { device: of }) => {
+                        need_admins_alpn(conn)?;
+                        let reply = match shared.store.revoke_group_admin(&group, &device, &of)? {
+                            Ok(()) => {
+                                tracing::info!(group = %short(&group), "с устройства снят админ");
+                                shared.hub.devices_changed(&group, reg.id);
+                                ServerMsg::GroupAdmins { admins: shared.store.group_admins(&group)? }
+                            }
+                            Err(f) => ServerMsg::AdminFailed(f),
+                        };
+                        write_msg(&mut send, &reply).await?;
                     }
                     Some(ClientMsg::ClaimGroupAdmin) => {
                         need_admin_alpn(conn)?;
@@ -517,7 +550,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         // потерян: роль забирается и при живом админе.
                         let reply = if !admin.authorized(shared) {
                             ServerMsg::AdminFailed(AdminFail::NotAuthorized)
-                        } else if shared.store.take_group_admin(&group, &device)? {
+                        } else if shared.store.take_group_admin(&group, &device, now_ms())? {
                             tracing::info!(group = %short(&group), "администратор сервера стал админом группы");
                             shared.hub.devices_changed(&group, reg.id);
                             ServerMsg::GroupAdmin { admin: Some(device) }
@@ -698,6 +731,14 @@ impl PendingGroup {
 fn need_admin_alpn(conn: &Connection) -> Result<()> {
     if !knows_admin(conn.alpn()) {
         bail!("сообщение clipwire/9 по старому протоколу");
+    }
+    Ok(())
+}
+
+/// Сообщения `clipwire/13` (несколько админов группы) по старому ALPN.
+fn need_admins_alpn(conn: &Connection) -> Result<()> {
+    if !knows_group_admins(conn.alpn()) {
+        bail!("сообщение clipwire/13 по старому протоколу");
     }
     Ok(())
 }

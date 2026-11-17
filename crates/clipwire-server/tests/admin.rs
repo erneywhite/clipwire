@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clipwire_core::admin::AdminFail;
 use clipwire_core::proto::io::{read_msg, write_msg};
-use clipwire_core::proto::{ALPN_9, ClientMsg, ServerMsg};
+use clipwire_core::proto::{ALPN_9, ALPN_12, ALPN_13, ClientMsg, ServerMsg};
 use clipwire_core::{AdminKey, AdminServerInfo, DeviceId, GroupKey, ServerInfo};
 use clipwire_server::{Config, Guards};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
@@ -90,10 +90,15 @@ impl Client {
 
     /// Новое соединение с того же эндпоинта: то же устройство.
     async fn connect_on(ep: Endpoint, s: &Server) -> Result<Self> {
+        Self::connect_alpn(ep, s, ALPN_9).await
+    }
+
+    /// Соединение по выбранному ALPN.
+    async fn connect_alpn(ep: Endpoint, s: &Server, alpn: &[u8]) -> Result<Self> {
         let url: RelayUrl = s.relay.parse()?;
         let addr =
             EndpointAddr::new(PublicKey::from_bytes(&s.info().server_id)?).with_relay_url(url);
-        let conn = tokio::time::timeout(T, ep.connect(addr, ALPN_9))
+        let conn = tokio::time::timeout(T, ep.connect(addr, alpn))
             .await
             .context("таймаут подключения")??;
         let (send, recv) = conn.open_bi().await?;
@@ -159,6 +164,37 @@ impl Client {
         match self.ask(&ClientMsg::GetGroupAdmin).await? {
             ServerMsg::GroupAdmin { admin } => Ok(admin),
             other => anyhow::bail!("ждали GroupAdmin, пришло {other:?}"),
+        }
+    }
+
+    /// Все админы группы (`clipwire/13`).
+    async fn group_admins(&mut self) -> Result<Vec<DeviceId>> {
+        match self.ask(&ClientMsg::GetGroupAdmins).await? {
+            ServerMsg::GroupAdmins { admins } => Ok(admins),
+            other => anyhow::bail!("ждали GroupAdmins, пришло {other:?}"),
+        }
+    }
+
+    /// Ждать `DevicesChanged` (и только его).
+    async fn devices_changed(&mut self) -> Result<()> {
+        let msg = tokio::time::timeout(T, read_msg::<_, ServerMsg>(&mut self.recv))
+            .await??
+            .context("закрыт")?;
+        anyhow::ensure!(
+            msg == ServerMsg::DevicesChanged,
+            "ждали DevicesChanged, пришло {msg:?}"
+        );
+        Ok(())
+    }
+
+    /// Дождаться, пока сервер закроет поток после успешного `Rekey`.
+    async fn closed(&mut self) -> Result<()> {
+        loop {
+            match tokio::time::timeout(T, read_msg::<_, ServerMsg>(&mut self.recv)).await?? {
+                None => return Ok(()),
+                Some(ServerMsg::DevicesChanged) => {}
+                Some(other) => anyhow::bail!("ждали закрытия, пришло {other:?}"),
+            }
         }
     }
 }
@@ -697,7 +733,8 @@ async fn server_admin_claims_group_admin() -> Result<()> {
         ServerMsg::AdminOk
     );
     assert_eq!(b.group_admin().await?, Some(a.device()));
-    // Явный запрос — роль у B, A узнаёт из DevicesChanged.
+    // Явный запрос — B становится ещё одним админом, A узнаёт из
+    // DevicesChanged. A админом остаётся: лишнего админа снимет уже B.
     assert_eq!(
         b.ask(&ClientMsg::ClaimGroupAdmin).await?,
         ServerMsg::GroupAdmin {
@@ -708,7 +745,8 @@ async fn server_admin_claims_group_admin() -> Result<()> {
         .await??
         .context("закрыт")?;
     assert_eq!(changed, ServerMsg::DevicesChanged);
-    assert_eq!(a.group_admin().await?, Some(b.device()));
+    assert_eq!(a.group_admin().await?, Some(a.device()));
+    assert_eq!(b.group_admin().await?, Some(b.device()));
     // Соединению только для администрирования (без группы) — нельзя.
     let mut adm = Client::connect(&s, "test-token").await?;
     assert_eq!(
@@ -719,5 +757,148 @@ async fn server_admin_claims_group_admin() -> Result<()> {
         adm.ask(&ClientMsg::ClaimGroupAdmin).await?,
         ServerMsg::Error(_)
     ));
+    s.running.shutdown().await
+}
+
+/// Несколько админов (`clipwire/13`): назначить и снять может только админ,
+/// последнего снять нельзя, все админы равны, остальные устройства узнают
+/// из `DevicesChanged`. Новые сообщения по старому ALPN — обрыв соединения.
+#[tokio::test(flavor = "multi_thread")]
+async fn several_group_admins() -> Result<()> {
+    let s = start(Some("test-token"), Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let ep = |t| endpoint(&s.relay, t);
+    let mut a = Client::connect_alpn(ep("test-token").await?, &s, ALPN_13).await?;
+    a.join_with(&as_admin(&key, &ADMIN)).await?;
+    let mut b = Client::connect_alpn(ep("test-token").await?, &s, ALPN_13).await?;
+    b.join_with(&with_token(&key, "test-token")).await?;
+    let mut c = Client::connect_alpn(ep("test-token").await?, &s, ALPN_13).await?;
+    c.join_with(&with_token(&key, "test-token")).await?;
+    let (ad, bd, cd) = (a.device(), b.device(), c.device());
+    assert_eq!(b.group_admins().await?, vec![ad]);
+
+    // Не админ: ни себя назначить, ни админа снять.
+    for msg in [
+        ClientMsg::GrantGroupAdmin { device: bd },
+        ClientMsg::RevokeGroupAdmin { device: ad },
+    ] {
+        assert_eq!(
+            b.ask(&msg).await?,
+            ServerMsg::AdminFailed(AdminFail::NotGroupAdmin)
+        );
+    }
+    // Последнего админа не снять, даже самому.
+    assert_eq!(
+        a.ask(&ClientMsg::RevokeGroupAdmin { device: ad }).await?,
+        ServerMsg::AdminFailed(AdminFail::LastAdmin)
+    );
+    // Только устройство группы.
+    assert_eq!(
+        a.ask(&ClientMsg::GrantGroupAdmin {
+            device: DeviceId([9; 32])
+        })
+        .await?,
+        ServerMsg::AdminFailed(AdminFail::NoSuchDevice)
+    );
+
+    // A делает B админом: ответ — список, C узнаёт из DevicesChanged.
+    a.send(&ClientMsg::GrantGroupAdmin { device: bd }).await?;
+    assert_eq!(
+        a.next().await?,
+        ServerMsg::GroupAdmins {
+            admins: vec![ad, bd]
+        }
+    );
+    c.devices_changed().await?;
+    // B равен A: снимает его и назначает C.
+    assert_eq!(
+        b.ask(&ClientMsg::RevokeGroupAdmin { device: ad }).await?,
+        ServerMsg::GroupAdmins { admins: vec![bd] }
+    );
+    assert_eq!(
+        b.ask(&ClientMsg::GrantGroupAdmin { device: cd }).await?,
+        ServerMsg::GroupAdmins {
+            admins: vec![bd, cd]
+        }
+    );
+    // Снятый A больше ничего не может.
+    assert_eq!(
+        a.ask(&ClientMsg::GrantGroupAdmin { device: ad }).await?,
+        ServerMsg::AdminFailed(AdminFail::NotGroupAdmin)
+    );
+
+    // Старый клиент на устройстве-админе видит себя админом.
+    let mut c_old = Client::connect_alpn(c.ep.clone(), &s, ALPN_12).await?;
+    c_old.join_with(&with_token(&key, "test-token")).await?;
+    assert_eq!(c_old.group_admin().await?, Some(cd));
+    // Старая передача роли: C делает A админом и сам перестаёт.
+    assert_eq!(
+        c_old
+            .ask(&ClientMsg::TransferGroupAdmin { device: ad })
+            .await?,
+        ServerMsg::GroupAdmin { admin: Some(ad) }
+    );
+    assert_eq!(b.group_admins().await?, vec![bd, ad]);
+    assert_eq!(c_old.group_admin().await?, Some(bd));
+    // Новое сообщение по старому ALPN — нарушение протокола, обрыв.
+    c_old.send(&ClientMsg::GetGroupAdmins).await?;
+    assert!(
+        c_old.next().await.is_err(),
+        "старый ALPN не знает GetGroupAdmins"
+    );
+
+    // Смена ключа: B исключает C, A получает пакет. Админы новой группы —
+    // A и B, C (не админ) никуда не попадает.
+    let new = GroupKey::generate()?;
+    let mut bn = Client::connect_alpn(b.ep.clone(), &s, ALPN_13).await?;
+    bn.join_with(&with_token(&new, "test-token")).await?;
+    assert!(
+        bn.group_admins().await?.is_empty(),
+        "админы — только после Rekey"
+    );
+    b.send(&ClientMsg::Rekey {
+        new_group: new.group_id(),
+        envelopes: vec![(ad, vec![1, 2, 3])],
+    })
+    .await?;
+    b.closed().await?;
+    assert_eq!(bn.group_admins().await?, vec![bd, ad]);
+    s.running.shutdown().await
+}
+
+/// Смена ключа, при которой исключается админ: в новой группе он не админ,
+/// а сменивший ключ остаётся им и один.
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_admin_loses_role() -> Result<()> {
+    let s = start(Some("test-token"), Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Client::connect_alpn(endpoint(&s.relay, "test-token").await?, &s, ALPN_13).await?;
+    a.join_with(&as_admin(&key, &ADMIN)).await?;
+    let mut b = Client::connect_alpn(endpoint(&s.relay, "test-token").await?, &s, ALPN_13).await?;
+    b.join_with(&with_token(&key, "test-token")).await?;
+    let bd = b.device();
+    assert_eq!(
+        a.ask(&ClientMsg::GrantGroupAdmin { device: bd }).await?,
+        ServerMsg::GroupAdmins {
+            admins: vec![a.device(), bd]
+        }
+    );
+    // B исключает A: пакетов нет ни для кого.
+    let new = GroupKey::generate()?;
+    let mut bn = Client::connect_alpn(b.ep.clone(), &s, ALPN_13).await?;
+    bn.join_with(&with_token(&new, "test-token")).await?;
+    b.send(&ClientMsg::Rekey {
+        new_group: new.group_id(),
+        envelopes: vec![],
+    })
+    .await?;
+    b.closed().await?;
+    assert_eq!(bn.group_admins().await?, vec![bd]);
+    // A исключён: в старой группе ему отвечают Excluded.
+    let mut a2 = Client::connect_alpn(a.ep.clone(), &s, ALPN_13).await?;
+    assert_eq!(
+        a2.ask(&with_token(&key, "test-token")).await?,
+        ServerMsg::Excluded
+    );
     s.running.shutdown().await
 }

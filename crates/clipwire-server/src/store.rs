@@ -101,8 +101,9 @@ const IDLE_GROUP: &str = "NOT EXISTS (SELECT 1 FROM devices AS d
 
 /// Таблицы с данными группы, которые чистятся, когда от группы остаётся
 /// только строка (надгробие, заброшенная группа).
-const GROUP_TABLES: [&str; 9] = [
+const GROUP_TABLES: [&str; 10] = [
     "rekeys",
+    "group_admins",
     "cards",
     "devices",
     "items",
@@ -324,6 +325,10 @@ impl Store {
                     "UPDATE groups SET idle_ms = NULL, admin_device = NULL, created_ms = ?2
                      WHERE group_id = ?1",
                     params![&group.0[..], now_ms],
+                )?;
+                tx.execute(
+                    "DELETE FROM group_admins WHERE group_id = ?1",
+                    params![&group.0[..]],
                 )?;
                 JoinOutcome::Created
             }
@@ -1616,6 +1621,6 @@ mod tests {
             join(&a, &k.join_secret(), Create::No, 10),
             JoinOutcome::Joined
         );
-        assert!(s.claim_group_admin(&g, &a).unwrap());
+        assert!(s.claim_group_admin(&g, &a, 1100).unwrap());
     }
 }

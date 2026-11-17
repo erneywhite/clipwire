@@ -4,8 +4,14 @@
 //!   Действующее значение: из этой таблицы, иначе из переменной окружения,
 //!   иначе встроенное. Сброс — удаление строки. Служебные ключи начинаются с
 //!   `_` и в настройки не попадают.
-//! - `groups.admin_device` — админ группы: только он меняет ключ группы и
-//!   удаляет устройства. `NULL` у групп, созданных до 0.5.0.
+//! - `group_admins(group_id, device_id, since_ms)` — админы группы
+//!   (`clipwire/13`): только они меняют ключ группы, удаляют устройства и
+//!   назначают или снимают других админов. Все админы равны. Пусто у групп,
+//!   созданных до 0.5.0. Таблица появилась вместо одного столбца
+//!   `groups.admin_device`: при первом запуске новой версии его значения
+//!   один раз копируются в неё. Решения столбец больше не принимает, но
+//!   держится равным самому раннему админу ([`sync_legacy`]): сервер, который
+//!   откатили на старую версию, увидит осмысленного админа.
 //! - `groups.pending_by`, `pending_ms` — группа создана для смены ключа
 //!   (вход с токеном relay без ключа администратора), а `Rekey` ещё не
 //!   пришёл. У устройства такая группа одна; брошенная удаляется через
@@ -103,7 +109,143 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!("ALTER TABLE groups ADD COLUMN {col} {ty};"))?;
         }
     }
+    // Несколько админов (`clipwire/13`). Таблицы нет — база старой версии:
+    // единственный админ из `groups.admin_device` переходит в неё один раз,
+    // в той же транзакции, что и создание таблицы.
+    let has_admins: bool = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'group_admins'")?
+        .exists([])?;
+    if !has_admins {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE group_admins (
+                 group_id  BLOB NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+                 device_id BLOB NOT NULL,
+                 since_ms  INTEGER NOT NULL,
+                 PRIMARY KEY (group_id, device_id)
+             );
+             INSERT INTO group_admins (group_id, device_id, since_ms)
+                 SELECT group_id, admin_device, created_ms FROM groups
+                 WHERE admin_device IS NOT NULL;
+             COMMIT;",
+        )?;
+    }
     Ok(())
+}
+
+/// Группа живая: есть, ключ не сменён, не надгробие, не незавершённая смена
+/// ключа и не заброшена. Роли админов меняются только у такой.
+const LIVE_GROUP: &str = "rotated_ms IS NULL AND tombstone_ms IS NULL
+     AND pending_by IS NULL AND idle_ms IS NULL";
+
+fn is_live(conn: &Connection, group: &GroupId) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT 1 FROM groups WHERE group_id = ?1 AND {LIVE_GROUP}"),
+            params![&group.0[..]],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Админы группы с отметкой «с какого времени», самый ранний первым.
+fn admins_since(conn: &Connection, group: &GroupId) -> Result<Vec<(DeviceId, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT device_id, since_ms FROM group_admins WHERE group_id = ?1
+         ORDER BY since_ms, rowid",
+    )?;
+    let rows = stmt.query_map(params![&group.0[..]], |r| {
+        Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, since) = row?;
+        let id = DeviceId(
+            id.try_into()
+                .ok()
+                .context("битый device_id админа в базе")?,
+        );
+        out.push((id, since));
+    }
+    Ok(out)
+}
+
+/// Админы группы, самый ранний первым. Пусто — админа нет или нет группы.
+pub(super) fn admins_of(conn: &Connection, group: &GroupId) -> Result<Vec<DeviceId>> {
+    Ok(admins_since(conn, group)?
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect())
+}
+
+/// Админ ли `device` этой группы.
+pub(super) fn is_admin(conn: &Connection, group: &GroupId, device: &DeviceId) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM group_admins WHERE group_id = ?1 AND device_id = ?2",
+            params![&group.0[..], &device.0[..]],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Есть ли у группы хоть один админ.
+pub(super) fn has_admins(conn: &Connection, group: &GroupId) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM group_admins WHERE group_id = ?1 LIMIT 1",
+            params![&group.0[..]],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Добавить админа (уже админ — ничего не меняется) и выровнять старый
+/// столбец.
+fn add_admin(conn: &Connection, group: &GroupId, device: &DeviceId, since_ms: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO group_admins (group_id, device_id, since_ms) VALUES (?1, ?2, ?3)",
+        params![&group.0[..], &device.0[..], since_ms],
+    )?;
+    sync_legacy(conn, group)
+}
+
+/// `groups.admin_device` — самый ранний админ (`NULL`, если админов нет).
+/// Решений по нему не принимается, он нужен только старой версии сервера
+/// после отката.
+fn sync_legacy(conn: &Connection, group: &GroupId) -> Result<()> {
+    conn.execute(
+        "UPDATE groups SET admin_device = (
+             SELECT device_id FROM group_admins WHERE group_id = ?1
+             ORDER BY since_ms, rowid LIMIT 1)
+         WHERE group_id = ?1",
+        params![&group.0[..]],
+    )?;
+    Ok(())
+}
+
+/// Снять `device` с админов, если он не последний. Не админ — не ошибка.
+fn revoke_in(
+    conn: &Connection,
+    group: &GroupId,
+    device: &DeviceId,
+) -> Result<Result<(), AdminFail>> {
+    let admins = admins_of(conn, group)?;
+    if !admins.contains(device) {
+        return Ok(Ok(()));
+    }
+    if admins.len() == 1 {
+        return Ok(Err(AdminFail::LastAdmin));
+    }
+    conn.execute(
+        "DELETE FROM group_admins WHERE group_id = ?1 AND device_id = ?2",
+        params![&group.0[..], &device.0[..]],
+    )?;
+    sync_legacy(conn, group)?;
+    Ok(Ok(()))
 }
 
 /// Когда токен relay последний раз меняли из клиента (мс), `None` — не меняли.
@@ -147,7 +289,9 @@ pub(super) fn may_rekey_any(conn: &Connection, device: &DeviceId) -> Result<bool
             "SELECT 1 FROM devices AS d JOIN groups AS g ON g.group_id = d.group_id
              WHERE d.device_id = ?1 AND g.rotated_ms IS NULL AND g.tombstone_ms IS NULL
                AND g.pending_by IS NULL AND g.idle_ms IS NULL
-               AND (g.admin_device IS NULL OR g.admin_device = ?1)
+               AND (NOT EXISTS (SELECT 1 FROM group_admins AS a WHERE a.group_id = g.group_id)
+                    OR EXISTS (SELECT 1 FROM group_admins AS a
+                               WHERE a.group_id = g.group_id AND a.device_id = ?1))
              LIMIT 1",
             params![&device.0[..]],
             |_| Ok(()),
@@ -195,12 +339,7 @@ pub(super) fn mark_created(
 ) -> Result<()> {
     match create {
         Create::No => {}
-        Create::Admin | Create::Invite(_) => {
-            conn.execute(
-                "UPDATE groups SET admin_device = ?2 WHERE group_id = ?1",
-                params![&group.0[..], &device.0[..]],
-            )?;
-        }
+        Create::Admin | Create::Invite(_) => add_admin(conn, group, device, now_ms)?,
         Create::ForRekey => {
             conn.execute(
                 "UPDATE groups SET pending_by = ?2, pending_ms = ?3 WHERE group_id = ?1",
@@ -211,39 +350,41 @@ pub(super) fn mark_created(
     Ok(())
 }
 
-/// Админ группы (`None` — нет админа или нет группы).
-pub(super) fn admin_of(conn: &Connection, group: &GroupId) -> Result<Option<DeviceId>> {
-    let raw: Option<Option<Vec<u8>>> = conn
-        .query_row(
-            "SELECT admin_device FROM groups WHERE group_id = ?1",
-            params![&group.0[..]],
-            |r| r.get(0),
-        )
-        .optional()?;
-    raw.flatten()
-        .map(|b| {
-            Ok(DeviceId(
-                b.try_into().ok().context("битый admin_device в базе")?,
-            ))
-        })
-        .transpose()
-}
-
-/// После смены ключа: админ новой группы — админ старой (если у старой он
-/// был), пометка «для смены ключа» снимается. Уже заданного админа новой
-/// группы это не перезаписывает (у незавершённой группы его и нет).
-pub(super) fn inherit_admin(
+/// После смены ключа: админы новой группы — те админы старой, кто остался
+/// в группе (получил пакет нового ключа), и сам сменивший ключ (он админ
+/// старой группы, иначе `Rekey` не прошёл бы). Исключённые при смене ключа
+/// роль не уносят. У старой группы без админов (до 0.5.0) админов нет и у
+/// новой. Пометка «для смены ключа» снимается. Уже заданных админов новой
+/// группы это не трогает (у незавершённой группы их и нет).
+pub(super) fn inherit_admins(
     conn: &Connection,
+    old: &GroupId,
     new: &GroupId,
-    old_admin: Option<&DeviceId>,
+    sender: &DeviceId,
+    kept: &std::collections::HashSet<DeviceId>,
+    now_ms: i64,
 ) -> Result<()> {
+    let old_admins = admins_since(conn, old)?;
+    if !old_admins.is_empty() {
+        for (device, since) in &old_admins {
+            if device == sender || kept.contains(device) {
+                conn.execute(
+                    "INSERT OR IGNORE INTO group_admins (group_id, device_id, since_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![&new.0[..], &device.0[..], since],
+                )?;
+            }
+        }
+        // Страховка: без админов новая группа остаться не должна.
+        if !has_admins(conn, new)? {
+            add_admin(conn, new, sender, now_ms)?;
+        }
+    }
     conn.execute(
-        "UPDATE groups SET admin_device = COALESCE(admin_device, ?2),
-             pending_by = NULL, pending_ms = NULL
-         WHERE group_id = ?1",
-        params![&new.0[..], old_admin.map(|d| d.0.to_vec())],
+        "UPDATE groups SET pending_by = NULL, pending_ms = NULL WHERE group_id = ?1",
+        params![&new.0[..]],
     )?;
-    Ok(())
+    sync_legacy(conn, new)
 }
 
 impl Store {
@@ -302,63 +443,150 @@ impl Store {
         Ok(())
     }
 
-    /// Админ группы.
+    /// Админы группы, самый ранний первым.
+    pub fn group_admins(&self, group: &GroupId) -> Result<Vec<DeviceId>> {
+        admins_of(&self.conn(), group)
+    }
+
+    /// Один админ группы для старых клиентов (`GetGroupAdmin`, до
+    /// `clipwire/13`): сам `asker`, если он админ, иначе самый ранний. Так
+    /// старый клиент на устройстве-админе видит себя админом и может удалять
+    /// устройства.
+    pub fn group_admin_for(&self, group: &GroupId, asker: &DeviceId) -> Result<Option<DeviceId>> {
+        let admins = admins_of(&self.conn(), group)?;
+        Ok(if admins.contains(asker) {
+            Some(*asker)
+        } else {
+            admins.first().copied()
+        })
+    }
+
+    /// Самый ранний админ группы.
+    #[cfg(test)]
     pub fn group_admin(&self, group: &GroupId) -> Result<Option<DeviceId>> {
-        admin_of(&self.conn(), group)
+        Ok(admins_of(&self.conn(), group)?.first().copied())
     }
 
-    /// Сделать `device` админом группы, если админа у неё нет (группа до
-    /// 0.5.0), ключ не сменён и устройство в ней состоит. `true` — стало.
-    pub fn claim_group_admin(&self, group: &GroupId, device: &DeviceId) -> Result<bool> {
-        Ok(self.conn().execute(
-            "UPDATE groups SET admin_device = ?2
-             WHERE group_id = ?1 AND admin_device IS NULL AND rotated_ms IS NULL
-               AND tombstone_ms IS NULL AND pending_by IS NULL AND idle_ms IS NULL
-               AND EXISTS (SELECT 1 FROM devices WHERE group_id = ?1 AND device_id = ?2)",
-            params![&group.0[..], &device.0[..]],
-        )? > 0)
+    /// Сделать `device` админом группы, если админов у неё нет (группа до
+    /// 0.5.0), группа живая и устройство в ней состоит. `true` — стало.
+    pub fn claim_group_admin(
+        &self,
+        group: &GroupId,
+        device: &DeviceId,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if !is_live(&tx, group)?
+            || has_admins(&tx, group)?
+            || !super::devices::is_member(&tx, group, device)?
+        {
+            return Ok(false);
+        }
+        add_admin(&tx, group, device, now_ms)?;
+        tx.commit()?;
+        Ok(true)
     }
 
-    /// Сделать `device` админом группы и при живом админе (`ClaimGroupAdmin`
-    /// администратора сервера: прежний админ потерян). Права администратора
-    /// проверяет вызывающий. `true` — `device` теперь админ; `false` — он не
-    /// в группе, или ключ группы сменён, или это незавершённая группа.
-    pub fn take_group_admin(&self, group: &GroupId, device: &DeviceId) -> Result<bool> {
-        Ok(self.conn().execute(
-            "UPDATE groups SET admin_device = ?2
-             WHERE group_id = ?1 AND rotated_ms IS NULL AND tombstone_ms IS NULL
-               AND pending_by IS NULL AND idle_ms IS NULL
-               AND EXISTS (SELECT 1 FROM devices WHERE group_id = ?1 AND device_id = ?2)",
-            params![&group.0[..], &device.0[..]],
-        )? > 0)
+    /// Добавить `device` в админы группы и при живых админах (`ClaimGroupAdmin`
+    /// администратора сервера: прежние админы потеряны). Остальных админов
+    /// это не снимает: лишних потом снимет сам `device`. Права администратора
+    /// проверяет вызывающий. `true` — `device` теперь админ; `false` — он не в
+    /// группе, или ключ группы сменён, или это незавершённая группа.
+    pub fn take_group_admin(
+        &self,
+        group: &GroupId,
+        device: &DeviceId,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if !is_live(&tx, group)? || !super::devices::is_member(&tx, group, device)? {
+            return Ok(false);
+        }
+        add_admin(&tx, group, device, now_ms)?;
+        tx.commit()?;
+        Ok(true)
     }
 
-    /// Незавершённая ли это группа смены ключа (`Rekey` ещё не пришёл).
-    pub fn is_pending(&self, group: &GroupId) -> Result<bool> {
-        is_pending(&self.conn(), group)
+    /// Сделать `device` админом группы по запросу админа `by`. Уже админ —
+    /// не ошибка.
+    pub fn grant_group_admin(
+        &self,
+        group: &GroupId,
+        by: &DeviceId,
+        device: &DeviceId,
+        now_ms: i64,
+    ) -> Result<Result<(), AdminFail>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if !is_live(&tx, group)? || !is_admin(&tx, group, by)? {
+            return Ok(Err(AdminFail::NotGroupAdmin));
+        }
+        if !super::devices::is_member(&tx, group, device)? {
+            return Ok(Err(AdminFail::NoSuchDevice));
+        }
+        add_admin(&tx, group, device, now_ms)?;
+        tx.commit()?;
+        Ok(Ok(()))
     }
 
-    /// Передать роль админа группы от `from` к `to`.
+    /// Снять роль админа с `device` по запросу админа `by` (в том числе с
+    /// себя). Последнего админа снять нельзя: группа осталась бы без того,
+    /// кто удаляет устройства. `device` не админ — не ошибка.
+    pub fn revoke_group_admin(
+        &self,
+        group: &GroupId,
+        by: &DeviceId,
+        device: &DeviceId,
+    ) -> Result<Result<(), AdminFail>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if !is_live(&tx, group)? || !is_admin(&tx, group, by)? {
+            return Ok(Err(AdminFail::NotGroupAdmin));
+        }
+        if !super::devices::is_member(&tx, group, device)? {
+            return Ok(Err(AdminFail::NoSuchDevice));
+        }
+        if let Err(f) = revoke_in(&tx, group, device)? {
+            return Ok(Err(f));
+        }
+        tx.commit()?;
+        Ok(Ok(()))
+    }
+
+    /// Передать роль админа от `from` к `to` (`TransferGroupAdmin` старых
+    /// клиентов): одной транзакцией `to` становится админом, `from` перестаёт.
+    /// Другие админы остаются.
     pub fn transfer_group_admin(
         &self,
         group: &GroupId,
         from: &DeviceId,
         to: &DeviceId,
+        now_ms: i64,
     ) -> Result<Result<(), AdminFail>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        if admin_of(&tx, group)?.as_ref() != Some(from) || super::is_rotated(&tx, group)? {
+        if !is_live(&tx, group)? || !is_admin(&tx, group, from)? {
             return Ok(Err(AdminFail::NotGroupAdmin));
         }
         if !super::devices::is_member(&tx, group, to)? {
             return Ok(Err(AdminFail::NoSuchDevice));
         }
-        tx.execute(
-            "UPDATE groups SET admin_device = ?2 WHERE group_id = ?1",
-            params![&group.0[..], &to.0[..]],
-        )?;
+        add_admin(&tx, group, to, now_ms)?;
+        // `to` уже админ, так что `from` последним не окажется.
+        if from != to
+            && let Err(f) = revoke_in(&tx, group, from)?
+        {
+            return Ok(Err(f));
+        }
         tx.commit()?;
         Ok(Ok(()))
+    }
+
+    /// Незавершённая ли это группа смены ключа (`Rekey` ещё не пришёл).
+    pub fn is_pending(&self, group: &GroupId) -> Result<bool> {
+        is_pending(&self.conn(), group)
     }
 
     /// Сводка сервера без версии (её знает не база).
@@ -450,7 +678,7 @@ mod tests {
         // Остальные входят как обычно, админ не меняется.
         assert_eq!(join(&s, &k, 2, Create::Admin), JoinOutcome::Joined);
         assert!(
-            !s.claim_group_admin(&k.group_id(), &DeviceId([2; 32]))
+            !s.claim_group_admin(&k.group_id(), &DeviceId([2; 32]), 20)
                 .unwrap()
         );
         assert_eq!(
@@ -488,18 +716,18 @@ mod tests {
         join(&s, &legacy, 3, Create::Admin);
         s.conn()
             .execute(
-                "UPDATE groups SET admin_device = NULL WHERE group_id = ?1",
+                "DELETE FROM group_admins WHERE group_id = ?1",
                 params![&legacy.group_id().0[..]],
             )
             .unwrap();
         assert_eq!(join(&s, &n3, 3, Create::ForRekey), JoinOutcome::Created);
         // Первое устройство с ключом администратора становится её админом.
         assert!(
-            s.claim_group_admin(&legacy.group_id(), &DeviceId([3; 32]))
+            s.claim_group_admin(&legacy.group_id(), &DeviceId([3; 32]), 20)
                 .unwrap()
         );
         assert!(
-            !s.claim_group_admin(&legacy.group_id(), &DeviceId([4; 32]))
+            !s.claim_group_admin(&legacy.group_id(), &DeviceId([4; 32]), 20)
                 .unwrap()
         );
     }
@@ -571,7 +799,8 @@ mod tests {
     }
 
     /// Ревью безопасности, находка 4: администратор сервера забирает роль
-    /// админа группы и при живом админе, но только в своей группе.
+    /// админа группы и при живом админе, но только в своей группе. С
+    /// несколькими админами он добавляется к ним, прежних не снимает.
     #[test]
     fn server_admin_takes_group_admin() {
         let s = Store::in_memory().unwrap();
@@ -580,40 +809,251 @@ mod tests {
         let (a, b, x) = (DeviceId([1; 32]), DeviceId([2; 32]), DeviceId([3; 32]));
         join(&s, &k, 1, Create::Admin);
         join(&s, &k, 2, Create::No);
-        assert_eq!(s.group_admin(&g).unwrap(), Some(a));
-        assert!(s.take_group_admin(&g, &b).unwrap());
-        assert_eq!(s.group_admin(&g).unwrap(), Some(b));
+        assert_eq!(s.group_admins(&g).unwrap(), vec![a]);
+        assert!(s.take_group_admin(&g, &b, 20).unwrap());
+        assert_eq!(s.group_admins(&g).unwrap(), vec![a, b]);
+        // Повтор ничего не ломает.
+        assert!(s.take_group_admin(&g, &b, 30).unwrap());
+        assert_eq!(s.group_admins(&g).unwrap(), vec![a, b]);
         // Не из группы — нет.
-        assert!(!s.take_group_admin(&g, &x).unwrap());
-        assert_eq!(s.group_admin(&g).unwrap(), Some(b));
+        assert!(!s.take_group_admin(&g, &x, 20).unwrap());
+        assert_eq!(s.group_admins(&g).unwrap(), vec![a, b]);
         // Незавершённой группе смены ключа — нет.
         let n = GroupKey([2; 32]);
         join(&s, &n, 2, Create::ForRekey);
-        assert!(!s.take_group_admin(&n.group_id(), &b).unwrap());
+        assert!(!s.take_group_admin(&n.group_id(), &b, 20).unwrap());
+        assert!(s.group_admins(&n.group_id()).unwrap().is_empty());
     }
 
+    /// Старый `TransferGroupAdmin`: `to` становится админом, `from`
+    /// перестаёт, остальные админы остаются.
     #[test]
     fn transfer_needs_current_admin_and_member() {
         let s = Store::in_memory().unwrap();
         let k = GroupKey([1; 32]);
         let g = k.group_id();
-        let (a, b, x) = (DeviceId([1; 32]), DeviceId([2; 32]), DeviceId([3; 32]));
+        let (a, b, c, x) = (
+            DeviceId([1; 32]),
+            DeviceId([2; 32]),
+            DeviceId([3; 32]),
+            DeviceId([9; 32]),
+        );
         join(&s, &k, 1, Create::Admin);
         join(&s, &k, 2, Create::No);
+        join(&s, &k, 3, Create::No);
         assert_eq!(
-            s.transfer_group_admin(&g, &b, &a).unwrap(),
+            s.transfer_group_admin(&g, &b, &a, 20).unwrap(),
             Err(AdminFail::NotGroupAdmin)
         );
         assert_eq!(
-            s.transfer_group_admin(&g, &a, &x).unwrap(),
+            s.transfer_group_admin(&g, &a, &x, 20).unwrap(),
             Err(AdminFail::NoSuchDevice)
         );
-        assert_eq!(s.transfer_group_admin(&g, &a, &b).unwrap(), Ok(()));
+        assert_eq!(s.transfer_group_admin(&g, &a, &b, 20).unwrap(), Ok(()));
+        assert_eq!(s.group_admins(&g).unwrap(), vec![b]);
         assert_eq!(s.group_admin(&g).unwrap(), Some(b));
         assert_eq!(
-            s.transfer_group_admin(&g, &a, &b).unwrap(),
+            s.transfer_group_admin(&g, &a, &b, 20).unwrap(),
             Err(AdminFail::NotGroupAdmin)
         );
+        // Передача себе — ничего не меняется, последний админ не теряется.
+        assert_eq!(s.transfer_group_admin(&g, &b, &b, 30).unwrap(), Ok(()));
+        assert_eq!(s.group_admins(&g).unwrap(), vec![b]);
+        // При двух админах передача трогает только передающего.
+        assert_eq!(s.grant_group_admin(&g, &b, &c, 40).unwrap(), Ok(()));
+        assert_eq!(s.transfer_group_admin(&g, &c, &a, 50).unwrap(), Ok(()));
+        assert_eq!(s.group_admins(&g).unwrap(), vec![b, a]);
+    }
+
+    #[test]
+    fn admins_grant_and_revoke_each_other() {
+        let s = Store::in_memory().unwrap();
+        let k = GroupKey([1; 32]);
+        let g = k.group_id();
+        let (a, b, c, x) = (
+            DeviceId([1; 32]),
+            DeviceId([2; 32]),
+            DeviceId([3; 32]),
+            DeviceId([9; 32]),
+        );
+        join(&s, &k, 1, Create::Admin);
+        join(&s, &k, 2, Create::No);
+        join(&s, &k, 3, Create::No);
+        // Не админ ни назначить, ни снять не может, в том числе себя.
+        assert_eq!(
+            s.grant_group_admin(&g, &b, &b, 20).unwrap(),
+            Err(AdminFail::NotGroupAdmin)
+        );
+        assert_eq!(
+            s.revoke_group_admin(&g, &b, &a).unwrap(),
+            Err(AdminFail::NotGroupAdmin)
+        );
+        // Только устройство группы.
+        assert_eq!(
+            s.grant_group_admin(&g, &a, &x, 20).unwrap(),
+            Err(AdminFail::NoSuchDevice)
+        );
+        assert_eq!(
+            s.revoke_group_admin(&g, &a, &x).unwrap(),
+            Err(AdminFail::NoSuchDevice)
+        );
+        // Последнего админа не снять, и себя тоже.
+        assert_eq!(
+            s.revoke_group_admin(&g, &a, &a).unwrap(),
+            Err(AdminFail::LastAdmin)
+        );
+        assert_eq!(s.grant_group_admin(&g, &a, &b, 20).unwrap(), Ok(()));
+        // Повтор — не ошибка, время назначения не меняется.
+        assert_eq!(s.grant_group_admin(&g, &a, &b, 30).unwrap(), Ok(()));
+        assert_eq!(s.group_admins(&g).unwrap(), vec![a, b]);
+        // Новый админ равен первому: назначает и снимает, в том числе его.
+        assert_eq!(s.grant_group_admin(&g, &b, &c, 40).unwrap(), Ok(()));
+        assert_eq!(s.revoke_group_admin(&g, &b, &a).unwrap(), Ok(()));
+        assert_eq!(s.group_admins(&g).unwrap(), vec![b, c]);
+        assert_eq!(s.group_admin(&g).unwrap(), Some(b));
+        // Снятый больше ничего не может.
+        assert_eq!(
+            s.grant_group_admin(&g, &a, &a, 50).unwrap(),
+            Err(AdminFail::NotGroupAdmin)
+        );
+        // Снять не-админа — не ошибка.
+        assert_eq!(s.revoke_group_admin(&g, &b, &a).unwrap(), Ok(()));
+        // Себя можно, пока остаётся другой админ.
+        assert_eq!(s.revoke_group_admin(&g, &c, &c).unwrap(), Ok(()));
+        assert_eq!(s.group_admins(&g).unwrap(), vec![b]);
+        assert_eq!(
+            s.revoke_group_admin(&g, &b, &b).unwrap(),
+            Err(AdminFail::LastAdmin)
+        );
+        // Старый вопрос «кто админ» видит себя, если сам админ.
+        assert_eq!(s.grant_group_admin(&g, &b, &c, 60).unwrap(), Ok(()));
+        assert_eq!(s.group_admin_for(&g, &c).unwrap(), Some(c));
+        assert_eq!(s.group_admin_for(&g, &a).unwrap(), Some(b));
+        // Старый столбец держится равным самому раннему админу.
+        let legacy: Option<Vec<u8>> = s
+            .conn()
+            .query_row(
+                "SELECT admin_device FROM groups WHERE group_id = ?1",
+                params![&g.0[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy.as_deref(), Some(&b.0[..]));
+        // У незавершённой группы смены ключа ролей не меняют.
+        let n = GroupKey([2; 32]);
+        join(&s, &n, 2, Create::ForRekey);
+        assert_eq!(
+            s.grant_group_admin(&n.group_id(), &b, &b, 70).unwrap(),
+            Err(AdminFail::NotGroupAdmin)
+        );
+    }
+
+    /// Админы старой группы при смене ключа: остаются те, кто получил новый
+    /// ключ, и сменивший ключ; исключённые роль не уносят.
+    #[test]
+    fn rekey_keeps_admins_that_stay() {
+        let s = Store::in_memory().unwrap();
+        let (k, n) = (GroupKey([1; 32]), GroupKey([2; 32]));
+        let g = k.group_id();
+        let (a, b, c, d) = (
+            DeviceId([1; 32]),
+            DeviceId([2; 32]),
+            DeviceId([3; 32]),
+            DeviceId([4; 32]),
+        );
+        join(&s, &k, 1, Create::Admin);
+        for dev in 2..=4 {
+            join(&s, &k, dev, Create::No);
+        }
+        assert_eq!(s.grant_group_admin(&g, &a, &b, 20).unwrap(), Ok(()));
+        assert_eq!(s.grant_group_admin(&g, &a, &c, 30).unwrap(), Ok(()));
+        // Не админ смену ключа не начнёт.
+        assert_eq!(join(&s, &n, 4, Create::ForRekey), JoinOutcome::NoGroup);
+        // Ключ меняет b: c удаляется, d остаётся, a в пакетах есть.
+        assert_eq!(join(&s, &n, 2, Create::ForRekey), JoinOutcome::Created);
+        let limits = crate::store::RekeyLimits { max_envelope: 512 };
+        let envelopes = vec![(a, vec![1]), (d, vec![1])];
+        assert!(matches!(
+            s.rekey(&g, &b, &n.group_id(), &envelopes, 40, &limits)
+                .unwrap(),
+            crate::store::RekeyOutcome::Done { .. }
+        ));
+        // Порядок — по времени назначения в старой группе.
+        assert_eq!(s.group_admins(&n.group_id()).unwrap(), vec![a, b]);
+        let _ = c;
+
+        // Сменивший ключ остаётся админом, даже если других не осталось.
+        let m = GroupKey([3; 32]);
+        assert_eq!(join(&s, &m, 2, Create::ForRekey), JoinOutcome::Created);
+        assert!(matches!(
+            s.rekey(&n.group_id(), &b, &m.group_id(), &[], 50, &limits)
+                .unwrap(),
+            crate::store::RekeyOutcome::Done { .. }
+        ));
+        assert_eq!(s.group_admins(&m.group_id()).unwrap(), vec![b]);
+    }
+
+    /// База версии с одним админом: столбец `admin_device` один раз
+    /// переходит в таблицу `group_admins`.
+    #[test]
+    fn migrates_single_admin_column() {
+        let path =
+            std::env::temp_dir().join(format!("clipwire-admins-{}.db", uuid::Uuid::now_v7()));
+        let (k, legacy) = (GroupKey([1; 32]), GroupKey([2; 32]));
+        let (a, b) = (DeviceId([1; 32]), DeviceId([2; 32]));
+        {
+            let s = Store::open(&path).unwrap();
+            join(&s, &k, 1, Create::Admin);
+            join(&s, &k, 2, Create::No);
+            join(&s, &legacy, 2, Create::Admin);
+            // Как в базе старой версии: таблицы нет, админ — в столбце, у
+            // второй группы админа нет совсем.
+            s.conn()
+                .execute_batch(&format!(
+                    "DROP TABLE group_admins;
+                     UPDATE groups SET admin_device = x'{}' WHERE group_id = x'{}';
+                     UPDATE groups SET admin_device = NULL WHERE group_id = x'{}';",
+                    hex(&b.0),
+                    hex(&k.group_id().0),
+                    hex(&legacy.group_id().0),
+                ))
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.group_admins(&k.group_id()).unwrap(), vec![b]);
+        assert!(s.group_admins(&legacy.group_id()).unwrap().is_empty());
+        assert_eq!(
+            s.grant_group_admin(&k.group_id(), &b, &a, 20).unwrap(),
+            Ok(())
+        );
+        drop(s);
+        // Второй запуск не копирует заново и не теряет новых админов.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.group_admins(&k.group_id()).unwrap(), vec![b, a]);
+        drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Заброшенная группа уносит и админов.
+    #[test]
+    fn admins_go_with_the_group() {
+        let s = Store::in_memory().unwrap();
+        let k = GroupKey([1; 32]);
+        let g = k.group_id();
+        join(&s, &k, 1, Create::Admin);
+        assert!(s.bury_idle_group(&g, 500, 600).unwrap());
+        assert!(s.group_admins(&g).unwrap().is_empty());
+        let n: i64 = s
+            .conn()
+            .query_row("SELECT COUNT(*) FROM group_admins", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
