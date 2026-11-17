@@ -499,9 +499,12 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         // С несколькими админами (`clipwire/13`) это «сделать
                         // `to` админом и снять себя» одной транзакцией.
                         let reply = match shared.store.transfer_group_admin(&group, &device, &to, now_ms())? {
-                            Ok(()) => {
-                                tracing::info!(group = %short(&group), "админ группы передан");
-                                shared.hub.devices_changed(&group, reg.id);
+                            Ok(changed) => {
+                                // Остальным — только если роли и правда поменялись.
+                                if changed {
+                                    tracing::info!(group = %short(&group), "админ группы передан");
+                                    shared.hub.devices_changed(&group, reg.id);
+                                }
                                 ServerMsg::GroupAdmin { admin: Some(to) }
                             }
                             Err(f) => ServerMsg::AdminFailed(f),
@@ -523,9 +526,11 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     Some(ClientMsg::GrantGroupAdmin { device: to }) => {
                         need_admins_alpn(conn)?;
                         let reply = match shared.store.grant_group_admin(&group, &device, &to, now_ms())? {
-                            Ok(()) => {
-                                tracing::info!(group = %short(&group), "у группы новый админ");
-                                shared.hub.devices_changed(&group, reg.id);
+                            Ok(changed) => {
+                                if changed {
+                                    tracing::info!(group = %short(&group), "у группы новый админ");
+                                    shared.hub.devices_changed(&group, reg.id);
+                                }
                                 ServerMsg::GroupAdmins { admins: shared.store.group_admins(&group)? }
                             }
                             Err(f) => ServerMsg::AdminFailed(f),
@@ -535,9 +540,11 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     Some(ClientMsg::RevokeGroupAdmin { device: of }) => {
                         need_admins_alpn(conn)?;
                         let reply = match shared.store.revoke_group_admin(&group, &device, &of)? {
-                            Ok(()) => {
-                                tracing::info!(group = %short(&group), "с устройства снят админ");
-                                shared.hub.devices_changed(&group, reg.id);
+                            Ok(changed) => {
+                                if changed {
+                                    tracing::info!(group = %short(&group), "с устройства снят админ");
+                                    shared.hub.devices_changed(&group, reg.id);
+                                }
                                 ServerMsg::GroupAdmins { admins: shared.store.group_admins(&group)? }
                             }
                             Err(f) => ServerMsg::AdminFailed(f),

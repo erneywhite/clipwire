@@ -187,6 +187,20 @@ impl Client {
         Ok(())
     }
 
+    /// За полсекунды сервер ничего не прислал (рассылка `DevicesChanged`
+    /// идёт сразу, так что её бы заметили).
+    async fn quiet(&mut self) -> Result<()> {
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            read_msg::<_, ServerMsg>(&mut self.recv),
+        )
+        .await
+        {
+            Err(_) => Ok(()),
+            Ok(msg) => anyhow::bail!("ждали тишины, пришло {msg:?}"),
+        }
+    }
+
     /// Дождаться, пока сервер закроет поток после успешного `Rekey`.
     async fn closed(&mut self) -> Result<()> {
         loop {
@@ -810,6 +824,30 @@ async fn several_group_admins() -> Result<()> {
         }
     );
     c.devices_changed().await?;
+    // Повтор ничего не меняет: ответ тот же, остальным рассылки нет. Так же
+    // снятие с не-админа и передача роли самому себе.
+    assert_eq!(
+        a.ask(&ClientMsg::GrantGroupAdmin { device: bd }).await?,
+        ServerMsg::GroupAdmins {
+            admins: vec![ad, bd]
+        }
+    );
+    assert_eq!(
+        a.ask(&ClientMsg::RevokeGroupAdmin { device: cd }).await?,
+        ServerMsg::GroupAdmins {
+            admins: vec![ad, bd]
+        }
+    );
+    let mut a_old = Client::connect_alpn(a.ep.clone(), &s, ALPN_12).await?;
+    a_old.join_with(&with_token(&key, "test-token")).await?;
+    c.devices_changed().await?; // вход второго соединения A
+    assert_eq!(
+        a_old
+            .ask(&ClientMsg::TransferGroupAdmin { device: ad })
+            .await?,
+        ServerMsg::GroupAdmin { admin: Some(ad) }
+    );
+    c.quiet().await?;
     // B равен A: снимает его и назначает C.
     assert_eq!(
         b.ask(&ClientMsg::RevokeGroupAdmin { device: ad }).await?,

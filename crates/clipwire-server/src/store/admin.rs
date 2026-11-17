@@ -259,13 +259,14 @@ pub(super) fn has_admins(conn: &Connection, group: &GroupId) -> Result<bool> {
 }
 
 /// Добавить админа (уже админ — ничего не меняется) и выровнять старый
-/// столбец.
-fn add_admin(conn: &Connection, group: &GroupId, device: &DeviceId, since_ms: i64) -> Result<()> {
-    conn.execute(
+/// столбец. `true` — устройство стало админом только что.
+fn add_admin(conn: &Connection, group: &GroupId, device: &DeviceId, since_ms: i64) -> Result<bool> {
+    let added = conn.execute(
         "INSERT OR IGNORE INTO group_admins (group_id, device_id, since_ms) VALUES (?1, ?2, ?3)",
         params![&group.0[..], &device.0[..], since_ms],
-    )?;
-    sync_legacy(conn, group)
+    )? > 0;
+    sync_legacy(conn, group)?;
+    Ok(added)
 }
 
 /// `groups.admin_device` — самый ранний админ (`NULL`, если админов нет).
@@ -285,14 +286,15 @@ fn sync_legacy(conn: &Connection, group: &GroupId) -> Result<()> {
 /// Снять `device` с админов, если после этого в группе останется хоть один
 /// админ, который в ней состоит. Админы, ещё не вошедшие после смены ключа,
 /// не считаются: иначе группа осталась бы с одним таким «призраком», и
-/// удалять устройства не смог бы никто. Не админ — не ошибка.
+/// удалять устройства не смог бы никто. Не админ — не ошибка. `Ok(true)` —
+/// роль снята, `Ok(false)` — снимать было нечего.
 fn revoke_in(
     conn: &Connection,
     group: &GroupId,
     device: &DeviceId,
-) -> Result<Result<(), AdminFail>> {
+) -> Result<Result<bool, AdminFail>> {
     if !is_admin(conn, group, device)? {
-        return Ok(Ok(()));
+        return Ok(Ok(false));
     }
     if active_admins_except(conn, group, device)? == 0 {
         return Ok(Err(AdminFail::LastAdmin));
@@ -302,7 +304,7 @@ fn revoke_in(
         params![&group.0[..], &device.0[..]],
     )?;
     sync_legacy(conn, group)?;
-    Ok(Ok(()))
+    Ok(Ok(true))
 }
 
 /// Когда токен relay последний раз меняли из клиента (мс), `None` — не меняли.
@@ -396,7 +398,9 @@ pub(super) fn mark_created(
 ) -> Result<()> {
     match create {
         Create::No => {}
-        Create::Admin | Create::Invite(_) => add_admin(conn, group, device, now_ms)?,
+        Create::Admin | Create::Invite(_) => {
+            add_admin(conn, group, device, now_ms)?;
+        }
         Create::ForRekey => {
             conn.execute(
                 "UPDATE groups SET pending_by = ?2, pending_ms = ?3 WHERE group_id = ?1",
@@ -568,14 +572,14 @@ impl Store {
     }
 
     /// Сделать `device` админом группы по запросу админа `by`. Уже админ —
-    /// не ошибка.
+    /// не ошибка. `Ok(true)` — роли поменялись, `Ok(false)` — уже был админом.
     pub fn grant_group_admin(
         &self,
         group: &GroupId,
         by: &DeviceId,
         device: &DeviceId,
         now_ms: i64,
-    ) -> Result<Result<(), AdminFail>> {
+    ) -> Result<Result<bool, AdminFail>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         if !is_live(&tx, group)? || !is_active_admin(&tx, group, by)? {
@@ -584,9 +588,9 @@ impl Store {
         if !super::devices::is_member(&tx, group, device)? {
             return Ok(Err(AdminFail::NoSuchDevice));
         }
-        add_admin(&tx, group, device, now_ms)?;
+        let added = add_admin(&tx, group, device, now_ms)?;
         tx.commit()?;
-        Ok(Ok(()))
+        Ok(Ok(added))
     }
 
     /// Снять роль админа с `device` по запросу админа `by` (в том числе с
@@ -599,7 +603,7 @@ impl Store {
         group: &GroupId,
         by: &DeviceId,
         device: &DeviceId,
-    ) -> Result<Result<(), AdminFail>> {
+    ) -> Result<Result<bool, AdminFail>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         if !is_live(&tx, group)? || !is_active_admin(&tx, group, by)? {
@@ -608,23 +612,25 @@ impl Store {
         if !is_admin(&tx, group, device)? && !super::devices::is_member(&tx, group, device)? {
             return Ok(Err(AdminFail::NoSuchDevice));
         }
-        if let Err(f) = revoke_in(&tx, group, device)? {
-            return Ok(Err(f));
-        }
+        let removed = match revoke_in(&tx, group, device)? {
+            Ok(removed) => removed,
+            Err(f) => return Ok(Err(f)),
+        };
         tx.commit()?;
-        Ok(Ok(()))
+        Ok(Ok(removed))
     }
 
     /// Передать роль админа от `from` к `to` (`TransferGroupAdmin` старых
     /// клиентов): одной транзакцией `to` становится админом, `from` перестаёт.
-    /// Другие админы остаются.
+    /// Другие админы остаются. `Ok(true)` — роли поменялись, `Ok(false)` —
+    /// нет (передача себе).
     pub fn transfer_group_admin(
         &self,
         group: &GroupId,
         from: &DeviceId,
         to: &DeviceId,
         now_ms: i64,
-    ) -> Result<Result<(), AdminFail>> {
+    ) -> Result<Result<bool, AdminFail>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         if !is_live(&tx, group)? || !is_active_admin(&tx, group, from)? {
@@ -633,16 +639,17 @@ impl Store {
         if !super::devices::is_member(&tx, group, to)? {
             return Ok(Err(AdminFail::NoSuchDevice));
         }
-        add_admin(&tx, group, to, now_ms)?;
+        let mut changed = add_admin(&tx, group, to, now_ms)?;
         // `to` уже админ и состоит в группе, так что `from` последним не
         // окажется.
-        if from != to
-            && let Err(f) = revoke_in(&tx, group, from)?
-        {
-            return Ok(Err(f));
+        if from != to {
+            match revoke_in(&tx, group, from)? {
+                Ok(removed) => changed |= removed,
+                Err(f) => return Ok(Err(f)),
+            }
         }
         tx.commit()?;
-        Ok(Ok(()))
+        Ok(Ok(changed))
     }
 
     /// Незавершённая ли это группа смены ключа (`Rekey` ещё не пришёл).
@@ -910,7 +917,7 @@ mod tests {
             s.transfer_group_admin(&g, &a, &x, 20).unwrap(),
             Err(AdminFail::NoSuchDevice)
         );
-        assert_eq!(s.transfer_group_admin(&g, &a, &b, 20).unwrap(), Ok(()));
+        assert_eq!(s.transfer_group_admin(&g, &a, &b, 20).unwrap(), Ok(true));
         assert_eq!(s.group_admins(&g).unwrap(), vec![b]);
         assert_eq!(s.group_admin(&g).unwrap(), Some(b));
         assert_eq!(
@@ -918,11 +925,11 @@ mod tests {
             Err(AdminFail::NotGroupAdmin)
         );
         // Передача себе — ничего не меняется, последний админ не теряется.
-        assert_eq!(s.transfer_group_admin(&g, &b, &b, 30).unwrap(), Ok(()));
+        assert_eq!(s.transfer_group_admin(&g, &b, &b, 30).unwrap(), Ok(false));
         assert_eq!(s.group_admins(&g).unwrap(), vec![b]);
         // При двух админах передача трогает только передающего.
-        assert_eq!(s.grant_group_admin(&g, &b, &c, 40).unwrap(), Ok(()));
-        assert_eq!(s.transfer_group_admin(&g, &c, &a, 50).unwrap(), Ok(()));
+        assert_eq!(s.grant_group_admin(&g, &b, &c, 40).unwrap(), Ok(true));
+        assert_eq!(s.transfer_group_admin(&g, &c, &a, 50).unwrap(), Ok(true));
         assert_eq!(s.group_admins(&g).unwrap(), vec![b, a]);
     }
 
@@ -963,13 +970,13 @@ mod tests {
             s.revoke_group_admin(&g, &a, &a).unwrap(),
             Err(AdminFail::LastAdmin)
         );
-        assert_eq!(s.grant_group_admin(&g, &a, &b, 20).unwrap(), Ok(()));
-        // Повтор — не ошибка, время назначения не меняется.
-        assert_eq!(s.grant_group_admin(&g, &a, &b, 30).unwrap(), Ok(()));
+        assert_eq!(s.grant_group_admin(&g, &a, &b, 20).unwrap(), Ok(true));
+        // Повтор — не ошибка, время назначения не меняется, и это не правка.
+        assert_eq!(s.grant_group_admin(&g, &a, &b, 30).unwrap(), Ok(false));
         assert_eq!(s.group_admins(&g).unwrap(), vec![a, b]);
         // Новый админ равен первому: назначает и снимает, в том числе его.
-        assert_eq!(s.grant_group_admin(&g, &b, &c, 40).unwrap(), Ok(()));
-        assert_eq!(s.revoke_group_admin(&g, &b, &a).unwrap(), Ok(()));
+        assert_eq!(s.grant_group_admin(&g, &b, &c, 40).unwrap(), Ok(true));
+        assert_eq!(s.revoke_group_admin(&g, &b, &a).unwrap(), Ok(true));
         assert_eq!(s.group_admins(&g).unwrap(), vec![b, c]);
         assert_eq!(s.group_admin(&g).unwrap(), Some(b));
         // Снятый больше ничего не может.
@@ -977,17 +984,17 @@ mod tests {
             s.grant_group_admin(&g, &a, &a, 50).unwrap(),
             Err(AdminFail::NotGroupAdmin)
         );
-        // Снять не-админа — не ошибка.
-        assert_eq!(s.revoke_group_admin(&g, &b, &a).unwrap(), Ok(()));
+        // Снять не-админа — не ошибка и не правка.
+        assert_eq!(s.revoke_group_admin(&g, &b, &a).unwrap(), Ok(false));
         // Себя можно, пока остаётся другой админ.
-        assert_eq!(s.revoke_group_admin(&g, &c, &c).unwrap(), Ok(()));
+        assert_eq!(s.revoke_group_admin(&g, &c, &c).unwrap(), Ok(true));
         assert_eq!(s.group_admins(&g).unwrap(), vec![b]);
         assert_eq!(
             s.revoke_group_admin(&g, &b, &b).unwrap(),
             Err(AdminFail::LastAdmin)
         );
         // Старый вопрос «кто админ» видит себя, если сам админ.
-        assert_eq!(s.grant_group_admin(&g, &b, &c, 60).unwrap(), Ok(()));
+        assert_eq!(s.grant_group_admin(&g, &b, &c, 60).unwrap(), Ok(true));
         assert_eq!(s.group_admin_for(&g, &c).unwrap(), Some(c));
         assert_eq!(s.group_admin_for(&g, &a).unwrap(), Some(b));
         // Старый столбец держится равным самому раннему админу.
@@ -1026,8 +1033,8 @@ mod tests {
         for dev in 2..=4 {
             join(&s, &k, dev, Create::No);
         }
-        assert_eq!(s.grant_group_admin(&g, &a, &b, 20).unwrap(), Ok(()));
-        assert_eq!(s.grant_group_admin(&g, &a, &c, 30).unwrap(), Ok(()));
+        assert_eq!(s.grant_group_admin(&g, &a, &b, 20).unwrap(), Ok(true));
+        assert_eq!(s.grant_group_admin(&g, &a, &c, 30).unwrap(), Ok(true));
         // Не админ смену ключа не начнёт.
         assert_eq!(join(&s, &n, 4, Create::ForRekey), JoinOutcome::NoGroup);
         // Ключ меняет b: c удаляется, d остаётся, a в пакетах есть.
@@ -1068,7 +1075,7 @@ mod tests {
         join(&s, &k, 3, Create::No);
         assert_eq!(
             s.grant_group_admin(&k.group_id(), &a, &b, 20).unwrap(),
-            Ok(())
+            Ok(true)
         );
         // A меняет ключ и оставляет B, но B с новым ключом не входит.
         assert_eq!(join(&s, &n, 1, Create::ForRekey), JoinOutcome::Created);
@@ -1092,7 +1099,7 @@ mod tests {
             Err(AdminFail::NoSuchDevice)
         );
         // А снять его можно.
-        assert_eq!(s.revoke_group_admin(&g, &a, &b).unwrap(), Ok(()));
+        assert_eq!(s.revoke_group_admin(&g, &a, &b).unwrap(), Ok(true));
         assert_eq!(s.group_admins(&g).unwrap(), vec![a]);
         // Кого нет ни в админах, ни в группе — отказ.
         assert_eq!(
@@ -1105,8 +1112,8 @@ mod tests {
             Err(AdminFail::NoSuchDevice)
         );
         join(&s, &n, 3, Create::No);
-        assert_eq!(s.grant_group_admin(&g, &a, &c, 33).unwrap(), Ok(()));
-        assert_eq!(s.revoke_group_admin(&g, &a, &a).unwrap(), Ok(()));
+        assert_eq!(s.grant_group_admin(&g, &a, &c, 33).unwrap(), Ok(true));
+        assert_eq!(s.revoke_group_admin(&g, &a, &a).unwrap(), Ok(true));
         assert_eq!(s.group_admins(&g).unwrap(), vec![c]);
         // Снятый A больше ничего не может.
         assert_eq!(
@@ -1146,7 +1153,7 @@ mod tests {
         assert!(s.group_admins(&legacy.group_id()).unwrap().is_empty());
         assert_eq!(
             s.grant_group_admin(&k.group_id(), &b, &a, 20).unwrap(),
-            Ok(())
+            Ok(true)
         );
         drop(s);
         // Второй запуск не копирует заново и не теряет новых админов.
@@ -1180,7 +1187,7 @@ mod tests {
             join(&s, &k, 3, Create::No);
             assert_eq!(
                 s.grant_group_admin(&k.group_id(), &a, &b, 20).unwrap(),
-                Ok(())
+                Ok(true)
             );
             join(&s, &idle, 1, Create::Admin);
             join(&s, &rotated, 1, Create::Admin);
@@ -1213,7 +1220,7 @@ mod tests {
         // Без расхождений следующий запуск ничего не меняет.
         assert_eq!(
             s.grant_group_admin(&k.group_id(), &c, &a, 30).unwrap(),
-            Ok(())
+            Ok(true)
         );
         drop(s);
         let s = Store::open(&path).unwrap();
