@@ -409,6 +409,11 @@ mod win {
     const WM_VIRTUAL_DONE: u32 = WM_APP + 8;
     const READ_TIMER: usize = 1;
     const READ_DELAY_MS: u32 = 60;
+    /// Буфер занят другой программой или менялся во время чтения: сколько
+    /// раз перечитать и через сколько мс. Проводник по Ctrl+C держит буфер
+    /// дольше, и первое чтение может не открыть его.
+    const READ_RETRIES: u8 = 6;
+    const RETRY_DELAY_MS: u32 = 150;
 
     /// Колбэк получает содержимое и полный путь exe программы-владельца
     /// буфера, если удалось узнать.
@@ -437,6 +442,8 @@ mod win {
         ole: bool,
         /// Свой объект «картинка с файлом», положенный в буфер последним.
         offered: Option<windows::Win32::System::Com::IDataObject>,
+        /// Сколько раз подряд этот буфер не прочитался (см. `READ_RETRIES`).
+        retries: u8,
     }
 
     /// Следит за буфером, пока жив. Колбэк вызывается в потоке слежения на
@@ -473,6 +480,7 @@ mod win {
                         virt: Default::default(),
                         ole,
                         offered: None,
+                        retries: 0,
                     });
                     let hwnd = match create_window(ctx) {
                         Ok(h) => h,
@@ -528,6 +536,11 @@ mod win {
             // тишины READ_DELAY_MS и читаем один раз: таймер перезапускается
             // каждым новым уведомлением.
             WM_CLIPBOARDUPDATE => {
+                let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Ctx;
+                // SAFETY: как в WM_TIMER.
+                if let Some(ctx) = unsafe { ptr.as_mut() } {
+                    ctx.retries = 0;
+                }
                 unsafe { SetTimer(Some(hwnd), READ_TIMER, READ_DELAY_MS, None) };
                 LRESULT(0)
             }
@@ -543,8 +556,33 @@ mod win {
                     // метки могли относиться к одному содержимому, а прочитали
                     // другое. Поэтому сверяем номер версии буфера до и после.
                     let seq = || unsafe { GetClipboardSequenceNumber() };
-                    match super::read_consistent(seq, || snapshot(ctx, hwnd)) {
+                    let read = super::read_consistent(seq, || snapshot(ctx, hwnd));
+                    let retry = match &read {
+                        Some((Snapshot::Busy(why), _)) => Some(*why),
+                        None => Some("буфер менялся во время чтения"),
+                        _ => None,
+                    };
+                    if let Some(why) = retry {
+                        if ctx.retries < READ_RETRIES {
+                            ctx.retries += 1;
+                            tracing::debug!(attempt = ctx.retries, "{why}, перечитаю");
+                            unsafe { SetTimer(Some(hwnd), READ_TIMER, RETRY_DELAY_MS, None) };
+                        } else {
+                            tracing::warn!(
+                                "буфер не прочитался за {} попыток, пропускаю: {why}",
+                                READ_RETRIES + 1
+                            );
+                            ctx.retries = 0;
+                        }
+                        return LRESULT(0);
+                    }
+                    if ctx.retries > 0 {
+                        tracing::info!(attempts = ctx.retries + 1, "буфер прочитался не сразу");
+                    }
+                    ctx.retries = 0;
+                    match read {
                         Some((Snapshot::Content(content, owner), seq)) => {
+                            tracing::info!(kind = content_kind(&content), "скопировано");
                             // Картинку — ещё и виртуальным файлом для
                             // Проводника. Решение по форматам буфера — в
                             // `image_offer::offer`, здесь — настройка,
@@ -568,13 +606,13 @@ mod win {
                         }
                         Some((Snapshot::Virtual(owner), _)) => start_virtual(ctx, hwnd, owner),
                         Some((Snapshot::Excluded, _)) => {
-                            tracing::debug!("буфер помечен как приватный, пропускаю");
+                            tracing::info!("буфер помечен как приватный, пропускаю");
                         }
                         Some((Snapshot::Ours, _)) => {
                             tracing::debug!("в буфере своя картинка с файлом, пропускаю");
                         }
                         Some((Snapshot::Empty, _)) => {}
-                        None => tracing::debug!("буфер менялся во время чтения, пропускаю"),
+                        Some((Snapshot::Busy(_), _)) | None => {}
                     }
                 }
                 LRESULT(0)
@@ -644,6 +682,20 @@ mod win {
         Ours,
         /// Ничего, что мы умеем брать.
         Empty,
+        /// Не прочиталось, хотя что-то есть: буфер занят другой программой.
+        /// Причина для журнала; чтение повторится.
+        Busy(&'static str),
+    }
+
+    /// Вид содержимого для журнала. Само содержимое в журнал не пишется.
+    fn content_kind(c: &Content) -> String {
+        match c {
+            Content::Text(_) => "текст".into(),
+            Content::Image { .. } => "картинка".into(),
+            Content::Rich { .. } => "форматированный текст".into(),
+            Content::Files(f) => format!("файлы ({})", f.len()),
+            _ => "другое".into(),
+        }
     }
 
     /// Один проход чтения буфера: метки исключения, содержимое, владелец.
@@ -653,8 +705,10 @@ mod win {
         if raw_available(ctx.formats.image_file) {
             return Snapshot::Ours;
         }
-        if ctx.formats.excluded(hwnd) {
-            return Snapshot::Excluded;
+        match ctx.formats.excluded(hwnd) {
+            Some(true) => return Snapshot::Excluded,
+            Some(false) => {}
+            None => return Snapshot::Busy("метка приватности не прочиталась"),
         }
         // Порядок форматов и почему он такой — в `super::pick`.
         let pick = super::pick(
@@ -662,11 +716,13 @@ mod win {
             crate::virtual_files::descriptor_format(),
             png_format(),
         );
-        let content = if pick == super::Pick::Files
-            && let Some(files) = read_files()
-        {
-            // Проводник кладёт файлы списком путей (CF_HDROP).
-            Content::Files(files)
+        let content = if pick == super::Pick::Files {
+            // Проводник кладёт файлы списком путей (CF_HDROP). Не прочитались —
+            // буфер занят: не подменять файлы текстом или картинкой рядом.
+            match read_files() {
+                Some(files) => Content::Files(files),
+                None => return Snapshot::Busy("список файлов не прочитался"),
+            }
         } else if pick == super::Pick::Virtual {
             // Outlook и другие источники без файлов на диске.
             return Snapshot::Virtual(owner_exe());
@@ -938,17 +994,22 @@ mod win {
             }
         }
 
-        fn excluded(&self, hwnd: HWND) -> bool {
+        /// `Some(true)` — приватное, `None` — буфер занят и метку не
+        /// прочитать: перечитать позже.
+        fn excluded(&self, hwnd: HWND) -> Option<bool> {
             let available = |f: u32| f != 0 && unsafe { IsClipboardFormatAvailable(f) }.is_ok();
             if available(self.exclude_monitor) || available(self.viewer_ignore) {
-                return true;
+                return Some(true);
             }
-            // Эти два формата — DWORD: 0 означает «нельзя». Метка есть, но не
-            // прочиталась (буфер не открылся, данных нет) — считаем
-            // содержимое приватным: лучше не отправить, чем отправить пароль.
-            [self.can_history, self.can_cloud]
-                .into_iter()
-                .any(|f| available(f) && read_dword(hwnd, f).is_none_or(|v| v == 0))
+            // Эти два формата — DWORD: 0 означает «нельзя». Метка есть, но
+            // данных нет — считаем содержимое приватным: лучше не отправить,
+            // чем отправить пароль.
+            for f in [self.can_history, self.can_cloud] {
+                if available(f) && read_dword(hwnd, f)?.is_none_or(|v| v == 0) {
+                    return Some(true);
+                }
+            }
+            Some(false)
         }
     }
 
@@ -1000,7 +1061,8 @@ mod win {
         }
     }
 
-    fn read_dword(hwnd: HWND, format: u32) -> Option<u32> {
+    /// `None` — буфер не открылся, `Some(None)` — данных нет.
+    fn read_dword(hwnd: HWND, format: u32) -> Option<Option<u32>> {
         unsafe {
             // Буфер может быть занят другой программой — несколько коротких попыток.
             let opened = (0..5).any(|_| {
@@ -1028,7 +1090,7 @@ mod win {
                 Some(v)
             })();
             let _ = CloseClipboard();
-            res
+            Some(res)
         }
     }
 }
