@@ -554,8 +554,8 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
 - Three themes (Graphite, Paper, Signal), each in light and dark, or follow the system.
 - Language: English, Русский or as in the system.
 - Launch at login: the program starts minimized to the tray.
-- Copy sound: a short click when something new enters the history. Pasting from the history and
-  copying the same thing again are silent. On Linux it plays through `pw-play`, `paplay` or `aplay`.
+- Copy sound: a short click on every copy made here and on anything new from another device.
+  Pasting from the history is silent. On Linux it plays through `pw-play`, `paplay` or `aplay`.
 - History retention, from a day to forever (pinned entries are kept forever).
 - Device name, invitation code (**Show code**), leaving the group (it also removes the server
   administrator key from the device).
@@ -611,7 +611,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.8.3`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.8.4`.
 
 **Through a Docker control panel or plain `docker compose`:**
 

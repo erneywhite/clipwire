@@ -61,9 +61,10 @@ pub enum UiEvent {
     /// Смена ключа на этом устройстве не состоялась, хотя ответ на неё
     /// потерялся (текст для человека).
     RekeyLost(String),
-    /// В истории появилась новая запись: своё копирование или пришедшее с
-    /// другого устройства. Повтор того, что уже есть в истории (вставка из
-    /// истории, то же содержимое ещё раз), новой записью не считается.
+    /// Повод для звука: своё копирование (и повтор того, что уже есть в
+    /// истории, — человек скопировал ещё раз) или новая запись с другого
+    /// устройства. Вставка из истории сюда не попадает: её отсекает
+    /// `LoopGuard` раньше.
     NewEntry,
     /// Настройки группы изменились (здесь или на другом устройстве). Без
     /// секретов: полные настройки — `StorageController::config_for_form`.
@@ -340,7 +341,7 @@ impl Copier {
             entry.set_source_app(app);
         }
         let key = (entry.id, entry.seen_ms);
-        let new = record(&self.history, entry);
+        record(&self.history, entry);
         let took = started.elapsed();
         if took > SLOW_RECORD {
             tracing::warn!(
@@ -349,9 +350,7 @@ impl Copier {
             );
         }
         (self.on_event)(UiEvent::Copied(content));
-        if new {
-            (self.on_event)(UiEvent::NewEntry);
-        }
+        (self.on_event)(UiEvent::NewEntry);
         key
     }
 
@@ -1573,10 +1572,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
-    /// Новая запись в истории даёт событие для звука, повтор того же
-    /// содержимого (вставка из истории, второе копирование) — нет.
+    /// Звук на каждое своё копирование, и на повтор того, что уже есть в
+    /// истории: человек скопировал ещё раз и ждёт отклика.
     #[tokio::test]
-    async fn only_new_entries_signal_sound() {
+    async fn every_own_copy_signals_sound() {
         let d = tmp("sound");
         let history = Arc::new(Mutex::new(History::open(&d).unwrap()));
         let (copied, new) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
@@ -1610,7 +1609,12 @@ mod tests {
         c.dispatch(Content::Text("раз".into()), false, None);
         c.dispatch(Content::Text("два".into()), false, None);
         assert_eq!(copied.load(Ordering::SeqCst), 3);
-        assert_eq!(new.load(Ordering::SeqCst), 2, "повтор звука не даёт");
+        assert_eq!(new.load(Ordering::SeqCst), 3, "повтор тоже звучит");
+        assert_eq!(
+            history.lock().unwrap().len(),
+            2,
+            "повтор не дублирует запись"
+        );
         let h = history.lock().unwrap();
         let e = h.find(&Content::Text("раз".into())).unwrap();
         assert_eq!(e.source_app(), Some(app), "источник записан в историю");
