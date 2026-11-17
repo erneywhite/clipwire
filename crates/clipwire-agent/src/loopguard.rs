@@ -4,7 +4,9 @@
 //! изменении буфера так же, как при обычном Ctrl+C. Чтобы не отправить элемент
 //! обратно, агент запоминает хэш записанного и пропускает совпадающее изменение.
 //! Заодно отсекаются повторные уведомления с тем же содержимым (некоторые
-//! программы кладут текст в буфер несколько раз подряд).
+//! программы кладут текст в буфер несколько раз подряд, «Ножницы» — картинку
+//! дважды за 0,1 с). Только в пределах [`REPEAT_WINDOW`]: то же самое,
+//! скопированное позже, — это человек скопировал ещё раз.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -16,16 +18,21 @@ use clipwire_core::Content;
 /// записи и обратного чтения байты PNG могут отличаться.
 const IMAGE_ECHO_WINDOW: Duration = Duration::from_millis(1500);
 
+/// Сколько то же содержимое считается эхом записи или повтором уведомления.
+/// Эхо своей записи приходит через десятые доли секунды (с перечитыванием
+/// занятого буфера — до полсекунды); человек повторяет Ctrl+C не так быстро.
+const REPEAT_WINDOW: Duration = Duration::from_millis(1500);
+
 #[derive(Default)]
 pub struct LoopGuard {
-    last: Mutex<Option<[u8; 32]>>,
+    last: Mutex<Option<([u8; 32], Instant)>>,
     image_written: Mutex<Option<Instant>>,
 }
 
 impl LoopGuard {
     /// Вызывать перед записью в буфер содержимого с другого устройства.
     pub fn wrote(&self, c: &Content) {
-        *self.lock() = Some(c.hash());
+        *self.lock() = Some((c.hash(), Instant::now()));
         if matches!(c, Content::Image { .. }) {
             *self.image_written.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         }
@@ -34,22 +41,30 @@ impl LoopGuard {
     /// Вызывать на каждое изменение буфера. `true` — изменение новое и его
     /// надо отправить.
     pub fn should_send(&self, c: &Content) -> bool {
+        self.should_send_at(c, Instant::now())
+    }
+
+    fn should_send_at(&self, c: &Content, now: Instant) -> bool {
         if matches!(c, Content::Image { .. }) {
             let mut w = self.image_written.lock().unwrap_or_else(|e| e.into_inner());
-            if w.take().is_some_and(|t| t.elapsed() < IMAGE_ECHO_WINDOW) {
+            if w.take()
+                .is_some_and(|t| now.saturating_duration_since(t) < IMAGE_ECHO_WINDOW)
+            {
                 return false;
             }
         }
         let h = c.hash();
         let mut last = self.lock();
-        if *last == Some(h) {
-            return false;
+        let repeat =
+            last.is_some_and(|(x, at)| x == h && now.saturating_duration_since(at) < REPEAT_WINDOW);
+        // Время повтора не продлевается: серия уведомлений не растягивает окно.
+        if !repeat {
+            *last = Some((h, now));
         }
-        *last = Some(h);
-        true
+        !repeat
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<[u8; 32]>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<([u8; 32], Instant)>> {
         self.last.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -96,5 +111,29 @@ mod tests {
         assert!(g.should_send(&t("b")));
         // Вернулись к прежнему тексту — это новое копирование, его надо отправить.
         assert!(g.should_send(&t("a")));
+    }
+
+    /// То же самое позже окна — человек скопировал ещё раз; эхо своей
+    /// записи и двойное уведомление внутри окна отсекаются.
+    #[test]
+    fn same_content_later_is_a_new_copy() {
+        let g = LoopGuard::default();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        assert!(g.should_send_at(&t("a"), t0));
+        assert!(
+            !g.should_send_at(&t("a"), t0 + ms(120)),
+            "двойное уведомление"
+        );
+        assert!(
+            !g.should_send_at(&t("a"), t0 + ms(1400)),
+            "окно не продлевается, но ещё идёт"
+        );
+        assert!(g.should_send_at(&t("a"), t0 + ms(1600)), "повторный Ctrl+C");
+        // Своя запись: эхо отсекается, а скопировать то же позже можно.
+        g.wrote(&t("с другого"));
+        let w = Instant::now();
+        assert!(!g.should_send_at(&t("с другого"), w + ms(300)));
+        assert!(g.should_send_at(&t("с другого"), w + ms(2000)));
     }
 }
