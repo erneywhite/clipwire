@@ -109,6 +109,61 @@ pub mod legacy {
 
     use super::{Content, FileRef};
 
+    /// Самый первый `FileRef`: файлы только в локальной истории, без времени
+    /// изменения и передачи (13.11.2026, отладочные сборки до передачи файлов).
+    #[derive(Deserialize)]
+    pub struct FileRefV1 {
+        pub name: String,
+        pub path: String,
+        pub size: u64,
+        pub is_dir: bool,
+        pub width: u32,
+        pub height: u32,
+    }
+
+    /// `Content` с `FileRefV1`. Порядок вариантов совпадает с `Content`.
+    #[derive(Deserialize)]
+    pub enum ContentV1 {
+        Text(String),
+        Image {
+            width: u32,
+            height: u32,
+            png: Vec<u8>,
+        },
+        Rich {
+            text: String,
+            html: Option<String>,
+            rtf: Option<Vec<u8>>,
+        },
+        Files(Vec<FileRefV1>),
+    }
+
+    impl From<ContentV1> for Content {
+        fn from(c: ContentV1) -> Self {
+            match c {
+                ContentV1::Text(t) => Content::Text(t),
+                ContentV1::Image { width, height, png } => Content::Image { width, height, png },
+                ContentV1::Rich { text, html, rtf } => Content::Rich { text, html, rtf },
+                ContentV1::Files(f) => Content::Files(
+                    f.into_iter()
+                        .map(|f| FileRef {
+                            name: f.name,
+                            path: f.path,
+                            size: f.size,
+                            is_dir: f.is_dir,
+                            width: f.width,
+                            height: f.height,
+                            modified_ms: 0,
+                            blob: None,
+                            blob_size: 0,
+                            p2p: false,
+                        })
+                        .collect(),
+                ),
+            }
+        }
+    }
+
     /// `FileRef` до полей `blob_size` и `p2p` (передача через сервер, ноябрь 2026).
     #[derive(Deserialize)]
     pub struct FileRefV2 {

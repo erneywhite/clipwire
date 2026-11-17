@@ -504,13 +504,20 @@ impl Copier {
             if let Some(tx) = tx.as_ref() {
                 let mut out = Outgoing::new(content.clone(), source);
                 out.reused = reused;
+                // Пометка — до передачи движку: в сети он отправляет сразу и
+                // снимает её по `Event::Pushed`. Поставленная после, она
+                // появлялась уже после отправки и досылалась при каждом запуске.
+                let mark = self.mark.as_ref().filter(|_| resendable(content));
+                let hash = content.hash();
+                if let Some(m) = mark {
+                    m.set(&hash);
+                }
                 if tx.try_send(out).is_err() {
                     tracing::warn!("очередь отправки переполнена, копирование не ушло в группу");
                     discard(content);
-                } else if let Some(mark) = &self.mark
-                    && resendable(content)
-                {
-                    mark.set(&content.hash());
+                    if let Some(m) = mark {
+                        m.clear_if(&hash);
+                    }
                 }
             }
         } else if self.is_cancelled() {
@@ -1738,6 +1745,42 @@ mod tests {
         assert!(z[0].blob.is_none());
         assert!(!needs_scan(&Content::Files(vec![p(&small)]), 0));
         assert!(needs_scan(&Content::Files(vec![p(&small)]), 1));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Пометка «не отправлено» стоит раньше, чем копирование увидит движок:
+    /// снятие по `Pushed` сразу после отправки её не оставляет. Раньше она
+    /// ставилась после передачи движку и досылалась при каждом запуске.
+    #[tokio::test]
+    async fn push_mark_is_set_before_engine_sees_the_copy() {
+        let d = tmp("mark-race");
+        let (tx, mut rx) = mpsc::channel::<Outgoing>(4);
+        let mark = crate::push_mark::PushMark::new(&d);
+        let c = Copier {
+            tx: Arc::new(Mutex::new(Some(tx))),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            history: Arc::new(Mutex::new(History::open(&d.join("h")).unwrap())),
+            device: DeviceId([1; 32]),
+            device_name: "тест".into(),
+            on_event: Arc::new(|_| {}),
+            blobs: None,
+            limit_mb: Arc::new(AtomicU64::new(1)),
+            rt: tokio::runtime::Handle::current(),
+            mark: Some(mark.clone()),
+            fingerprints: Default::default(),
+        };
+        // «Движок»: получил копирование — пометка уже должна быть, снимает её.
+        let engine_mark = mark.clone();
+        let engine = std::thread::spawn(move || {
+            let out = rx.blocking_recv().unwrap();
+            let h = out.content.hash();
+            let seen = engine_mark.get() == Some(h);
+            engine_mark.clear_if(&h);
+            seen
+        });
+        c.finish(Content::Text("раз".into()), true, None);
+        assert!(engine.join().unwrap(), "пометка стоит до передачи движку");
+        assert_eq!(mark.get(), None, "после отправки пометки нет");
         let _ = std::fs::remove_dir_all(d);
     }
 
