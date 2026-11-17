@@ -23,48 +23,74 @@ const IMAGE_ECHO_WINDOW: Duration = Duration::from_millis(1500);
 /// занятого буфера — до полсекунды); человек повторяет Ctrl+C не так быстро.
 const REPEAT_WINDOW: Duration = Duration::from_millis(1500);
 
+/// Что делать с изменением буфера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Новое копирование: записать и отправить.
+    New,
+    /// То же самое внутри окна: человек жмёт Ctrl+C ещё раз или программа
+    /// прислала уведомление дважды. Не записывать и не отправлять, только
+    /// дать звук — чтобы было слышно, что копирование сработало.
+    Repeat,
+    /// Эхо своей записи в буфер (элемент с другого устройства, вставка из
+    /// истории): ничего.
+    Echo,
+}
+
 #[derive(Default)]
 pub struct LoopGuard {
-    last: Mutex<Option<([u8; 32], Instant)>>,
+    /// Хэш последнего, когда и записано ли нами (тогда совпадение — эхо).
+    last: Mutex<Option<([u8; 32], Instant, bool)>>,
     image_written: Mutex<Option<Instant>>,
 }
 
 impl LoopGuard {
     /// Вызывать перед записью в буфер содержимого с другого устройства.
     pub fn wrote(&self, c: &Content) {
-        *self.lock() = Some((c.hash(), Instant::now()));
+        *self.lock() = Some((c.hash(), Instant::now(), true));
         if matches!(c, Content::Image { .. }) {
             *self.image_written.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         }
     }
 
-    /// Вызывать на каждое изменение буфера. `true` — изменение новое и его
-    /// надо отправить.
+    /// `true` — изменение новое и его надо отправить ([`Verdict::New`]).
     pub fn should_send(&self, c: &Content) -> bool {
-        self.should_send_at(c, Instant::now())
+        self.check(c) == Verdict::New
     }
 
-    fn should_send_at(&self, c: &Content, now: Instant) -> bool {
+    /// Вызывать на каждое изменение буфера.
+    pub fn check(&self, c: &Content) -> Verdict {
+        self.check_at(c, Instant::now())
+    }
+
+    fn check_at(&self, c: &Content, now: Instant) -> Verdict {
         if matches!(c, Content::Image { .. }) {
             let mut w = self.image_written.lock().unwrap_or_else(|e| e.into_inner());
             if w.take()
                 .is_some_and(|t| now.saturating_duration_since(t) < IMAGE_ECHO_WINDOW)
             {
-                return false;
+                return Verdict::Echo;
             }
         }
         let h = c.hash();
         let mut last = self.lock();
-        let repeat =
-            last.is_some_and(|(x, at)| x == h && now.saturating_duration_since(at) < REPEAT_WINDOW);
-        // Время повтора не продлевается: серия уведомлений не растягивает окно.
-        if !repeat {
-            *last = Some((h, now));
+        match *last {
+            // Время не продлевается: серия уведомлений не растягивает окно.
+            Some((x, at, ours)) if x == h && now.saturating_duration_since(at) < REPEAT_WINDOW => {
+                if ours {
+                    Verdict::Echo
+                } else {
+                    Verdict::Repeat
+                }
+            }
+            _ => {
+                *last = Some((h, now, false));
+                Verdict::New
+            }
         }
-        !repeat
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<([u8; 32], Instant)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<([u8; 32], Instant, bool)>> {
         self.last.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -113,27 +139,32 @@ mod tests {
         assert!(g.should_send(&t("a")));
     }
 
-    /// То же самое позже окна — человек скопировал ещё раз; эхо своей
-    /// записи и двойное уведомление внутри окна отсекаются.
+    /// Повтор внутри окна — звук без записи, эхо своей записи — ничего,
+    /// то же самое позже окна — новое копирование.
     #[test]
     fn same_content_later_is_a_new_copy() {
         let g = LoopGuard::default();
         let t0 = Instant::now();
         let ms = Duration::from_millis;
-        assert!(g.should_send_at(&t("a"), t0));
-        assert!(
-            !g.should_send_at(&t("a"), t0 + ms(120)),
-            "двойное уведомление"
+        assert_eq!(g.check_at(&t("a"), t0), Verdict::New);
+        assert_eq!(
+            g.check_at(&t("a"), t0 + ms(120)),
+            Verdict::Repeat,
+            "Ctrl+C ещё раз"
         );
-        assert!(
-            !g.should_send_at(&t("a"), t0 + ms(1400)),
-            "окно не продлевается, но ещё идёт"
+        assert_eq!(
+            g.check_at(&t("a"), t0 + ms(1400)),
+            Verdict::Repeat,
+            "окно не продлевается"
         );
-        assert!(g.should_send_at(&t("a"), t0 + ms(1600)), "повторный Ctrl+C");
-        // Своя запись: эхо отсекается, а скопировать то же позже можно.
+        assert_eq!(
+            g.check_at(&t("a"), t0 + ms(1600)),
+            Verdict::New,
+            "после окна — новое"
+        );
         g.wrote(&t("с другого"));
         let w = Instant::now();
-        assert!(!g.should_send_at(&t("с другого"), w + ms(300)));
-        assert!(g.should_send_at(&t("с другого"), w + ms(2000)));
+        assert_eq!(g.check_at(&t("с другого"), w + ms(300)), Verdict::Echo);
+        assert_eq!(g.check_at(&t("с другого"), w + ms(2000)), Verdict::New);
     }
 }
