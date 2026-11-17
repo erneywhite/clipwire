@@ -27,8 +27,32 @@ impl Sound {
     }
 }
 
-/// Сыграть звук копирования.
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Сколько после вставки из окна молчит щелчок копирования. Вставка кладёт
+/// запись в буфер обычным копированием, и его щелчок, пришедший через
+/// миллисекунды, прервал бы звук вставки.
+const PASTE_MUTES_COPY: Duration = Duration::from_secs(1);
+
+static PASTE_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Отметить вставку из окна: ближайший щелчок копирования от неё не играет.
+/// Вызывать до того, как запись попадёт в буфер.
+pub fn mark_paste() {
+    *PASTE_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+}
+
+fn copy_muted(paste_at: Option<Instant>, now: Instant) -> bool {
+    paste_at.is_some_and(|t| now.saturating_duration_since(t) < PASTE_MUTES_COPY)
+}
+
+/// Сыграть звук копирования, если его не перекрывает недавняя вставка.
 pub fn play_copy() {
+    let paste_at = *PASTE_AT.lock().unwrap_or_else(|e| e.into_inner());
+    if copy_muted(paste_at, Instant::now()) {
+        return;
+    }
     play(Sound::Copy);
 }
 
@@ -62,7 +86,6 @@ pub fn play(sound: Sound) {
     use objc2::rc::Retained;
     use objc2_app_kit::NSSound;
     use objc2_foundation::NSData;
-    use std::sync::Mutex;
 
     struct Player(Retained<NSSound>);
     // SAFETY: NSSound играет асинхронно сам; вызовы stop/play идут по одному
@@ -184,5 +207,20 @@ mod tests {
         super::play_copy();
         super::play(super::Sound::Paste);
         super::play_copy();
+    }
+}
+
+#[cfg(test)]
+mod mute_tests {
+    use super::*;
+
+    #[test]
+    fn copy_is_muted_only_right_after_paste() {
+        let t = Instant::now();
+        assert!(!copy_muted(None, t));
+        assert!(copy_muted(Some(t), t + Duration::from_millis(30)));
+        assert!(!copy_muted(Some(t), t + PASTE_MUTES_COPY));
+        // Часы не идут назад, но и тогда не глушить навсегда и не падать.
+        assert!(copy_muted(Some(t + Duration::from_millis(5)), t));
     }
 }

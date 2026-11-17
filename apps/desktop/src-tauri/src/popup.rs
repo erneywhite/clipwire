@@ -540,6 +540,16 @@ pub fn copy(
     source: Option<clipwire_core::SourceApp>,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
+    // Копирование здесь — часть вставки из окна: если у вставки свой звук,
+    // щелчок копирования не должен его перебить.
+    if state
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .sound_on_paste
+    {
+        crate::sound::mark_paste();
+    }
     let svc = state.service.lock().unwrap_or_else(|e| e.into_inner());
     match svc.as_ref() {
         Some(s) => s.copy(content, source),
