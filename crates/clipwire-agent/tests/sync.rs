@@ -74,6 +74,21 @@ impl Agent {
         })
     }
 
+    /// Разбирать события в фоне, как сервис: отвечать на `Flush`. Без этого
+    /// устройство, которое переподключилось и получает историю пачками, ждёт
+    /// ответа вечно и не закрывается. После вызова `wait` не работает.
+    fn drain_events(&mut self) {
+        let (_, closed) = mpsc::unbounded_channel();
+        let mut events = std::mem::replace(&mut self.events, closed);
+        tokio::spawn(async move {
+            while let Some(e) = events.recv().await {
+                if let Event::Flush(done) = e {
+                    let _ = done.send(());
+                }
+            }
+        });
+    }
+
     /// Ждёт события, подходящего под условие, остальные пропускает.
     async fn wait<T>(&mut self, mut f: impl FnMut(&Event) -> Option<T>) -> Result<T> {
         tokio::time::timeout(T, async {
@@ -381,6 +396,9 @@ async fn long_history_arrives_in_batches() -> Result<()> {
     let key = GroupKey::generate()?;
     let mut a = Agent::spawn(&info, &key, None)?;
     a.online().await?;
+    // Отправителя никто не читает, а под нагрузкой он может переподключиться
+    // и получить историю пачками: ответы на `Flush` держат его живым.
+    a.drain_events();
     // Курсор устройства, которое было на связи до этих элементов.
     let before = ItemId::new();
     for i in 0..MISSED {
