@@ -109,28 +109,63 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!("ALTER TABLE groups ADD COLUMN {col} {ty};"))?;
         }
     }
-    // Несколько админов (`clipwire/13`). Таблицы нет — база старой версии:
-    // единственный админ из `groups.admin_device` переходит в неё один раз,
-    // в той же транзакции, что и создание таблицы.
-    let has_admins: bool = conn
-        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'group_admins'")?
-        .exists([])?;
-    if !has_admins {
-        conn.execute_batch(
-            "BEGIN;
-             CREATE TABLE group_admins (
-                 group_id  BLOB NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
-                 device_id BLOB NOT NULL,
-                 since_ms  INTEGER NOT NULL,
-                 PRIMARY KEY (group_id, device_id)
-             );
-             INSERT INTO group_admins (group_id, device_id, since_ms)
-                 SELECT group_id, admin_device, created_ms FROM groups
-                 WHERE admin_device IS NOT NULL;
-             COMMIT;",
-        )?;
+    // Несколько админов (`clipwire/13`). Таблица создаётся один раз, а
+    // сверка со старым столбцом идёт при каждом запуске: так база старой
+    // версии получает своего админа, а правки, сделанные старым сервером
+    // после отката, не теряются.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS group_admins (
+             group_id  BLOB NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+             device_id BLOB NOT NULL,
+             since_ms  INTEGER NOT NULL,
+             PRIMARY KEY (group_id, device_id)
+         );",
+    )?;
+    let fixed = reconcile_legacy(conn)?;
+    if fixed > 0 {
+        tracing::warn!(
+            groups = fixed,
+            "админы групп сверены со столбцом admin_device: базу правила старая версия сервера"
+        );
     }
     Ok(())
+}
+
+/// Сверить `group_admins` со старым столбцом `groups.admin_device`.
+///
+/// Эта версия держит в столбце самого раннего админа ([`sync_legacy`]).
+/// Расхождение значит, что столбец писала старая версия сервера: база ещё
+/// без таблицы или сервер откатывали. Старая версия знает одного админа, и
+/// её правка главнее: строки группы заменяются этим одним админом (время —
+/// создание группы). Пустой столбец при строках в таблице старая версия
+/// оставляет, когда снимает админа (заброшенная или удалённая группа, вход
+/// заново в заброшенную): строки удаляются. Группы со сменённым ключом и
+/// надгробия не трогаются: их строки `purge_rotated` чистит, а столбец нет,
+/// и решений по ним всё равно не принимается. Возвращает, сколько групп
+/// поправлено.
+fn reconcile_legacy(conn: &Connection) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let stale = "SELECT g.group_id FROM groups AS g
+         WHERE g.rotated_ms IS NULL AND g.tombstone_ms IS NULL
+           AND g.admin_device IS NOT (
+               SELECT a.device_id FROM group_admins AS a WHERE a.group_id = g.group_id
+               ORDER BY a.since_ms, a.rowid LIMIT 1)";
+    let groups: Vec<Vec<u8>> = {
+        let mut stmt = tx.prepare(stale)?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for g in &groups {
+        tx.execute("DELETE FROM group_admins WHERE group_id = ?1", params![g])?;
+        tx.execute(
+            "INSERT INTO group_admins (group_id, device_id, since_ms)
+             SELECT group_id, admin_device, created_ms FROM groups
+             WHERE group_id = ?1 AND admin_device IS NOT NULL",
+            params![g],
+        )?;
+    }
+    tx.commit()?;
+    Ok(groups.len())
 }
 
 /// Группа живая: есть, ключ не сменён, не надгробие, не незавершённая смена
@@ -1117,6 +1152,72 @@ mod tests {
         // Второй запуск не копирует заново и не теряет новых админов.
         let s = Store::open(&path).unwrap();
         assert_eq!(s.group_admins(&k.group_id()).unwrap(), vec![b, a]);
+        drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    /// Ревью безопасности: сервер откатили на версию с одним админом, она
+    /// правила только `groups.admin_device`, потом сервер обновили снова.
+    /// Правки старой версии не теряются: передача роли, новая группа после
+    /// смены ключа, снятый админ. Группы со сменённым ключом не трогаются.
+    #[test]
+    fn reconciles_after_rollback() {
+        let path =
+            std::env::temp_dir().join(format!("clipwire-rollback-{}.db", uuid::Uuid::now_v7()));
+        let (k, idle, rotated, fresh) = (
+            GroupKey([1; 32]),
+            GroupKey([2; 32]),
+            GroupKey([3; 32]),
+            GroupKey([4; 32]),
+        );
+        let (a, b, c) = (DeviceId([1; 32]), DeviceId([2; 32]), DeviceId([3; 32]));
+        {
+            let s = Store::open(&path).unwrap();
+            join(&s, &k, 1, Create::Admin);
+            join(&s, &k, 2, Create::No);
+            join(&s, &k, 3, Create::No);
+            assert_eq!(
+                s.grant_group_admin(&k.group_id(), &a, &b, 20).unwrap(),
+                Ok(())
+            );
+            join(&s, &idle, 1, Create::Admin);
+            join(&s, &rotated, 1, Create::Admin);
+            // Старая версия: передала роль от A к C, сняла админа у
+            // заброшенной группы, создала группу со своим админом, а у группы
+            // со сменённым ключом столбец пустой (так оставляет и эта версия).
+            s.conn()
+                .execute_batch(&format!(
+                    "UPDATE groups SET admin_device = x'{c}' WHERE group_id = x'{k}';
+                     UPDATE groups SET admin_device = NULL WHERE group_id = x'{idle}';
+                     UPDATE groups SET admin_device = NULL, rotated_ms = 5
+                         WHERE group_id = x'{rot}';
+                     INSERT INTO groups (group_id, join_digest, created_ms, admin_device)
+                         VALUES (x'{fresh}', x'00', 7, x'{b}');",
+                    c = hex(&c.0),
+                    k = hex(&k.group_id().0),
+                    idle = hex(&idle.group_id().0),
+                    rot = hex(&rotated.group_id().0),
+                    fresh = hex(&fresh.group_id().0),
+                    b = hex(&b.0),
+                ))
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        // Старая версия знает одного админа, её правка главнее.
+        assert_eq!(s.group_admins(&k.group_id()).unwrap(), vec![c]);
+        assert!(s.group_admins(&idle.group_id()).unwrap().is_empty());
+        assert_eq!(s.group_admins(&fresh.group_id()).unwrap(), vec![b]);
+        assert_eq!(s.group_admins(&rotated.group_id()).unwrap(), vec![a]);
+        // Без расхождений следующий запуск ничего не меняет.
+        assert_eq!(
+            s.grant_group_admin(&k.group_id(), &c, &a, 30).unwrap(),
+            Ok(())
+        );
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.group_admins(&k.group_id()).unwrap(), vec![c, a]);
         drop(s);
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
