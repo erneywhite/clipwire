@@ -1,102 +1,136 @@
-//! Звук копирования: короткий щелчок, когда в историю попадает новое.
+//! Звуки: щелчок копирования (в историю попало новое или скопировали ещё
+//! раз) и щелчок вставки из окна Clipwire (вторая нота ниже).
 //!
-//! Файл `sounds/copy.wav` вшит в программу. На Windows играет `PlaySoundW`
+//! Файлы `sounds/copy.wav` и `sounds/paste.wav` вшиты в программу. На Windows играет `PlaySoundW`
 //! из памяти без ожидания, на macOS — `NSSound` из тех же байтов, на Linux —
 //! системный проигрыватель звуковой службы (`pw-play` у PipeWire, `paplay` у
 //! PulseAudio, `aplay` у голой ALSA): постоянный аудиопоток в программе
 //! держал бы звуковую карту занятой ради щелчка раз в несколько минут.
 
-/// Сыграть звук копирования. Не ждёт конца звука; новый звук прерывает
-/// предыдущий, поэтому частое копирование не копит очередь.
-#[cfg(windows)]
+/// Какой звук.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sound {
+    Copy,
+    Paste,
+}
+
+impl Sound {
+    #[cfg_attr(
+        not(any(windows, target_os = "macos", target_os = "linux")),
+        allow(dead_code)
+    )]
+    fn wav(self) -> &'static [u8] {
+        match self {
+            Sound::Copy => include_bytes!("../sounds/copy.wav"),
+            Sound::Paste => include_bytes!("../sounds/paste.wav"),
+        }
+    }
+}
+
+/// Сыграть звук копирования.
 pub fn play_copy() {
+    play(Sound::Copy);
+}
+
+/// Сыграть звук. Не ждёт конца звука; новый звук прерывает предыдущий,
+/// поэтому частое копирование не копит очередь.
+#[cfg(windows)]
+pub fn play(sound: Sound) {
     use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
     use windows::core::PCWSTR;
 
     // С SND_MEMORY первый аргумент — указатель на сам WAV в памяти. Данные
     // статические, поэтому живут, пока звук играет асинхронно.
-    static COPY_WAV: &[u8] = include_bytes!("../sounds/copy.wav");
+    let wav = sound.wav();
     let ok = unsafe {
         PlaySoundW(
-            PCWSTR(COPY_WAV.as_ptr().cast()),
+            PCWSTR(wav.as_ptr().cast()),
             None,
             SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
         )
     };
     if !ok.as_bool() {
-        tracing::debug!("звук копирования не сыгрался");
+        tracing::debug!(?sound, "звук не сыгрался");
     }
 }
 
-/// Сыграть звук копирования (macOS). Один `NSSound` на всю программу: он
-/// должен жить, пока играет, а новый звук перезапускает его с начала.
+/// Сыграть звук (macOS). По одному `NSSound` на звук: он должен жить, пока
+/// играет; новый звук останавливает оба и играет свой с начала.
 #[cfg(target_os = "macos")]
-pub fn play_copy() {
+pub fn play(sound: Sound) {
     use objc2::AnyThread;
     use objc2::rc::Retained;
     use objc2_app_kit::NSSound;
     use objc2_foundation::NSData;
     use std::sync::Mutex;
 
-    struct Sound(Retained<NSSound>);
+    struct Player(Retained<NSSound>);
     // SAFETY: NSSound играет асинхронно сам; вызовы stop/play идут по одному
     // под мьютексом.
-    unsafe impl Send for Sound {}
+    unsafe impl Send for Player {}
 
-    static COPY_WAV: &[u8] = include_bytes!("../sounds/copy.wav");
-    static SOUND: Mutex<Option<Sound>> = Mutex::new(None);
+    static SOUNDS: Mutex<[Option<Player>; 2]> = Mutex::new([None, None]);
 
-    let mut slot = SOUND.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slots = SOUNDS.lock().unwrap_or_else(|e| e.into_inner());
+    for Player(s) in slots.iter().flatten() {
+        s.stop();
+    }
+    let slot = &mut slots[sound as usize];
     if slot.is_none() {
-        let data = NSData::with_bytes(COPY_WAV);
-        *slot = NSSound::initWithData(NSSound::alloc(), &data).map(Sound);
+        let data = NSData::with_bytes(sound.wav());
+        *slot = NSSound::initWithData(NSSound::alloc(), &data).map(Player);
     }
     match slot.as_ref() {
-        Some(Sound(s)) => {
-            s.stop();
+        Some(Player(s)) => {
             if !s.play() {
-                tracing::debug!("звук копирования не сыгрался");
+                tracing::debug!(?sound, "звук не сыгрался");
             }
         }
-        None => tracing::debug!("звук копирования не загрузился"),
+        None => tracing::debug!(?sound, "звук не загрузился"),
     }
 }
 
-/// Сыграть звук копирования (Linux). WAV один раз кладётся в
-/// `$XDG_RUNTIME_DIR` (или в каталог данных Clipwire); новый звук останавливает ещё играющий.
+/// Сыграть звук (Linux). WAV один раз кладётся в `$XDG_RUNTIME_DIR` (или в
+/// каталог данных Clipwire); новый звук останавливает ещё играющий.
 #[cfg(target_os = "linux")]
-pub fn play_copy() {
+pub fn play(sound: Sound) {
     use std::process::{Child, Command, Stdio};
     use std::sync::{Mutex, OnceLock};
 
-    static COPY_WAV: &[u8] = include_bytes!("../sounds/copy.wav");
-    static FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static FILES: [OnceLock<Option<std::path::PathBuf>>; 2] = [OnceLock::new(), OnceLock::new()];
     static PLAYING: Mutex<Option<Child>> = Mutex::new(None);
     /// Первый проигрыватель, который нашёлся; `None` — никакого нет.
     static PLAYER: OnceLock<Option<(&str, &[&str])>> = OnceLock::new();
 
-    let Some(file) = FILE
+    let dir = DIR.get_or_init(|| {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            // Без него — каталог данных Clipwire, он личный; в общий /tmp
+            // с предсказуемым именем писать нельзя (подмена файла чужим
+            // пользователем или ссылкой).
+            .or_else(|| {
+                clipwire_agent::state::Paths::resolve()
+                    .ok()
+                    .map(|p| p.dir)
+                    .filter(|d| std::fs::create_dir_all(d).is_ok())
+            })
+    });
+    let Some(dir) = dir else {
+        tracing::debug!("звук: нет личного каталога");
+        return;
+    };
+    let Some(file) = FILES[sound as usize]
         .get_or_init(|| {
-            let dir: Option<std::path::PathBuf> = std::env::var_os("XDG_RUNTIME_DIR")
-                .map(std::path::PathBuf::from)
-                // Без него — каталог данных Clipwire, он личный; в общий /tmp
-                // с предсказуемым именем писать нельзя (подмена файла чужим
-                // пользователем или ссылкой).
-                .or_else(|| {
-                    clipwire_agent::state::Paths::resolve()
-                        .ok()
-                        .map(|p| p.dir)
-                        .filter(|d| std::fs::create_dir_all(d).is_ok())
-                });
-            let Some(dir) = dir else {
-                tracing::debug!("звук копирования: нет личного каталога");
-                return None;
-            };
             // Имя постоянное: файлы не копятся от запуска к запуску, а
             // содержимое у всех копий одинаковое.
-            let path = dir.join("clipwire-copy.wav");
-            std::fs::write(&path, COPY_WAV)
-                .map_err(|e| tracing::debug!("звук копирования не записался: {e}"))
+            let name = match sound {
+                Sound::Copy => "clipwire-copy.wav",
+                Sound::Paste => "clipwire-paste.wav",
+            };
+            let path = dir.join(name);
+            std::fs::write(&path, sound.wav())
+                .map_err(|e| tracing::debug!(?sound, "звук не записался: {e}"))
                 .ok()
                 .map(|_| path)
         })
@@ -113,7 +147,7 @@ pub fn play_copy() {
                 .any(|d| std::path::Path::new(d).join(cmd).is_file())
         });
         if found.is_none() {
-            tracing::info!("звук копирования: нет pw-play, paplay или aplay");
+            tracing::info!("звуки: нет pw-play, paplay или aplay");
         }
         found
     }) else {
@@ -133,21 +167,22 @@ pub fn play_copy() {
         .spawn()
     {
         Ok(child) => *playing = Some(child),
-        Err(e) => tracing::debug!("звук копирования не сыгрался: {e}"),
+        Err(e) => tracing::debug!(?sound, "звук не сыгрался: {e}"),
     }
     // Доигравший процесс забирается при следующем звуке (kill по завершённому
     // ничего не делает), зомби не копятся дольше одного.
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-pub fn play_copy() {}
+pub fn play(_sound: Sound) {}
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     #[test]
-    fn copy_sound_loads_and_repeats() {
+    fn sounds_load_and_repeat() {
         // Без звуковой карты (CI) play вернёт false, но не упадёт.
         super::play_copy();
+        super::play(super::Sound::Paste);
         super::play_copy();
     }
 }

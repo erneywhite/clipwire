@@ -19,6 +19,8 @@ export interface Settings {
   popup_height: number
   popup_hotkey: string
   sound_on_receive: boolean
+  /** Звук при вставке из окна Clipwire. */
+  sound_on_paste: boolean
   link_previews: boolean
   hide_from_capture: boolean
   ignored_apps: string[]

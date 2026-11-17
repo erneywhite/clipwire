@@ -354,5 +354,7 @@ const en: Record<string, string> = {
   "Картинки": "Images",
   "Папки": "Folders",
   "Выключенное остаётся в истории этого устройства, но на другие не уходит. Если среди скопированного есть выключенное, например папка рядом с файлами, не отправляется ничего.": "Turned-off items stay in this device's history but aren't sent to others. If a copy includes something turned off, such as a folder next to files, nothing is sent.",
+  "Звук при вставке": "Paste sound",
+  "Другой щелчок, пониже, когда вставляете запись из окна Clipwire.": "A different, lower click when you paste an entry from the Clipwire window.",
 }
 export default en

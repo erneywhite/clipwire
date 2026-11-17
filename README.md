@@ -563,7 +563,8 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
 - Language: English, Русский or as in the system.
 - Launch at login: the program starts minimized to the tray.
 - Copy sound: a short click on every copy made here and on anything new from another device.
-  Pasting from the history is silent. On Linux it plays through `pw-play`, `paplay` or `aplay`.
+  Pasting from the history is silent unless **Paste sound** is on: it has its own, lower click.
+  On Linux the sounds play through `pw-play`, `paplay` or `aplay`.
 - History retention, from a day to forever (pinned entries are kept forever).
 - Device name, invitation code (**Show code**), leaving the group (it also removes the server
   administrator key from the device).
