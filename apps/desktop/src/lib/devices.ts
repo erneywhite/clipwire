@@ -164,9 +164,18 @@ export function isAdmin(roles: Roles, d: GroupDevice): boolean {
   return !!roles?.supported && roles.admins.includes(d.id)
 }
 
-/** Устройство — единственный админ группы: снять с него роль нельзя. */
-export function lastAdmin(roles: Roles, d: GroupDevice): boolean {
-  return !!roles?.supported && roles.admins.length === 1 && roles.admins[0] === d.id
+/** Админы, которые есть в списке устройств группы. Админ старой группы,
+ *  ещё не вошедший с новым ключом, в списке не виден и не считается: сервер
+ *  тоже не даёт оставить группу только с таким админом. */
+function listedAdmins(roles: Roles, list: GroupDevice[]): string[] {
+  if (!roles?.supported) return []
+  return roles.admins.filter((id) => list.some((d) => d.id === id))
+}
+
+/** Устройство — единственный админ группы из списка: снять с него роль нельзя. */
+export function lastAdmin(roles: Roles, list: GroupDevice[], d: GroupDevice): boolean {
+  const listed = listedAdmins(roles, list)
+  return listed.length === 1 && listed[0] === d.id
 }
 
 /**
@@ -194,7 +203,7 @@ export function rolesText(roles: Roles, list: GroupDevice[]): string {
   }
   const meAdmin = list.some((d) => d.me && roles.admins.includes(d.id))
   if (roles.multi) {
-    if (meAdmin && roles.admins.length === 1) {
+    if (meAdmin && listedAdmins(roles, list).length === 1) {
       return t('Это устройство — единственный админ группы: оно удаляет устройства, меняет ключ группы и назначает других админов. Снять роль с себя можно, когда в группе есть другой админ.')
     }
     if (meAdmin) {

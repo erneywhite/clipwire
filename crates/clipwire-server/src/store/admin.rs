@@ -191,6 +191,26 @@ pub(super) fn is_admin(conn: &Connection, group: &GroupId, device: &DeviceId) ->
         .is_some())
 }
 
+/// Админ, который состоит в группе (есть строка `devices`). После смены
+/// ключа админы старой группы попадают в админы новой сразу, а в её
+/// устройства — только когда войдут с новым ключом. Пока не вошли, удалять
+/// устройства и менять ключ они не могут, и группу без такого админа
+/// оставлять нельзя.
+fn is_active_admin(conn: &Connection, group: &GroupId, device: &DeviceId) -> Result<bool> {
+    Ok(is_admin(conn, group, device)? && super::devices::is_member(conn, group, device)?)
+}
+
+/// Сколько админов группы в ней состоит, не считая `except`.
+fn active_admins_except(conn: &Connection, group: &GroupId, except: &DeviceId) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM group_admins AS a
+         JOIN devices AS d ON d.group_id = a.group_id AND d.device_id = a.device_id
+         WHERE a.group_id = ?1 AND a.device_id != ?2",
+        params![&group.0[..], &except.0[..]],
+        |r| r.get(0),
+    )?)
+}
+
 /// Есть ли у группы хоть один админ.
 pub(super) fn has_admins(conn: &Connection, group: &GroupId) -> Result<bool> {
     Ok(conn
@@ -227,17 +247,19 @@ fn sync_legacy(conn: &Connection, group: &GroupId) -> Result<()> {
     Ok(())
 }
 
-/// Снять `device` с админов, если он не последний. Не админ — не ошибка.
+/// Снять `device` с админов, если после этого в группе останется хоть один
+/// админ, который в ней состоит. Админы, ещё не вошедшие после смены ключа,
+/// не считаются: иначе группа осталась бы с одним таким «призраком», и
+/// удалять устройства не смог бы никто. Не админ — не ошибка.
 fn revoke_in(
     conn: &Connection,
     group: &GroupId,
     device: &DeviceId,
 ) -> Result<Result<(), AdminFail>> {
-    let admins = admins_of(conn, group)?;
-    if !admins.contains(device) {
+    if !is_admin(conn, group, device)? {
         return Ok(Ok(()));
     }
-    if admins.len() == 1 {
+    if active_admins_except(conn, group, device)? == 0 {
         return Ok(Err(AdminFail::LastAdmin));
     }
     conn.execute(
@@ -467,8 +489,9 @@ impl Store {
         Ok(admins_of(&self.conn(), group)?.first().copied())
     }
 
-    /// Сделать `device` админом группы, если админов у неё нет (группа до
-    /// 0.5.0), группа живая и устройство в ней состоит. `true` — стало.
+    /// Сделать `device` админом группы, если среди её устройств админа нет
+    /// (группа до 0.5.0), группа живая и устройство в ней состоит. `true` —
+    /// стало.
     pub fn claim_group_admin(
         &self,
         group: &GroupId,
@@ -478,8 +501,8 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         if !is_live(&tx, group)?
-            || has_admins(&tx, group)?
             || !super::devices::is_member(&tx, group, device)?
+            || active_admins_except(&tx, group, device)? > 0
         {
             return Ok(false);
         }
@@ -520,7 +543,7 @@ impl Store {
     ) -> Result<Result<(), AdminFail>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        if !is_live(&tx, group)? || !is_admin(&tx, group, by)? {
+        if !is_live(&tx, group)? || !is_active_admin(&tx, group, by)? {
             return Ok(Err(AdminFail::NotGroupAdmin));
         }
         if !super::devices::is_member(&tx, group, device)? {
@@ -533,7 +556,9 @@ impl Store {
 
     /// Снять роль админа с `device` по запросу админа `by` (в том числе с
     /// себя). Последнего админа снять нельзя: группа осталась бы без того,
-    /// кто удаляет устройства. `device` не админ — не ошибка.
+    /// кто удаляет устройства. `device` не админ — не ошибка. Админа, который
+    /// после смены ключа так и не вошёл в группу, снять можно: устройства у
+    /// него в группе нет, но роль есть.
     pub fn revoke_group_admin(
         &self,
         group: &GroupId,
@@ -542,10 +567,10 @@ impl Store {
     ) -> Result<Result<(), AdminFail>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        if !is_live(&tx, group)? || !is_admin(&tx, group, by)? {
+        if !is_live(&tx, group)? || !is_active_admin(&tx, group, by)? {
             return Ok(Err(AdminFail::NotGroupAdmin));
         }
-        if !super::devices::is_member(&tx, group, device)? {
+        if !is_admin(&tx, group, device)? && !super::devices::is_member(&tx, group, device)? {
             return Ok(Err(AdminFail::NoSuchDevice));
         }
         if let Err(f) = revoke_in(&tx, group, device)? {
@@ -567,14 +592,15 @@ impl Store {
     ) -> Result<Result<(), AdminFail>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        if !is_live(&tx, group)? || !is_admin(&tx, group, from)? {
+        if !is_live(&tx, group)? || !is_active_admin(&tx, group, from)? {
             return Ok(Err(AdminFail::NotGroupAdmin));
         }
         if !super::devices::is_member(&tx, group, to)? {
             return Ok(Err(AdminFail::NoSuchDevice));
         }
         add_admin(&tx, group, to, now_ms)?;
-        // `to` уже админ, так что `from` последним не окажется.
+        // `to` уже админ и состоит в группе, так что `from` последним не
+        // окажется.
         if from != to
             && let Err(f) = revoke_in(&tx, group, from)?
         {
@@ -991,6 +1017,67 @@ mod tests {
             crate::store::RekeyOutcome::Done { .. }
         ));
         assert_eq!(s.group_admins(&m.group_id()).unwrap(), vec![b]);
+    }
+
+    /// Ревью безопасности: после смены ключа админ старой группы, который
+    /// не вошёл с новым ключом, — админ без устройства в группе. Такого
+    /// можно снять, а последнего настоящего админа — нельзя, даже если в
+    /// таблице админов есть ещё «призрак».
+    #[test]
+    fn ghost_admin_after_rekey() {
+        let s = Store::in_memory().unwrap();
+        let (k, n) = (GroupKey([1; 32]), GroupKey([2; 32]));
+        let (a, b, c) = (DeviceId([1; 32]), DeviceId([2; 32]), DeviceId([3; 32]));
+        join(&s, &k, 1, Create::Admin);
+        join(&s, &k, 2, Create::No);
+        join(&s, &k, 3, Create::No);
+        assert_eq!(
+            s.grant_group_admin(&k.group_id(), &a, &b, 20).unwrap(),
+            Ok(())
+        );
+        // A меняет ключ и оставляет B, но B с новым ключом не входит.
+        assert_eq!(join(&s, &n, 1, Create::ForRekey), JoinOutcome::Created);
+        let limits = crate::store::RekeyLimits { max_envelope: 512 };
+        let envelopes = vec![(b, vec![1]), (c, vec![1])];
+        assert!(matches!(
+            s.rekey(&k.group_id(), &a, &n.group_id(), &envelopes, 30, &limits)
+                .unwrap(),
+            crate::store::RekeyOutcome::Done { .. }
+        ));
+        let g = n.group_id();
+        assert_eq!(s.group_admins(&g).unwrap(), vec![a, b]);
+        // Себя A не снимет: остался бы только B, которого в группе нет.
+        assert_eq!(
+            s.revoke_group_admin(&g, &a, &a).unwrap(),
+            Err(AdminFail::LastAdmin)
+        );
+        // Передать роль «призраку» тоже нельзя: его нет среди устройств.
+        assert_eq!(
+            s.transfer_group_admin(&g, &a, &b, 31).unwrap(),
+            Err(AdminFail::NoSuchDevice)
+        );
+        // А снять его можно.
+        assert_eq!(s.revoke_group_admin(&g, &a, &b).unwrap(), Ok(()));
+        assert_eq!(s.group_admins(&g).unwrap(), vec![a]);
+        // Кого нет ни в админах, ни в группе — отказ.
+        assert_eq!(
+            s.revoke_group_admin(&g, &a, &b).unwrap(),
+            Err(AdminFail::NoSuchDevice)
+        );
+        // Вошедший с новым ключом админ снова считается.
+        assert_eq!(
+            s.grant_group_admin(&g, &a, &b, 32).unwrap(),
+            Err(AdminFail::NoSuchDevice)
+        );
+        join(&s, &n, 3, Create::No);
+        assert_eq!(s.grant_group_admin(&g, &a, &c, 33).unwrap(), Ok(()));
+        assert_eq!(s.revoke_group_admin(&g, &a, &a).unwrap(), Ok(()));
+        assert_eq!(s.group_admins(&g).unwrap(), vec![c]);
+        // Снятый A больше ничего не может.
+        assert_eq!(
+            s.grant_group_admin(&g, &a, &a, 34).unwrap(),
+            Err(AdminFail::NotGroupAdmin)
+        );
     }
 
     /// База версии с одним админом: столбец `admin_device` один раз

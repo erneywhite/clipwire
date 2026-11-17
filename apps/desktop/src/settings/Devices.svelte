@@ -244,8 +244,8 @@
           <button disabled={busy || handBusy} onclick={() => (handing = { id: d.id, revoke: false })}>{t('Сделать админом')}</button>
         {:else if adminAction(roles, list, d) === 'revoke'}
           <button
-            disabled={busy || handBusy || lastAdmin(roles, d)}
-            title={lastAdmin(roles, d) ? t('Это последний админ группы. Сначала сделайте админом другое устройство.') : undefined}
+            disabled={busy || handBusy || lastAdmin(roles, list, d)}
+            title={lastAdmin(roles, list, d) ? t('Это последний админ группы. Сначала сделайте админом другое устройство.') : undefined}
             onclick={() => (handing = { id: d.id, revoke: true })}>{t('Снять админа')}</button>
         {/if}
       {:else if !d.me && meAdmin && d.known}
