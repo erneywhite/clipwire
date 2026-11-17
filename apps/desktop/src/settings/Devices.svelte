@@ -5,7 +5,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, type DevicesIncoming, type GroupDevice, type RekeyResult, type Status, type StorageKind } from '../lib/api'
   import { ago, plural } from '../lib/format'
-  import { CHECKING, adminAction, adminConfirmText, canClaimAdmin, canManage, lastAdmin, checking as checkingText, confirmText, deviceTitle, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, recipients, rekeyChoice, rolesText, sameName, seenLabel, staying, type Roles } from '../lib/devices'
+  import { CHECKING, adminAction, adminConfirmText, canClaimAdmin, canManage, lastAdmin, checking as checkingText, confirmText, deviceTitle, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, pendingAdminTitle, pendingAdmins, recipients, rekeyChoice, rolesText, sameName, seenLabel, staying, type Roles } from '../lib/devices'
 
   // `incoming` — итог смены ключа, пришедший событием (его забирает окно
   // настроек: раздел мог быть закрыт). Принятый сообщается `onIncomingTaken`.
@@ -55,6 +55,8 @@
   const manage = $derived(canManage(roles, list))
   const rolesNote = $derived(rolesText(roles, list))
   const meAdmin = $derived(list.some((d) => d.me && isAdmin(roles, d)))
+  // Админы, ещё не вошедшие с новым ключом: в списке их нет, снять может админ.
+  const pending = $derived(meAdmin ? pendingAdmins(roles, list) : [])
   const claimable = $derived(canClaimAdmin(roles, list, serverAdmin))
   /** Подтверждение «Стать админом группы». */
   let claiming = $state(false)
@@ -271,6 +273,27 @@
         <p class="hint">{t('Это устройство перестанет быть админом: удалять устройства и менять ключ группы сможет только «{name}». Вернуть роль сможет только оно.', { name: deviceTitle(d) })}</p>
         <div class="buttons">
           <button class="primary" disabled={handBusy} onclick={handOver}>{handBusy ? t('Передаю…') : t('Сделать админом')}</button>
+          <button disabled={handBusy} onclick={() => (handing = null)}>{t('Отмена')}</button>
+        </div>
+      </div>
+    {/if}
+  {/each}
+  {#each pending as d (d.id)}
+    <div class="row device">
+      <span class="dot"></span>
+      <div class="who">
+        <span class="name unknown">{pendingAdminTitle()}<span class="badge">{t('админ')}</span></span>
+        <span class="meta mono">{d.fingerprint} · {t('ждёт входа с новым ключом')}</span>
+      </div>
+      <button disabled={busy || handBusy} onclick={() => (handing = { id: d.id, revoke: true })}>{t('Снять админа')}</button>
+    </div>
+    {#if handing?.id === d.id}
+      {@const q = adminConfirmText(d, true, true)}
+      <div class="row confirm" role="alertdialog">
+        <strong>{q.title}</strong>
+        <p class="hint">{q.hint}</p>
+        <div class="buttons">
+          <button class="primary" disabled={handBusy} onclick={handOver}>{handBusy ? t('Сохраняю…') : t('Снять админа')}</button>
           <button disabled={handBusy} onclick={() => (handing = null)}>{t('Отмена')}</button>
         </div>
       </div>

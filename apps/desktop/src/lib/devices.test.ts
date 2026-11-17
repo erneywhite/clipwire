@@ -3,7 +3,7 @@
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
 import type { GroupDevice } from './api'
 
-const { FRESH_MS, adminAction, adminConfirmText, canClaimAdmin, canManage, lastAdmin, confirmText, deviceTitle, exposedAccessText, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, leftOut, offerText, recipients, rekeyChoice, rekeyedBy, rolesText, sameName, seenLabel, staying } = (await import('./devices' + '.ts')) as typeof import('./devices')
+const { FRESH_MS, adminAction, adminConfirmText, canClaimAdmin, canManage, lastAdmin, confirmText, deviceTitle, exposedAccessText, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, leftOut, pendingAdmins, offerText, recipients, rekeyChoice, rekeyedBy, rolesText, sameName, seenLabel, staying } = (await import('./devices' + '.ts')) as typeof import('./devices')
 const fmt = (await import('./format' + '.ts')) as typeof import('./format')
 
 function check(cond: boolean, msg: string) {
@@ -148,6 +148,15 @@ check(adminAction(one('aaaa'), list, work) === null, 'старый сервер 
 check(lastAdmin(many('aaaa'), list, me) && !lastAdmin(many('aaaa', 'bbbb'), list, me), 'последний админ')
 check(lastAdmin(many('aaaa', 'ffff'), list, me), 'админ не из списка (не вошёл после смены ключа) не считается')
 check(adminConfirmText(work, false).title.includes('«Рабочий»'), 'назначить — по имени')
+
+// Админ, оставленный при смене ключа, но ещё не вошедший с новым: в списке его нет.
+const ghost = 'ffff'.padEnd(64, '0')
+check(pendingAdmins(many('aaaa', ghost), list).map((d) => d.fingerprint).join() === ghost.slice(0, 10), 'призрак — строкой с отпечатком')
+check(pendingAdmins(many('aaaa', 'bbbb'), list).length === 0, 'все админы в списке — призраков нет')
+check(pendingAdmins(one(ghost), list).length === 0 && pendingAdmins(many(ghost), []).length === 0, 'старый сервер или пустой список — не показываем')
+check(rolesText(many('bbbb', ghost), list).includes(`устройство ${ghost.slice(0, 10)}, которое ещё не вошло`), 'призрак в пояснении — не обрывком id')
+check(!rolesText(many('bbbb', ghost), list).includes(`«${ghost.slice(0, 10)}»`), 'без кавычек вокруг id')
+check(adminConfirmText(pendingAdmins(many(ghost), list)[0], true, true).title.includes(ghost.slice(0, 10)), 'снять призрака — по отпечатку')
 check(adminConfirmText(me, true).title === 'Перестать быть админом?', 'снять себя')
 check(adminConfirmText(work, true).title.includes('Снять админа'), 'снять другого')
 
