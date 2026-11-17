@@ -882,6 +882,15 @@ pub static EN: &[(&str, &str)] = &[
         "Сервер не умеет хранить имена групп: обновите образ сервера Clipwire",
         "The server cannot store group names: update the Clipwire server image",
     ),
+    // Несколько админов группы (`clipwire/13`).
+    (
+        "Сервер знает только одного админа группы: обновите образ сервера Clipwire",
+        "The server supports only one group admin: update the Clipwire server image",
+    ),
+    (
+        "Это последний админ группы. Сначала сделайте админом другое устройство.",
+        "This is the last group admin. Make another device an admin first.",
+    ),
     // Коды создания группы (`clipwire/11`).
     (
         "Код создания группы не разобрался ({e}). Скопируйте его целиком, он начинается с cwgroup1-.",
