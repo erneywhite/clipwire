@@ -148,34 +148,88 @@ export function serverTokenText(): string {
   )
 }
 
-/** Админ группы по ответу `group_admin`; `null` — не знаем (нет связи). */
+/** Админы группы по ответу `group_admin`; `null` — не знаем (нет связи). */
 export type Roles = GroupAdmin | null
 
 /** Может ли это устройство удалять устройства и менять ключ группы. Сервер
  *  старше 0.5.0 и группа без админа разрешают это всем; не знаем — не
  *  запрещаем, сервер всё равно проверит сам. */
 export function canManage(roles: Roles, list: GroupDevice[]): boolean {
-  if (!roles || !roles.supported || roles.admin === null) return true
-  return list.some((d) => d.me && d.id === roles.admin)
+  if (!roles || !roles.supported || roles.admins.length === 0) return true
+  return list.some((d) => d.me && roles.admins.includes(d.id))
 }
 
-/** Это устройство — админ группы. */
+/** Устройство — админ группы. */
 export function isAdmin(roles: Roles, d: GroupDevice): boolean {
-  return !!roles?.supported && roles.admin === d.id
+  return !!roles?.supported && roles.admins.includes(d.id)
+}
+
+/** Устройство — единственный админ группы: снять с него роль нельзя. */
+export function lastAdmin(roles: Roles, d: GroupDevice): boolean {
+  return !!roles?.supported && roles.admins.length === 1 && roles.admins[0] === d.id
+}
+
+/**
+ * Что админ может сделать с ролью устройства в строке списка (сервер с
+ * несколькими админами): назначить админом, снять роль (и с себя) или ничего.
+ * Админом назначают только устройство с карточкой: без неё не видно, кто это.
+ * На старом сервере роль только передаётся, там `null`.
+ */
+export function adminAction(roles: Roles, list: GroupDevice[], d: GroupDevice): 'grant' | 'revoke' | null {
+  if (!roles?.supported || !roles.multi) return null
+  if (!list.some((x) => x.me && isAdmin(roles, x))) return null
+  if (isAdmin(roles, d)) return 'revoke'
+  return d.known ? 'grant' : null
 }
 
 /** Пояснение под списком: кто админ и что это значит для этого устройства. */
 export function rolesText(roles: Roles, list: GroupDevice[]): string {
   if (!roles || !roles.supported) return ''
-  if (roles.admin === null) {
+  if (roles.admins.length === 0) {
     return t('У группы пока нет админа, поэтому ключ группы может сменить любое устройство. Админом станет первое устройство, которое подключится с кодом сервера администратора.')
   }
-  const admin = list.find((d) => d.id === roles.admin)
-  if (admin?.me) {
+  const nameOf = (id: string) => {
+    const dev = list.find((d) => d.id === id)
+    return dev ? deviceTitle(dev) : id.slice(0, 10)
+  }
+  const meAdmin = list.some((d) => d.me && roles.admins.includes(d.id))
+  if (roles.multi) {
+    if (meAdmin && roles.admins.length === 1) {
+      return t('Это устройство — единственный админ группы: оно удаляет устройства, меняет ключ группы и назначает других админов. Снять роль с себя можно, когда в группе есть другой админ.')
+    }
+    if (meAdmin) {
+      return t('Это устройство — админ группы. Админы удаляют устройства, меняют ключ группы и назначают или снимают других админов.')
+    }
+    return t('Удалять устройства и менять ключ группы могут только админы группы: {names}.', {
+      names: roles.admins.map((id) => `«${nameOf(id)}»`).join(', '),
+    })
+  }
+  if (meAdmin) {
     return t('Это устройство — админ группы: только оно удаляет устройства и меняет ключ группы. Роль можно передать другому устройству.')
   }
-  const name = admin ? deviceTitle(admin) : roles.admin.slice(0, 10)
-  return t('Удалять устройства и менять ключ группы может только админ группы — «{name}». Передать роль другому устройству может только он.', { name })
+  return t('Удалять устройства и менять ключ группы может только админ группы — «{name}». Передать роль другому устройству может только он.', { name: nameOf(roles.admins[0]) })
+}
+
+/** Заголовок и пояснение подтверждения: назначить админом, снять роль с
+ *  другого устройства или с себя. */
+export function adminConfirmText(d: GroupDevice, revoke: boolean): { title: string; hint: string } {
+  const name = deviceTitle(d)
+  if (!revoke) {
+    return {
+      title: t('Сделать «{name}» админом группы?', { name }),
+      hint: t('Оно сможет удалять устройства, менять ключ группы и назначать или снимать админов, в том числе это устройство.'),
+    }
+  }
+  if (d.me) {
+    return {
+      title: t('Перестать быть админом?'),
+      hint: t('Это устройство больше не сможет удалять устройства и менять ключ группы. Вернуть роль сможет другой админ.'),
+    }
+  }
+  return {
+    title: t('Снять админа с «{name}»?', { name }),
+    hint: t('Оно больше не сможет удалять устройства и менять ключ группы.'),
+  }
 }
 
 /**
@@ -240,7 +294,7 @@ export function confirmText(list: GroupDevice[], removeId: string | null, _fmt: 
  * не удалить. Группа без админа получает его и так, при входе с ключом.
  */
 export function canClaimAdmin(roles: Roles, list: GroupDevice[], serverAdmin: boolean): boolean {
-  if (!serverAdmin || !roles?.supported || !roles.admin) return false
+  if (!serverAdmin || !roles?.supported || roles.admins.length === 0) return false
   const me = list.find((d) => d.me)
   return !!me && !isAdmin(roles, me)
 }

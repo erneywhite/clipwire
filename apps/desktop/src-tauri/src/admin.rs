@@ -9,11 +9,11 @@ use std::sync::atomic::Ordering;
 
 use clipwire_agent::admin::{adopt_server_code, check_admin_code, claim_code, fail_text};
 use clipwire_agent::i18n::{tr, trf};
-use clipwire_core::GroupId;
 use clipwire_core::admin::{
     GroupEntry, GroupInviteInfo, GroupState, MAX_INVITE_TTL_HOURS, SETTINGS, ServerSettings,
     ServerSummary, SettingUnit, check_setting, normalize_group_name,
 };
+use clipwire_core::{DeviceId, GroupId};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
@@ -295,35 +295,76 @@ pub async fn server_rotate_admin_key(window: WebviewWindow, app: AppHandle) -> C
     Ok(server_code)
 }
 
-/// Админ группы для списка устройств.
+/// Админы группы для списка устройств.
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupAdminDto {
     /// Сервер знает админов групп (`clipwire/9`).
     pub supported: bool,
-    /// Id админа (64 hex); `None` — у группы админа нет.
-    pub admin: Option<String>,
+    /// Сервер знает нескольких админов (`clipwire/13`): назначать и снимать
+    /// админов. Нет — админ один, роль только передаётся.
+    pub multi: bool,
+    /// Id админов (64 hex), самый ранний первым; пусто — у группы админа нет.
+    pub admins: Vec<String>,
+}
+
+fn admins_dto(supported: bool, multi: bool, admins: &[DeviceId]) -> GroupAdminDto {
+    GroupAdminDto {
+        supported,
+        multi,
+        admins: admins
+            .iter()
+            .map(|d| data_encoding::HEXLOWER.encode(&d.0))
+            .collect(),
+    }
 }
 
 #[tauri::command]
 pub async fn group_admin(window: WebviewWindow, app: AppHandle) -> CmdResult<GroupAdminDto> {
     only_settings(&window)?;
     let ctl = controller(&app)?;
-    let link = ctl.link().await?;
-    // Админы групп появились в `clipwire/9`.
-    if link.server_protocol < 9 {
-        return Ok(GroupAdminDto {
-            supported: false,
-            admin: None,
-        });
+    let protocol = ctl.link().await?.server_protocol;
+    // Админы групп появились в `clipwire/9`, несколько админов — в
+    // `clipwire/13`. Старому серверу новый запрос не шлём: он оборвал бы
+    // соединение.
+    if protocol < 9 {
+        return Ok(admins_dto(false, false, &[]));
+    }
+    if protocol >= 13 {
+        return Ok(admins_dto(true, true, &ctl.group_admins().await?));
     }
     let admin = ctl.group_admin().await?;
-    Ok(GroupAdminDto {
-        supported: true,
-        admin: admin.map(|d| data_encoding::HEXLOWER.encode(&d.0)),
-    })
+    Ok(admins_dto(true, false, &Vec::from_iter(admin)))
 }
 
-/// Передать роль админа группы другому устройству.
+/// Сделать устройство группы ещё одним админом (`clipwire/13`).
+#[tauri::command]
+pub async fn device_grant_admin(
+    window: WebviewWindow,
+    app: AppHandle,
+    device_id: String,
+) -> CmdResult<GroupAdminDto> {
+    only_settings(&window)?;
+    let id = parse_device(&device_id)?;
+    let admins = controller(&app)?.grant_group_admin(id).await?;
+    Ok(admins_dto(true, true, &admins))
+}
+
+/// Снять роль админа с устройства группы, в том числе с этого
+/// (`clipwire/13`). Последнего админа сервер снять не даст.
+#[tauri::command]
+pub async fn device_revoke_admin(
+    window: WebviewWindow,
+    app: AppHandle,
+    device_id: String,
+) -> CmdResult<GroupAdminDto> {
+    only_settings(&window)?;
+    let id = parse_device(&device_id)?;
+    let admins = controller(&app)?.revoke_group_admin(id).await?;
+    Ok(admins_dto(true, true, &admins))
+}
+
+/// Передать роль админа группы другому устройству (сервер старее
+/// `clipwire/13`, где админ один).
 #[tauri::command]
 pub async fn device_make_admin(
     window: WebviewWindow,

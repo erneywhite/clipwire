@@ -464,12 +464,15 @@ export interface InviteCreated {
   invites: GroupInvite[]
 }
 
-/** Админ группы (`group_admin`). */
+/** Админы группы (`group_admin`). */
 export interface GroupAdmin {
   /** Сервер знает админов групп (0.5.0 и новее). */
   supported: boolean
-  /** Id админа (64 hex); null — у группы админа нет. */
-  admin: string | null
+  /** Сервер знает нескольких админов: их назначают и снимают. Нет — админ
+   *  один, роль только передаётся (`deviceMakeAdmin`). */
+  multi: boolean
+  /** Id админов (64 hex), самый ранний первым; пусто — у группы админа нет. */
+  admins: string[]
 }
 
 export const api = {  settings: () => invoke<Settings>('get_settings'),
@@ -585,4 +588,6 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   serverRotateAdminKey: () => invoke<string>('server_rotate_admin_key'),
   groupAdmin: () => invoke<GroupAdmin>('group_admin'),
   /** Передать роль админа группы другому устройству. */
-  deviceMakeAdmin: (deviceId: string) => invoke<void>('device_make_admin', { deviceId }),}
+  deviceMakeAdmin: (deviceId: string) => invoke<void>('device_make_admin', { deviceId }),
+  deviceGrantAdmin: (deviceId: string) => invoke<GroupAdmin>('device_grant_admin', { deviceId }),
+  deviceRevokeAdmin: (deviceId: string) => invoke<GroupAdmin>('device_revoke_admin', { deviceId }),}
