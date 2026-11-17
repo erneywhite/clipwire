@@ -860,7 +860,7 @@
             {#if info?.group_fingerprint}
               <div class="kv">
                 <span>{t('Группа')}</span>
-                <span>{#if ownGroupName}{ownGroupName} {/if}<span class="mono">{info.group_fingerprint}</span></span>
+                <span>{#if ownGroupName}{ownGroupName}{' '}<span class="mono">({info.group_fingerprint})</span>{:else}<span class="mono">{info.group_fingerprint}</span>{/if}</span>
               </div>
             {/if}
             <div class="kv"><span>{t('Отпечаток устройства')}</span><span class="mono">{info?.device_id ?? '—'}</span></div>
