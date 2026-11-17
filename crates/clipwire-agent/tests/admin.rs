@@ -2,7 +2,8 @@
 //! сервера на 127.0.0.1: создание группы с ключом администратора и без него,
 //! вход администратора на устройстве в группе, настройки сервера, смена
 //! ключа администратора и токена relay, админ группы. Группы сервера и их
-//! удаление (`clipwire/10`). Коды создания группы (`clipwire/11`).
+//! удаление (`clipwire/10`). Коды создания группы (`clipwire/11`). Несколько
+//! админов группы (`clipwire/13`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -353,6 +354,15 @@ async fn server_admin_takes_group_admin() -> Result<()> {
         .claim_group_admin()
         .await
         .map_err(anyhow::Error::msg)?;
+    // B стал ещё одним админом, A им остался: лишнего снимет сам B.
+    assert_eq!(
+        a.ctl.group_admins().await.map_err(anyhow::Error::msg)?,
+        vec![a.ctl.device(), b.ctl.device()]
+    );
+    b.ctl
+        .revoke_group_admin(a.ctl.device())
+        .await
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(
         a.ctl.group_admin().await.map_err(anyhow::Error::msg)?,
         Some(b.ctl.device())
@@ -697,5 +707,85 @@ async fn group_invite_retry_after_lost_reply_reuses_draft() -> Result<()> {
 
     let _ = std::fs::remove_dir_all(&paths.dir);
     drop(a);
+    server.shutdown().await
+}
+
+/// Список устройств, когда у `n` устройств есть карточки: без них новый ключ
+/// не передать.
+async fn cards(a: &Agent, n: usize) -> Result<Vec<clipwire_core::DeviceId>> {
+    let t0 = std::time::Instant::now();
+    loop {
+        let list = a.ctl.list_devices().await;
+        if let Ok(l) = &list
+            && l.iter().filter(|d| d.card.is_some()).count() == n
+        {
+            return Ok(l.iter().map(|d| d.device).collect());
+        }
+        anyhow::ensure!(t0.elapsed() < T, "не дождались {n} карточек: {list:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Несколько админов (`clipwire/13`): админ назначает и снимает других,
+/// не админ не может ничего, последнего админа не снять. При смене ключа
+/// админы, получившие новый ключ, остаются админами, исключённый — нет.
+#[tokio::test(flavor = "multi_thread")]
+async fn several_admins_and_rekey() -> Result<()> {
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut a = Agent::spawn(&info, &key, Some(ADMIN))?;
+    a.status().await?.expect("на связи");
+    let mut b = Agent::spawn(&info, &key, None)?;
+    b.status().await?.expect("на связи");
+    let mut c = Agent::spawn(&info, &key, None)?;
+    c.status().await?.expect("на связи");
+    let (ad, bd, cd) = (a.ctl.device(), b.ctl.device(), c.ctl.device());
+
+    let err = b.ctl.grant_group_admin(bd).await.unwrap_err();
+    assert!(err.contains("админ группы"), "{err}");
+    let err = a.ctl.revoke_group_admin(ad).await.unwrap_err();
+    assert!(err.contains("последний админ"), "{err}");
+    assert_eq!(
+        a.ctl
+            .grant_group_admin(bd)
+            .await
+            .map_err(anyhow::Error::msg)?,
+        vec![ad, bd]
+    );
+    assert_eq!(
+        b.ctl
+            .grant_group_admin(cd)
+            .await
+            .map_err(anyhow::Error::msg)?,
+        vec![ad, bd, cd]
+    );
+    // C снимает себя сам.
+    assert_eq!(
+        c.ctl
+            .revoke_group_admin(cd)
+            .await
+            .map_err(anyhow::Error::msg)?,
+        vec![ad, bd]
+    );
+    assert_eq!(
+        c.ctl.group_admins().await.map_err(anyhow::Error::msg)?,
+        vec![ad, bd]
+    );
+
+    // B меняет ключ и удаляет A: в новой группе админ только B.
+    let seen = cards(&b, 3).await?;
+    let done = b
+        .ctl
+        .rekey(vec![ad], seen)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    drop((a, b, c));
+    let mut d = Agent::spawn(&info, &done.key, None)?;
+    d.status().await?.expect("в новой группе на связи");
+    assert_eq!(
+        d.ctl.group_admins().await.map_err(anyhow::Error::msg)?,
+        vec![bd]
+    );
+    drop(d);
     server.shutdown().await
 }

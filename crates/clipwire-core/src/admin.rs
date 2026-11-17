@@ -429,7 +429,8 @@ pub enum AdminFail {
     /// Значение вне допустимых пределов.
     #[error("значение {key} должно быть от {min} до {max}")]
     OutOfRange { key: String, min: u64, max: u64 },
-    /// Устройства нет в группе (`TransferGroupAdmin`).
+    /// Устройства нет в группе (`TransferGroupAdmin`, `GrantGroupAdmin`,
+    /// `RevokeGroupAdmin`).
     #[error("такого устройства нет в группе")]
     NoSuchDevice,
     /// Запрос нельзя выполнить на этом сервере, причина в тексте (например,
@@ -469,6 +470,10 @@ pub enum AdminFail {
     /// управляющими символами (`SetGroupName`).
     #[error("имя группы — до {max} символов, без управляющих символов")]
     BadGroupName { max: u64 },
+    /// Только по `clipwire/13`: это последний админ группы, снять его нельзя
+    /// (`RevokeGroupAdmin`). Сначала сделать админом другое устройство.
+    #[error("это последний админ группы: сначала сделайте админом другое устройство")]
+    LastAdmin,
 }
 
 #[cfg(test)]

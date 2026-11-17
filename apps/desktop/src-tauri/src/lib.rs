@@ -730,6 +730,8 @@ pub fn run() {
             admin::server_rotate_admin_key,
             admin::group_admin,
             admin::device_make_admin,
+            admin::device_grant_admin,
+            admin::device_revoke_admin,
             admin::group_admin_claim,
             admin::server_groups,
             admin::server_group_delete,

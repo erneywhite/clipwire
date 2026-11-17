@@ -180,10 +180,9 @@ impl Store {
             Some(Some(_)) => return Ok(Refused("ключ этой группы уже сменён")),
             Some(None) => {}
         }
-        // Ключ меняет и устройства удаляет только админ группы. У группы без
-        // админа (создана до 0.5.0) — любой участник, как раньше.
-        let old_admin = super::admin::admin_of(&tx, group)?;
-        if old_admin.is_some_and(|a| a != *sender) {
+        // Ключ меняют и устройства удаляют только админы группы. У группы без
+        // админов (создана до 0.5.0) — любой участник, как раньше.
+        if super::admin::has_admins(&tx, group)? && !super::admin::is_admin(&tx, group, sender)? {
             return Ok(Refused(
                 "сменить ключ группы и удалить устройство может только админ группы",
             ));
@@ -212,7 +211,7 @@ impl Store {
         // Новой группой годится только та, что отправитель сам только что
         // создал под смену ключа (`Create::ForRekey`) и где он один. Иначе
         // участник одной группы перевёл бы её устройства в другую
-        // существующую группу и унаследовал бы там админа (`inherit_admin`).
+        // существующую группу и унаследовал бы там админов (`inherit_admins`).
         if pending_by.as_deref() != Some(&sender.0[..]) {
             return Ok(Refused(
                 "новая группа должна быть создана этим устройством для смены ключа",
@@ -247,7 +246,10 @@ impl Store {
             "UPDATE groups SET rotated_to = ?2, rotated_ms = ?3, rotated_by = ?4 WHERE group_id = ?1",
             params![&group.0[..], &new_group.0[..], now_ms, &sender.0[..]],
         )?;
-        super::admin::inherit_admin(&tx, new_group, old_admin.as_ref())?;
+        // Админы старой группы, получившие новый ключ, остаются админами;
+        // исключённые этой сменой ключа — нет.
+        let kept: HashSet<DeviceId> = envelopes.iter().map(|(d, _)| *d).collect();
+        super::admin::inherit_admins(&tx, group, new_group, sender, &kept, now_ms)?;
         super::groups::inherit_name(&tx, group, new_group)?;
         for (device, envelope) in envelopes {
             tx.execute(
@@ -600,7 +602,7 @@ mod tests {
         join(&s, &free, 1);
         s.conn()
             .execute(
-                "UPDATE groups SET admin_device = NULL WHERE group_id = ?1",
+                "DELETE FROM group_admins WHERE group_id = ?1",
                 params![&free.group_id().0[..]],
             )
             .unwrap();

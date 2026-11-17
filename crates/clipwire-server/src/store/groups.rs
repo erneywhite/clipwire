@@ -204,7 +204,9 @@ impl Store {
             params![CHUNK as i64, OVERHEAD as i64],
         )?;
         let mut stmt = conn.prepare(
-            "SELECT group_id, created_ms, admin_device IS NOT NULL, pending_by IS NOT NULL,
+            "SELECT group_id, created_ms,
+                    EXISTS (SELECT 1 FROM group_admins AS a WHERE a.group_id = groups.group_id),
+                    pending_by IS NOT NULL,
                     rotated_ms, tombstone_ms IS NOT NULL, idle_ms IS NOT NULL,
                     COALESCE(name, '')
              FROM groups WHERE deleted_ms IS NULL",

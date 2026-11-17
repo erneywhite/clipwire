@@ -516,6 +516,10 @@ pub fn fail_text(f: &AdminFail) -> String {
             "Это группа этого устройства. Чтобы удалить её, сначала выйдите из неё (или удалите её с другого устройства администратора).",
         )
         .into(),
+        AdminFail::LastAdmin => tr(
+            "Это последний админ группы. Сначала сделайте админом другое устройство.",
+        )
+        .into(),
     }
 }
 
@@ -534,6 +538,11 @@ pub fn old_server_invites() -> &'static str {
 /// Отказ серверу, который не знает имён групп (`clipwire/12`).
 pub fn old_server_names() -> &'static str {
     tr("Сервер не умеет хранить имена групп: обновите образ сервера Clipwire")
+}
+
+/// Отказ серверу, который знает только одного админа группы (`clipwire/13`).
+pub fn old_server_admins() -> &'static str {
+    tr("Сервер знает только одного админа группы: обновите образ сервера Clipwire")
 }
 
 fn old_server() -> &'static str {
@@ -574,6 +583,13 @@ pub enum AdminRequest {
         group: GroupId,
         name: String,
     },
+    /// Все админы группы (`clipwire/13`).
+    GroupAdmins,
+    /// Сделать устройство группы ещё одним админом (`clipwire/13`).
+    GrantGroupAdmin(DeviceId),
+    /// Снять роль админа с устройства группы, в том числе с себя
+    /// (`clipwire/13`).
+    RevokeGroupAdmin(DeviceId),
 }
 
 impl AdminRequest {
@@ -602,6 +618,9 @@ impl AdminRequest {
                 group: *group,
                 name: name.clone(),
             },
+            Self::GroupAdmins => ClientMsg::GetGroupAdmins,
+            Self::GrantGroupAdmin(device) => ClientMsg::GrantGroupAdmin { device: *device },
+            Self::RevokeGroupAdmin(device) => ClientMsg::RevokeGroupAdmin { device: *device },
         }
     }
 
@@ -614,6 +633,7 @@ impl AdminRequest {
             | Self::ListGroupInvites
             | Self::RevokeGroupInvite(_) => 11,
             Self::SetGroupName { .. } => 12,
+            Self::GroupAdmins | Self::GrantGroupAdmin(_) | Self::RevokeGroupAdmin(_) => 13,
             _ => 9,
         }
     }
@@ -645,6 +665,7 @@ pub(crate) fn is_admin_reply(msg: &ServerMsg) -> bool {
             | ServerMsg::GroupInviteCreated { .. }
             | ServerMsg::GroupInvites(_)
             | ServerMsg::GroupList(_)
+            | ServerMsg::GroupAdmins { .. }
     )
 }
 
@@ -657,10 +678,12 @@ pub(crate) struct AdminWaiter {
 }
 
 /// Отказ серверу, который не знает запроса: `clipwire/9` (администрирование),
-/// `clipwire/10` (группы сервера), `clipwire/11` (коды создания группы) или
-/// `clipwire/12` (имена групп).
+/// `clipwire/10` (группы сервера), `clipwire/11` (коды создания группы),
+/// `clipwire/12` (имена групп) или `clipwire/13` (несколько админов группы).
 pub(crate) fn refuse_old(reply: AdminReply, req: &AdminRequest) {
-    let why = if req.min_protocol() >= 12 {
+    let why = if req.min_protocol() >= 13 {
+        old_server_admins()
+    } else if req.min_protocol() >= 12 {
         old_server_names()
     } else if req.min_protocol() >= 11 {
         old_server_invites()
@@ -678,6 +701,14 @@ fn group_list(msg: ServerMsg) -> Result<Vec<GroupEntry>, String> {
     match msg {
         ServerMsg::GroupList(list) => Ok(list),
         ServerMsg::Groups(list) => Ok(list.into_iter().map(unnamed).collect()),
+        m => Err(unexpected(&m)),
+    }
+}
+
+/// Админы группы из ответа `GroupAdmins`.
+fn admin_list(msg: ServerMsg) -> Result<Vec<DeviceId>, String> {
+    match msg {
+        ServerMsg::GroupAdmins { admins } => Ok(admins),
         m => Err(unexpected(&m)),
     }
 }
@@ -783,12 +814,33 @@ impl Controller {
         }
     }
 
-    /// Передать роль админа группы устройству `device`.
+    /// Передать роль админа группы устройству `device`: оно становится
+    /// админом, это устройство перестаёт. Для сервера старее `clipwire/13`,
+    /// где админ у группы один.
     pub async fn transfer_group_admin(&self, device: DeviceId) -> Result<(), String> {
         match self.admin(AdminRequest::TransferGroupAdmin(device)).await? {
             ServerMsg::GroupAdmin { .. } => Ok(()),
             m => Err(unexpected(&m)),
         }
+    }
+
+    /// Все админы группы, самый ранний первым; пусто — админа нет. Сервер
+    /// старее `clipwire/13` — отказ без запроса (там спрашивают
+    /// [`Self::group_admin`]).
+    pub async fn group_admins(&self) -> Result<Vec<DeviceId>, String> {
+        admin_list(self.admin(AdminRequest::GroupAdmins).await?)
+    }
+
+    /// Сделать устройство группы ещё одним админом. Возвращает админов после
+    /// правки.
+    pub async fn grant_group_admin(&self, device: DeviceId) -> Result<Vec<DeviceId>, String> {
+        admin_list(self.admin(AdminRequest::GrantGroupAdmin(device)).await?)
+    }
+
+    /// Снять роль админа с устройства группы (можно и с себя, кроме
+    /// последнего админа). Возвращает админов после правки.
+    pub async fn revoke_group_admin(&self, device: DeviceId) -> Result<Vec<DeviceId>, String> {
+        admin_list(self.admin(AdminRequest::RevokeGroupAdmin(device)).await?)
     }
 
     /// Группы сервера с именами, по убыванию последней активности. У сервера
@@ -1045,6 +1097,38 @@ mod tests {
         assert!(fail_text(&AdminFail::InviteRevoked).contains("отозвал"));
         assert!(fail_text(&AdminFail::TooManyInvites { max: 100 }).contains("100"));
         assert!(fail_text(&AdminFail::BadGroupName { max: 64 }).contains("64"));
+        assert!(fail_text(&AdminFail::LastAdmin).contains("последний админ"));
+    }
+
+    #[test]
+    fn several_admins_need_protocol_13() {
+        let d = DeviceId([3; 32]);
+        for (req, msg) in [
+            (AdminRequest::GroupAdmins, ClientMsg::GetGroupAdmins),
+            (
+                AdminRequest::GrantGroupAdmin(d),
+                ClientMsg::GrantGroupAdmin { device: d },
+            ),
+            (
+                AdminRequest::RevokeGroupAdmin(d),
+                ClientMsg::RevokeGroupAdmin { device: d },
+            ),
+        ] {
+            assert_eq!(req.min_protocol(), 13);
+            assert_eq!(req.msg(), msg);
+            let (tx, mut rx) = oneshot::channel();
+            refuse_old(tx, &req);
+            let why = rx.try_recv().unwrap().unwrap_err();
+            assert!(why.contains("одного админа"), "{why}");
+        }
+        // Старые запросы про одного админа идут и к серверу `clipwire/9`.
+        assert_eq!(AdminRequest::GroupAdmin.min_protocol(), 9);
+        assert_eq!(AdminRequest::TransferGroupAdmin(d).min_protocol(), 9);
+        assert!(is_admin_reply(&ServerMsg::GroupAdmins { admins: vec![] }));
+        assert_eq!(
+            admin_list(ServerMsg::GroupAdmins { admins: vec![d] }),
+            Ok(vec![d])
+        );
     }
 
     #[test]
