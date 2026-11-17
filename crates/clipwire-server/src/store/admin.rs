@@ -149,7 +149,7 @@ fn reconcile_legacy(conn: &Connection) -> Result<usize> {
          WHERE g.rotated_ms IS NULL AND g.tombstone_ms IS NULL
            AND g.admin_device IS NOT (
                SELECT a.device_id FROM group_admins AS a WHERE a.group_id = g.group_id
-               ORDER BY a.since_ms, a.rowid LIMIT 1)";
+               ORDER BY a.since_ms, a.device_id LIMIT 1)";
     let groups: Vec<Vec<u8>> = {
         let mut stmt = tx.prepare(stale)?;
         stmt.query_map([], |r| r.get(0))?
@@ -188,7 +188,7 @@ fn is_live(conn: &Connection, group: &GroupId) -> Result<bool> {
 fn admins_since(conn: &Connection, group: &GroupId) -> Result<Vec<(DeviceId, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT device_id, since_ms FROM group_admins WHERE group_id = ?1
-         ORDER BY since_ms, rowid",
+         ORDER BY since_ms, device_id",
     )?;
     let rows = stmt.query_map(params![&group.0[..]], |r| {
         Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
@@ -276,7 +276,7 @@ fn sync_legacy(conn: &Connection, group: &GroupId) -> Result<()> {
     conn.execute(
         "UPDATE groups SET admin_device = (
              SELECT device_id FROM group_admins WHERE group_id = ?1
-             ORDER BY since_ms, rowid LIMIT 1)
+             ORDER BY since_ms, device_id LIMIT 1)
          WHERE group_id = ?1",
         params![&group.0[..]],
     )?;
@@ -545,9 +545,12 @@ impl Store {
         {
             return Ok(false);
         }
-        add_admin(&tx, group, device, now_ms)?;
+        // Уже админ (единственный действующий) — ничего не поменялось:
+        // без `true`, иначе каждый вход администратора сервера рассылал бы
+        // группе `DevicesChanged`.
+        let added = add_admin(&tx, group, device, now_ms)?;
         tx.commit()?;
-        Ok(true)
+        Ok(added)
     }
 
     /// Добавить `device` в админы группы и при живых админах (`ClaimGroupAdmin`
@@ -752,6 +755,12 @@ mod tests {
         assert_eq!(
             s.group_admin(&k.group_id()).unwrap(),
             Some(DeviceId([1; 32]))
+        );
+        // Сам единственный админ: «стал» — нет, ничего не поменялось
+        // (иначе каждый вход администратора сервера будил бы группу).
+        assert!(
+            !s.claim_group_admin(&k.group_id(), &DeviceId([1; 32]), 30)
+                .unwrap()
         );
     }
 
