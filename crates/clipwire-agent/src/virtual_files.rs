@@ -563,8 +563,7 @@ fn read_clipboard(root: &Path, max_bytes: u64, seq: u32) -> Result<Captured> {
         Ok(())
     };
     let res = (|| {
-        let obj =
-            unsafe { OleGetClipboard() }.map_err(|e| anyhow!("буфер OLE не открылся: {e}"))?;
+        let obj = open_clipboard(&tick)?;
         let dir = root.join(uuid::Uuid::now_v7().simple().to_string());
         let tops = capture_unchanged(&obj, &dir, max_bytes, &Progress { tick: &tick }, &unchanged)?;
         Ok(Captured { dir, tops })
@@ -574,6 +573,29 @@ fn read_clipboard(root: &Path, max_bytes: u64, seq: u32) -> Result<Captured> {
         let _ = w.join();
     }
     res
+}
+
+/// CLIPBRD_E_CANT_OPEN: буфер в этот момент открыт другой программой.
+const CLIPBOARD_CANT_OPEN: i32 = 0x800401D0_u32 as i32;
+
+/// Взять объект буфера через OLE. Буфер на миг занимают другие слушатели
+/// (история буфера Windows, менеджеры буфера, другие копии программы), и
+/// тогда `OleGetClipboard` отвечает CLIPBRD_E_CANT_OPEN. Это не ошибка
+/// источника: повторяем недолго, как слежение повторяет чтение обычных форматов.
+fn open_clipboard(tick: &dyn Fn() -> Result<()>) -> Result<IDataObject> {
+    const ATTEMPTS: u32 = 20;
+    let mut attempt = 1;
+    loop {
+        match unsafe { OleGetClipboard() } {
+            Ok(obj) => return Ok(obj),
+            Err(e) if e.code().0 == CLIPBOARD_CANT_OPEN && attempt < ATTEMPTS => {
+                tick()?;
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(anyhow!("буфер OLE не открылся: {e}")),
+        }
+    }
 }
 
 #[cfg(test)]
