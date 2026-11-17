@@ -14,7 +14,7 @@ function check(cond: boolean, msg: string) {
 }
 
 const now = Date.parse('2026-11-13T12:00:00Z')
-const dev = (over: Partial<GroupDevice>): GroupDevice => ({ id: 'a', fingerprint: 'a', name: 'a', os: null, known: true, me: false, online: false, last_seen_ms: 0, ...over })
+const dev = (over: Partial<GroupDevice>): GroupDevice => ({ id: 'a', fingerprint: 'a', name: 'a', os: null, known: true, me: false, online: false, last_seen_ms: 0, first_seen_ms: 0, ...over })
 
 setLang('en')
 try {
