@@ -159,6 +159,10 @@ pub const FRESH_FROM_HISTORY: Duration = Duration::from_secs(10 * 60);
 pub struct Outgoing {
     pub content: Content,
     pub ext: Vec<Ext>,
+    /// Файлы взяты у прежней записи с тем же содержимым: они уже на
+    /// сервере (или заливаются), резерв и загрузка не нужны, а их архивы в
+    /// outbox не трогать — их ждёт прежняя загрузка.
+    pub reused: bool,
 }
 
 impl Outgoing {
@@ -186,6 +190,7 @@ impl From<Content> for Outgoing {
         Self {
             content,
             ext: Vec::new(),
+            reused: false,
         }
     }
 }
@@ -1884,6 +1889,7 @@ impl Engine {
     fn replace_pending(&mut self, c: Outgoing) {
         let reserved = std::mem::take(&mut self.pending_reserved);
         if let Some(old) = self.pending.replace(c)
+            && !old.reused
             && let (Some(b), Content::Files(files)) = (&self.blobs, &old.content)
         {
             if reserved {
@@ -1912,13 +1918,17 @@ impl Engine {
         send: &mut iroh::endpoint::SendStream,
         out: Outgoing,
     ) -> Result<()> {
-        let Outgoing { content: c, ext } = out;
+        let Outgoing {
+            content: c,
+            ext,
+            reused,
+        } = out;
         let hash = c.hash();
         // Огромный HTML из Word не повод не отправить сам текст.
         let c = c.fit(MAX_ITEM_BYTES);
         if c.len() > MAX_ITEM_BYTES {
             tracing::info!(len = c.len(), "слишком большой элемент, не отправляю");
-            if let (Some(b), Content::Files(files)) = (&self.blobs, &c) {
+            if let (Some(b), Content::Files(files), false) = (&self.blobs, &c, reused) {
                 b.discard_outbox(files);
             }
             return Ok(());
@@ -1927,6 +1937,8 @@ impl Engine {
         // элемент сразу, будет ждать частей, а не получит «файла нет».
         // Отказанным файлам blob снимается, загрузок по ним не будет.
         let (c, jobs, places) = match (&self.blobs, c) {
+            // Места файлов получатели уже знают по прежней записи.
+            (Some(_), c @ Content::Files(_)) if reused => (c, Vec::new(), Vec::new()),
             (Some(b), c @ Content::Files(_)) => {
                 let give_up = self.reserve_failures + 1 >= MAX_RESERVE_ATTEMPTS;
                 match b.reserve_files(conn, c, give_up).await {
@@ -1937,6 +1949,7 @@ impl Engine {
                         self.restore_pending(Outgoing {
                             content: f.content,
                             ext,
+                            reused,
                         });
                         bail!(trf(
                             "файлы не зарезервировались: {error}",
@@ -1960,6 +1973,7 @@ impl Engine {
             self.restore_pending(Outgoing {
                 content: item.content,
                 ext: item.ext,
+                reused,
             });
             return Err(e.into());
         }

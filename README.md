@@ -346,6 +346,9 @@ Explorer on the file.
   restart and does not depend on the server's `CLIPWIRE_TTL_HOURS`).
 - Transfers resume after a dropped connection, and the upload queue survives a restart. If a
   file changes while it is being uploaded, the upload is cancelled.
+- Copying the same files or folder again does not upload them again while the earlier upload is
+  still running or finished less than a day ago. A file counts as the same when its path, size and
+  modification time match; a folder, when that holds for every file inside it.
 - A folder is sent as one uncompressed tar archive and unpacked into the cache on the other
   device. Links are left out of the archive, and folders with more than 100,000 entries or nested
   deeper than 64 levels are not sent.
@@ -611,7 +614,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.8.4`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.8.5`.
 
 **Through a Docker control panel or plain `docker compose`:**
 
