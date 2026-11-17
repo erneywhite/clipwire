@@ -56,21 +56,6 @@ pub fn play_copy() {
     play(Sound::Copy);
 }
 
-#[cfg(test)]
-mod mute_tests {
-    use super::*;
-
-    #[test]
-    fn copy_is_muted_only_right_after_paste() {
-        let t = Instant::now();
-        assert!(!copy_muted(None, t));
-        assert!(copy_muted(Some(t), t + Duration::from_millis(30)));
-        assert!(!copy_muted(Some(t), t + PASTE_MUTES_COPY));
-        // Часы не идут назад, но и тогда не глушить навсегда и не падать.
-        assert!(copy_muted(Some(t + Duration::from_millis(5)), t));
-    }
-}
-
 /// Сыграть звук. Не ждёт конца звука; новый звук прерывает предыдущий,
 /// поэтому частое копирование не копит очередь.
 #[cfg(windows)]
@@ -222,5 +207,20 @@ mod tests {
         super::play_copy();
         super::play(super::Sound::Paste);
         super::play_copy();
+    }
+}
+
+#[cfg(test)]
+mod mute_tests {
+    use super::*;
+
+    #[test]
+    fn copy_is_muted_only_right_after_paste() {
+        let t = Instant::now();
+        assert!(!copy_muted(None, t));
+        assert!(copy_muted(Some(t), t + Duration::from_millis(30)));
+        assert!(!copy_muted(Some(t), t + PASTE_MUTES_COPY));
+        // Часы не идут назад, но и тогда не глушить навсегда и не падать.
+        assert!(copy_muted(Some(t + Duration::from_millis(5)), t));
     }
 }
