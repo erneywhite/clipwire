@@ -172,6 +172,32 @@ function listedAdmins(roles: Roles, list: GroupDevice[]): string[] {
   return roles.admins.filter((id) => list.some((d) => d.id === id))
 }
 
+/** Как называть админа, которого нет в списке: оставили при смене ключа,
+ *  но с новым ключом он ещё не вошёл. */
+export function pendingAdminTitle(): string {
+  return t('Устройство, которое ещё не вошло с новым ключом')
+}
+
+/** Админы, которых нет в списке устройств (см. `listedAdmins`), строками для
+ *  списка: их можно снять, если это устройство само админ. Отпечаток — как у
+ *  остальных, первые 5 байт id. */
+export function pendingAdmins(roles: Roles, list: GroupDevice[]): GroupDevice[] {
+  if (!roles?.supported || !roles.multi || list.length === 0) return []
+  return roles.admins
+    .filter((id) => !list.some((d) => d.id === id))
+    .map((id) => ({
+      id,
+      fingerprint: id.slice(0, 10),
+      name: null,
+      os: null,
+      known: false,
+      me: false,
+      online: false,
+      last_seen_ms: 0,
+      first_seen_ms: 0,
+    }))
+}
+
 /** Устройство — единственный админ группы из списка: снять с него роль нельзя. */
 export function lastAdmin(roles: Roles, list: GroupDevice[], d: GroupDevice): boolean {
   const listed = listedAdmins(roles, list)
@@ -197,9 +223,10 @@ export function rolesText(roles: Roles, list: GroupDevice[]): string {
   if (roles.admins.length === 0) {
     return t('У группы пока нет админа, поэтому ключ группы может сменить любое устройство. Админом станет первое устройство, которое подключится с кодом сервера администратора.')
   }
+  // Админ не из списка ещё не вошёл с новым ключом: имени у него здесь нет.
   const nameOf = (id: string) => {
     const dev = list.find((d) => d.id === id)
-    return dev ? deviceTitle(dev) : id.slice(0, 10)
+    return dev ? `«${deviceTitle(dev)}»` : t('устройство {fp}, которое ещё не вошло с новым ключом', { fp: id.slice(0, 10) })
   }
   const meAdmin = list.some((d) => d.me && roles.admins.includes(d.id))
   if (roles.multi) {
@@ -210,18 +237,24 @@ export function rolesText(roles: Roles, list: GroupDevice[]): string {
       return t('Это устройство — админ группы. Админы удаляют устройства, меняют ключ группы и назначают или снимают других админов.')
     }
     return t('Удалять устройства и менять ключ группы могут только админы группы: {names}.', {
-      names: roles.admins.map((id) => `«${nameOf(id)}»`).join(', '),
+      names: roles.admins.map(nameOf).join(', '),
     })
   }
   if (meAdmin) {
     return t('Это устройство — админ группы: только оно удаляет устройства и меняет ключ группы. Роль можно передать другому устройству.')
   }
-  return t('Удалять устройства и менять ключ группы может только админ группы — «{name}». Передать роль другому устройству может только он.', { name: nameOf(roles.admins[0]) })
+  return t('Удалять устройства и менять ключ группы может только админ группы — {name}. Передать роль другому устройству может только он.', { name: nameOf(roles.admins[0]) })
 }
 
 /** Заголовок и пояснение подтверждения: назначить админом, снять роль с
  *  другого устройства или с себя. */
-export function adminConfirmText(d: GroupDevice, revoke: boolean): { title: string; hint: string } {
+export function adminConfirmText(d: GroupDevice, revoke: boolean, pending = false): { title: string; hint: string } {
+  if (pending) {
+    return {
+      title: t('Снять админа с устройства {fp}?', { fp: d.fingerprint }),
+      hint: t('Оно ещё не вошло в группу с новым ключом. Если войдёт, останется в группе, но уже не админом.'),
+    }
+  }
   const name = deviceTitle(d)
   if (!revoke) {
     return {

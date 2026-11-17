@@ -473,7 +473,9 @@ admin**, including from itself. All admins are equal. The last admin cannot be r
 make another device an admin. Groups created before server 0.5.0 have no admin: there any device
 can still change the key, and the first device that connects with the administrator code becomes
 the admin. After a key change the admins that received the new key stay admins, and a device
-removed by that key change loses the role. If all admins are lost (the computers broke or went
+removed by that key change loses the role. Until a kept admin joins with the new key, the other
+admins see it at the end of the list as **Device that hasn't joined with the new key yet** and
+can remove its role. If all admins are lost (the computers broke or went
 missing), the server administrator presses **Become the group admin (you are the server
 administrator)** under the list on their device in that group and confirms: that device becomes
 one more admin and can then remove the lost ones. One device can change the group key at most 10
