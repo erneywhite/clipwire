@@ -135,7 +135,7 @@ const en: Record<string, string> = {
   "Программа бесплатная. Если она экономит вам время, можно угостить автора кофе: это правда помогает её развивать.": "The app is free. If it saves you time, you can buy the author a coffee: it genuinely helps keep it going.",
   "Запускать при входе в систему": "Launch at login",
   "Звук при копировании": "Sound on copy",
-  "Короткий щелчок, когда в историю попадает новое: скопированное здесь или пришедшее с другого устройства.": "A short click when something new lands in history: copied here or received from another device.",
+  "Короткий щелчок, когда копируете здесь и когда приходит новое с другого устройства. Вставка из истории звука не даёт.": "A short click when you copy here and when something new arrives from another device. Pasting from the history is silent.",
   "Обновляться автоматически": "Update automatically",
   "Новая версия скачивается в фоне и ставится, когда вы не пользуетесь Clipwire. Выключено — обновление ставится по кнопке в «О программе» или в меню трея.": "A new version downloads in the background and installs when you are not using Clipwire. When off, update from the About page or the tray menu.",
   "Режим": "Mode",
