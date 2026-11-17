@@ -22,7 +22,7 @@ check(serverItemsLabel(s, fmt) === '42 элемента · 2 КБ', serverItemsL
 check(serverFilesLabel(s, fmt) === '3 файла · 3,0 МБ', serverFilesLabel(s, fmt))
 
 function d(id: string, over: Partial<GroupDevice>): GroupDevice {
-  return { id, fingerprint: id, name: id, os: null, known: true, me: false, online: false, last_seen_ms: 0, ...over }
+  return { id, fingerprint: id, name: id, os: null, known: true, me: false, online: false, last_seen_ms: 0, first_seen_ms: 0, ...over }
 }
 check(devicesLabel([d('a', { me: true }), d('b', { online: true }), d('c', {})]) === '3, в сети 2', 'устройства')
 

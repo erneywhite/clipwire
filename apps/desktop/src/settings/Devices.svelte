@@ -5,7 +5,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, type DevicesIncoming, type GroupDevice, type RekeyResult, type Status, type StorageKind } from '../lib/api'
   import { ago, plural } from '../lib/format'
-  import { CHECKING, canClaimAdmin, canManage, checking as checkingText, confirmText, deviceTitle, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, recipients, rekeyChoice, rolesText, sameName, seenLabel, staying, type Roles } from '../lib/devices'
+  import { CHECKING, adminAction, adminConfirmText, canClaimAdmin, canManage, lastAdmin, checking as checkingText, confirmText, deviceTitle, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, recipients, rekeyChoice, rolesText, sameName, seenLabel, staying, type Roles } from '../lib/devices'
 
   // `incoming` — итог смены ключа, пришедший событием (его забирает окно
   // настроек: раздел мог быть закрыт). Принятый сообщается `onIncomingTaken`.
@@ -45,10 +45,11 @@
   let checking = $state(false)
   /** Вид хранилища файлов группы: у внешнего доступы остаются у тех, кто окажется вне группы. */
   let storageKind = $state<StorageKind | null>(null)
-  /** Кто админ группы; null — не знаем (нет связи). */
+  /** Кто админы группы; null — не знаем (нет связи). */
   let roles = $state<Roles>(null)
-  /** Кому передаём роль админа (подтверждение). */
-  let handing = $state<string | null>(null)
+  /** Подтверждение роли: кого назначаем админом (`revoke: false`) или с кого
+   *  снимаем роль. На старом сервере назначение — это передача роли. */
+  let handing = $state<{ id: string; revoke: boolean } | null>(null)
   let handBusy = $state(false)
 
   const manage = $derived(canManage(roles, list))
@@ -121,13 +122,16 @@
     }
   }
 
-  /** Передать роль админа группы устройству handing. */
+  /** Назначить или снять админа (сервер с несколькими админами) либо
+   *  передать роль (старый сервер). */
   async function handOver() {
     if (!handing) return
     handBusy = true
     error = ''
     try {
-      await api.deviceMakeAdmin(handing)
+      const { id, revoke } = handing
+      if (!roles?.multi) await api.deviceMakeAdmin(id)
+      else roles = revoke ? await api.deviceRevokeAdmin(id) : await api.deviceGrantAdmin(id)
       handing = null
       await load()
     } catch (e) {
@@ -235,14 +239,33 @@
         <span class="name" class:unknown={!d.known}>{deviceTitle(d)}{#if d.me}<span class="me">{' · '}{t('это устройство')}</span>{/if}{#if isAdmin(roles, d)}<span class="badge">{t('админ')}</span>{/if}</span>
         <span class="meta mono">{d.os ?? t('нет карточки')} · {d.fingerprint} · {seenLabel(d, fmt)}</span>
       </div>
-      {#if !d.me && meAdmin && d.known}
-        <button disabled={busy || handBusy} onclick={() => (handing = d.id)}>{t('Сделать админом')}</button>
+      {#if roles?.multi}
+        {#if adminAction(roles, list, d) === 'grant'}
+          <button disabled={busy || handBusy} onclick={() => (handing = { id: d.id, revoke: false })}>{t('Сделать админом')}</button>
+        {:else if adminAction(roles, list, d) === 'revoke'}
+          <button
+            disabled={busy || handBusy || lastAdmin(roles, list, d)}
+            title={lastAdmin(roles, list, d) ? t('Это последний админ группы. Сначала сделайте админом другое устройство.') : undefined}
+            onclick={() => (handing = { id: d.id, revoke: true })}>{t('Снять админа')}</button>
+        {/if}
+      {:else if !d.me && meAdmin && d.known}
+        <button disabled={busy || handBusy} onclick={() => (handing = { id: d.id, revoke: false })}>{t('Сделать админом')}</button>
       {/if}
       {#if !d.me && manage}
         <button class="danger" disabled={busy} onclick={() => ask(d.id)}>{t('Удалить')}</button>
       {/if}
     </div>
-    {#if handing === d.id}
+    {#if handing?.id === d.id && roles?.multi}
+      {@const q = adminConfirmText(d, handing.revoke)}
+      <div class="row confirm" role="alertdialog">
+        <strong>{q.title}</strong>
+        <p class="hint">{q.hint}</p>
+        <div class="buttons">
+          <button class="primary" disabled={handBusy} onclick={handOver}>{handBusy ? t('Сохраняю…') : handing.revoke ? t('Снять админа') : t('Сделать админом')}</button>
+          <button disabled={handBusy} onclick={() => (handing = null)}>{t('Отмена')}</button>
+        </div>
+      </div>
+    {:else if handing?.id === d.id}
       <div class="row confirm" role="alertdialog">
         <strong>{t('Сделать «{name}» админом группы?', { name: deviceTitle(d) })}</strong>
         <p class="hint">{t('Это устройство перестанет быть админом: удалять устройства и менять ключ группы сможет только «{name}». Вернуть роль сможет только оно.', { name: deviceTitle(d) })}</p>
@@ -262,7 +285,11 @@
     {#if claiming}
       <div class="confirm" role="alertdialog">
         <strong>{t('Стать админом группы?')}</strong>
-        <p class="hint">{t('Нынешний админ перестанет им быть: удалять устройства и менять ключ группы сможет только это устройство. Это нужно, если прежний админ потерян. Сервер разрешит это только с действующим ключом администратора сервера.')}</p>
+        {#if roles?.multi}
+          <p class="hint">{t('Это устройство станет ещё одним админом группы. Это нужно, если прежние админы потеряны: потом их можно снять. Сервер разрешит это только с действующим ключом администратора сервера.')}</p>
+        {:else}
+          <p class="hint">{t('Нынешний админ перестанет им быть: удалять устройства и менять ключ группы сможет только это устройство. Это нужно, если прежний админ потерян. Сервер разрешит это только с действующим ключом администратора сервера.')}</p>
+        {/if}
         <div class="buttons">
           <button class="primary" disabled={claimBusy} onclick={claimAdmin}>{claimBusy ? t('Передаю…') : t('Стать админом')}</button>
           <button disabled={claimBusy} onclick={() => (claiming = false)}>{t('Отмена')}</button>

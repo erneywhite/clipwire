@@ -563,6 +563,16 @@ fn put_quietly(app: &AppHandle, content: &clipwire_core::Content) -> Result<(), 
 /// Спрятать окно `label` и, если `paste`, вернуть фокус окну, которое было
 /// активным до окна вставки, и нажать там Ctrl+V.
 pub async fn return_and_paste(app: &AppHandle, label: &str, paste: bool) {
+    // Сюда приходят все вставки из окна и редактора: запись уже в буфере.
+    if app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .sound_on_paste
+    {
+        crate::sound::play(crate::sound::Sound::Paste);
+    }
     // Порядок важен: вернуть фокус прежнему окну, пока наше ещё активно.
     // Если сначала спрятать окно, Windows отдаст фокус кому-то ещё, и
     // SetForegroundWindow из фонового процесса молча откажет.

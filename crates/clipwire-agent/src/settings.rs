@@ -69,6 +69,9 @@ pub struct Settings {
     /// Звук, когда в историю попадает новое: скопированное здесь или
     /// пришедшее с другого устройства. Имя поля прежнее, смысл шире.
     pub sound_on_receive: bool,
+    /// Звук, когда запись вставляется из окна Clipwire (свой, ниже щелчка
+    /// копирования).
+    pub sound_on_paste: bool,
     /// Загружать карточки ссылок (og:-теги) по пробелу.
     pub link_previews: bool,
     /// Не показывать окна Clipwire при демонстрации и записи экрана.
@@ -148,6 +151,7 @@ impl Default for Settings {
             popup_height: 520,
             popup_hotkey: default_hotkey().into(),
             sound_on_receive: true,
+            sound_on_paste: false,
             link_previews: true,
             hide_from_capture: false,
             ignored_apps: default_ignored_apps(),

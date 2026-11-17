@@ -79,10 +79,17 @@ pub const ALPN_11: &[u8] = b"clipwire/11";
 /// новые добавлены в конец enum.
 pub const ALPN_12: &[u8] = b"clipwire/12";
 
+/// Как [`ALPN_12`], плюс несколько админов группы: `GrantGroupAdmin`,
+/// `RevokeGroupAdmin`, `GetGroupAdmins` и ответ `GroupAdmins`. Старые
+/// сообщения про одного админа (`GetGroupAdmin`, `TransferGroupAdmin`)
+/// работают и здесь. Варианты `clipwire/12` не меняются, новые добавлены в
+/// конец enum.
+pub const ALPN_13: &[u8] = b"clipwire/13";
+
 /// Все ALPN, новейший первым: в этом порядке их предлагает агент и
 /// принимает сервер.
-pub const ALPNS: [&[u8]; 10] = [
-    ALPN_12, ALPN_11, ALPN_10, ALPN_9, ALPN_8, ALPN_7, ALPN_6, ALPN_5, ALPN_4, ALPN,
+pub const ALPNS: [&[u8]; 11] = [
+    ALPN_13, ALPN_12, ALPN_11, ALPN_10, ALPN_9, ALPN_8, ALPN_7, ALPN_6, ALPN_5, ALPN_4, ALPN,
 ];
 
 /// Номер версии протокола из ALPN (`clipwire/7` → 7), 0 — не наш ALPN.
@@ -139,6 +146,12 @@ pub fn knows_group_invites(alpn: &[u8]) -> bool {
 /// Знает ли соединение с этим ALPN имена групп (`SetGroupName`, `GroupList`).
 pub fn knows_group_names(alpn: &[u8]) -> bool {
     alpn_version(alpn) >= 12
+}
+
+/// Знает ли соединение с этим ALPN нескольких админов группы
+/// (`GrantGroupAdmin`, `RevokeGroupAdmin`, `GetGroupAdmins`).
+pub fn knows_group_admins(alpn: &[u8]) -> bool {
+    alpn_version(alpn) >= 13
 }
 
 /// Новейший протокол, который знает этот код (первый в [`ALPNS`]).
@@ -308,9 +321,13 @@ pub enum ClientMsg {
     RotateAdminKey,
     /// Передать роль админа группы другому устройству группы. Только по
     /// [`ALPN_9`] и только от текущего админа. Ответ — `GroupAdmin`,
-    /// остальным — `DevicesChanged`.
+    /// остальным — `DevicesChanged`. С [`ALPN_13`] админов может быть
+    /// несколько, и передача — это «сделать `device` админом и снять себя»
+    /// одной транзакцией.
     TransferGroupAdmin { device: DeviceId },
-    /// Кто админ группы — ответ `GroupAdmin`. Только по [`ALPN_9`].
+    /// Кто админ группы — ответ `GroupAdmin`. Только по [`ALPN_9`]. Если
+    /// админов несколько (с [`ALPN_13`]), в ответе спросившее устройство,
+    /// когда оно само админ, иначе самый первый админ.
     GetGroupAdmin,
     /// Забрать роль админа группы себе, даже если админ у группы есть
     /// (прежний админ потерян: устройство сломано или пропало). Только по
@@ -361,6 +378,18 @@ pub enum ClientMsg {
     /// пробелов) снимает имя. Ответ — `GroupList` (список после правки);
     /// отказы — `AdminFailed(BadGroupName | NoSuchGroup | NotAuthorized)`.
     SetGroupName { group: GroupId, name: String },
+    /// Сделать устройство группы ещё одним админом (только по [`ALPN_13`] и
+    /// только от админа группы). Уже админ — не ошибка. Ответ — `GroupAdmins`,
+    /// остальным — `DevicesChanged`; отказы — `AdminFailed(NotGroupAdmin |
+    /// NoSuchDevice)`.
+    GrantGroupAdmin { device: DeviceId },
+    /// Снять роль админа с устройства группы, в том числе с себя (только по
+    /// [`ALPN_13`] и только от админа группы). Последнего админа снять нельзя.
+    /// Ответ — `GroupAdmins`, остальным — `DevicesChanged`; отказы —
+    /// `AdminFailed(NotGroupAdmin | NoSuchDevice | LastAdmin)`.
+    RevokeGroupAdmin { device: DeviceId },
+    /// Все админы группы — ответ `GroupAdmins`. Только по [`ALPN_13`].
+    GetGroupAdmins,
 }
 
 /// Закреп на сервере (в `Pins`, `Pinned`, `PinRejected`).
@@ -546,6 +575,10 @@ pub enum ServerMsg {
     /// `SetGroupName` соединениям по [`ALPN_12`], по убыванию последней
     /// активности. Старым соединениям вместо него — `Groups`.
     GroupList(Vec<GroupEntry>),
+    /// Админы группы, первым — самый ранний (ответ на `GetGroupAdmins`,
+    /// `GrantGroupAdmin` и `RevokeGroupAdmin`, только по [`ALPN_13`]). Пусто —
+    /// у группы админа нет.
+    GroupAdmins { admins: Vec<DeviceId> },
 }
 
 /// Первый кадр потока файла.
@@ -772,10 +805,13 @@ mod tests {
         assert_eq!(alpn_version(ALPN), 3);
         assert_eq!(alpn_version(ALPN_7), 7);
         assert_eq!(alpn_version(ALPN_8), 8);
-        assert_eq!(ALPNS[0], ALPN_12);
-        assert_eq!(ALPNS[1], ALPN_11);
-        assert_eq!(ALPNS[2], ALPN_10);
-        assert_eq!(ALPNS[3], ALPN_9);
+        assert_eq!(ALPNS[0], ALPN_13);
+        assert_eq!(ALPNS[1], ALPN_12);
+        assert_eq!(ALPNS[2], ALPN_11);
+        assert_eq!(ALPNS[3], ALPN_10);
+        assert_eq!(ALPNS[4], ALPN_9);
+        assert_eq!(alpn_version(ALPN_13), 13);
+        assert!(!knows_group_admins(ALPN_12) && knows_group_admins(ALPN_13));
         assert_eq!(alpn_version(ALPN_12), 12);
         assert!(!knows_group_names(ALPN_11) && knows_group_names(ALPN_12));
         assert_eq!(alpn_version(ALPN_11), 11);
@@ -783,7 +819,7 @@ mod tests {
         assert_eq!(alpn_version(ALPN_9), 9);
         assert_eq!(alpn_version(ALPN_10), 10);
         assert!(!knows_server_groups(ALPN_9) && knows_server_groups(ALPN_10));
-        assert_eq!(alpn_version(b"clipwire/13"), 13);
+        assert_eq!(alpn_version(b"clipwire/14"), 14);
         assert_eq!(alpn_version(b"other/7"), 0);
         // Новая версия не теряет старые возможности.
         for a in ALPNS {
@@ -797,6 +833,7 @@ mod tests {
             assert_eq!(knows_server_groups(a), v >= 10);
             assert_eq!(knows_group_invites(a), v >= 11);
             assert_eq!(knows_group_names(a), v >= 12);
+            assert_eq!(knows_group_admins(a), v >= 13);
         }
         assert!(knows_deletes(b"clipwire/9"));
     }
@@ -912,6 +949,28 @@ mod tests {
             postcard::to_stdvec(&AdminFail::BadGroupName { max: 64 }).unwrap()[0],
             15
         );
+        // `clipwire/13`: тоже только в конце.
+        let d = DeviceId([0; 32]);
+        assert_eq!(
+            tag(postcard::to_stdvec(&ClientMsg::GrantGroupAdmin { device: d }).unwrap()),
+            32
+        );
+        assert_eq!(
+            tag(postcard::to_stdvec(&ClientMsg::RevokeGroupAdmin { device: d }).unwrap()),
+            33
+        );
+        assert_eq!(
+            tag(postcard::to_stdvec(&ClientMsg::GetGroupAdmins).unwrap()),
+            34
+        );
+        let admins = ServerMsg::GroupAdmins { admins: vec![d] };
+        assert_eq!(tag(postcard::to_stdvec(&admins).unwrap()), 33);
+        assert_eq!(postcard::to_stdvec(&AdminFail::LastAdmin).unwrap()[0], 16);
+        // Старые ответы про одного админа не сдвинулись.
+        let one = ServerMsg::GroupAdmin { admin: None };
+        assert_eq!(tag(postcard::to_stdvec(&one).unwrap()), 26);
+        let transfer = ClientMsg::TransferGroupAdmin { device: d };
+        assert_eq!(tag(postcard::to_stdvec(&transfer).unwrap()), 22);
         // Вход по приглашению влезает в предел первого кадра.
         assert!(postcard::to_stdvec(&inv).unwrap().len() < 128);
         // Вход администратора влезает в предел первого кадра сервера (512).

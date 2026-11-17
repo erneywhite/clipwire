@@ -1,7 +1,9 @@
-"""Звук копирования: двойной клик (две короткие ноты, вторая выше).
+"""Звуки копирования и вставки: двойной клик из двух коротких нот.
 
-Синтезируется, а не берётся готовым, чтобы не было вопросов с лицензией.
-Запуск: python apps/desktop/scripts/sound.py  →  apps/desktop/src-tauri/sounds/copy.wav
+Копирование — вторая нота выше, вставка — ниже и чуть тише, чтобы на слух
+их было не спутать. Синтезируются, а не берутся готовыми, чтобы не было
+вопросов с лицензией.
+Запуск: python apps/desktop/scripts/sound.py  →  apps/desktop/src-tauri/sounds/{copy,paste}.wav
 """
 import math
 import pathlib
@@ -29,15 +31,28 @@ def mix(*tracks):
 
 
 CLICK = ((2.7, 0.2),)
-samples = mix(
-    note(1150, 1090, 0.045, 0.001, 0.009, CLICK),
-    note(1540, 1470, 0.05, 0.001, 0.01, CLICK, delay=0.048),
-)
-peak = max(abs(s) for s in samples)
-out = pathlib.Path(__file__).resolve().parents[1] / "src-tauri" / "sounds" / "copy.wav"
-with wave.open(str(out), "wb") as w:
-    w.setnchannels(1)
-    w.setsampwidth(2)
-    w.setframerate(SR)
-    w.writeframes(b"".join(struct.pack("<h", int(s / peak * 0.5 * 32767)) for s in samples))
-print(out)
+SOUNDS = {
+    "copy": (
+        mix(
+            note(1150, 1090, 0.045, 0.001, 0.009, CLICK),
+            note(1540, 1470, 0.05, 0.001, 0.01, CLICK, delay=0.048),
+        ),
+        0.5,
+    ),
+    "paste": (
+        mix(
+            note(1320, 1260, 0.045, 0.001, 0.009, CLICK),
+            note(990, 940, 0.055, 0.001, 0.012, CLICK, delay=0.048),
+        ),
+        0.42,
+    ),
+}
+for name, (samples, gain) in SOUNDS.items():
+    peak = max(abs(s) for s in samples)
+    out = pathlib.Path(__file__).resolve().parents[1] / "src-tauri" / "sounds" / f"{name}.wav"
+    with wave.open(str(out), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes(b"".join(struct.pack("<h", int(s / peak * gain * 32767)) for s in samples))
+    print(out)

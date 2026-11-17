@@ -465,16 +465,22 @@ invitation code ended up in the wrong place. The group's history on the server i
 history is untouched and the invitation code changes. Devices without a card do not receive the
 new key, and Clipwire warns about it before you confirm.
 
-**Group admin.** The device that created the group is its admin and is marked in the device
-list. Only the admin removes devices and changes the group key: other devices do not get these
-buttons, and a note under the list says who the admin is. The role is handed over with **Make
-admin** next to another device of the group. Groups created before server 0.5.0 have no admin: there any
-device can still change the key, and the first device that connects with the administrator
-code becomes the admin. After a key change the admin stays the same. If the admin is lost (the
-computer broke or went missing), the server administrator presses **Become the group admin (you
-are the server administrator)** under the list on their device in that group and confirms: the
-role moves to them even while the old admin exists. One device can change the group key at most
-10 times a day.
+**Group admins.** The device that created the group is its first admin. Every admin is marked
+**admin** in the device list. Only admins remove devices and change the group key: other devices
+do not get these buttons, and a note under the list says who the admins are. An admin can make
+another device of the group an admin with **Make admin** and take the role away with **Remove
+admin**, including from itself. All admins are equal. The last admin cannot be removed: first
+make another device an admin. Groups created before server 0.5.0 have no admin: there any device
+can still change the key, and the first device that connects with the administrator code becomes
+the admin. After a key change the admins that received the new key stay admins, and a device
+removed by that key change loses the role. If all admins are lost (the computers broke or went
+missing), the server administrator presses **Become the group admin (you are the server
+administrator)** under the list on their device in that group and confirms: that device becomes
+one more admin and can then remove the lost ones. One device can change the group key at most 10
+times a day.
+
+Several admins need a server with protocol `clipwire/13`. With an older server there is one
+admin, and **Make admin** hands the role over as before.
 
 Details of the protocol are in [docs/devices.md](docs/devices.md).
 
@@ -563,7 +569,8 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
 - Language: English, Русский or as in the system.
 - Launch at login: the program starts minimized to the tray.
 - Copy sound: a short click on every copy made here and on anything new from another device.
-  Pasting from the history is silent. On Linux it plays through `pw-play`, `paplay` or `aplay`.
+  Pasting from the history is silent unless **Paste sound** is on: it has its own, lower click.
+  On Linux the sounds play through `pw-play`, `paplay` or `aplay`.
 - History retention, from a day to forever (pinned entries are kept forever).
 - Device name, invitation code (**Show code**), leaving the group (it also removes the server
   administrator key from the device).
@@ -619,7 +626,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.8.8`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.9.0`.
 
 **Through a Docker control panel or plain `docker compose`:**
 

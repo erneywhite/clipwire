@@ -3,7 +3,7 @@
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
 import type { GroupDevice } from './api'
 
-const { FRESH_MS, canClaimAdmin, canManage, confirmText, deviceTitle, exposedAccessText, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, leftOut, offerText, recipients, rekeyChoice, rekeyedBy, rolesText, sameName, seenLabel, staying } = (await import('./devices' + '.ts')) as typeof import('./devices')
+const { FRESH_MS, adminAction, adminConfirmText, canClaimAdmin, canManage, lastAdmin, confirmText, deviceTitle, exposedAccessText, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, leftOut, offerText, recipients, rekeyChoice, rekeyedBy, rolesText, sameName, seenLabel, staying } = (await import('./devices' + '.ts')) as typeof import('./devices')
 const fmt = (await import('./format' + '.ts')) as typeof import('./format')
 
 function check(cond: boolean, msg: string) {
@@ -120,21 +120,43 @@ check(offer[0].endsWith('Перейти на него?'), 'вопрос')
 check(offer.some((s) => s.includes('синхронизация стоит')) && offer.some((s) => s.includes('не переходите')), 'что происходит и когда отказаться')
 check(offerText({ name: ' ', os: '', fingerprint: 'ff', received_ms: 0 }, '')[0].includes('«Неизвестное устройство» (?'), 'без имени и ОС')
 
-// Админ группы.
-check(canManage(null, list) && canManage({ supported: false, admin: null }, list), 'не знаем или старый сервер — можно')
-check(canManage({ supported: true, admin: null }, list), 'группа без админа — можно')
-check(canManage({ supported: true, admin: 'aaaa' }, list), 'это устройство — админ')
-check(!canManage({ supported: true, admin: 'bbbb' }, list), 'админ — другое устройство')
-check(isAdmin({ supported: true, admin: 'bbbb' }, work) && !isAdmin({ supported: true, admin: 'bbbb' }, me), 'пометка админа')
-check(rolesText({ supported: true, admin: 'bbbb' }, list).includes('«Рабочий»'), 'кто админ — по имени')
-check(rolesText({ supported: true, admin: null }, list).includes('кодом сервера администратора'), 'группа без админа')
-check(rolesText({ supported: false, admin: null }, list) === '', 'старый сервер — без пояснения')
+// Админ группы. `one` — сервер с одним админом, `many` — с несколькими.
+const one = (...admins: string[]) => ({ supported: true, multi: false, admins })
+const many = (...admins: string[]) => ({ supported: true, multi: true, admins })
+const old = { supported: false, multi: false, admins: [] }
+check(canManage(null, list) && canManage(old, list), 'не знаем или старый сервер — можно')
+check(canManage(one(), list) && canManage(many(), list), 'группа без админа — можно')
+check(canManage(one('aaaa'), list), 'это устройство — админ')
+check(!canManage(one('bbbb'), list), 'админ — другое устройство')
+check(canManage(many('bbbb', 'aaaa'), list) && !canManage(many('bbbb', 'cccc'), list), 'одно из админов — это устройство')
+check(isAdmin(one('bbbb'), work) && !isAdmin(one('bbbb'), me), 'пометка админа')
+check(isAdmin(many('aaaa', 'bbbb'), work) && isAdmin(many('aaaa', 'bbbb'), me) && !isAdmin(many('aaaa', 'bbbb'), phone), 'пометка у каждого админа')
+check(rolesText(one('bbbb'), list).includes('«Рабочий»'), 'кто админ — по имени')
+check(rolesText(one(), list).includes('кодом сервера администратора'), 'группа без админа')
+check(rolesText(old, list) === '', 'старый сервер — без пояснения')
+check(rolesText(many('bbbb', 'cccc'), list).includes('«Рабочий», «Старый»'), 'админы — по именам')
+check(rolesText(many('aaaa'), list).includes('единственный'), 'единственный админ — это устройство')
+check(rolesText(many('aaaa', 'bbbb'), list).includes('назначают или снимают'), 'одно из админов')
+
+// Действия с ролью — только у админа и только на сервере с несколькими админами.
+check(adminAction(many('aaaa'), list, work) === 'grant', 'назначить другое устройство')
+check(adminAction(many('aaaa', 'bbbb'), list, work) === 'revoke', 'снять другого админа')
+check(adminAction(many('aaaa', 'bbbb'), list, me) === 'revoke', 'снять себя')
+check(adminAction(many('aaaa'), list, unknown) === null, 'без карточки не назначить')
+check(adminAction(many('bbbb'), list, phone) === null, 'не админ — ничего')
+check(adminAction(one('aaaa'), list, work) === null, 'старый сервер — только передача')
+check(lastAdmin(many('aaaa'), list, me) && !lastAdmin(many('aaaa', 'bbbb'), list, me), 'последний админ')
+check(lastAdmin(many('aaaa', 'ffff'), list, me), 'админ не из списка (не вошёл после смены ключа) не считается')
+check(adminConfirmText(work, false).title.includes('«Рабочий»'), 'назначить — по имени')
+check(adminConfirmText(me, true).title === 'Перестать быть админом?', 'снять себя')
+check(adminConfirmText(work, true).title.includes('Снять админа'), 'снять другого')
 
 // Администратор сервера забирает роль, только если админ — другое устройство.
-check(canClaimAdmin({ supported: true, admin: 'bbbb' }, list, true), 'админ другой — можно забрать')
-check(!canClaimAdmin({ supported: true, admin: 'bbbb' }, list, false), 'без ключа администратора — нет')
-check(!canClaimAdmin({ supported: true, admin: 'aaaa' }, list, true), 'уже админ — нет')
-check(!canClaimAdmin({ supported: true, admin: null }, list, true), 'без админа роль приходит сама')
-check(!canClaimAdmin({ supported: false, admin: null }, list, true) && !canClaimAdmin(null, list, true), 'старый сервер или нет связи — нет')
+check(canClaimAdmin(one('bbbb'), list, true), 'админ другой — можно забрать')
+check(canClaimAdmin(many('bbbb', 'cccc'), list, true), 'админы другие — можно стать ещё одним')
+check(!canClaimAdmin(one('bbbb'), list, false), 'без ключа администратора — нет')
+check(!canClaimAdmin(one('aaaa'), list, true) && !canClaimAdmin(many('bbbb', 'aaaa'), list, true), 'уже админ — нет')
+check(!canClaimAdmin(one(), list, true), 'без админа роль приходит сама')
+check(!canClaimAdmin(old, list, true) && !canClaimAdmin(null, list, true), 'старый сервер или нет связи — нет')
 
 console.log('devices: всё прошло')

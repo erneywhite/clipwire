@@ -686,6 +686,12 @@
             onchange={(v) => save({ sound_on_receive: v })}
           />
           <Toggle
+            label={t('Звук при вставке')}
+            hint={t('Другой щелчок, пониже, когда вставляете запись из окна Clipwire.')}
+            checked={s.sound_on_paste}
+            onchange={(v) => save({ sound_on_paste: v })}
+          />
+          <Toggle
             label={t('Обновляться автоматически')}
             hint={t('Новая версия скачивается в фоне и ставится, когда вы не пользуетесь Clipwire. Выключено — обновление ставится по кнопке в «О программе» или в меню трея.')}
             checked={s.auto_update}
