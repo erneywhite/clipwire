@@ -655,6 +655,7 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
         std::sync::atomic::Ordering::Relaxed,
     );
     clipwire_agent::clipboard::set_image_as_file(settings.image_as_file);
+    clipwire_agent::service::set_send_kinds(settings.send_kinds.bits());
 
     if old.popup_hotkey != settings.popup_hotkey
         && let Err(e) = crate::popup::register_hotkey(&app)

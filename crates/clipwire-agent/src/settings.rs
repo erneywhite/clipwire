@@ -92,6 +92,47 @@ pub struct Settings {
     /// Windows: к картинке в буфере добавлять виртуальный PNG-файл, чтобы
     /// обычный Ctrl+V в Проводнике вставлял её файлом (см. `image_file`).
     pub image_as_file: bool,
+    /// Что скопированное здесь уходит на другие устройства группы.
+    pub send_kinds: SendKinds,
+}
+
+/// Что с этого устройства уходит на другие устройства группы. Выключенное
+/// остаётся только в своей истории; что приходит сюда, решают настройки
+/// других устройств.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SendKinds {
+    pub text: bool,
+    pub images: bool,
+    pub files: bool,
+    pub folders: bool,
+}
+
+impl Default for SendKinds {
+    fn default() -> Self {
+        Self {
+            text: true,
+            images: true,
+            files: true,
+            folders: true,
+        }
+    }
+}
+
+impl SendKinds {
+    /// Набор битов для [`crate::service::set_send_kinds`].
+    pub fn bits(self) -> u8 {
+        use crate::service::{SEND_FILES, SEND_FOLDERS, SEND_IMAGES, SEND_TEXT};
+        [
+            (self.text, SEND_TEXT),
+            (self.images, SEND_IMAGES),
+            (self.files, SEND_FILES),
+            (self.folders, SEND_FOLDERS),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .fold(0, |acc, (_, b)| acc | b)
+    }
 }
 
 impl Default for Settings {
@@ -116,6 +157,7 @@ impl Default for Settings {
             language: "system".into(),
             portal_paste: false,
             image_as_file: true,
+            send_kinds: SendKinds::default(),
         }
     }
 }
@@ -309,6 +351,11 @@ mod tests {
         assert!(s.sound_on_receive);
         let s: Settings = serde_json::from_str(r#"{"sound_on_receive":false}"#).unwrap();
         assert!(!s.sound_on_receive);
+        // Старые настройки без `send_kinds` — всё отправляется; часть полей —
+        // остальные по умолчанию.
+        assert_eq!(s.send_kinds, SendKinds::default());
+        let s: Settings = serde_json::from_str(r#"{"send_kinds":{"folders":false}}"#).unwrap();
+        assert!(s.send_kinds.text && s.send_kinds.files && !s.send_kinds.folders);
         // Автообновление по умолчанию включено, в том числе в старом файле без поля.
         assert!(s.auto_update);
         let s: Settings = serde_json::from_str(r#"{"auto_update":false}"#).unwrap();

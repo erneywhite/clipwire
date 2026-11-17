@@ -34,6 +34,8 @@ export interface Settings {
   portal_paste: boolean
   /** Windows: картинка из буфера вставляется в Проводник PNG-файлом. */
   image_as_file: boolean
+  /** Что скопированное здесь уходит на другие устройства группы. */
+  send_kinds: { text: boolean; images: boolean; files: boolean; folders: boolean }
 }
 
 export interface DeviceInfo {

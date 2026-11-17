@@ -333,6 +333,7 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
         clipwire_agent::image_file::PASTED_GRACE,
     );
     clipwire_agent::clipboard::set_image_as_file(settings.image_as_file);
+    clipwire_agent::service::set_send_kinds(settings.send_kinds.bits());
     let rt = tokio::runtime::Runtime::new()?;
     let service = Service::start(
         rt.handle(),

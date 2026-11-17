@@ -349,5 +349,10 @@ const en: Record<string, string> = {
   "отозван {when}": "revoked {when}",
   "выпущен {when}": "issued {when}",
   "без подписи": "no label",
+  "Что отправлять на другие устройства": "What to send to other devices",
+  "Текст": "Text",
+  "Картинки": "Images",
+  "Папки": "Folders",
+  "Выключенное остаётся в истории этого устройства, но на другие не уходит. Если среди скопированного есть выключенное, например папка рядом с файлами, не отправляется ничего.": "Turned-off items stay in this device's history but aren't sent to others. If a copy includes something turned off, such as a folder next to files, nothing is sent.",
 }
 export default en

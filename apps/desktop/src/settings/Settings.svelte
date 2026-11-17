@@ -910,6 +910,31 @@
             />
           </div>
 
+          <h2>{t('Что отправлять на другие устройства')}</h2>
+          <div class="card">
+            <Toggle
+              label={t('Текст')}
+              checked={s.send_kinds.text}
+              onchange={(v) => save({ send_kinds: { ...s!.send_kinds, text: v } })}
+            />
+            <Toggle
+              label={t('Картинки')}
+              checked={s.send_kinds.images}
+              onchange={(v) => save({ send_kinds: { ...s!.send_kinds, images: v } })}
+            />
+            <Toggle
+              label={t('Файлы')}
+              checked={s.send_kinds.files}
+              onchange={(v) => save({ send_kinds: { ...s!.send_kinds, files: v } })}
+            />
+            <Toggle
+              label={t('Папки')}
+              checked={s.send_kinds.folders}
+              onchange={(v) => save({ send_kinds: { ...s!.send_kinds, folders: v } })}
+            />
+          </div>
+          <p class="hint">{t('Выключенное остаётся в истории этого устройства, но на другие не уходит. Если среди скопированного есть выключенное, например папка рядом с файлами, не отправляется ничего.')}</p>
+
           <h2>{t('Файлы')}</h2>
           <div class="card pad">
             <label class="field">
