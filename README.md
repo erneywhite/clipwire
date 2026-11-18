@@ -273,6 +273,10 @@ portal (the desktop may ask to confirm once). On Sway, which has none of these, 
 
 ## Exclusions
 
+<p align="center">
+  <img src="docs/screenshots/settings-exclusions.png" width="600" alt="Exclusions: what to send and rules for files and folders">
+</p>
+
 The **Exclusions** tab in settings gathers what doesn't go to other devices:
 - the **What to send** switches: text, images, files, folders;
 - rules for files and folders: a condition (extension, name starts with, contains, matches a mask
