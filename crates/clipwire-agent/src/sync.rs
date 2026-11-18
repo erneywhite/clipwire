@@ -202,6 +202,29 @@ pub enum Status {
     Offline(String),
 }
 
+/// Когда показывать «Подключение…». Попытка к недоступному серверу длится
+/// долго, и если объявлять каждую, статус почти всё время «Подключение…» с
+/// пульсирующим значком. Поэтому подключение объявляется при первой попытке и
+/// после обрыва рабочей связи, а после неудачи до следующего входа остаётся
+/// «нет связи», хотя попытки идут.
+#[derive(Debug, Default)]
+struct ConnShown {
+    failed: bool,
+}
+
+impl ConnShown {
+    /// Перед попыткой: `true` — объявить «Подключение…».
+    fn before_attempt(&self) -> bool {
+        !self.failed
+    }
+
+    /// Сессия кончилась ошибкой. `was_online` — до ошибки связь была: это
+    /// обрыв, и следующая попытка снова объявляется.
+    fn after_error(&mut self, was_online: bool) {
+        self.failed = !was_online;
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
     Status(Status),
@@ -662,8 +685,11 @@ impl Engine {
 
         let mut control = self.control.take();
         let mut backoff = Duration::from_secs(1);
+        let mut shown = ConnShown::default();
         loop {
-            self.emit(Event::Status(Status::Connecting));
+            if shown.before_attempt() {
+                self.emit(Event::Status(Status::Connecting));
+            }
             let res = self
                 .session(&ep, addr.clone(), &mut local, &mut control)
                 .await;
@@ -717,6 +743,7 @@ impl Engine {
                     }
                     tracing::warn!("нет связи с сервером: {e:#}");
                     self.emit(Event::Status(Status::Offline(format!("{e:#}"))));
+                    shown.after_error(self.went_online);
                 }
             }
             if std::mem::take(&mut self.went_online) {
@@ -2225,6 +2252,21 @@ fn relay_hint(ep: &Endpoint) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connecting_is_announced_once_until_back_online() {
+        let mut s = ConnShown::default();
+        assert!(s.before_attempt(), "первая попытка — «Подключение…»");
+        s.after_error(false);
+        assert!(!s.before_attempt(), "после неудачи остаётся «нет связи»");
+        s.after_error(false);
+        assert!(!s.before_attempt(), "и при следующих неудачах");
+        s.after_error(true);
+        assert!(
+            s.before_attempt(),
+            "обрыв рабочей связи — снова «Подключение…»"
+        );
+    }
+
     #[test]
     fn backfill_pause_by_size() {
         use std::time::Duration;

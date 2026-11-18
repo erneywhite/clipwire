@@ -658,7 +658,7 @@
       {/each}
       <div class="status" data-kind={status.kind}>
         <span class="dot" aria-hidden="true"></span>
-        <span>{statusText(status)}</span>
+        <span title={statusText(status)}>{statusText(status)}</span>
       </div>
     </nav>
 
@@ -1397,10 +1397,14 @@
     font-size: var(--text-s);
     color: var(--c-muted);
   }
+  /* Длинная причина («Нет связи: …») переносится до трёх строк, целиком — в подсказке. */
   .status span:last-child {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
     overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
   .dot {
     width: 8px;

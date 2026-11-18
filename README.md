@@ -602,6 +602,10 @@ group sit on the server, how much of the server's quota for files is used
 (`CLIPWIRE_BLOB_QUOTA`; pinned files are counted in the pins row), and how many devices are in the group and how many are online. Server
 numbers need server 0.1.2 or newer. The Ko-fi button is there too.
 
+When the server is unreachable, the status stays **No connection** with the error tray icon while
+Clipwire keeps retrying in the background. **Connecting…** with a blinking icon shows only on
+the first attempt and right after the connection drops.
+
 The **Sync** page shows which group the device is in: the group fingerprint, the same short id
 as in the server's group list. On the server administrator's device the group's name is shown
 next to it, if one is set.
