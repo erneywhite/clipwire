@@ -732,6 +732,10 @@ pub static EN: &[(&str, &str)] = &[
     ("объект не удалился", "the object was not deleted"),
     // Закрепы группы.
     (
+        "Файлы с такими расширениями не отправляются на другие устройства: закреплено только здесь",
+        "Files with these extensions are not sent to other devices: pinned on this device only",
+    ),
+    (
         "Подписать можно только закреплённую запись",
         "Only a pinned item can have a note",
     ),

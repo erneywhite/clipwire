@@ -216,10 +216,22 @@ A deletion made offline waits for the connection and survives a Clipwire restart
 Entries pinned on another device are not deleted. The server does not know what was deleted: the
 deletion note is encrypted with the group key. This needs server 0.1.3 or newer.
 
-**What to send.** Under Sync you can turn off sending text, images, files or folders. Turned-off
-items stay in this device's history but are not sent to other devices. What arrives here is
-decided by the other devices' settings. If a copy includes something turned off, such as a folder
-next to files, nothing is sent.
+**Exclusions.** The **Exclusions** tab gathers what doesn't go to other devices:
+- the **What to send** switches: text, images, files, folders;
+- rules for files and folders: a condition (extension, name starts with, contains, matches a mask
+  with `*` and `?`, size over or under) and an action. **Don't send** keeps matching items only in
+  this device's history, pinned ones included. Inside folders such files and subfolders are
+  skipped and the folder itself is sent. **Don't upload right away** transfers the file directly
+  on paste, like a file above the upload limit;
+- programs that must not be synced (password managers by default).
+
+The default rules drop system clutter and temporary files: `desktop.ini`, `Thumbs.db`,
+`.DS_Store`, `._*`, Office lock files `~$…`, `*.tmp`, unfinished downloads `*.crdownload` and
+`*.part`. Rules for project folders (`.git`, `node_modules`, `.venv`, `__pycache__`) and `*.log`
+are there but turned off. A rule can be turned off with its checkbox, edited or removed, and
+**Restore default rules** adds back the missing ones. Extension and size are checked for files
+only, the name for folders too. If a copy includes something excluded, such as a folder next to
+files, nothing is sent. What arrives here is decided by the other devices' settings.
 
 **Pins and notes.** Pinned entries are the same on every device of the group, including devices
 that joined later or were off for a long time. A pinned entry can have a note of up to 80
@@ -588,7 +600,7 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
   used by history, files and pins, version), the server's groups with deletion, server limits
   and secret changes (see [Administrator code](#administrator-code)).
 - Paste window size (one slider with a live preview next to it) and the hotkey.
-- Programs that must not be synced (password managers by default).
+- Exclusions: what to send, rules for files and folders, programs (see **Exclusions** above).
 - Hiding Clipwire windows during screen sharing (Windows and macOS; Linux has no way to do it).
 - Link previews on or off, formatted text always plain, update settings.
 
@@ -633,7 +645,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.9.4`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.9.5`.
 
 **Through a Docker control panel or plain `docker compose`:**
 

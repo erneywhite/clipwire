@@ -97,6 +97,9 @@ pub struct Settings {
     pub image_as_file: bool,
     /// Что скопированное здесь уходит на другие устройства группы.
     pub send_kinds: SendKinds,
+    /// Правила исключений (см. [`crate::exclusions`]). Нет в файле — правила
+    /// по умолчанию.
+    pub exclusion_rules: Vec<crate::exclusions::Rule>,
 }
 
 /// Что с этого устройства уходит на другие устройства группы. Выключенное
@@ -162,6 +165,7 @@ impl Default for Settings {
             portal_paste: false,
             image_as_file: true,
             send_kinds: SendKinds::default(),
+            exclusion_rules: crate::exclusions::defaults(),
         }
     }
 }

@@ -824,6 +824,12 @@ impl Engine {
             tracing::info!("закреплённой записи уже нет в истории, закреп не уходит");
             return None;
         };
+        if item.origin == self.device && crate::exclusions::blocks_send(&item.content) {
+            self.emit(Event::PinFailed(
+                tr("Файлы с такими расширениями не отправляются на другие устройства: закреплено только здесь").into(),
+            ));
+            return None;
+        }
         crate::history::strip_note(&mut item.ext);
         item.content = item.content.fit(MAX_ITEM_BYTES);
         if item.content.len() > MAX_ITEM_BYTES {
@@ -1075,6 +1081,10 @@ impl Engine {
                 missing += 1;
                 continue;
             };
+            // Свои файлы из «Не отправлять» в группу не уходят и закрепом.
+            if item.origin == self.device && crate::exclusions::blocks_send(&item.content) {
+                continue;
+            }
             crate::history::strip_note(&mut item.ext);
             item.content = item.content.fit(MAX_ITEM_BYTES);
             let Ok(id) = PinId::random() else { continue };

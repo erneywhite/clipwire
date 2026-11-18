@@ -630,6 +630,12 @@ pub fn history_clear(
     Ok(())
 }
 
+/// Правила исключений по умолчанию (кнопка «Вернуть правила по умолчанию»).
+#[tauri::command]
+pub fn exclusion_defaults() -> Vec<clipwire_agent::exclusions::Rule> {
+    clipwire_agent::exclusions::defaults()
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Settings {
     state
@@ -656,6 +662,7 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
     );
     clipwire_agent::clipboard::set_image_as_file(settings.image_as_file);
     clipwire_agent::service::set_send_kinds(settings.send_kinds.bits());
+    clipwire_agent::exclusions::set(&settings.exclusion_rules);
 
     if old.popup_hotkey != settings.popup_hotkey
         && let Err(e) = crate::popup::register_hotkey(&app)

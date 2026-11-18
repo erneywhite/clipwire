@@ -51,6 +51,8 @@ pub struct DirScan {
     pub bytes: u64,
     /// Ссылки (symlink, junction): не разыменовываются и в архив не идут.
     pub skipped_links: usize,
+    /// Пропущено по правилам исключений (файлы и папки целиком).
+    pub skipped_rules: usize,
 }
 
 /// Почему папку не передать.
@@ -88,15 +90,23 @@ fn mtime_secs(m: &std::fs::Metadata) -> u64 {
 
 /// Обойти папку: не больше [`MAX_ENTRIES`] записей и не глубже
 /// [`MAX_DEPTH`] уровней, ссылки не разыменовываются. Порядок записей
-/// постоянный (по именам), чтобы повторный обход дал тот же архив.
+/// постоянный (по именам), чтобы повторный обход дал тот же архив. Файлы и
+/// подпапки под правило «не отправлять» пропускаются
+/// ([`crate::exclusions::skip_in_folder`]).
 pub fn scan_dir(root: &Path) -> Result<DirScan, ScanError> {
-    scan_dir_limited(root, MAX_ENTRIES, MAX_DEPTH)
+    scan_dir_limited(
+        root,
+        MAX_ENTRIES,
+        MAX_DEPTH,
+        &crate::exclusions::skip_in_folder,
+    )
 }
 
 fn scan_dir_limited(
     root: &Path,
     max_entries: usize,
     max_depth: usize,
+    skip: &dyn Fn(crate::exclusions::Entry) -> bool,
 ) -> Result<DirScan, ScanError> {
     let meta = std::fs::symlink_metadata(root).map_err(ScanError::Io)?;
     if !meta.is_dir() {
@@ -123,7 +133,7 @@ fn scan_dir_limited(
             }
             let name = item.file_name().to_string_lossy().into_owned();
             let child_rel = if rel.is_empty() {
-                name
+                name.clone()
             } else {
                 format!("{rel}/{name}")
             };
@@ -139,6 +149,14 @@ fn scan_dir_limited(
                 return Err(ScanError::TooDeep);
             }
             if ty.is_dir() {
+                if skip(crate::exclusions::Entry {
+                    name: &name,
+                    is_dir: true,
+                    size: 0,
+                }) {
+                    scan.skipped_rules += 1;
+                    continue;
+                }
                 scan.entries.push(DirEntry {
                     rel: child_rel.clone(),
                     path: item.path(),
@@ -147,6 +165,14 @@ fn scan_dir_limited(
                 subdirs.push((item.path(), child_rel, depth));
             } else if ty.is_file() {
                 let m = item.metadata().map_err(ScanError::Io)?;
+                if skip(crate::exclusions::Entry {
+                    name: &name,
+                    is_dir: false,
+                    size: m.len(),
+                }) {
+                    scan.skipped_rules += 1;
+                    continue;
+                }
                 scan.bytes = scan.bytes.saturating_add(m.len());
                 scan.entries.push(DirEntry {
                     rel: child_rel,
@@ -519,6 +545,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
+    /// Исключённое внутри папки пропускается: файл целиком, папка вместе с
+    /// содержимым; размер считается без пропущенного.
+    #[test]
+    fn scan_skips_excluded_entries() {
+        let d = tmp("skip");
+        std::fs::create_dir_all(d.join("node_modules").join("pkg")).unwrap();
+        std::fs::write(
+            d.join("node_modules").join("pkg").join("big.js"),
+            "xxxxxxxx",
+        )
+        .unwrap();
+        std::fs::write(d.join("Thumbs.db"), "xxxx").unwrap();
+        std::fs::write(d.join("отчёт.txt"), "ab").unwrap();
+        let skip = |e: crate::exclusions::Entry| {
+            (e.is_dir && e.name == "node_modules") || (!e.is_dir && e.name == "Thumbs.db")
+        };
+        let s = scan_dir_limited(&d, MAX_ENTRIES, MAX_DEPTH, &skip).unwrap();
+        let rels: Vec<_> = s.entries.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(rels, ["отчёт.txt"]);
+        assert_eq!(s.bytes, 2);
+        assert_eq!(s.skipped_rules, 2);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn scan_limits_entries() {
         let d = tmp("many");
@@ -527,10 +577,16 @@ mod tests {
         for i in 0..4 {
             std::fs::write(d.join("sub").join(format!("f{i}")), "").unwrap();
         }
-        assert_eq!(scan_dir_limited(&d, 5, MAX_DEPTH).unwrap().entries.len(), 5);
+        assert_eq!(
+            scan_dir_limited(&d, 5, MAX_DEPTH, &|_| false)
+                .unwrap()
+                .entries
+                .len(),
+            5
+        );
         std::fs::write(d.join("lishniy"), "").unwrap();
         assert!(matches!(
-            scan_dir_limited(&d, 5, MAX_DEPTH),
+            scan_dir_limited(&d, 5, MAX_DEPTH, &|_| false),
             Err(ScanError::TooMany)
         ));
         let _ = std::fs::remove_dir_all(d);

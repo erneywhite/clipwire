@@ -251,7 +251,7 @@ impl Copier {
         let allowed = may_send(send_kinds(), &content);
         if send && !allowed {
             tracing::info!(
-                "этот вид не отправляется на другие устройства (настройка), только в историю"
+                "это не отправляется на другие устройства (настройки «Исключения»), только в историю"
             );
         }
         let send = send && allowed && self.tx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
@@ -1243,7 +1243,7 @@ fn kinds_of(c: &Content) -> u8 {
 /// отправляется ничего: делить одно копирование на части неожиданно.
 fn may_send(bits: u8, c: &Content) -> bool {
     let k = kinds_of(c);
-    k != 0 && k & bits == k
+    k != 0 && k & bits == k && !crate::exclusions::blocks_send(c)
 }
 
 /// То же для карточки истории (досылка старой истории при входе в группу).
@@ -1399,7 +1399,7 @@ fn assign_blobs_until(
             continue;
         };
         if !f.is_dir {
-            f.p2p = route(f.size, limit_mb) == Route::Direct;
+            f.p2p = route(f.size, limit_mb) == Route::Direct || crate::exclusions::no_upload(f);
             f.blob = Some(blob);
             f.blob_size = f.size;
             continue;
@@ -1454,6 +1454,9 @@ struct FolderScan {
 /// Обойти папку и поставить ей размер содержимого.
 fn scan_folder(f: &mut FileRef) -> Result<FolderScan> {
     let scan = crate::folder::scan_dir(Path::new(&f.path)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if scan.skipped_rules > 0 {
+        tracing::info!(n = scan.skipped_rules, "в папке пропущено по исключениям");
+    }
     f.size = scan.bytes;
     let tar = crate::folder::tar_size(&scan.entries)?;
     let fingerprint = crate::folder::fingerprint(&scan.entries);

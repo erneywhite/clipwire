@@ -18,13 +18,16 @@
   import TitleBar from './TitleBar.svelte'
   import Devices from './Devices.svelte'
   import Storage from './Storage.svelte'
+  import ListEditor from './ListEditor.svelte'
+  import Rules from './Rules.svelte'
   import Server from './Server.svelte'
   import { creationKind, tokenRefused } from '../lib/server'
 
-  type Section = 'general' | 'sync' | 'server' | 'privacy' | 'keys' | 'about'
+  type Section = 'general' | 'sync' | 'exclusions' | 'server' | 'privacy' | 'keys' | 'about'
   const allSections: { id: Section; title: string; icon: string }[] = [
     { id: 'general', title: t('Основные'), icon: 'M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0' },
     { id: 'sync', title: t('Синхронизация'), icon: 'M4 12a8 8 0 0 1 14-5.3M20 12a8 8 0 0 1-14 5.3M18 3v4h-4M6 21v-4h4' },
+    { id: 'exclusions', title: t('Исключения'), icon: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM5.6 5.6l12.8 12.8' },
     { id: 'server', title: t('Сервер'), icon: 'M4 4h16v7H4zM4 13h16v7H4zM8 7.5h0M8 16.5h0M12 7.5h5M12 16.5h5' },
     { id: 'privacy', title: t('Приватность'), icon: 'M6 11V8a6 6 0 0 1 12 0v3M5 11h14v10H5z' },
     { id: 'keys', title: t('Клавиши'), icon: 'M3 7h18v10H3zM7 11h0M11 11h0M15 11h0M8 14h8' },
@@ -73,7 +76,6 @@
 
   // Клавиши
   let recording = $state(false)
-  let newApp = $state('')
 
   // Обновления
   let update = $state<Update | null>(null)
@@ -496,12 +498,6 @@
     }
   })
 
-  function addApp() {
-    const name = newApp.trim()
-    if (!s || !name || s.ignored_apps.some((a) => a.toLowerCase() === name.toLowerCase())) return
-    save({ ignored_apps: [...s.ignored_apps, name] })
-    newApp = ''
-  }
 
   /** Метка «рекомендуемое» из latest.json (как `updates::recommendation`):
    *  `true` без причины, строка с причиной, `false` — обычный выпуск. */
@@ -916,31 +912,6 @@
             />
           </div>
 
-          <h2>{t('Что отправлять на другие устройства')}</h2>
-          <div class="card">
-            <Toggle
-              label={t('Текст')}
-              checked={s.send_kinds.text}
-              onchange={(v) => save({ send_kinds: { ...s!.send_kinds, text: v } })}
-            />
-            <Toggle
-              label={t('Картинки')}
-              checked={s.send_kinds.images}
-              onchange={(v) => save({ send_kinds: { ...s!.send_kinds, images: v } })}
-            />
-            <Toggle
-              label={t('Файлы')}
-              checked={s.send_kinds.files}
-              onchange={(v) => save({ send_kinds: { ...s!.send_kinds, files: v } })}
-            />
-            <Toggle
-              label={t('Папки')}
-              checked={s.send_kinds.folders}
-              onchange={(v) => save({ send_kinds: { ...s!.send_kinds, folders: v } })}
-            />
-          </div>
-          <p class="hint">{t('Выключенное остаётся в истории этого устройства, но на другие не уходит. Если среди скопированного есть выключенное, например папка рядом с файлами, не отправляется ничего.')}</p>
-
           <h2>{t('Файлы')}</h2>
           <div class="card pad">
             <label class="field">
@@ -1019,6 +990,38 @@
             {/if}
           </div>
         {/if}
+      {:else if section === 'exclusions'}
+        <h1>{t('Исключения')}</h1>
+        <h2>{t('Что отправлять на другие устройства')}</h2>
+        <div class="card pad">
+          <div class="kinds">
+            <Toggle inline label={t('Текст')} checked={s.send_kinds.text} onchange={(v) => save({ send_kinds: { ...s!.send_kinds, text: v } })} />
+            <Toggle inline label={t('Картинки')} checked={s.send_kinds.images} onchange={(v) => save({ send_kinds: { ...s!.send_kinds, images: v } })} />
+            <Toggle inline label={t('Файлы')} checked={s.send_kinds.files} onchange={(v) => save({ send_kinds: { ...s!.send_kinds, files: v } })} />
+            <Toggle inline label={t('Папки')} checked={s.send_kinds.folders} onchange={(v) => save({ send_kinds: { ...s!.send_kinds, folders: v } })} />
+          </div>
+        </div>
+        <p class="hint outside">{t('Выключенное остаётся в истории этого устройства, но на другие не уходит. Если среди скопированного есть выключенное, например папка рядом с файлами, не отправляется ничего.')}</p>
+
+
+        <h2>{t('Правила для файлов и папок')}</h2>
+        <div class="card pad">
+          <Rules rules={s.exclusion_rules} onchange={(v) => save({ exclusion_rules: v })} />
+        </div>
+        <p class="hint outside">{t('«Не отправлять»: подходящее остаётся только в истории этого устройства, в том числе закреплённое; внутри папок такие файлы и подпапки пропускаются, а сама папка уходит. «Не загружать сразу»: файл передаётся напрямую при вставке, пока этот компьютер включён, как файл больше порога. Расширение и размер проверяются только у файлов, имя — и у папок. В маске * — любые символы, ? — один.')}</p>
+
+        <h2>{t('Не синхронизировать из программ')}</h2>
+        {#if info && !info.knows_source_app}
+          <p class="hint outside">{t('На Wayland не видно, из какой программы скопировано, поэтому список не действует. Пароли, помеченные менеджером паролей как приватные, всё равно не синхронизируются.')}</p>
+        {/if}
+        <div class="card pad">
+          <ListEditor
+            items={s.ignored_apps}
+            onchange={(v) => save({ ignored_apps: v })}
+            placeholder={isMac ? 'KeePassXC' : isLinux ? 'keepassxc' : 'KeePass.exe'}
+            label={t('Имя программы')}
+          />
+        </div>
       {:else if section === 'server' && showServer}
         <h1>{t('Сервер')}</h1>
         <Server
@@ -1049,26 +1052,6 @@
         </div>
         <p class="hint outside">{t('Содержимое, которое менеджеры паролей помечают как приватное, не синхронизируется никогда, эта защита не отключается.')}</p>
 
-        <h2>{t('Не синхронизировать из программ')}</h2>
-        {#if info && !info.knows_source_app}
-          <p class="hint outside">{t('На Wayland не видно, из какой программы скопировано, поэтому список не действует. Пароли, помеченные менеджером паролей как приватные, всё равно не синхронизируются.')}</p>
-        {/if}
-        <div class="card pad">
-          <ul class="apps">
-            {#each s.ignored_apps as app (app)}
-              <li>
-                <span class="mono">{app}</span>
-                <button aria-label={t('Убрать {app}', { app })} onclick={() => save({ ignored_apps: s!.ignored_apps.filter((a) => a !== app) })}>✕</button>
-              </li>
-            {:else}
-              <li class="hint">{t('Список пуст')}</li>
-            {/each}
-          </ul>
-          <form class="add" onsubmit={(e) => { e.preventDefault(); addApp() }}>
-            <input bind:value={newApp} placeholder={isMac ? 'KeePassXC' : isLinux ? 'keepassxc' : 'KeePass.exe'} spellcheck="false" aria-label={t('Имя программы')} />
-            <button type="submit" disabled={!newApp.trim()}>{t('Добавить')}</button>
-          </form>
-        </div>
       {:else if section === 'keys'}
         <h1>{t('Клавиши')}</h1>
         <div class="card">
@@ -1711,29 +1694,6 @@
     border-bottom: 4px solid transparent;
   }
 
-  .apps {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-  }
-  .apps li {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 6px 0;
-  }
-  .apps li + li {
-    border-top: 1px solid var(--c-border);
-  }
-  .apps button {
-    border: 0;
-    padding: 2px 8px;
-    color: var(--c-muted);
-  }
-  .add {
-    display: flex;
-    gap: var(--space-2);
-  }
   .key {
     font-family: var(--font-mono);
     font-size: var(--text-s);
@@ -1742,6 +1702,11 @@
   .key.rec {
     border-color: var(--c-accent);
     color: var(--c-accent);
+  }
+  .kinds {
+    display: flex;
+    flex-wrap: wrap;
+    column-gap: var(--space-5);
   }
   .error {
     color: var(--c-danger);

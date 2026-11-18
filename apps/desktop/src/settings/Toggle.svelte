@@ -5,17 +5,20 @@
     label,
     hint = '',
     disabled = false,
+    inline = false,
     onchange,
   }: {
     checked?: boolean
     label: string
     hint?: string
     disabled?: boolean
+    /** Короткий вид для ряда переключателей: тумблер слева от подписи. */
+    inline?: boolean
     onchange?: (v: boolean) => void
   } = $props()
 </script>
 
-<label class="row" class:disabled>
+<label class="row" class:disabled class:inline>
   <span class="text">
     <span>{label}</span>
     {#if hint}<span class="hint">{hint}</span>{/if}
@@ -37,6 +40,12 @@
     gap: var(--space-4);
     padding: 11px 0;
     cursor: pointer;
+  }
+  .row.inline {
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    padding: 6px 0;
   }
   .row.disabled {
     cursor: default;

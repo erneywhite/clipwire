@@ -38,6 +38,8 @@ export interface Settings {
   image_as_file: boolean
   /** Что скопированное здесь уходит на другие устройства группы. */
   send_kinds: { text: boolean; images: boolean; files: boolean; folders: boolean }
+  /** Правила исключений (вкладка «Исключения»). */
+  exclusion_rules: ExclusionRule[]
 }
 
 export interface DeviceInfo {
@@ -477,7 +479,20 @@ export interface GroupAdmin {
   admins: string[]
 }
 
+/** Что проверяет правило исключения. */
+export type RuleWhat = 'ext' | 'name_starts' | 'name_contains' | 'name_glob' | 'size_over' | 'size_under'
+
+/** Правило исключения: условие, значение (или размер в байтах) и действие. */
+export interface ExclusionRule {
+  enabled: boolean
+  what: RuleWhat
+  value: string
+  size: number
+  action: 'no_send' | 'no_upload'
+}
+
 export const api = {  settings: () => invoke<Settings>('get_settings'),
+  exclusionDefaults: () => invoke<ExclusionRule[]>('exclusion_defaults'),
   saveSettings: (settings: Settings) => invoke<void>('save_settings', { settings }),
   status: () => invoke<Status>('get_status'),
   setPaused: (paused: boolean) => invoke<void>('set_paused', { paused }),

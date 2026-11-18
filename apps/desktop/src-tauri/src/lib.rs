@@ -355,6 +355,7 @@ fn load_state() -> anyhow::Result<AppState> {
     clipwire_agent::i18n::set_language(&settings.language);
     clipwire_agent::clipboard::set_image_as_file(settings.image_as_file);
     clipwire_agent::service::set_send_kinds(settings.send_kinds.bits());
+    clipwire_agent::exclusions::set(&settings.exclusion_rules);
     // Связка ключей заперта и человек не открыл её (или служба не ответила):
     // без ключа истории работать нельзя, поэтому ждём и спрашиваем снова.
     let history = loop {
@@ -677,6 +678,7 @@ pub fn run() {
             commands::history_delete,
             commands::history_clear,
             commands::get_settings,
+            commands::exclusion_defaults,
             commands::save_settings,
             commands::leave_group,
             commands::device_info,
