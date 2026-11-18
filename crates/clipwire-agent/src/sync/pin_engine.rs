@@ -102,7 +102,7 @@ pub(super) struct Repairs {
     budget: pin_files::Budget,
     /// Закрепы, чьё содержимое уже сверяли и чинить там было нечего: хэш и
     /// `rev`. Пока `rev` тот же, заново не спрашивать.
-    checked: HashMap<[u8; 32], u64>,
+    pub(super) checked: HashMap<[u8; 32], u64>,
 }
 
 /// Закрепы в одной сессии.
@@ -196,6 +196,16 @@ fn all_blobs(item: &Item) -> Vec<BlobId> {
 }
 
 impl Engine {
+    /// Запомнить, что у закрепа с этим `rev` чинить нечего, и на диске:
+    /// иначе после перезапуска он сверялся бы снова.
+    fn mark_checked(&mut self, hash: [u8; 32], rev: u64) {
+        if self.fix.checked.insert(hash, rev) != Some(rev)
+            && let Some(pins) = &self.pins
+        {
+            pins.save_checked(&self.fix.checked);
+        }
+    }
+
     /// Синхронизировать ли закрепы в этой сессии.
     pub(super) fn pins_on(&self) -> bool {
         // Закрепы — с clipwire/8 (proto::knows_pins).
@@ -1283,7 +1293,7 @@ impl Engine {
             // Пока у закрепа тот же `rev`, не спрашивать снова: список
             // файлов открытый, и чужая правка может держать его таким нарочно.
             tracing::info!("содержимое закрепа старее его записи, жду новой правки");
-            self.fix.checked.insert(hash, rev);
+            self.mark_checked(hash, rev);
             return Ok(());
         }
         let missing = self.fix.missing.clone();
@@ -1312,7 +1322,7 @@ impl Engine {
             .flatten();
         let Some(((files, picks), local)) = plan else {
             tracing::warn!("файлы закрепа не сходятся со своей записью, не чиню");
-            self.fix.checked.insert(hash, rev);
+            self.mark_checked(hash, rev);
             return Ok(());
         };
         // Бюджет на запуск: каждый источник один раз, не больше
@@ -1334,7 +1344,7 @@ impl Engine {
             .collect();
         if picks.is_empty() {
             tracing::debug!("закреп уже починили или чинить здесь нечем");
-            self.fix.checked.insert(hash, rev);
+            self.mark_checked(hash, rev);
             return Ok(());
         }
         let tries = self.fix.tries.entry(hash).or_insert(0);

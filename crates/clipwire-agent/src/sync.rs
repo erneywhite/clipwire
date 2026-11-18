@@ -549,6 +549,7 @@ impl Engine {
     /// Синхронизировать закрепы группы: книга `pins` и записи истории из
     /// `source`.
     pub fn with_pins(mut self, pins: Arc<Pins>, source: Arc<dyn PinSource>) -> Self {
+        self.fix.checked = pins.checked();
         self.pins = Some(pins);
         self.pin_source = Some(source);
         self

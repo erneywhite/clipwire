@@ -44,6 +44,8 @@ use serde::{Deserialize, Serialize};
 /// Книга закрепов группы, защищена как `state.bin` ([`crate::secret`]): в
 /// ней подписи и хэши содержимого.
 pub const PINS_FILE: &str = "pins.bin";
+/// Закрепы, которые уже сверяли и чинить было нечего (см. [`Pins::checked`]).
+pub const PINS_CHECKED_FILE: &str = "pins_checked.bin";
 
 /// Что сделать с закрепом.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,6 +666,45 @@ impl Pins {
         })
     }
 
+    /// Закрепы, чьё содержимое уже сверяли и чинить там было нечего: хэш и
+    /// `rev`. Лежит отдельным файлом рядом с книгой: без него закреп, у
+    /// которого своя запись истории расходится с содержимым на сервере
+    /// (запись скопировали заново), сверялся бы при каждом запуске. Файл от
+    /// другой группы или битый — пусто.
+    pub fn checked(&self) -> std::collections::HashMap<[u8; 32], u64> {
+        let Some(path) = self.checked_path() else {
+            return Default::default();
+        };
+        let group = self.read(|b| b.group);
+        std::fs::read(&path)
+            .ok()
+            .and_then(|raw| crate::secret::unprotect(&raw).ok())
+            .and_then(|p| postcard::from_bytes::<([u8; 32], Vec<([u8; 32], u64)>)>(&p).ok())
+            .filter(|(g, _)| *g == group)
+            .map(|(_, list)| list.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Записать [`Pins::checked`].
+    pub fn save_checked(&self, checked: &std::collections::HashMap<[u8; 32], u64>) {
+        let Some(path) = self.checked_path() else {
+            return;
+        };
+        let group = self.read(|b| b.group);
+        let list: Vec<([u8; 32], u64)> = checked.iter().map(|(h, r)| (*h, *r)).collect();
+        let res = postcard::to_stdvec(&(group, list))
+            .map_err(anyhow::Error::from)
+            .and_then(|plain| crate::secret::protect(&plain))
+            .and_then(|data| crate::state::write_atomic(&path, &data));
+        if let Err(e) = res {
+            tracing::warn!("сверенные закрепы не записались: {e:#}");
+        }
+    }
+
+    fn checked_path(&self) -> Option<PathBuf> {
+        Some(self.path.as_ref()?.with_file_name(PINS_CHECKED_FILE))
+    }
+
     /// Книга только в памяти (проверки).
     pub fn in_memory(group: GroupId) -> Arc<Self> {
         Arc::new(Self {
@@ -1198,6 +1239,23 @@ mod tests {
             assert_eq!(b.cursor, 0);
             assert_eq!(b.outbox.len(), 1);
         });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Сверенные закрепы переживают перезапуск; у другой группы их нет.
+    #[test]
+    fn checked_pins_survive_reopen_per_group() {
+        let dir =
+            std::env::temp_dir().join(format!("clipwire-pins-checked-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = GroupId([4; 32]);
+        let p = Pins::open(&dir, g);
+        assert!(p.checked().is_empty());
+        p.save_checked(&std::collections::HashMap::from([(H, 7)]));
+        drop(p);
+        assert_eq!(Pins::open(&dir, g).checked().get(&H), Some(&7));
+        assert!(Pins::open(&dir, GroupId([5; 32])).checked().is_empty());
+        assert!(Pins::in_memory(g).checked().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
