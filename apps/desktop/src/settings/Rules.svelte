@@ -248,7 +248,8 @@
     -webkit-line-clamp: 2;
     line-clamp: 2;
     white-space: normal;
-    overflow-wrap: anywhere;
+    /* Маски переносятся после запятой, а не посреди имени. */
+    overflow-wrap: break-word;
   }
   .row > :nth-child(5) {
     justify-self: start;
