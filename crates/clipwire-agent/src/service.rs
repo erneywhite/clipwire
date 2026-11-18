@@ -233,6 +233,10 @@ struct Copier {
     /// Отпечатки папок, отправленных с этого запуска (`blob` → отпечаток):
     /// по ним повторное копирование той же папки берёт прежний архив.
     fingerprints: Arc<Mutex<std::collections::HashMap<BlobId, [u8; 32]>>>,
+    /// Файлы, отправленные обычным копированием в этом запуске, по хэшу
+    /// содержимого: у закреплённой записи прежнюю загрузку берут отсюда, а не
+    /// из истории (части закрепа живут по своим правилам).
+    pushed: Arc<Mutex<std::collections::HashMap<[u8; 32], Content>>>,
 }
 
 /// Больше отпечатков папок не помним: дальше память чистится целиком.
@@ -355,7 +359,9 @@ impl Copier {
     /// повторять: те же пути, размеры и время изменения, у папок — тот же
     /// отпечаток; маршрут при нынешнем пороге тот же; всё, что шло на сервер,
     /// загружено (за сутки, см. [`Blobs::is_uploaded`]) или ещё в очереди.
-    /// Закреплённые записи не берутся: их файлы живут по своим правилам.
+    /// У закреплённой записи части закрепа не берутся (они живут по своим
+    /// правилам и могут лежать не там, где файлы группы): берётся прошлое
+    /// обычное копирование тех же файлов в этом запуске ([`Copier::pushed`]).
     fn reusable(
         &self,
         b: &Blobs,
@@ -369,10 +375,19 @@ impl Copier {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .files_entry(&probe.hash())?;
-        if !old.local || old.pinned {
+        if !old.local {
             return None;
         }
-        let Content::Files(prev) = &old.content else {
+        let base = if old.pinned {
+            self.pushed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&probe.hash())
+                .cloned()?
+        } else {
+            old.content
+        };
+        let Content::Files(prev) = &base else {
             return None;
         };
         if prev.len() != files.len() {
@@ -401,7 +416,7 @@ impl Copier {
                 return None;
             }
         }
-        Some(old.content.clone())
+        Some(base.clone())
     }
 
     /// Отправить и записать без подготовки файлов (тесты: готовое содержимое).
@@ -551,6 +566,16 @@ impl Copier {
                 return false;
             }
             if let Some(tx) = tx.as_ref() {
+                if matches!(content, Content::Files(_)) {
+                    // shortcut: при переполнении память чистится целиком, как
+                    // отпечатки папок; хватает на обычную работу.
+                    const MAX_PUSHED: usize = 256;
+                    let mut pushed = self.pushed.lock().unwrap_or_else(|e| e.into_inner());
+                    if pushed.len() >= MAX_PUSHED {
+                        pushed.clear();
+                    }
+                    pushed.insert(content.hash(), content.clone());
+                }
                 let mut out = Outgoing::new(content.clone(), source);
                 out.reused = reused;
                 // Пометка — до передачи движку: в сети он отправляет сразу и
@@ -714,6 +739,7 @@ impl Service {
             rt: rt.clone(),
             mark: synced.then(|| crate::push_mark::PushMark::new(&paths_dir)),
             fingerprints: Default::default(),
+            pushed: Default::default(),
         };
         // Прошлый раз программу закрыли, пока последнее копирование ждало
         // связи: дослать его первым.
@@ -1790,6 +1816,7 @@ mod tests {
             rt: tokio::runtime::Handle::current(),
             mark: Some(mark.clone()),
             fingerprints: Default::default(),
+            pushed: Default::default(),
         };
         // «Движок»: получил копирование — пометка уже должна быть, снимает её.
         let engine_mark = mark.clone();
@@ -1840,6 +1867,7 @@ mod tests {
             rt: tokio::runtime::Handle::current(),
             mark: Some(mark.clone()),
             fingerprints: Default::default(),
+            pushed: Default::default(),
         };
         c.resend_marked();
         let out = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -1883,6 +1911,7 @@ mod tests {
             rt: tokio::runtime::Handle::current(),
             mark: None,
             fingerprints: Default::default(),
+            pushed: Default::default(),
         };
         let app = SourceApp {
             name: "Блокнот".into(),
@@ -1934,6 +1963,7 @@ mod tests {
             rt: tokio::runtime::Handle::current(),
             mark: None,
             fingerprints: Default::default(),
+            pushed: Default::default(),
         };
         let folder = |path: &str, size: u64| {
             Content::Files(vec![FileRef {
@@ -2013,6 +2043,7 @@ mod tests {
             rt: tokio::runtime::Handle::current(),
             mark: None,
             fingerprints: Default::default(),
+            pushed: Default::default(),
         };
         let dir = d.join("папка");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2069,7 +2100,19 @@ mod tests {
             let id = h.id_by_hash(&changed_file.hash()).unwrap();
             h.set_pinned(id, true).unwrap();
         }
-        assert!(!c.prepare(copy(&file), 1).unwrap().1, "закреп");
+        assert!(
+            !c.prepare(copy(&file), 1).unwrap().1,
+            "закреп: частей закрепа не берём"
+        );
+        // Но если в этом запуске файл уже уходил обычным копированием, его
+        // загрузку берём: она лежит там же, где файлы группы.
+        c.pushed
+            .lock()
+            .unwrap()
+            .insert(changed_file.hash(), changed_file.clone());
+        let (again, reused) = c.prepare(copy(&file), 1).unwrap();
+        assert!(reused, "закреп: прежняя обычная загрузка");
+        assert_eq!(again, changed_file);
 
         // Загрузки нет ни в очереди, ни на сервере.
         c.record_local(changed.clone(), None);
@@ -2106,6 +2149,7 @@ mod tests {
             rt: tokio::runtime::Handle::current(),
             mark: None,
             fingerprints: Default::default(),
+            pushed: Default::default(),
         };
         let app = SourceApp {
             name: "Блокнот".into(),
@@ -2157,6 +2201,7 @@ mod tests {
             rt: tokio::runtime::Handle::current(),
             mark: None,
             fingerprints: Default::default(),
+            pushed: Default::default(),
         };
         let started = now_ms() - 5_000;
         history
