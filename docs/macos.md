@@ -143,7 +143,7 @@ Rich, PNG, только TIFF, файлов и папок, приватной м�
 процесс, а параллельные сетевые тесты поднимают десятки iroh-эндпоинтов. Без этого падает то
 один, то другой с «Too many open files (os error 24)». Это записано в README и сделано в CI.
 
-CI (`.github/workflows/ci.yml`): `macos-latest` в матрице, fmt, clippy и тесты (через bash с
+CI (`.github/workflows/ci.yml`): `macos-15` в матрице, fmt, clippy и тесты (через bash с
 `ulimit -n 10240`), тесты фронтенда (`node src/lib/*.test.ts`) на всех ОС.
 
 Выпуск (`release.yml`): задание `macos` работает параллельно с остальными, `tauri-action` с
