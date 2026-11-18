@@ -31,7 +31,7 @@
 
 <ul class="list">
   {#each items as item (item)}
-    <li>
+    <li class="chip">
       <span class="mono">{item}</span>
       <button aria-label={t('Убрать {app}', { app: item })} onclick={() => onchange(items.filter((x) => x !== item))}>✕</button>
     </li>
@@ -53,22 +53,27 @@
 <style>
   .list {
     list-style: none;
-    margin: 0;
+    margin: 0 0 var(--space-3);
     padding: 0;
-  }
-  .list li {
     display: flex;
-    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .chip {
+    display: inline-flex;
     align-items: center;
-    padding: 6px 0;
+    gap: 2px;
+    padding: 3px 4px 3px 10px;
+    border: 1px solid var(--c-border);
+    border-radius: var(--radius-m);
+    background: var(--c-bg);
   }
-  .list li + li {
-    border-top: 1px solid var(--c-border);
-  }
-  .list button {
+  .chip button {
     border: 0;
-    padding: 2px 8px;
+    padding: 0 6px;
     color: var(--c-muted);
+    background: transparent;
+    cursor: pointer;
   }
   .add {
     display: flex;

@@ -993,27 +993,13 @@
       {:else if section === 'exclusions'}
         <h1>{t('Исключения')}</h1>
         <h2>{t('Что отправлять на другие устройства')}</h2>
-        <div class="card">
-          <Toggle
-            label={t('Текст')}
-            checked={s.send_kinds.text}
-            onchange={(v) => save({ send_kinds: { ...s!.send_kinds, text: v } })}
-          />
-          <Toggle
-            label={t('Картинки')}
-            checked={s.send_kinds.images}
-            onchange={(v) => save({ send_kinds: { ...s!.send_kinds, images: v } })}
-          />
-          <Toggle
-            label={t('Файлы')}
-            checked={s.send_kinds.files}
-            onchange={(v) => save({ send_kinds: { ...s!.send_kinds, files: v } })}
-          />
-          <Toggle
-            label={t('Папки')}
-            checked={s.send_kinds.folders}
-            onchange={(v) => save({ send_kinds: { ...s!.send_kinds, folders: v } })}
-          />
+        <div class="card pad">
+          <div class="kinds">
+            <Toggle inline label={t('Текст')} checked={s.send_kinds.text} onchange={(v) => save({ send_kinds: { ...s!.send_kinds, text: v } })} />
+            <Toggle inline label={t('Картинки')} checked={s.send_kinds.images} onchange={(v) => save({ send_kinds: { ...s!.send_kinds, images: v } })} />
+            <Toggle inline label={t('Файлы')} checked={s.send_kinds.files} onchange={(v) => save({ send_kinds: { ...s!.send_kinds, files: v } })} />
+            <Toggle inline label={t('Папки')} checked={s.send_kinds.folders} onchange={(v) => save({ send_kinds: { ...s!.send_kinds, folders: v } })} />
+          </div>
         </div>
         <p class="hint outside">{t('Выключенное остаётся в истории этого устройства, но на другие не уходит. Если среди скопированного есть выключенное, например папка рядом с файлами, не отправляется ничего.')}</p>
 
@@ -1716,6 +1702,11 @@
   .key.rec {
     border-color: var(--c-accent);
     color: var(--c-accent);
+  }
+  .kinds {
+    display: flex;
+    flex-wrap: wrap;
+    column-gap: var(--space-5);
   }
   .error {
     color: var(--c-danger);

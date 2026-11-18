@@ -8,14 +8,6 @@
 
   let { rules, onchange }: { rules: ExclusionRule[]; onchange: (next: ExclusionRule[]) => void } = $props()
 
-  const whats: { id: RuleWhat; title: string }[] = [
-    { id: 'ext', title: t('Расширение') },
-    { id: 'name_starts', title: t('Имя начинается с') },
-    { id: 'name_contains', title: t('Имя содержит') },
-    { id: 'name_glob', title: t('Имя по маске') },
-    { id: 'size_over', title: t('Размер больше') },
-    { id: 'size_under', title: t('Размер меньше') },
-  ]
   const placeholders: Record<RuleWhat, string> = {
     ext: 'mp4, mkv, iso',
     name_starts: '~$',
@@ -32,8 +24,29 @@
   ]
   const actions = { no_send: t('Не отправлять'), no_upload: t('Не загружать сразу') }
 
+  type Kind = 'ext' | 'name' | 'size'
+  const kinds: { id: Kind; title: string }[] = [
+    { id: 'ext', title: t('Расширение') },
+    { id: 'name', title: t('Имя') },
+    { id: 'size', title: t('Размер') },
+  ]
+  const conds: Record<Kind, { id: RuleWhat; title: string }[]> = {
+    ext: [{ id: 'ext', title: t('одно из') }],
+    name: [
+      { id: 'name_starts', title: t('начинается с') },
+      { id: 'name_contains', title: t('содержит') },
+      { id: 'name_glob', title: t('по маске') },
+    ],
+    size: [
+      { id: 'size_over', title: t('больше') },
+      { id: 'size_under', title: t('меньше') },
+    ],
+  }
+  const kindOf = (w: RuleWhat): Kind => (w === 'ext' ? 'ext' : w.startsWith('name') ? 'name' : 'size')
+  const kindTitle = (w: RuleWhat) => kinds.find((k) => k.id === kindOf(w))?.title ?? w
+  const condTitle = (w: RuleWhat) => conds[kindOf(w)].find((c) => c.id === w)?.title ?? w
+
   const isSize = (w: RuleWhat) => w === 'size_over' || w === 'size_under'
-  const whatTitle = (w: RuleWhat) => whats.find((x) => x.id === w)?.title ?? w
 
   /** Самая крупная единица, в которой размер целый. */
   function unitOf(size: number) {
@@ -88,7 +101,9 @@
 <div class="table" role="table" aria-label={t('Правила для файлов и папок')}>
   <div class="row head" role="row">
     <span></span>
-    <span role="columnheader">{t('Правило')}</span>
+    <span role="columnheader">{t('Что')}</span>
+    <span role="columnheader">{t('Условие')}</span>
+    <span role="columnheader">{t('Значение')}</span>
     <span role="columnheader">{t('Действие')}</span>
     <span></span>
   </div>
@@ -101,49 +116,56 @@
           aria-label={t('Правило включено')}
           onchange={(e) => patch(i, { enabled: e.currentTarget.checked })}
         />
-        <div class="editor">
-          <select value={r.what} aria-label={t('Условие')} onchange={(e) => setWhat(i, e.currentTarget.value as RuleWhat)}>
-            {#each whats as w (w.id)}
-              <option value={w.id}>{w.title}</option>
-            {/each}
-          </select>
-          <select value={r.action} aria-label={t('Действие')} onchange={(e) => patch(i, { action: e.currentTarget.value as ExclusionRule['action'] })}>
-            <option value="no_send">{actions.no_send}</option>
-            <option value="no_upload">{actions.no_upload}</option>
-          </select>
-          {#if isSize(r.what)}
-            {@const u = unitOf(r.size)}
-            <div class="size">
-              <input
-                class="mono"
-                type="number"
-                min="0"
-                step="1"
-                value={r.size / u.bytes}
-                aria-label={t('Размер')}
-                onchange={(e) => setSize(i, Number(e.currentTarget.value), u.id)}
-              />
-              <select value={u.id} aria-label={t('Единица')} onchange={(e) => setSize(i, r.size / u.bytes, e.currentTarget.value)}>
-                {#each units as x (x.id)}
-                  <option value={x.id}>{x.title}</option>
-                {/each}
-              </select>
-            </div>
-          {:else}
-            <!-- svelte-ignore a11y_autofocus -->
+        <select value={kindOf(r.what)} aria-label={t('Что')} onchange={(e) => setWhat(i, conds[e.currentTarget.value as Kind][0].id)}>
+          {#each kinds as k (k.id)}
+            <option value={k.id}>{k.title}</option>
+          {/each}
+        </select>
+        <select value={r.what} aria-label={t('Условие')} onchange={(e) => setWhat(i, e.currentTarget.value as RuleWhat)}>
+          {#each conds[kindOf(r.what)] as c (c.id)}
+            <option value={c.id}>{c.title}</option>
+          {/each}
+        </select>
+        {#if isSize(r.what)}
+          {@const u = unitOf(r.size)}
+          <div class="size">
             <input
               class="mono"
-              value={r.value}
-              placeholder={placeholders[r.what]}
-              spellcheck="false"
-              autofocus
-              aria-label={t('Значение')}
-              onchange={(e) => patch(i, { value: e.currentTarget.value })}
-              onkeydown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+              type="number"
+              min="0"
+              step="1"
+              value={r.size / u.bytes}
+              aria-label={t('Размер')}
+              onchange={(e) => setSize(i, Number(e.currentTarget.value), u.id)}
             />
-          {/if}
-          <button class="done" onclick={() => (editing = null)}>{t('Готово')}</button>
-        </div>
+            <select value={u.id} aria-label={t('Единица')} onchange={(e) => setSize(i, r.size / u.bytes, e.currentTarget.value)}>
+              {#each units as x (x.id)}
+                <option value={x.id}>{x.title}</option>
+              {/each}
+            </select>
+          </div>
+        {:else}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="mono"
+            value={r.value}
+            placeholder={placeholders[r.what]}
+            spellcheck="false"
+            autofocus
+            aria-label={t('Значение')}
+            onchange={(e) => patch(i, { value: e.currentTarget.value })}
+            onkeydown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+          />
+        {/if}
+        <select value={r.action} aria-label={t('Действие')} onchange={(e) => patch(i, { action: e.currentTarget.value as ExclusionRule['action'] })}>
+          <option value="no_send">{actions.no_send}</option>
+          <option value="no_upload">{actions.no_upload}</option>
+        </select>
+        <span class="icons">
+          <button class="icon ok" aria-label={t('Готово')} title={t('Готово')} onclick={() => (editing = null)}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12l5 5L19 7" /></svg>
+          </button>
+        </span>
       </div>
     {:else}
       <div class="row" class:off={!r.enabled} role="row">
@@ -153,10 +175,9 @@
           aria-label={t('Правило включено')}
           onchange={(e) => patch(i, { enabled: e.currentTarget.checked })}
         />
-        <span class="rule">
-          <span class="what">{whatTitle(r.what)}</span>
-          <span class="value mono" title={valueText(r)}>{valueText(r)}</span>
-        </span>
+        <span class="cell">{kindTitle(r.what)}</span>
+        <span class="cell muted">{condTitle(r.what)}</span>
+        <span class="cell value mono" title={valueText(r)}>{valueText(r)}</span>
         <span><span class="pill" data-action={r.action}>{actions[r.action]}</span></span>
         <span class="icons">
           <button class="icon" aria-label={t('Изменить правило')} title={t('Изменить правило')} onclick={() => (editing = i)}>
@@ -184,65 +205,48 @@
   }
   .row {
     display: grid;
-    grid-template-columns: 18px minmax(0, 1fr) 9.5rem 52px;
+    grid-template-columns: 18px 6.5rem 7.5rem minmax(0, 1fr) 9.5rem 52px;
     gap: var(--space-3);
     align-items: center;
-    padding: 8px 0;
+    padding: 9px 0;
     font-size: var(--text-m);
   }
   .row + .row {
     border-top: 1px solid var(--c-border);
   }
   .head {
-    padding-top: 0;
+    padding-top: 2px;
     font-size: var(--text-s);
     color: var(--c-muted);
   }
-  .row.off .rule,
+  .row.edit {
+    grid-template-columns: 18px 6.5rem 7.5rem minmax(0, 1fr) 10.5rem 52px;
+    gap: var(--space-2);
+    padding: 6px 0;
+  }
+  .row.off .cell,
   .row.off .pill {
     opacity: 0.5;
   }
-  .row.edit {
-    grid-template-columns: 18px minmax(0, 1fr);
-    align-items: start;
-  }
-  .row.edit > input[type='checkbox'] {
-    margin-top: 9px;
-  }
-  .editor {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
-    gap: var(--space-2);
-  }
-  .editor > :nth-child(1) {
-    grid-column: 1;
-  }
-  .editor > :nth-child(2) {
-    grid-column: 2 / 4;
-  }
-  .editor > :nth-child(3) {
-    grid-column: 1 / 3;
-  }
-  .rule {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
+  .cell {
     min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .what {
-    font-size: var(--text-s);
+  .muted {
     color: var(--c-muted);
   }
   /* Длинный список масок — до двух строк, целиком в подсказке. */
-  .value {
+  .cell.value {
     display: -webkit-box;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
     line-clamp: 2;
-    overflow: hidden;
+    white-space: normal;
     overflow-wrap: anywhere;
   }
-  .row > :nth-child(3) {
+  .row > :nth-child(5) {
     justify-self: start;
   }
   .pill {
@@ -284,6 +288,9 @@
   }
   .icon:hover {
     color: var(--c-text);
+  }
+  .icon.ok {
+    color: var(--c-accent);
   }
   .size {
     display: grid;
@@ -337,8 +344,5 @@
   }
   button:hover {
     background: var(--c-hover);
-  }
-  .done {
-    padding: 6px 12px;
   }
 </style>
