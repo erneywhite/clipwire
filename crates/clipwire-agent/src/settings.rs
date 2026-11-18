@@ -100,6 +100,8 @@ pub struct Settings {
     /// Правила исключений (см. [`crate::exclusions`]). Нет в файле — правила
     /// по умолчанию.
     pub exclusion_rules: Vec<crate::exclusions::Rule>,
+    /// Учитывать `.gitignore` внутри скопированных папок.
+    pub use_gitignore: bool,
 }
 
 /// Что с этого устройства уходит на другие устройства группы. Выключенное
@@ -166,6 +168,7 @@ impl Default for Settings {
             image_as_file: true,
             send_kinds: SendKinds::default(),
             exclusion_rules: crate::exclusions::defaults(),
+            use_gitignore: false,
         }
     }
 }

@@ -663,6 +663,7 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
     clipwire_agent::clipboard::set_image_as_file(settings.image_as_file);
     clipwire_agent::service::set_send_kinds(settings.send_kinds.bits());
     clipwire_agent::exclusions::set(&settings.exclusion_rules);
+    clipwire_agent::exclusions::set_gitignore(settings.use_gitignore);
 
     if old.popup_hotkey != settings.popup_hotkey
         && let Err(e) = crate::popup::register_hotkey(&app)
