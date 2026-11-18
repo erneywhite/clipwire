@@ -534,6 +534,10 @@ mod win {
                         return;
                     }
                     let _ = tx.send(Ok(hwnd.0 as isize));
+                    // Что уже лежит в буфере — как последнее отданное: досдача
+                    // буфера после перезапуска (скопировали в прошлом запуске,
+                    // окно Проводника закрыли в этом) не звучит копированием.
+                    remember_current(hwnd);
                     let mut msg = MSG::default();
                     unsafe {
                         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -731,6 +735,17 @@ mod win {
                 LRESULT(0)
             }
             _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+        }
+    }
+
+    /// Запомнить хэш текущего содержимого буфера, ничего не отдавая.
+    fn remember_current(hwnd: HWND) {
+        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Ctx;
+        // SAFETY: как в WM_TIMER: указатель живёт до drop_ctx, поток тот же.
+        if let Some(ctx) = unsafe { ptr.as_mut() }
+            && let Snapshot::Content(content, _) = snapshot(ctx, hwnd)
+        {
+            ctx.last_hash = Some(content.hash());
         }
     }
 
