@@ -56,6 +56,8 @@
   // Wayland: окно не вставляет само, а только кладёт в буфер.
   let canX11Paste = $state(true)
   let portalPaste = $state(false)
+  /** «Вставлять без форматирования»: Enter вставляет только текст, Shift+Enter — с форматированием. */
+  let alwaysPlain = $state(false)
   const canPaste = $derived(canX11Paste || portalPaste)
   let input: HTMLInputElement | undefined = $state()
   // Прокручиваемая обёртка списка и сам список внутри неё.
@@ -875,11 +877,11 @@
         move(-1)
         return
       case 'Enter':
-        // Shift+Enter — без форматирования.
+        // Shift+Enter — наоборот настройке «Вставлять без форматирования».
         e.preventDefault()
         // В предпросмотре файлов отмечена часть — вставляем только её.
         if (picked && current && preview?.entry.id === current.id) pastePicked(current)
-        else paste(current, undefined, e.shiftKey ? true : undefined)
+        else paste(current, undefined, e.shiftKey ? !alwaysPlain : undefined)
         return
       case 'Escape':
         e.preventDefault()
@@ -936,6 +938,7 @@
     // стали другой ширины: ширина окна зажата в пределы (popup.rs), и разные
     // настройки дают одинаковые строки.
     portalPaste = s.portal_paste && s.paste_into_active
+    alwaysPlain = s.always_plain_text
     applyTheme(s.theme, s.mode)
     // При открытом предпросмотре окно шире, а список сохраняет свою ширину.
     document.documentElement.style.setProperty('--popup-w', `${s.popup_width}px`)
@@ -1283,7 +1286,7 @@
           {#if isUrl(preview.entry.text)}
             <button onclick={() => preview && openUrl(preview.entry.text.trim())}>{t('Открыть в браузере')}</button>
           {:else if preview.entry.rich}
-            <button onclick={() => paste(preview?.entry, undefined, true)}>{t('Без форматирования')}</button>
+            <button onclick={() => paste(preview?.entry, undefined, !alwaysPlain)}>{alwaysPlain ? t('С форматированием') : t('Без форматирования')}</button>
           {/if}
           <button onclick={(e) => togglePin(preview?.entry, below(e.currentTarget)).then(openPreview)}>
             {preview.entry.pinned ? t('Открепить') : t('Закрепить')}
@@ -1338,7 +1341,7 @@
     {:else}
     <button role="menuitem" onclick={() => act((e) => paste(e))}>{canPaste ? t('Вставить') : t('В буфер')}<kbd>Enter</kbd></button>
     {#if m.kind === 'text' && m.rich}
-      <button role="menuitem" onclick={() => act((e) => paste(e, undefined, true))}>{t('Без форматирования')}<kbd>Shift Enter</kbd></button>
+      <button role="menuitem" onclick={() => act((e) => paste(e, undefined, !alwaysPlain))}>{alwaysPlain ? t('С форматированием') : t('Без форматирования')}<kbd>Shift Enter</kbd></button>
     {/if}
     <button role="menuitem" onclick={() => act(openPreview)}>{t('Просмотр')}<kbd>{t('Пробел')}</kbd></button>
     {#if editable(m)}
@@ -1604,6 +1607,8 @@
     flex: none;
   }
   .error {
+    /* Адреса и пути в ошибках длинные и без пробелов: переносить где угодно. */
+    overflow-wrap: anywhere;
     color: var(--c-danger);
     font-size: var(--text-s);
     margin: 0 var(--space-1) var(--space-2);

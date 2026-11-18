@@ -292,6 +292,8 @@ const en: Record<string, string> = {
   "Оно ещё не вошло в группу с новым ключом. Если войдёт, останется в группе, но уже не админом.": "It hasn't joined the group with the new key yet. If it does, it stays in the group, but not as an admin.",
   "Исключения": "Exclusions",
   "Действие": "Action",
+  "Вставлять без форматирования": "Paste without formatting",
+  "Текст из браузера, Word или почты вставляется без шрифтов и оформления. Shift+Enter в окне вставки тогда вставляет с форматированием.": "Text from a browser, Word or mail is pasted without fonts and styling. Shift+Enter in the paste window then pastes with formatting.",
   "Учитывать .gitignore в папках": "Honour .gitignore in folders",
   "Внутри скопированной папки пропускается то, что перечислено в её файлах .gitignore, как это делает git. Например, папки сборки и файлы .env.": "Inside a copied folder, whatever its .gitignore files list is skipped, the way git does it. For example, build folders and .env files.",
   "Что": "What",

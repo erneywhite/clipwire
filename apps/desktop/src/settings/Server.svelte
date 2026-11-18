@@ -706,6 +706,8 @@
     color: var(--c-danger);
   }
   .error {
+    /* Адреса и пути в ошибках длинные и без пробелов: переносить где угодно. */
+    overflow-wrap: anywhere;
     color: var(--c-danger);
     margin: 0;
   }
