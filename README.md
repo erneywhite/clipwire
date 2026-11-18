@@ -212,6 +212,7 @@ memory use does not grow with it (details in `docs/history-storage.md`).
 **Deleting.** By default a deleted entry disappears only on this device. Turn on
 **Delete on all devices** under Sync and the deletion is sent to the rest of the group as well.
 Devices that are switched off apply it when they connect, within the server's retention period.
+A deletion made offline waits for the connection and survives a Clipwire restart.
 Entries pinned on another device are not deleted. The server does not know what was deleted: the
 deletion note is encrypted with the group key. This needs server 0.1.3 or newer.
 
@@ -288,8 +289,8 @@ About → Status, in the **Pins on the server** row.
 ## What gets synced
 
 Without a connection the latest copy waits and goes out as soon as the server is reachable. If
-Clipwire is closed or the computer shuts down before that, the copy is sent on the next start
-(text, formatted text and images; files copied offline stay on this device).
+Clipwire is closed or the computer shuts down before that, the copy is sent on the next start.
+Files and folders are prepared for sending again, as on a fresh copy.
 
 ### Text and formatting
 
