@@ -7,6 +7,7 @@ pub mod blobs;
 pub mod cache;
 pub mod clipboard;
 pub mod devices;
+pub mod exclusions;
 pub mod folder;
 pub mod group_config;
 pub mod history;
