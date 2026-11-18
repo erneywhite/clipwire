@@ -202,6 +202,29 @@ pub enum Status {
     Offline(String),
 }
 
+/// Когда показывать «Подключение…». Попытка к недоступному серверу длится
+/// долго, и если объявлять каждую, статус почти всё время «Подключение…» с
+/// пульсирующим значком. Поэтому подключение объявляется при первой попытке и
+/// после обрыва рабочей связи, а после неудачи до следующего входа остаётся
+/// «нет связи», хотя попытки идут.
+#[derive(Debug, Default)]
+struct ConnShown {
+    failed: bool,
+}
+
+impl ConnShown {
+    /// Перед попыткой: `true` — объявить «Подключение…».
+    fn before_attempt(&self) -> bool {
+        !self.failed
+    }
+
+    /// Сессия кончилась ошибкой. `was_online` — до ошибки связь была: это
+    /// обрыв, и следующая попытка снова объявляется.
+    fn after_error(&mut self, was_online: bool) {
+        self.failed = !was_online;
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
     Status(Status),
@@ -402,9 +425,10 @@ pub struct Engine {
     /// Сервер выбрал [`ALPN_5`] или новее: знает `Delete`.
     deletes_supported: bool,
     /// Удаления, сделанные без связи: уйдут после входа.
-    // shortcut: только в памяти; удаление без связи и перезапуск до входа —
-    // и оно останется только здесь. Хранить на диске, если будут жалобы.
     pending_deletes: Vec<DeleteNote>,
+    /// Копия `pending_deletes` на диске: удаление без связи переживает
+    /// перезапуск. `None` — только в памяти (тесты, консольный клиент).
+    deletes_store: Option<crate::pending_deletes::PendingDeletes>,
     /// Когда последний раз элемент ушёл и пришёл (для «О программе»).
     times: Arc<crate::devices::SyncTimes>,
     /// Ключ группы сменён (здесь или на другом устройстве) или устройство
@@ -497,6 +521,7 @@ impl Engine {
             server_version: None,
             deletes_supported: false,
             pending_deletes: Vec::new(),
+            deletes_store: None,
             times: Arc::default(),
             terminal: false,
             card_check: None,
@@ -524,6 +549,7 @@ impl Engine {
     /// Синхронизировать закрепы группы: книга `pins` и записи истории из
     /// `source`.
     pub fn with_pins(mut self, pins: Arc<Pins>, source: Arc<dyn PinSource>) -> Self {
+        self.fix.checked = pins.checked();
         self.pins = Some(pins);
         self.pin_source = Some(source);
         self
@@ -536,6 +562,20 @@ impl Engine {
     }
 
     /// Принимать команды интерфейса (`devices::Controller`).
+    /// Хранить неотправленные удаления на диске и подхватить оставшиеся с
+    /// прошлого запуска.
+    pub fn with_pending_deletes(mut self, store: crate::pending_deletes::PendingDeletes) -> Self {
+        self.pending_deletes = store.load();
+        self.deletes_store = Some(store);
+        self
+    }
+
+    fn save_deletes(&self) {
+        if let Some(store) = &self.deletes_store {
+            store.save(&self.pending_deletes);
+        }
+    }
+
     pub fn with_control(mut self, control: mpsc::Receiver<Control>) -> Self {
         self.control = Some(control);
         self
@@ -662,8 +702,11 @@ impl Engine {
 
         let mut control = self.control.take();
         let mut backoff = Duration::from_secs(1);
+        let mut shown = ConnShown::default();
         loop {
-            self.emit(Event::Status(Status::Connecting));
+            if shown.before_attempt() {
+                self.emit(Event::Status(Status::Connecting));
+            }
             let res = self
                 .session(&ep, addr.clone(), &mut local, &mut control)
                 .await;
@@ -717,6 +760,7 @@ impl Engine {
                     }
                     tracing::warn!("нет связи с сервером: {e:#}");
                     self.emit(Event::Status(Status::Offline(format!("{e:#}"))));
+                    shown.after_error(self.went_online);
                 }
             }
             if std::mem::take(&mut self.went_online) {
@@ -1846,18 +1890,14 @@ impl Engine {
         }
     }
 
-    /// Новое копирование, пока нет связи, вытесняет неотправленное. Если
-    /// отправка вытесненного уже начиналась, его резервы на сервере
-    /// отменяются при следующем соединении. Архивы его папок из outbox
-    /// удаляются: загружать их некому.
     /// Запомнить удаление до отправки. Предел — чтобы долгий офлайн не копил
     /// записки бесконечно; старые теряются первыми.
     fn queue_delete(&mut self, note: DeleteNote) {
-        const MAX_PENDING: usize = 50;
-        if self.pending_deletes.len() >= MAX_PENDING {
+        if self.pending_deletes.len() >= crate::pending_deletes::MAX_PENDING {
             self.pending_deletes.remove(0);
         }
         self.pending_deletes.push(note);
+        self.save_deletes();
     }
 
     /// Отправить накопленные удаления. Старый сервер их не знает: тогда они
@@ -1876,17 +1916,26 @@ impl Engine {
                 "сервер не знает удаления на всех устройствах, удалено только здесь"
             );
             self.pending_deletes.clear();
+            self.save_deletes();
             return Ok(());
         }
-        for note in std::mem::take(&mut self.pending_deletes) {
+        // С диска записка снимается, только когда ушла в поток: оборвётся
+        // связь посередине — неотправленные останутся до следующего входа.
+        while let Some(note) = self.pending_deletes.first().cloned() {
             match key.seal_delete(&note) {
                 Ok(sealed) => write_msg(send, &ClientMsg::Delete(sealed)).await?,
                 Err(e) => tracing::warn!("записка об удалении не зашифровалась: {e}"),
             }
+            self.pending_deletes.remove(0);
+            self.save_deletes();
         }
         Ok(())
     }
 
+    /// Новое копирование, пока нет связи, вытесняет неотправленное. Если
+    /// отправка вытесненного уже начиналась, его резервы на сервере
+    /// отменяются при следующем соединении. Архивы его папок из outbox
+    /// удаляются: загружать их некому.
     fn replace_pending(&mut self, c: Outgoing) {
         let reserved = std::mem::take(&mut self.pending_reserved);
         if let Some(old) = self.pending.replace(c)
@@ -2225,6 +2274,21 @@ fn relay_hint(ep: &Endpoint) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connecting_is_announced_once_until_back_online() {
+        let mut s = ConnShown::default();
+        assert!(s.before_attempt(), "первая попытка — «Подключение…»");
+        s.after_error(false);
+        assert!(!s.before_attempt(), "после неудачи остаётся «нет связи»");
+        s.after_error(false);
+        assert!(!s.before_attempt(), "и при следующих неудачах");
+        s.after_error(true);
+        assert!(
+            s.before_attempt(),
+            "обрыв рабочей связи — снова «Подключение…»"
+        );
+    }
+
     #[test]
     fn backfill_pause_by_size() {
         use std::time::Duration;

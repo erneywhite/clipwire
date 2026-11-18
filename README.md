@@ -212,6 +212,7 @@ memory use does not grow with it (details in `docs/history-storage.md`).
 **Deleting.** By default a deleted entry disappears only on this device. Turn on
 **Delete on all devices** under Sync and the deletion is sent to the rest of the group as well.
 Devices that are switched off apply it when they connect, within the server's retention period.
+A deletion made offline waits for the connection and survives a Clipwire restart.
 Entries pinned on another device are not deleted. The server does not know what was deleted: the
 deletion note is encrypted with the group key. This needs server 0.1.3 or newer.
 
@@ -288,8 +289,8 @@ About → Status, in the **Pins on the server** row.
 ## What gets synced
 
 Without a connection the latest copy waits and goes out as soon as the server is reachable. If
-Clipwire is closed or the computer shuts down before that, the copy is sent on the next start
-(text, formatted text and images; files copied offline stay on this device).
+Clipwire is closed or the computer shuts down before that, the copy is sent on the next start.
+Files and folders are prepared for sending again, as on a fresh copy.
 
 ### Text and formatting
 
@@ -602,6 +603,10 @@ group sit on the server, how much of the server's quota for files is used
 (`CLIPWIRE_BLOB_QUOTA`; pinned files are counted in the pins row), and how many devices are in the group and how many are online. Server
 numbers need server 0.1.2 or newer. The Ko-fi button is there too.
 
+When the server is unreachable, the status stays **No connection** with the error tray icon while
+Clipwire keeps retrying in the background. **Connecting…** with a blinking icon shows only on
+the first attempt and right after the connection drops.
+
 The **Sync** page shows which group the device is in: the group fingerprint, the same short id
 as in the server's group list. On the server administrator's device the group's name is shown
 next to it, if one is set.
@@ -628,7 +633,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.9.3`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.9.4`.
 
 **Through a Docker control panel or plain `docker compose`:**
 

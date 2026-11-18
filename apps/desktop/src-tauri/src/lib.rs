@@ -9,7 +9,6 @@ mod editor;
 mod files;
 mod link;
 mod popup;
-mod send_to;
 mod settings_window;
 mod sound;
 mod storage;
@@ -772,7 +771,6 @@ pub fn run() {
             if let Err(e) = popup::register_hotkey(app.handle()) {
                 tracing::warn!("{e}");
             }
-            send_to::remove_leftovers();
             tray::build(app.handle())?;
             tray::spawn_animator(app.handle().clone());
 

@@ -192,6 +192,36 @@ fn read_consistent<T>(
     None
 }
 
+/// Что делать с прочитанным буфером, когда программа могла «досдать» его.
+///
+/// Проводник кладёт скопированное живым объектом, а закрывая окно,
+/// переписывает буфер насовсем (`OleFlushClipboard`). Windows шлёт об этом
+/// два уведомления: сначала то же содержимое с тем же владельцем, через
+/// десятки миллисекунд — то же содержимое без владельца. Без проверки каждое
+/// звучало как копирование, а первое ещё и уходило в группу заново.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flush {
+    /// Обычное изменение: отдать дальше.
+    Deliver,
+    /// Досдача: то же содержимое без владельца. Пропустить.
+    Skip,
+    /// То же содержимое с владельцем: подождать, не придёт ли досдача.
+    Settle,
+}
+
+/// `same` — содержимое совпадает с последним отданным; `has_owner` — у
+/// буфера есть владелец; `settled` — это изменение уже выждало паузу.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn flush_verdict(same: bool, has_owner: bool, settled: bool) -> Flush {
+    match (same, has_owner, settled) {
+        (false, ..) => Flush::Deliver,
+        (true, false, _) => Flush::Skip,
+        (true, true, false) => Flush::Settle,
+        (true, true, true) => Flush::Deliver,
+    }
+}
+
 /// Добавлять ли к картинке в буфере виртуальный PNG-файл для Проводника
 /// (настройка «Картинку из буфера вставлять в Проводник файлом»). Только
 /// Windows; на других ОС ничего не меняет.
@@ -415,6 +445,9 @@ mod win {
     /// проходит почти всегда, поэтому пауза короткая.
     const READ_RETRIES: u8 = 10;
     const RETRY_DELAY_MS: u32 = 40;
+    /// Сколько ждать досдачи буфера после того же содержимого (см.
+    /// [`super::Flush`]). По наблюдению вторая часть приходит через ~60 мс.
+    const SETTLE_MS: u32 = 300;
 
     /// Колбэк получает содержимое и полный путь exe программы-владельца
     /// буфера, если удалось узнать.
@@ -445,6 +478,10 @@ mod win {
         offered: Option<windows::Win32::System::Com::IDataObject>,
         /// Сколько раз подряд этот буфер не прочитался (см. `READ_RETRIES`).
         retries: u8,
+        /// Хэш последнего отданного содержимого: с ним сверяется досдача.
+        last_hash: Option<[u8; 32]>,
+        /// Версия буфера, которая уже выждала паузу [`SETTLE_MS`].
+        settle_seq: Option<u32>,
     }
 
     /// Следит за буфером, пока жив. Колбэк вызывается в потоке слежения на
@@ -482,6 +519,8 @@ mod win {
                         ole,
                         offered: None,
                         retries: 0,
+                        last_hash: None,
+                        settle_seq: None,
                     });
                     let hwnd = match create_window(ctx) {
                         Ok(h) => h,
@@ -583,6 +622,31 @@ mod win {
                     ctx.retries = 0;
                     match read {
                         Some((Snapshot::Content(content, owner), seq)) => {
+                            let hash = content.hash();
+                            let has_owner = unsafe {
+                                windows::Win32::System::DataExchange::GetClipboardOwner()
+                            }
+                            .is_ok_and(|w| !w.0.is_null());
+                            match super::flush_verdict(
+                                ctx.last_hash == Some(hash),
+                                has_owner,
+                                ctx.settle_seq == Some(seq),
+                            ) {
+                                super::Flush::Skip => {
+                                    tracing::debug!(
+                                        "программа досдала буфер при закрытии, пропускаю"
+                                    );
+                                    ctx.settle_seq = None;
+                                    return LRESULT(0);
+                                }
+                                super::Flush::Settle => {
+                                    ctx.settle_seq = Some(seq);
+                                    unsafe { SetTimer(Some(hwnd), READ_TIMER, SETTLE_MS, None) };
+                                    return LRESULT(0);
+                                }
+                                super::Flush::Deliver => ctx.settle_seq = None,
+                            }
+                            ctx.last_hash = Some(hash);
                             tracing::info!(kind = content_kind(&content), "скопировано");
                             // Картинку — ещё и виртуальным файлом для
                             // Проводника. Решение по форматам буфера — в
@@ -1117,6 +1181,41 @@ pub fn knows_source_app() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explorer_flush_is_skipped_and_real_recopy_waits() {
+        use super::{Flush, flush_verdict};
+        assert_eq!(
+            flush_verdict(false, true, false),
+            Flush::Deliver,
+            "новое — сразу"
+        );
+        assert_eq!(
+            flush_verdict(false, false, false),
+            Flush::Deliver,
+            "новое без владельца — тоже"
+        );
+        assert_eq!(
+            flush_verdict(true, true, false),
+            Flush::Settle,
+            "то же с владельцем — выждать"
+        );
+        assert_eq!(
+            flush_verdict(true, false, false),
+            Flush::Skip,
+            "то же без владельца — досдача"
+        );
+        assert_eq!(
+            flush_verdict(true, false, true),
+            Flush::Skip,
+            "и после паузы"
+        );
+        assert_eq!(
+            flush_verdict(true, true, true),
+            Flush::Deliver,
+            "выждало — настоящий повтор"
+        );
+    }
+
     use super::*;
     use std::cell::Cell;
 

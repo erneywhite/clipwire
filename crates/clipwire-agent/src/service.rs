@@ -477,6 +477,55 @@ impl Copier {
         (self.on_event)(UiEvent::HistoryMerged(1));
     }
 
+    /// Дослать копирование, помеченное неотправленным до прошлого выхода
+    /// ([`crate::push_mark`]). Файлы проходят подготовку заново, как свежее
+    /// копирование: части прошлого запуска остались в очереди загрузки,
+    /// которой уже нет. Запись в истории обновляется на месте, без звука.
+    fn resend_marked(&self) {
+        let Some(mark) = &self.mark else {
+            return;
+        };
+        let Some(hash) = mark.get() else {
+            return;
+        };
+        let entry = {
+            let h = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            h.id_by_hash(&hash).and_then(|id| h.get(id))
+        };
+        match entry {
+            Some(e) if e.local && may_send(send_kinds(), &e.content) => {
+                if matches!(e.content, Content::Files(_)) {
+                    let me = self.clone();
+                    let source = e.source_app();
+                    let key = (e.id, e.seen_ms);
+                    self.rt.spawn_blocking(move || {
+                        let limit = me.limit_mb.load(Ordering::Relaxed);
+                        if let Some((content, reused)) = me.prepare(e.content, limit) {
+                            tracing::info!("досылаю файлы, не ушедшие до выхода");
+                            me.send(&content, true, reused, source.as_ref());
+                            me.update_local(key, content, source.as_ref());
+                        }
+                    });
+                    return;
+                }
+                let out = Outgoing {
+                    content: e.content,
+                    ext: without_note(&e.ext),
+                    reused: false,
+                };
+                let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(tx) = tx.as_ref()
+                    && tx.try_send(out).is_ok()
+                {
+                    tracing::info!("досылаю копирование, не ушедшее до выхода");
+                }
+            }
+            // Записи больше нет (удалили) или её больше нельзя отправлять — и
+            // досылать нечего.
+            _ => mark.clear(),
+        }
+    }
+
     /// Отправить в группу (`send`). `reused` — файлы прежней записи (см.
     /// [`Outgoing::reused`]): их архивы не удалять. `false` — сервис
     /// снимается, дальше ничего не делать.
@@ -507,7 +556,7 @@ impl Copier {
                 // Пометка — до передачи движку: в сети он отправляет сразу и
                 // снимает её по `Event::Pushed`. Поставленная после, она
                 // появлялась уже после отправки и досылалась при каждом запуске.
-                let mark = self.mark.as_ref().filter(|_| resendable(content));
+                let mark = self.mark.as_ref();
                 let hash = content.hash();
                 if let Some(m) = mark {
                     m.set(&hash);
@@ -606,6 +655,10 @@ impl Service {
                 .with_backfill(local_history)
                 .with_known_devices(crate::devices::load_known(&paths, group_key.group_id()))
                 .with_blobs(blobs.clone().expect("в группе передача файлов есть"))
+                .with_pending_deletes(crate::pending_deletes::PendingDeletes::new(
+                    &paths.dir,
+                    &group_key.group_id(),
+                ))
                 .with_control(ctl_rx);
                 let device = engine.device();
                 let book = Pins::open(&paths.dir, group_key.group_id());
@@ -664,33 +717,7 @@ impl Service {
         };
         // Прошлый раз программу закрыли, пока последнее копирование ждало
         // связи: дослать его первым.
-        if let Some(mark) = &copier.mark
-            && let Some(hash) = mark.get()
-        {
-            let entry = {
-                let h = history.lock().unwrap_or_else(|e| e.into_inner());
-                h.id_by_hash(&hash).and_then(|id| h.get(id))
-            };
-            match entry {
-                Some(e)
-                    if e.local && resendable(&e.content) && may_send(send_kinds(), &e.content) =>
-                {
-                    let out = Outgoing {
-                        content: e.content,
-                        ext: without_note(&e.ext),
-                        reused: false,
-                    };
-                    let tx = copier.tx.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(tx) = tx.as_ref()
-                        && tx.try_send(out).is_ok()
-                    {
-                        tracing::info!("досылаю копирование, не ушедшее до выхода");
-                    }
-                }
-                // Записи больше нет (удалили) — и досылать нечего.
-                _ => mark.clear(),
-            }
-        }
+        copier.resend_marked();
 
         // События движка.
         {
@@ -1178,14 +1205,6 @@ fn local_backfill(h: &History) -> Vec<(Outgoing, u64)> {
         .collect();
     out.reverse();
     out
-}
-
-/// Досылать ли неотправленное копирование после перезапуска. Файлы — нет:
-/// их части лежат в очереди загрузки, которая после перезапуска уже другая.
-// shortcut: файлы, скопированные без связи и не ушедшие до выхода, в группу
-// не попадут; если попросят — досылать их через тот же резерв, что backfill.
-fn resendable(c: &Content) -> bool {
-    !matches!(c, Content::Files(_))
 }
 
 /// Виды содержимого для [`set_send_kinds`].
@@ -1781,6 +1800,58 @@ mod tests {
         c.finish(Content::Text("раз".into()), true, None);
         assert!(engine.join().unwrap(), "пометка стоит до передачи движку");
         assert_eq!(mark.get(), None, "после отправки пометки нет");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Файлы, не ушедшие до прошлого выхода, досылаются: заново, без старой
+    /// части, без новой записи в истории и без звука копирования.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn marked_files_are_resent_after_restart() {
+        let d = tmp("resend-files");
+        let (tx, mut rx) = mpsc::channel::<Outgoing>(4);
+        let mark = crate::push_mark::PushMark::new(&d);
+        let history = Arc::new(Mutex::new(History::open(&d.join("h")).unwrap()));
+        let mut old = file(r"C:\docs\отчёт.pdf", 10, false);
+        old.blob = Some(BlobId([7; 16]));
+        let content = Content::Files(vec![old]);
+        record(
+            &history,
+            local_entry(DeviceId([1; 32]), "тест", content.clone()),
+        );
+        mark.set(&content.hash());
+        let sounds = Arc::new(AtomicU64::new(0));
+        let counted = sounds.clone();
+        let c = Copier {
+            tx: Arc::new(Mutex::new(Some(tx))),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            history: history.clone(),
+            device: DeviceId([1; 32]),
+            device_name: "тест".into(),
+            on_event: Arc::new(move |e| {
+                if matches!(e, UiEvent::NewEntry) {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+            blobs: None,
+            limit_mb: Arc::new(AtomicU64::new(100)),
+            rt: tokio::runtime::Handle::current(),
+            mark: Some(mark.clone()),
+            fingerprints: Default::default(),
+        };
+        c.resend_marked();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("файлы не дослались")
+            .unwrap();
+        assert_eq!(
+            out.content.hash(),
+            content.hash(),
+            "дослано то же копирование"
+        );
+        // Дождаться обновления записи (оно после отправки).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(history.lock().unwrap().len(), 1, "новой записи нет");
+        assert_eq!(sounds.load(Ordering::SeqCst), 0, "без звука копирования");
         let _ = std::fs::remove_dir_all(d);
     }
 
