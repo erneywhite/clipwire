@@ -908,7 +908,7 @@ CLIPWIRE_SFTP_HOST=127.0.0.1 CLIPWIRE_SFTP_PORT=2222 CLIPWIRE_SFTP_USER=... CLIP
 - `crates/clipwire-core`: формат элементов, шифрование, коды сервера и приглашения.
 - `docs/`: [архитектура](docs/architecture.md), [обзор готовых решений](docs/research.md),
   [передача файлов](docs/files-transfer.md), [устройства](docs/devices.md),
-  [хранилище](docs/storage.md), [обновления](docs/updates.md), [macOS](docs/macos.md),
+  [хранилище](docs/storage.md), [хранение истории](docs/history-storage.md), [обновления](docs/updates.md), [macOS](docs/macos.md),
   [Linux](docs/linux.md) и исходники оформления
   (`docs/brand/`).
 - `deploy/`: compose-файлы и пример обратного прокси для сервера.

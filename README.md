@@ -902,7 +902,7 @@ two clients can run on one machine.
 - `crates/clipwire-core`: item format, encryption, server codes and invitations.
 - `docs/`: [architecture](docs/architecture.md), [research of existing tools](docs/research.md),
   [files-transfer](docs/files-transfer.md), [devices](docs/devices.md),
-  [storage](docs/storage.md), [updates](docs/updates.md), [macOS](docs/macos.md),
+  [storage](docs/storage.md), [history storage](docs/history-storage.md), [updates](docs/updates.md), [macOS](docs/macos.md),
   [Linux](docs/linux.md) and the brand sources (`docs/brand/`).
   These documents are in Russian.
 - `deploy/`: compose files and a reverse proxy example for the server.
