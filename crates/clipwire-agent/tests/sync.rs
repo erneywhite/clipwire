@@ -466,3 +466,59 @@ async fn join_and_count(
     let _ = tokio::time::timeout(Duration::from_secs(10), b.task).await;
     Ok((hist, batches, clip))
 }
+
+/// Удаление на всех устройствах, сделанное без связи до прошлого выхода,
+/// лежит на диске и после входа уходит в группу; файл очереди убирается.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_delete_survives_restart() -> Result<()> {
+    use clipwire_agent::pending_deletes::PendingDeletes;
+    use clipwire_core::delete::DeleteNote;
+    let (server, info) = start_server().await?;
+    let key = GroupKey::generate()?;
+    let mut b = Agent::spawn(&info, &key, None)?;
+    b.online().await?;
+
+    // «Прошлый запуск» A: удаление без связи осталось в очереди на диске.
+    let dir = std::env::temp_dir().join(format!("clipwire-del-restart-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir)?;
+    let hash = Content::Text("удалено без связи".into()).hash();
+    let store = PendingDeletes::new(&dir, &key.group_id());
+    store.save(&[DeleteNote {
+        hashes: vec![hash],
+        at_ms: 1,
+    }]);
+
+    let state = AgentState {
+        invite: Invite {
+            server: info.clone(),
+            group_key: key.clone(),
+        },
+        device_key: random_key()?,
+    };
+    let (etx, _events) = mpsc::unbounded_channel();
+    let (local, lrx) = mpsc::channel(16);
+    let engine = Engine::new(state, "A".into(), None, etx, Arc::new(|| {}))
+        .with_admin_key(Some(TEST_ADMIN))
+        .with_pending_deletes(store.clone());
+    let task = tokio::spawn(engine.run(lrx));
+
+    let got = b
+        .wait(|e| match e {
+            Event::Deleted(n) if n.hashes == vec![hash] => Some(()),
+            _ => None,
+        })
+        .await;
+    assert!(got.is_ok(), "удаление с прошлого запуска не дошло");
+    // Записка снимается с диска сразу после записи в поток; ждём с запасом.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !store.load().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(store.load().is_empty(), "очередь на диске не очистилась");
+
+    drop(local);
+    let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    drop(b.local);
+    let _ = std::fs::remove_dir_all(&dir);
+    server.shutdown().await
+}

@@ -606,6 +606,10 @@ impl Service {
                 .with_backfill(local_history)
                 .with_known_devices(crate::devices::load_known(&paths, group_key.group_id()))
                 .with_blobs(blobs.clone().expect("в группе передача файлов есть"))
+                .with_pending_deletes(crate::pending_deletes::PendingDeletes::new(
+                    &paths.dir,
+                    &group_key.group_id(),
+                ))
                 .with_control(ctl_rx);
                 let device = engine.device();
                 let book = Pins::open(&paths.dir, group_key.group_id());

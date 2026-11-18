@@ -425,9 +425,10 @@ pub struct Engine {
     /// Сервер выбрал [`ALPN_5`] или новее: знает `Delete`.
     deletes_supported: bool,
     /// Удаления, сделанные без связи: уйдут после входа.
-    // shortcut: только в памяти; удаление без связи и перезапуск до входа —
-    // и оно останется только здесь. Хранить на диске, если будут жалобы.
     pending_deletes: Vec<DeleteNote>,
+    /// Копия `pending_deletes` на диске: удаление без связи переживает
+    /// перезапуск. `None` — только в памяти (тесты, консольный клиент).
+    deletes_store: Option<crate::pending_deletes::PendingDeletes>,
     /// Когда последний раз элемент ушёл и пришёл (для «О программе»).
     times: Arc<crate::devices::SyncTimes>,
     /// Ключ группы сменён (здесь или на другом устройстве) или устройство
@@ -520,6 +521,7 @@ impl Engine {
             server_version: None,
             deletes_supported: false,
             pending_deletes: Vec::new(),
+            deletes_store: None,
             times: Arc::default(),
             terminal: false,
             card_check: None,
@@ -559,6 +561,20 @@ impl Engine {
     }
 
     /// Принимать команды интерфейса (`devices::Controller`).
+    /// Хранить неотправленные удаления на диске и подхватить оставшиеся с
+    /// прошлого запуска.
+    pub fn with_pending_deletes(mut self, store: crate::pending_deletes::PendingDeletes) -> Self {
+        self.pending_deletes = store.load();
+        self.deletes_store = Some(store);
+        self
+    }
+
+    fn save_deletes(&self) {
+        if let Some(store) = &self.deletes_store {
+            store.save(&self.pending_deletes);
+        }
+    }
+
     pub fn with_control(mut self, control: mpsc::Receiver<Control>) -> Self {
         self.control = Some(control);
         self
@@ -1873,18 +1889,14 @@ impl Engine {
         }
     }
 
-    /// Новое копирование, пока нет связи, вытесняет неотправленное. Если
-    /// отправка вытесненного уже начиналась, его резервы на сервере
-    /// отменяются при следующем соединении. Архивы его папок из outbox
-    /// удаляются: загружать их некому.
     /// Запомнить удаление до отправки. Предел — чтобы долгий офлайн не копил
     /// записки бесконечно; старые теряются первыми.
     fn queue_delete(&mut self, note: DeleteNote) {
-        const MAX_PENDING: usize = 50;
-        if self.pending_deletes.len() >= MAX_PENDING {
+        if self.pending_deletes.len() >= crate::pending_deletes::MAX_PENDING {
             self.pending_deletes.remove(0);
         }
         self.pending_deletes.push(note);
+        self.save_deletes();
     }
 
     /// Отправить накопленные удаления. Старый сервер их не знает: тогда они
@@ -1903,17 +1915,26 @@ impl Engine {
                 "сервер не знает удаления на всех устройствах, удалено только здесь"
             );
             self.pending_deletes.clear();
+            self.save_deletes();
             return Ok(());
         }
-        for note in std::mem::take(&mut self.pending_deletes) {
+        // С диска записка снимается, только когда ушла в поток: оборвётся
+        // связь посередине — неотправленные останутся до следующего входа.
+        while let Some(note) = self.pending_deletes.first().cloned() {
             match key.seal_delete(&note) {
                 Ok(sealed) => write_msg(send, &ClientMsg::Delete(sealed)).await?,
                 Err(e) => tracing::warn!("записка об удалении не зашифровалась: {e}"),
             }
+            self.pending_deletes.remove(0);
+            self.save_deletes();
         }
         Ok(())
     }
 
+    /// Новое копирование, пока нет связи, вытесняет неотправленное. Если
+    /// отправка вытесненного уже начиналась, его резервы на сервере
+    /// отменяются при следующем соединении. Архивы его папок из outbox
+    /// удаляются: загружать их некому.
     fn replace_pending(&mut self, c: Outgoing) {
         let reserved = std::mem::take(&mut self.pending_reserved);
         if let Some(old) = self.pending.replace(c)
