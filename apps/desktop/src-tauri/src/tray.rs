@@ -333,7 +333,7 @@ pub fn spawn_animator(app: AppHandle) {
                 refresh_light_panel();
                 theme_due = THEME_POLL.map(|p| now + p);
             }
-            render(&app);
+            on_main(&app, render);
             match next_wake(next_frame, theme_due) {
                 Some(at) => tokio::select! {
                     _ = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {}
@@ -442,54 +442,75 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub fn show_status(app: &AppHandle, st: &StatusDto) {
-    let text = describe(st);
-    if let Some(items) = app.try_state::<TrayItems>() {
-        let _ = items.status.set_text(&text);
-        let _ = items.pause.set_checked(matches!(st, StatusDto::Paused));
-        let _ = items
-            .pause
-            .set_enabled(!matches!(st, StatusDto::Unconfigured));
-    }
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let _ = tray.set_tooltip(Some(format!("Clipwire: {text}")));
-    }
     LOOK.lock().unwrap_or_else(|e| e.into_inner()).status = Some(st.clone());
-    render(app);
+    let st = st.clone();
+    on_main(app, move |app| {
+        let text = describe(&st);
+        if let Some(items) = app.try_state::<TrayItems>() {
+            let _ = items.status.set_text(&text);
+            let _ = items.pause.set_checked(matches!(st, StatusDto::Paused));
+            let _ = items
+                .pause
+                .set_enabled(!matches!(st, StatusDto::Unconfigured));
+        }
+        if let Some(tray) = app.tray_by_id(TRAY_ID) {
+            let _ = tray.set_tooltip(Some(format!("Clipwire: {text}")));
+        }
+        render(app);
+    });
     WAKE.notify_one();
+}
+
+/// Обновить трей в главном потоке, не дожидаясь его. Значок и меню трея
+/// живут в главном потоке: вызов из задачи tokio ставит туда задание и ждёт
+/// ответа. При выходе главный поток сам ждёт, пока закроется движок
+/// (`RunEvent::Exit`), и такое ожидание вешало программу намертво; без связи
+/// это случалось почти всегда — статус и пульсация значка меняются каждые
+/// полсекунды. Задание, не успевшее до выхода, просто пропадает.
+fn on_main(app: &AppHandle, f: impl FnOnce(&AppHandle) + Send + 'static) {
+    let a = app.clone();
+    let _ = app.run_on_main_thread(move || f(&a));
 }
 
 /// Язык сменили: переписать пункты меню и подсказку.
 pub fn retranslate(app: &AppHandle) {
-    if let Some(items) = app.try_state::<TrayItems>() {
-        let _ = items.pause.set_text(tr("Пауза"));
-        let _ = items.settings.set_text(tr("Настройки"));
-        let _ = items.quit.set_text(tr("Выход"));
-        let version = items
-            .update_version
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let _ = items.update.set_text(match version {
-            Some(v) => trf("Обновить до {version}", &[("version", &v)]),
-            None => tr("Обновлений нет").into(),
-        });
-    }
+    on_main(app, |app| {
+        if let Some(items) = app.try_state::<TrayItems>() {
+            let _ = items.pause.set_text(tr("Пауза"));
+            let _ = items.settings.set_text(tr("Настройки"));
+            let _ = items.quit.set_text(tr("Выход"));
+            let version = items
+                .update_version
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let _ = items.update.set_text(match version {
+                Some(v) => trf("Обновить до {version}", &[("version", &v)]),
+                None => tr("Обновлений нет").into(),
+            });
+        }
+    });
     publish_status(app);
 }
 
 pub fn show_update(app: &AppHandle, version: &str) {
     if let Some(items) = app.try_state::<TrayItems>() {
-        let _ = items
-            .update
-            .set_text(trf("Обновить до {version}", &[("version", &version)]));
-        let _ = items.update.set_enabled(true);
         *items
             .update_version
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(version.to_string());
     }
     LOOK.lock().unwrap_or_else(|e| e.into_inner()).update = true;
-    render(app);
+    let version = version.to_string();
+    on_main(app, move |app| {
+        if let Some(items) = app.try_state::<TrayItems>() {
+            let _ = items
+                .update
+                .set_text(trf("Обновить до {version}", &[("version", &version)]));
+            let _ = items.update.set_enabled(true);
+        }
+        render(app);
+    });
     WAKE.notify_one();
 }
 
