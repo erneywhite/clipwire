@@ -116,6 +116,19 @@ struct Compiled {
 
 static RULES: RwLock<Vec<Compiled>> = RwLock::new(Vec::new());
 
+/// Учитывать `.gitignore` внутри скопированных папок.
+static GITIGNORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Включить или выключить учёт `.gitignore` (настройка `use_gitignore`).
+pub fn set_gitignore(on: bool) {
+    GITIGNORE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Учитывать ли `.gitignore` при обходе папки.
+pub fn gitignore() -> bool {
+    GITIGNORE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Разобрать список: через запятую или точку с запятой, без пустых и
 /// повторов, в нижнем регистре.
 fn split_list(raw: &str) -> Vec<String> {

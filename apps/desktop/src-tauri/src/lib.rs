@@ -356,6 +356,7 @@ fn load_state() -> anyhow::Result<AppState> {
     clipwire_agent::clipboard::set_image_as_file(settings.image_as_file);
     clipwire_agent::service::set_send_kinds(settings.send_kinds.bits());
     clipwire_agent::exclusions::set(&settings.exclusion_rules);
+    clipwire_agent::exclusions::set_gitignore(settings.use_gitignore);
     // Связка ключей заперта и человек не открыл её (или служба не ответила):
     // без ключа истории работать нельзя, поэтому ждём и спрашиваем снова.
     let history = loop {

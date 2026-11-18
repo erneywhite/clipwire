@@ -112,6 +112,8 @@
       <div class="row edit" role="row">
         <input
           type="checkbox"
+          role="switch"
+          class="switch"
           checked={r.enabled}
           aria-label={t('Правило включено')}
           onchange={(e) => patch(i, { enabled: e.currentTarget.checked })}
@@ -171,6 +173,8 @@
       <div class="row" class:off={!r.enabled} role="row">
         <input
           type="checkbox"
+          role="switch"
+          class="switch"
           checked={r.enabled}
           aria-label={t('Правило включено')}
           onchange={(e) => patch(i, { enabled: e.currentTarget.checked })}
@@ -205,7 +209,7 @@
   }
   .row {
     display: grid;
-    grid-template-columns: 18px 6.5rem 7.5rem minmax(0, 1fr) 9.5rem 52px;
+    grid-template-columns: 28px 6.5rem 7.5rem minmax(0, 1fr) 9.5rem 52px;
     gap: var(--space-3);
     align-items: center;
     padding: 9px 0;
@@ -220,7 +224,7 @@
     color: var(--c-muted);
   }
   .row.edit {
-    grid-template-columns: 18px 6.5rem 7.5rem minmax(0, 1fr) 10.5rem 52px;
+    grid-template-columns: 28px 6.5rem 7.5rem minmax(0, 1fr) 10.5rem 52px;
     gap: var(--space-2);
     padding: 6px 0;
   }
@@ -311,9 +315,39 @@
   .size select {
     width: auto;
   }
-  input[type='checkbox'] {
+  /* Тумблер, как в остальных настройках, только меньше. */
+  .switch {
+    appearance: none;
+    width: 28px;
+    height: 16px;
+    border-radius: 8px;
+    background: var(--c-border);
+    position: relative;
     margin: 0;
-    accent-color: var(--c-accent);
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease-out);
+  }
+  .switch::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--c-muted);
+    transition: transform var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+  }
+  .switch:checked {
+    background: var(--c-accent);
+  }
+  .switch:checked::after {
+    transform: translateX(12px);
+    background: var(--c-on-accent);
+  }
+  .switch:focus-visible {
+    outline: 2px solid var(--c-accent);
+    outline-offset: 2px;
   }
   .mono {
     font-family: var(--font-mono);

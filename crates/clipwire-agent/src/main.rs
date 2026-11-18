@@ -335,6 +335,7 @@ fn run(state: AgentState, paths: Paths) -> Result<()> {
     clipwire_agent::clipboard::set_image_as_file(settings.image_as_file);
     clipwire_agent::service::set_send_kinds(settings.send_kinds.bits());
     clipwire_agent::exclusions::set(&settings.exclusion_rules);
+    clipwire_agent::exclusions::set_gitignore(settings.use_gitignore);
     let rt = tokio::runtime::Runtime::new()?;
     let service = Service::start(
         rt.handle(),

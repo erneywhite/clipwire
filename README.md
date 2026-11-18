@@ -223,6 +223,9 @@ deletion note is encrypted with the group key. This needs server 0.1.3 or newer.
   this device's history, pinned ones included. Inside folders such files and subfolders are
   skipped and the folder itself is sent. **Don't upload right away** transfers the file directly
   on paste, like a file above the upload limit;
+- **Honour .gitignore in folders**: inside a copied folder, whatever its `.gitignore` files list is
+  skipped, following git's rules (a nested file wins, `!` brings an item back). For example,
+  build folders and `.env`. Off by default;
 - programs that must not be synced (password managers by default).
 
 The default rules drop system clutter and temporary files: `desktop.ini`, `Thumbs.db`,
@@ -645,7 +648,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.9.5`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.9.6`.
 
 **Through a Docker control panel or plain `docker compose`:**
 

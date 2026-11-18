@@ -99,7 +99,37 @@ pub fn scan_dir(root: &Path) -> Result<DirScan, ScanError> {
         MAX_ENTRIES,
         MAX_DEPTH,
         &crate::exclusions::skip_in_folder,
+        crate::exclusions::gitignore(),
     )
+}
+
+type IgnoreChain = Vec<std::sync::Arc<ignore::gitignore::Gitignore>>;
+
+/// `.gitignore` папки, если он есть и разбирается. Непонятные строки
+/// пропускаются, как это делает git.
+fn gitignore_of(dir: &Path) -> Option<std::sync::Arc<ignore::gitignore::Gitignore>> {
+    let file = dir.join(".gitignore");
+    if !file.is_file() {
+        return None;
+    }
+    let mut b = ignore::gitignore::GitignoreBuilder::new(dir);
+    if let Some(e) = b.add(&file) {
+        tracing::debug!("в .gitignore есть непонятные строки: {e}");
+    }
+    b.build().ok().map(std::sync::Arc::new)
+}
+
+/// Пропускает ли запись цепочка `.gitignore` от корня папки до её папки:
+/// решает ближайший файл, где правило совпало (так же, как в git).
+fn ignored_by(chain: &IgnoreChain, path: &Path, is_dir: bool) -> bool {
+    for g in chain.iter().rev() {
+        match g.matched(path, is_dir) {
+            ignore::Match::Ignore(_) => return true,
+            ignore::Match::Whitelist(_) => return false,
+            ignore::Match::None => {}
+        }
+    }
+    false
 }
 
 fn scan_dir_limited(
@@ -107,6 +137,7 @@ fn scan_dir_limited(
     max_entries: usize,
     max_depth: usize,
     skip: &dyn Fn(crate::exclusions::Entry) -> bool,
+    use_gitignore: bool,
 ) -> Result<DirScan, ScanError> {
     let meta = std::fs::symlink_metadata(root).map_err(ScanError::Io)?;
     if !meta.is_dir() {
@@ -118,8 +149,13 @@ fn scan_dir_limited(
     let mut scan = DirScan::default();
     let mut seen = 0usize;
     // (папка на диске, её путь в архиве, её уровень)
-    let mut stack: Vec<(PathBuf, String, usize)> = vec![(root.to_path_buf(), String::new(), 0)];
-    while let Some((dir, rel, depth)) = stack.pop() {
+    // (папка на диске, её путь в архиве, её уровень, `.gitignore` над ней)
+    let mut stack: Vec<(PathBuf, String, usize, IgnoreChain)> =
+        vec![(root.to_path_buf(), String::new(), 0, Vec::new())];
+    while let Some((dir, rel, depth, mut chain)) = stack.pop() {
+        if use_gitignore && let Some(g) = gitignore_of(&dir) {
+            chain.push(g);
+        }
         let mut items: Vec<std::fs::DirEntry> = std::fs::read_dir(&dir)
             .map_err(ScanError::Io)?
             .collect::<io::Result<_>>()
@@ -148,6 +184,10 @@ fn scan_dir_limited(
             if depth > max_depth {
                 return Err(ScanError::TooDeep);
             }
+            if !chain.is_empty() && ignored_by(&chain, &item.path(), ty.is_dir()) {
+                scan.skipped_rules += 1;
+                continue;
+            }
             if ty.is_dir() {
                 if skip(crate::exclusions::Entry {
                     name: &name,
@@ -162,7 +202,7 @@ fn scan_dir_limited(
                     path: item.path(),
                     kind: EntryKind::Dir,
                 });
-                subdirs.push((item.path(), child_rel, depth));
+                subdirs.push((item.path(), child_rel, depth, chain.clone()));
             } else if ty.is_file() {
                 let m = item.metadata().map_err(ScanError::Io)?;
                 if skip(crate::exclusions::Entry {
@@ -561,11 +601,60 @@ mod tests {
         let skip = |e: crate::exclusions::Entry| {
             (e.is_dir && e.name == "node_modules") || (!e.is_dir && e.name == "Thumbs.db")
         };
-        let s = scan_dir_limited(&d, MAX_ENTRIES, MAX_DEPTH, &skip).unwrap();
+        let s = scan_dir_limited(&d, MAX_ENTRIES, MAX_DEPTH, &skip, false).unwrap();
         let rels: Vec<_> = s.entries.iter().map(|e| e.rel.as_str()).collect();
         assert_eq!(rels, ["отчёт.txt"]);
         assert_eq!(s.bytes, 2);
         assert_eq!(s.skipped_rules, 2);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// `.gitignore` внутри папки учитывается, если включено: вложенный
+    /// файл главнее внешнего, `!` возвращает исключённое.
+    #[test]
+    fn scan_honours_gitignore() {
+        let d = tmp("gitignore");
+        std::fs::create_dir_all(d.join("build")).unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(
+            d.join(".gitignore"),
+            "build/
+*.log
+.env
+",
+        )
+        .unwrap();
+        std::fs::write(d.join("build").join("out.bin"), "x").unwrap();
+        std::fs::write(d.join("app.log"), "x").unwrap();
+        std::fs::write(d.join(".env"), "x").unwrap();
+        std::fs::write(
+            d.join("src").join(".gitignore"),
+            "!keep.log
+",
+        )
+        .unwrap();
+        std::fs::write(d.join("src").join("keep.log"), "x").unwrap();
+        std::fs::write(d.join("src").join("drop.log"), "x").unwrap();
+        std::fs::write(d.join("src").join("main.rs"), "x").unwrap();
+        let rels = |on: bool| -> Vec<String> {
+            scan_dir_limited(&d, MAX_ENTRIES, MAX_DEPTH, &|_| false, on)
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|e| e.rel)
+                .collect()
+        };
+        assert_eq!(
+            rels(true),
+            [
+                ".gitignore",
+                "src",
+                "src/.gitignore",
+                "src/keep.log",
+                "src/main.rs"
+            ]
+        );
+        assert_eq!(rels(false).len(), 10, "выключено — всё на месте");
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -578,7 +667,7 @@ mod tests {
             std::fs::write(d.join("sub").join(format!("f{i}")), "").unwrap();
         }
         assert_eq!(
-            scan_dir_limited(&d, 5, MAX_DEPTH, &|_| false)
+            scan_dir_limited(&d, 5, MAX_DEPTH, &|_| false, false)
                 .unwrap()
                 .entries
                 .len(),
@@ -586,7 +675,7 @@ mod tests {
         );
         std::fs::write(d.join("lishniy"), "").unwrap();
         assert!(matches!(
-            scan_dir_limited(&d, 5, MAX_DEPTH, &|_| false),
+            scan_dir_limited(&d, 5, MAX_DEPTH, &|_| false, false),
             Err(ScanError::TooMany)
         ));
         let _ = std::fs::remove_dir_all(d);

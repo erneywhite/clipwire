@@ -2281,10 +2281,9 @@ impl History {
         Ok(())
     }
 
-    /// Удалить старше срока хранения (кроме закреплённого). Возвращает число удалённых.
-    // shortcut: значки программ, на которые больше не ссылается ни одна
-    // запись, остаются в `icons` (их по одному на программу, килобайты);
-    // чистить, если таблица заметно разрастётся.
+    /// Удалить старше срока хранения (кроме закреплённого). Возвращает число
+    /// удалённых. Если что-то удалилось, заодно убираются значки программ, на
+    /// которые больше не ссылается ни одна запись ([`History::prune_icons`]).
     pub fn prune(&mut self, retention: Retention, now: i64) -> Result<usize> {
         let Some(max) = retention.max_age_ms() else {
             return Ok(0);
@@ -2299,7 +2298,54 @@ impl History {
             .collect::<Result<_, _>>()?;
         let n = self.delete_ids(&ids)?;
         tx.commit()?;
+        if n > 0 {
+            match self.prune_icons() {
+                Ok(0) => {}
+                Ok(k) => tracing::info!(n = k, "из истории убраны значки программ без записей"),
+                Err(e) => tracing::warn!("значки программ не почистились: {e:#}"),
+            }
+        }
         Ok(n)
+    }
+
+    /// Убрать из `icons` значки, на которые не ссылается ни одна карточка.
+    /// Ключ значка лежит в зашифрованной карточке, поэтому карточки
+    /// обходятся целиком; не прочиталось — ничего не удаляется. Возвращает
+    /// число убранных.
+    pub fn prune_icons(&mut self) -> Result<usize> {
+        let mut used = std::collections::HashSet::new();
+        self.scan(false, 0, |_, _, _, card| {
+            if let Some(k) = card.icon {
+                used.insert(k);
+            }
+            ControlFlow::Continue(())
+        })?;
+        let all: Vec<Vec<u8>> = self
+            .conn
+            .prepare_cached("SELECT key FROM icons")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let stale: Vec<Vec<u8>> = all
+            .into_iter()
+            .filter(|k| <[u8; 32]>::try_from(k.as_slice()).is_ok_and(|k| !used.contains(&k)))
+            .collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.tx()?;
+        for k in &stale {
+            self.conn
+                .prepare_cached("DELETE FROM icons WHERE key = ?1")?
+                .execute([k])?;
+        }
+        tx.commit()?;
+        let mut cache = self.icons.lock().unwrap_or_else(|e| e.into_inner());
+        for k in &stale {
+            if let Ok(k) = <[u8; 32]>::try_from(k.as_slice()) {
+                cache.map.remove(&k);
+            }
+        }
+        Ok(stale.len())
     }
 
     // ---- чтение ----
@@ -3264,6 +3310,45 @@ mod tests {
         assert!(h.list("telegram", false, 10).is_empty());
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unused_icons_are_pruned_used_kept() {
+        let mut h = History::in_memory();
+        let app = |name: &str, png: &[u8]| SourceApp {
+            name: name.into(),
+            exe: format!("{name}.exe"),
+            icon_png: png.to_vec(),
+        };
+        let mut a = local_entry(
+            DeviceId([1; 32]),
+            "ПК",
+            Content::Text("из телеграма".into()),
+        );
+        a.set_source_app(&app("Telegram", b"TG-ICON-0123456789"));
+        a.seen_ms = 1;
+        let mut b = local_entry(DeviceId([1; 32]), "ПК", Content::Text("из блокнота".into()));
+        b.set_source_app(&app("Notepad", b"NP-ICON-0123456789"));
+        h.add(a).unwrap();
+        h.add(b).unwrap();
+        let count = |h: &History| -> i64 {
+            h.conn
+                .query_row("SELECT COUNT(*) FROM icons", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&h), 2);
+        assert_eq!(h.prune_icons().unwrap(), 0, "оба значка нужны");
+        // Запись из телеграма устарела: её значок больше не нужен.
+        assert_eq!(h.prune(Retention::Day, 2 * 24 * 3600 * 1000).unwrap(), 1);
+        assert_eq!(count(&h), 1);
+        let left = h.list("блокнот", false, 1);
+        assert!(
+            h.get(left[0].id)
+                .unwrap()
+                .source_app()
+                .is_some_and(|s| !s.icon_png.is_empty()),
+            "оставшийся значок на месте"
+        );
     }
 
     #[test]

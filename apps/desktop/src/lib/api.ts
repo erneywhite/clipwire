@@ -40,6 +40,8 @@ export interface Settings {
   send_kinds: { text: boolean; images: boolean; files: boolean; folders: boolean }
   /** Правила исключений (вкладка «Исключения»). */
   exclusion_rules: ExclusionRule[]
+  /** Учитывать .gitignore внутри скопированных папок. */
+  use_gitignore: boolean
 }
 
 export interface DeviceInfo {
