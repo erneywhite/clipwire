@@ -148,7 +148,7 @@ On macOS use Cmd instead of Ctrl in the shortcuts below.
 |---|---|
 | Up, Down, mouse | select |
 | Enter, double click | paste where the text cursor is (and send to your other devices) |
-| Shift+Enter | paste without formatting |
+| Shift+Enter | paste without formatting (with formatting when **Paste without formatting** is on) |
 | Ctrl+1…9 | paste the entry with that number |
 | Space | preview (when the search field is empty) |
 | Ctrl+P, click the pin on the right of a row | pin or unpin |
@@ -303,7 +303,8 @@ Files and folders are prepared for sending again, as on a fresh copy.
 
 Copying from a browser, Word or a mail client keeps HTML and RTF along with the text. Pasting
 inserts the formatted version; Shift+Enter (or the plain-text button in the preview) inserts just
-the text. Such entries are marked `HTML` or `RTF` in the
+the text. With **General → Paste → Paste without formatting** turned on it is the other way round:
+Enter inserts just the text and Shift+Enter keeps the formatting. Such entries are marked `HTML` or `RTF` in the
 list. The preview renders them in an isolated frame: scripts do not run and external images and
 fonts are not loaded, so opening a message does not tell the sender that you read it. If the
 formatted text is too big to send, the other devices receive it as plain text.
@@ -582,8 +583,8 @@ Settings open from the tray icon menu (the menu bar on macOS). Tabs:
   from the history, with its own lower click (on Linux the sounds play through `pw-play`, `paplay`
   or `aplay`); automatic updates; language (English, Русский or as in the system); appearance:
   three themes (Graphite, Paper, Signal), each in light and dark, or follow the system; paste:
-  **Paste straight into the active window** and, on Windows, **Paste clipboard images into File
-  Explorer as files**; history retention, from a day to forever (pinned entries are kept forever).
+  **Paste straight into the active window**, **Paste without formatting** and, on Windows,
+  **Paste clipboard images into File Explorer as files**; history retention, from a day to forever (pinned entries are kept forever).
 - **Sync:** the group (create, join, leave) and its fingerprint; **New invite code**: after the
   access token is changed, a device enters a new invite code to the same group without leaving it
   (the field opens by itself when the server refuses the old code; an invite to another group is

@@ -94,6 +94,7 @@ const en: Record<string, string> = {
   'Отменить правку': 'Discard changes',
   'Открыть в браузере': 'Open in browser',
   'Без форматирования': 'Paste as plain text',
+  'С форматированием': 'Paste with formatting',
   'Просмотр': 'Preview',
   'Пробел': 'Space',
   // Подписи и закрепы

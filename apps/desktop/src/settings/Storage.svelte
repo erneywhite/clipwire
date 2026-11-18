@@ -492,6 +492,8 @@
     font-size: var(--text-s);
   }
   .error {
+    /* Адреса и пути в ошибках длинные и без пробелов: переносить где угодно. */
+    overflow-wrap: anywhere;
     color: var(--c-danger);
     margin: 0;
     display: flex;
@@ -634,6 +636,10 @@
     border: 1px solid var(--c-danger);
     border-radius: var(--radius-m);
     font-size: var(--text-s);
+  }
+  .warning > span {
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
   .warning .mono {
     color: var(--c-muted);

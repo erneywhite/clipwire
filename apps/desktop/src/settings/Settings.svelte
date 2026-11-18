@@ -740,6 +740,12 @@
               onchange={(v) => save({ paste_into_active: v })}
             />
           {/if}
+          <Toggle
+            label={t('Вставлять без форматирования')}
+            hint={t('Текст из браузера, Word или почты вставляется без шрифтов и оформления. Shift+Enter в окне вставки тогда вставляет с форматированием.')}
+            checked={s.always_plain_text}
+            onchange={(v) => save({ always_plain_text: v })}
+          />
           {#if !isMac && !isLinux}
             <!-- Только Windows: Проводник не вставляет картинку, к ней добавляется PNG-файл. -->
             <Toggle
@@ -1717,6 +1723,8 @@
     column-gap: var(--space-5);
   }
   .error {
+    /* Адреса и пути в ошибках длинные и без пробелов: переносить где угодно. */
+    overflow-wrap: anywhere;
     color: var(--c-danger);
     margin: 0 0 var(--space-3);
   }
