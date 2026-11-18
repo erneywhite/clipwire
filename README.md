@@ -42,6 +42,7 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
 
 - [Getting started](#getting-started)
 - [Paste window](#paste-window)
+- [Exclusions](#exclusions)
 - [What gets synced](#what-gets-synced)
 - [Image editor](#image-editor)
 - [Devices and groups](#devices-and-groups)
@@ -49,6 +50,7 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
 - [Privacy and security](#privacy-and-security)
 - [Updates](#updates)
 - [Settings](#settings)
+- [Moving from Paste (macOS)](#moving-from-paste-macos)
 - [Self-hosted server](#self-hosted-server)
 - [Building from source and tests](#building-from-source-and-tests)
 - [Project layout](#project-layout)
@@ -56,6 +58,21 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
 - [License](#license)
 
 ## Getting started
+
+**How it works.** The server is your own: a single Docker container. It holds groups, and a group
+is your devices sharing one encryption key. What you copy on one device of a group arrives on the
+others. There are three kinds of codes:
+
+- `cwserver2-…` is the server administrator code. The server prints it on first start; it creates
+  groups and manages the server.
+- `cwgroup1-…` is a one-time group creation code. The server administrator issues it to another
+  person so they can set up their own group on that server.
+- `clipwire1-…` is a group invitation code. It contains the group's encryption key and is how you
+  connect your other devices.
+
+If you run the server yourself, start with [Self-hosted server](#self-hosted-server), then install
+the client. If a server already exists, or you only want clipboard history on one computer,
+install the client right away.
 
 <p align="center">
   <img src="docs/screenshots/settings-sync.png" width="560" alt="Sync settings: create a group or join one">
@@ -96,8 +113,8 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
    extension, otherwise the icon is not shown (Clipwire still works: open it from the menu).
 4. **Wayland.** On GNOME and KDE Plasma the paste window opens next to the tray, elsewhere in the
    middle of the screen. To have it paste by itself,
-   turn on **Paste into the active window**; the system asks once for permission, see
-   [Paste window](#paste-window). The shortcut is registered with the desktop by itself on GNOME,
+   turn on **Paste straight into the active window**; the system asks once for permission, see
+   [Linux and Wayland](#linux-and-wayland). The shortcut is registered with the desktop by itself on GNOME,
    KDE Plasma and Hyprland; on Sway bind `clipwire --popup` to a key yourself.
 5. Keys are kept in the system password store (GNOME Keyring, KWallet).
 
@@ -105,81 +122,27 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
 a server at any time: the last 50 entries of the local history go to the group, and the group's
 history is merged into the local one. The clipboard itself is not touched.
 
-**Connecting a server.** Set up the server first (see [Self-hosted server](#self-hosted-server)); it
-prints a server code that looks like `cwserver2-…`. That is the administrator's code: groups are
-created with it (see [Administrator code](#administrator-code)). If the server belongs to someone else,
-its administrator can issue you a one-time group creation code `cwgroup1-…` (see
-[Group creation codes](#group-creation-codes)); you enter it in the same place as the server code.
+**Connecting a server.**
 
-1. On the first device open **Sync**, enter the server code `cwserver2-…` and create a group.
-   The device becomes the group admin and the server administrator: a **Server** section appears
-   in settings. An old `cwserver1-…` code cannot create a group; the app tells you where to get
-   the new one.
-2. Clipwire shows an invitation code, `clipwire1-…`. Enter it on your other devices.
+1. On the first device click the Clipwire icon in the tray (the menu bar on macOS) → **Settings** →
+   **Sync**. Enter the server code `cwserver2-…` and create a group. The device becomes the group
+   admin and the server administrator: a **Server** section appears in settings (see
+   [Administrator code](#administrator-code)). If the server belongs to someone else, enter the
+   group creation code `cwgroup1-…` from its administrator instead (see
+   [Group creation codes](#group-creation-codes)). An old `cwserver1-…` code cannot create a group;
+   the app tells you where to get the new one.
+2. Clipwire shows an invitation code, `clipwire1-…`. On your other devices open **Sync** in the
+   same way and enter it.
 
 The invitation code contains the group's encryption key. Share it only with yourself.
-
-**Moving from Paste (macOS).** The history of [Paste](https://pasteapp.io) can be moved with a
-command-line tool for now; a button in Settings is planned. Text and formatted text are moved with
-their dates and source apps, pinboard entries become pinned and their titles become notes. A
-repeated run pins and labels entries that were moved before; in a group the pins reach the other
-devices the next time Clipwire starts. Files are skipped (Paste keeps only
-links to them); images are moved with `--images`. Quit Clipwire, set history retention to
-"forever", then run from the repository:
-
-```
-cargo run --release -p clipwire-agent -- import-paste --dry-run   # only count
-cargo run --release -p clipwire-agent -- import-paste --send      # move and send to the group
-```
-
-macOS asks once for access to the Clipwire key in the Keychain. Running it again skips what was
-already moved.
-
-With `--send` the moved entries also go to the group. Keep your other devices online for the whole
-time: the server keeps only the latest entries of a group (50 by default, `CLIPWIRE_HISTORY_LEN`),
-and old Paste entries don't make it into that history, so a device that is offline won't get them
-later. Entries go out in batches so the receivers keep up: text is quick, images take about 1 MB/s,
-and an archive of a few gigabytes takes hours. The tool prints its progress every hundred entries.
-If the connection drops, it reconnects and continues from the last entry the server confirmed. If
-there is no connection for longer than `--wait` minutes (10 by default), it exits with code 2 and
-prints the command that sends the rest, for example:
-
-```
-cargo run --release -p clipwire-agent -- import-paste --resend --images --since 1731700000000
-```
-
-`--resend` sends entries already moved from Paste to the group without touching the history; it
-finds them by their copy time. `--since` takes a date (`YYYY-MM-DD`) or the milliseconds from the
-hint, `--skip N` skips the N oldest entries, `--limit N` caps the count. Sending something twice is
-harmless: receivers drop entries they already have.
 
 ## Paste window
 
 Press Ctrl+Shift+V on Windows, Cmd+Shift+V on macOS or Ctrl+Alt+V on Linux (configurable; on Linux
-Ctrl+Shift+V is how terminals paste). The window opens next to the mouse cursor.
+Ctrl+Shift+V is how terminals paste). The window opens next to the mouse cursor. For Linux and
+Wayland see [below](#linux-and-wayland).
 
-On Linux in an Xorg session it works the same way; in terminals it pastes with Ctrl+Shift+V. On Wayland apps can't see the mouse cursor or
-press keys in other windows. On GNOME and KDE Plasma the window opens in the corner next to the
-panel, on the tray side (Clipwire runs its windows through XWayland there, so it can choose where
-they go; set `CLIPWIRE_NATIVE_WAYLAND=1` to keep native Wayland windows). On other Wayland desktops
-it opens in the middle of the screen. Enter only puts the entry on the clipboard; you paste it with Ctrl+V
-yourself.
-
-**Pasting by itself on Wayland.** Turn on **Paste into the active window** under Paste. The
-system then asks once for permission to *control the keyboard* (GNOME calls it "remote desktop" or
-"remote control"). It sounds scarier than it is: this is the standard desktop portal that remote
-access apps use, and it is the only way Wayland lets an app press a key. Clipwire uses it for
-exactly one thing — pressing Ctrl+V right after you pick an entry. It does not see your screen,
-does not read what you type and does nothing in the background. While Clipwire is pasting, GNOME
-shows a remote-control icon in the top bar; it goes away a minute after the last paste. The
-permission is remembered; turn the switch off to revoke it (Clipwire forgets it as well). On Wayland
-Clipwire can't tell which window is active, so it always presses Ctrl+V; terminals paste with
-Ctrl+Shift+V, so there press it yourself (the entry is already on the clipboard). An app's own shortcut doesn't reach
-other apps' windows there, so Clipwire registers it with the desktop and keeps it in sync with its
-settings: on GNOME among the custom keyboard shortcuts, on KDE Plasma in the KDE shortcut service
-(System Settings → Shortcuts → Clipwire), on Hyprland and other desktops with the global shortcuts
-portal (the desktop may ask to confirm once). On Sway, which has none of these, bind
-`clipwire --popup` to a key in its config.
+On macOS use Cmd instead of Ctrl in the shortcuts below.
 
 | Keys | Action |
 |---|---|
@@ -191,7 +154,7 @@ portal (the desktop may ask to confirm once). On Sway, which has none of these, 
 | Ctrl+P, click the pin on the right of a row | pin or unpin |
 | Ctrl+R | add or edit the note of a pinned entry (Enter saves, Esc cancels) |
 | Ctrl+E | edit an image |
-| Delete (with an empty search), Shift+Delete, the bin icon in a row | delete from history; on a pinned entry, first a choice of what to do |
+| Delete (⌘⌫ on macOS) with an empty search, Shift+Delete, the bin icon in a row | delete from history; on a pinned entry, first a choice of what to do |
 | Right click, Menu key, Shift+F10 | entry menu: paste, preview, edit, pin, note, delete |
 | Tab | switch between History and Pinned |
 | Alt+Left, Alt+Right, the icons next to the tabs | filter: text, links, images, files |
@@ -216,27 +179,9 @@ A deletion made offline waits for the connection and survives a Clipwire restart
 Entries pinned on another device are not deleted. The server does not know what was deleted: the
 deletion note is encrypted with the group key. This needs server 0.1.3 or newer.
 
-**Exclusions.** The **Exclusions** tab gathers what doesn't go to other devices:
-- the **What to send** switches: text, images, files, folders;
-- rules for files and folders: a condition (extension, name starts with, contains, matches a mask
-  with `*` and `?`, size over or under) and an action. **Don't send** keeps matching items only in
-  this device's history, pinned ones included. Inside folders such files and subfolders are
-  skipped and the folder itself is sent. **Don't upload right away** transfers the file directly
-  on paste, like a file above the upload limit;
-- **Honour .gitignore in folders**: inside a copied folder, whatever its `.gitignore` files list is
-  skipped, following git's rules (a nested file wins, `!` brings an item back). For example,
-  build folders and `.env`. Off by default;
-- programs that must not be synced (password managers by default).
+### Pins and notes
 
-The default rules drop system clutter and temporary files: `desktop.ini`, `Thumbs.db`,
-`.DS_Store`, `._*`, Office lock files `~$…`, `*.tmp`, unfinished downloads `*.crdownload` and
-`*.part`. Rules for project folders (`.git`, `node_modules`, `.venv`, `__pycache__`) and `*.log`
-are there but turned off. A rule can be turned off with its checkbox, edited or removed, and
-**Restore default rules** adds back the missing ones. Extension and size are checked for files
-only, the name for folders too. If a copy includes something excluded, such as a folder next to
-files, nothing is sent. What arrives here is decided by the other devices' settings.
-
-**Pins and notes.** Pinned entries are the same on every device of the group, including devices
+Pinned entries are the same on every device of the group, including devices
 that joined later or were off for a long time. A pinned entry can have a note of up to 80
 characters, and search looks at it too. Unpinning removes the pin everywhere and erases the note;
 the entry stays in the history as an ordinary one. Pinning, unpinning and notes work offline as
@@ -301,6 +246,53 @@ right away, as before. How many pins the server holds and how much space they ta
 included, is shown in
 About → Status, in the **Pins on the server** row.
 
+### Linux and Wayland
+
+In an Xorg session the window opens at the cursor and pastes by itself; in terminals Clipwire pastes
+with Ctrl+Shift+V. On Wayland apps can't see the mouse cursor or press keys in other windows. On GNOME and KDE Plasma the window opens in the corner next to the
+panel, on the tray side (Clipwire runs its windows through XWayland there, so it can choose where
+they go; set `CLIPWIRE_NATIVE_WAYLAND=1` to keep native Wayland windows). On other Wayland desktops
+it opens in the middle of the screen. Enter only puts the entry on the clipboard; you paste it with Ctrl+V
+yourself.
+
+**Pasting by itself on Wayland.** Turn on **Paste straight into the active window** under **General → Paste**. The
+system then asks once for permission to *control the keyboard* (GNOME calls it "remote desktop" or
+"remote control"). It sounds scarier than it is: this is the standard desktop portal that remote
+access apps use, and it is the only way Wayland lets an app press a key. Clipwire uses it for
+exactly one thing — pressing Ctrl+V right after you pick an entry. It does not see your screen,
+does not read what you type and does nothing in the background. While Clipwire is pasting, GNOME
+shows a remote-control icon in the top bar; it goes away a minute after the last paste. The
+permission is remembered; turn the switch off to revoke it (Clipwire forgets it as well). On Wayland
+Clipwire can't tell which window is active, so it always presses Ctrl+V; terminals paste with
+Ctrl+Shift+V, so there press it yourself (the entry is already on the clipboard). An app's own shortcut doesn't reach
+other apps' windows there, so Clipwire registers it with the desktop and keeps it in sync with its
+settings: on GNOME among the custom keyboard shortcuts, on KDE Plasma in the KDE shortcut service
+(System Settings → Shortcuts → Clipwire), on Hyprland and other desktops with the global shortcuts
+portal (the desktop may ask to confirm once). On Sway, which has none of these, bind
+`clipwire --popup` to a key in its config.
+
+## Exclusions
+
+The **Exclusions** tab in settings gathers what doesn't go to other devices:
+- the **What to send** switches: text, images, files, folders;
+- rules for files and folders: a condition (extension, name starts with, contains, matches a mask
+  with `*` and `?`, size over or under) and an action. **Don't send** keeps matching items only in
+  this device's history, pinned ones included. Inside folders such files and subfolders are
+  skipped and the folder itself is sent. **Don't upload right away** transfers the file directly
+  on paste, like a file above the upload limit;
+- **Honour .gitignore in folders**: inside a copied folder, whatever its `.gitignore` files list is
+  skipped, following git's rules (a nested file wins, `!` brings an item back). For example,
+  build folders and `.env`. Off by default;
+- programs that must not be synced (password managers by default).
+
+The default rules drop system clutter and temporary files: `desktop.ini`, `Thumbs.db`,
+`.DS_Store`, `._*`, Office lock files `~$…`, `*.tmp`, unfinished downloads `*.crdownload` and
+`*.part`. Rules for project folders (`.git`, `node_modules`, `.venv`, `__pycache__`) and `*.log`
+are there but turned off. A rule can be turned off with its switch, edited or removed, and
+**Restore default rules** adds back the missing ones. Extension and size are checked for files
+only, the name for folders too. If a copy includes something excluded, such as a folder next to
+files, nothing is sent. What arrives here is decided by the other devices' settings.
+
 ## What gets synced
 
 Without a connection the latest copy waits and goes out as soon as the server is reachable. If
@@ -311,7 +303,7 @@ Files and folders are prepared for sending again, as on a fresh copy.
 
 Copying from a browser, Word or a mail client keeps HTML and RTF along with the text. Pasting
 inserts the formatted version; Shift+Enter (or the plain-text button in the preview) inserts just
-the text, and a setting can make that the default. Such entries are marked `HTML` or `RTF` in the
+the text. Such entries are marked `HTML` or `RTF` in the
 list. The preview renders them in an isolated frame: scripts do not run and external images and
 fonts are not loaded, so opening a message does not tell the sender that you read it. If the
 formatted text is too big to send, the other devices receive it as plain text.
@@ -583,29 +575,34 @@ the button in About or from the tray menu. More in [docs/updates.md](docs/update
   <img src="docs/screenshots/settings-general.png" width="560" alt="General settings">
 </p>
 
-- Three themes (Graphite, Paper, Signal), each in light and dark, or follow the system.
-- Language: English, Русский or as in the system.
-- Launch at login: the program starts minimized to the tray.
-- Copy sound: a short click on every copy made here and on anything new from another device.
-  Pasting from the history is silent unless **Paste sound** is on: it has its own, lower click.
-  On Linux the sounds play through `pw-play`, `paplay` or `aplay`.
-- History retention, from a day to forever (pinned entries are kept forever).
-- Device name, invitation code (**Show code**), leaving the group (it also removes the server
-  administrator key from the device).
-- **I am the server administrator** in Sync: the `cwserver2-…` code for a device that is already
-  in a group. If the administrator key was changed on another device, the app forgets the old one,
-  sync goes on without it, and Sync shows a hint to enter the new code.
-- **New invite code** in Sync: after the access token is changed, a device enters a new invite
-  code to the same group without leaving it. The field opens by itself when the server refuses
-  the old code, otherwise it is folded into a link. An invite to another group is not accepted
-  there.
-- The **Server** section, for the server administrator only: a summary (groups, devices, space
-  used by history, files and pins, version), the server's groups with deletion, server limits
-  and secret changes (see [Administrator code](#administrator-code)).
-- Paste window size (one slider with a live preview next to it) and the hotkey.
-- Exclusions: what to send, rules for files and folders, programs (see **Exclusions** above).
-- Hiding Clipwire windows during screen sharing (Windows and macOS; Linux has no way to do it).
-- Link previews on or off, formatted text always plain, update settings.
+Settings open from the tray icon menu (the menu bar on macOS). Tabs:
+
+- **General:** launch at login (minimized to the tray); **Sound on copy**, a short click on every
+  copy made here and on anything new from another device; a separate **Paste sound** for pasting
+  from the history, with its own lower click (on Linux the sounds play through `pw-play`, `paplay`
+  or `aplay`); automatic updates; language (English, Русский or as in the system); appearance:
+  three themes (Graphite, Paper, Signal), each in light and dark, or follow the system; paste:
+  **Paste straight into the active window** and, on Windows, **Paste clipboard images into File
+  Explorer as files**; history retention, from a day to forever (pinned entries are kept forever).
+- **Sync:** the group (create, join, leave) and its fingerprint; **New invite code**: after the
+  access token is changed, a device enters a new invite code to the same group without leaving it
+  (the field opens by itself when the server refuses the old code; an invite to another group is
+  not accepted there); device name; **Delete on all devices**; files: **Automatically upload files
+  up to, MB** and the download cache; [file storage](#file-storage-s3--sftp);
+  [the group's devices](#devices-and-groups); the invitation code for new devices; **I am the
+  server administrator**: the `cwserver2-…` code for a device that is already in a group (if the
+  administrator key was changed on another device, the app forgets the old one and asks for the
+  new code); leaving the group (it also removes the server administrator key from the device).
+- **Exclusions:** what to send, rules for files and folders, `.gitignore`, programs (see
+  [Exclusions](#exclusions)).
+- **Server**, for the server administrator only: a summary (groups, devices, space used by
+  history, files and pins, version), the server's groups with deletion, server limits and secret
+  changes (see [Administrator code](#administrator-code)).
+- **Privacy:** hiding Clipwire windows during screen sharing (Windows and macOS; Linux has no way
+  to do it) and link cards.
+- **Shortcuts:** the paste window shortcut, its size (one slider with a live preview next to it)
+  and key hints.
+- **About:** version, updates, connection status and logs, see below.
 
 The **About** page shows the version and the update check, and below it a status block: the
 connection to the server and how it runs (direct over UDP or through the relay, with latency),
@@ -638,6 +635,42 @@ events and errors. Files are named `clipwire.<date>.log`, one per day, the last 
 
 With `CLIPWIRE_HOME` set, the `logs` folder is inside it. The `RUST_LOG` variable changes the
 log level (for example `RUST_LOG=debug`).
+
+## Moving from Paste (macOS)
+
+The history of [Paste](https://pasteapp.io) can be moved with a
+command-line tool for now; a button in Settings is planned. Text and formatted text are moved with
+their dates and source apps, pinboard entries become pinned and their titles become notes. A
+repeated run pins and labels entries that were moved before; in a group the pins reach the other
+devices the next time Clipwire starts. Files are skipped (Paste keeps only
+links to them); images are moved with `--images`. Quit Clipwire, set history retention to
+"forever", then run from the repository:
+
+```
+cargo run --release -p clipwire-agent -- import-paste --dry-run   # only count
+cargo run --release -p clipwire-agent -- import-paste --send      # move and send to the group
+```
+
+macOS asks once for access to the Clipwire key in the Keychain. Running it again skips what was
+already moved.
+
+With `--send` the moved entries also go to the group. Keep your other devices online for the whole
+time: the server keeps only the latest entries of a group (50 by default, `CLIPWIRE_HISTORY_LEN`),
+and old Paste entries don't make it into that history, so a device that is offline won't get them
+later. Entries go out in batches so the receivers keep up: text is quick, images take about 1 MB/s,
+and an archive of a few gigabytes takes hours. The tool prints its progress every hundred entries.
+If the connection drops, it reconnects and continues from the last entry the server confirmed. If
+there is no connection for longer than `--wait` minutes (10 by default), it exits with code 2 and
+prints the command that sends the rest, for example:
+
+```
+cargo run --release -p clipwire-agent -- import-paste --resend --images --since 1731700000000
+```
+
+`--resend` sends entries already moved from Paste to the group without touching the history; it
+finds them by their copy time. `--since` takes a date (`YYYY-MM-DD`) or the milliseconds from the
+hint, `--skip N` skips the N oldest entries, `--limit N` caps the count. Sending something twice is
+harmless: receivers drop entries they already have.
 
 ## Self-hosted server
 
