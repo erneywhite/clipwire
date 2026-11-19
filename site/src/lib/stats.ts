@@ -61,6 +61,34 @@ export const showStars = (n: number | null): n is number => n !== null && n >= S
 export const showDownloads = (d: Downloads | null): d is Downloads =>
   d !== null && Math.min(d.windows, d.macos, d.linux) >= DOWNLOADS_MIN;
 
+const semver = (v: string) => v.split('.').map(Number);
+const newer = (a: string, b: string) => {
+  const [x, y] = [semver(a), semver(b)];
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
+  return false;
+};
+
+/**
+ * Сводит цифры из нескольких источников, от самого свежего к самому старому:
+ * ответ GitHub сейчас, последний удачный ответ в этом браузере, сборка сайта.
+ * Загрузки только растут, поэтому по каждой ОС берётся наибольшее: если GitHub не
+ * ответил, человек не увидит, как 2000 загрузок вдруг превратились в 50.
+ * Звёзды могут и убывать, их берём из самого свежего источника, где они есть.
+ */
+export function mergeStats(...items: (Stats | null | undefined)[]): Stats {
+  const known = items.filter((x): x is Stats => !!x);
+  const out: Stats = { stars: null, downloads: null, latest: null };
+  for (const s of known) {
+    if (out.stars === null && s.stars !== null) out.stars = s.stars;
+    if (s.latest && (!out.latest || newer(s.latest, out.latest))) out.latest = s.latest;
+    if (s.downloads) {
+      out.downloads ??= { windows: 0, macos: 0, linux: 0 };
+      for (const os of ['windows', 'macos', 'linux'] as OsKey[]) out.downloads[os] = Math.max(out.downloads[os], s.downloads[os] || 0);
+    }
+  }
+  return out;
+}
+
 /** Запрос к GitHub API: звёзды и выпуски (до 100, больше пока нет). */
 export async function fetchStats(repo: string, opts: { token?: string; timeoutMs?: number } = {}): Promise<Stats> {
   const headers: Record<string, string> = { Accept: 'application/vnd.github+json' };

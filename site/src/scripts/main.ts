@@ -8,7 +8,7 @@ import { ScrambleTextPlugin } from 'gsap/ScrambleTextPlugin';
 import { Flip } from 'gsap/Flip';
 import { SplitText } from 'gsap/SplitText';
 import Lenis from 'lenis';
-import { fetchStats, showStars, showDownloads, type Stats, type OsKey } from '../lib/stats';
+import { fetchStats, mergeStats, showStars, showDownloads, type Stats, type OsKey } from '../lib/stats';
 import 'lenis/dist/lenis.css';
 
 gsap.registerPlugin(ScrollTrigger, MotionPathPlugin, DrawSVGPlugin, ScrambleTextPlugin, Flip, SplitText);
@@ -94,11 +94,12 @@ if (os === 'mobile') {
 applyVersion(data.version);
 
 // Сайт заливается руками и может отстать от выпусков: спрашиваем GitHub о последнем
-// выпуске, звёздах и загрузках и подменяем ссылки и цифры. Ответ живёт до конца сессии
-// браузера, так что лимит API в 60 запросов в час не мешает. Не ответил — остаётся сборка.
+// выпуске, звёздах и загрузках и подменяем ссылки и цифры. Свежий ответ живёт до конца
+// сессии (лимит API в 60 запросов в час не мешает), последний удачный хранится в браузере
+// дальше: если GitHub не ответил, показываем его, а не старые цифры сборки.
 const nf = new Intl.NumberFormat(document.documentElement.lang);
 const pr = new Intl.PluralRules(document.documentElement.lang);
-const dlForms = (data as unknown as { dlForms: Record<string, string> }).dlForms;
+const extra = data as unknown as { dlForms: Record<string, string>; stats: Stats };
 
 function applyStats(s: Stats) {
   if (s.latest && s.latest !== data.version) applyVersion(s.latest);
@@ -113,28 +114,41 @@ function applyStats(s: Stats) {
       const n = s.downloads![el.dataset.dl as OsKey] ?? 0;
       el.hidden = !on;
       $('[data-dl-n]', el).textContent = nf.format(n);
-      $('[data-dl-w]', el).textContent = dlForms[pr.select(n)] ?? dlForms.other;
+      $('[data-dl-w]', el).textContent = extra.dlForms[pr.select(n)] ?? extra.dlForms.other;
     });
   }
 }
 
-(async () => {
-  const key = 'clipwire-gh';
-  let s: Stats | null = null;
+const readStats = (store: Storage, key: string): Stats | null => {
   try {
-    s = JSON.parse(sessionStorage.getItem(key) || 'null');
+    return JSON.parse(store.getItem(key) || 'null');
   } catch {
-    /* хранилище недоступно — просто спросим */
+    return null; // хранилище недоступно или испорчено
   }
-  if (!s) {
-    s = await fetchStats(data.repo).catch(() => null);
-    try {
-      if (s && (s.latest || s.stars !== null)) sessionStorage.setItem(key, JSON.stringify(s));
-    } catch {
-      /* не важно */
+};
+const writeStats = (store: Storage, key: string, s: Stats) => {
+  try {
+    store.setItem(key, JSON.stringify(s));
+  } catch {
+    /* не важно */
+  }
+};
+
+(async () => {
+  const SESSION = 'clipwire-gh';
+  const LAST = 'clipwire-gh-last';
+  const stored = readStats(localStorage, LAST);
+  // Сразу показываем лучшее из известного, потом, если надо, уточняем ответом GitHub.
+  applyStats(mergeStats(stored, extra.stats));
+  let fresh = readStats(sessionStorage, SESSION);
+  if (!fresh) {
+    fresh = await fetchStats(data.repo).catch(() => null);
+    if (fresh && (fresh.latest || fresh.stars !== null)) {
+      writeStats(sessionStorage, SESSION, fresh);
+      writeStats(localStorage, LAST, mergeStats(fresh, stored));
     }
   }
-  if (s) applyStats(s);
+  if (fresh) applyStats(mergeStats(fresh, stored, extra.stats));
 })();
 
 // ── Главный экран: два устройства копируют в одну общую историю ────────
