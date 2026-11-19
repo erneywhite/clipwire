@@ -735,24 +735,57 @@ function initRail() {
   };
   ticks.forEach((b, i) => b.addEventListener('click', () => go(topOf(i))));
 
-  // Перетаскивание и клик по самой полосе.
+  // Клик по полосе едет плавно (рядом с риской — к её разделу), перетаскивание
+  // двигает страницу сразу, как обычный ползунок.
+  const SNAP = 14; // px: промах мимо риски в этих пределах считается попаданием
+  let down: { y: number; id: number } | null = null;
   let dragging = false;
-  const seek = (e: PointerEvent) => {
+  const ratio = (clientY: number) => {
     const r = rail.getBoundingClientRect();
-    const p = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
-    if (lenis) lenis.scrollTo(p * maxScroll(), { immediate: true });
-    else window.scrollTo(0, p * maxScroll());
+    return Math.min(1, Math.max(0, (clientY - r.top) / r.height));
+  };
+  const nearestTick = (clientY: number) => {
+    let best = -1;
+    let dist = SNAP;
+    ticks.forEach((t, i) => {
+      const r = t.getBoundingClientRect();
+      const d = Math.abs(r.top + r.height / 2 - clientY);
+      if (d <= dist) {
+        dist = d;
+        best = i;
+      }
+    });
+    return best;
   };
   rail.addEventListener('pointerdown', (e) => {
     if ((e.target as Element).closest('[data-rail-tick]')) return;
-    dragging = true;
-    rail.setPointerCapture(e.pointerId);
-    seek(e);
+    down = { y: e.clientY, id: e.pointerId };
+    try {
+      rail.setPointerCapture(e.pointerId);
+    } catch {
+      /* без захвата перетаскивание просто кончится на краю полосы */
+    }
   });
-  rail.addEventListener('pointermove', (e) => dragging && seek(e));
-  const stop = () => (dragging = false);
-  rail.addEventListener('pointerup', stop);
-  rail.addEventListener('pointercancel', stop);
+  rail.addEventListener('pointermove', (e) => {
+    if (!down) return;
+    if (!dragging && Math.abs(e.clientY - down.y) < 4) return;
+    dragging = true;
+    const y = ratio(e.clientY) * maxScroll();
+    if (lenis) lenis.scrollTo(y, { immediate: true });
+    else window.scrollTo(0, y);
+  });
+  rail.addEventListener('pointerup', (e) => {
+    if (down && !dragging) {
+      const i = nearestTick(e.clientY);
+      go(i >= 0 ? topOf(i) : ratio(e.clientY) * maxScroll());
+    }
+    down = null;
+    dragging = false;
+  });
+  rail.addEventListener('pointercancel', () => {
+    down = null;
+    dragging = false;
+  });
 
   window.addEventListener('scroll', update, { passive: true });
   ScrollTrigger.addEventListener('refresh', layout);
@@ -832,4 +865,4 @@ document.fonts?.ready.then(() => {
 });
 
 // Для проверки в разработке: доступ к таймлайну сцены из консоли.
-if (import.meta.env.DEV) (window as unknown as { __cw: object }).__cw = { hero: () => heroTl, lane: () => laneTl };
+if (import.meta.env.DEV) (window as unknown as { __cw: object }).__cw = { hero: () => heroTl, lane: () => laneTl, lenis: () => lenis };
