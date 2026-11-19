@@ -832,6 +832,19 @@ function initRail() {
 }
 initRail();
 
+// Логотип в шапке на той же странице не перезагружает её, а плавно поднимает наверх.
+$<HTMLAnchorElement>('.brand').addEventListener('click', (e) => {
+  const a = e.currentTarget as HTMLAnchorElement;
+  if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // новая вкладка — как обычно
+  if (new URL(a.href).pathname !== location.pathname) return;
+  e.preventDefault();
+  if (location.hash) history.replaceState(null, '', location.pathname);
+  // Чем дальше от верха, тем дольше путь, но не больше 1,6 с.
+  const duration = Math.min(1.6, 0.6 + window.scrollY / 9000);
+  if (lenis) lenis.scrollTo(0, { duration, easing: (t: number) => 1 - Math.pow(1 - t, 4) });
+  else window.scrollTo({ top: 0, behavior: 'auto' });
+});
+
 // ── Запуск ─────────────────────────────────────────────────────────────
 initTry();
 
