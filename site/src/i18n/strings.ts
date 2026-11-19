@@ -1,0 +1,658 @@
+// Тексты сайта на двух языках. Английский основной (корень), русский в /ru/.
+
+export type Lang = 'en' | 'ru';
+
+export interface Row {
+  kind: 'text' | 'code' | 'link' | 'image' | 'file' | 'folder';
+  text: string;
+  meta: string;
+  /** Для формата: метка HTML/RTF в мете. */
+  tag?: string;
+}
+
+const en = {
+  htmlLang: 'en',
+  title: 'Clipwire · Self-hosted clipboard sync for Windows, macOS and Linux',
+  description:
+    'Free open-source clipboard sync for Windows, macOS and Linux. Copy on one computer, paste on another: text, images and files go through your own server, end-to-end encrypted.',
+  skip: 'Skip to content',
+  nav: { how: 'How it works', security: 'Encryption', server: 'Self-hosting', download: 'Download', support: 'Support' },
+  langSwitch: { label: 'Русский', href: '/ru/', short: 'RU' },
+  rail: {
+    label: 'Page sections',
+    items: [
+      ['top', 'Start'],
+      ['how', 'How it works'],
+      ['security', 'Encryption'],
+      ['exclusions', 'Exclusions'],
+      ['server', 'Self-hosting'],
+      ['local', 'Without a server'],
+      ['try', 'Try it'],
+      ['download', 'Download'],
+      ['faq', 'Questions'],
+      ['support', 'Support'],
+    ] as [string, string][],
+  },
+
+  hero: {
+    a: 'Copy here.',
+    b: 'Paste there.',
+    lead:
+      'A shared clipboard for Windows, macOS and Linux. Text, images and files travel through a server you run yourself and are encrypted before they leave the device. The server only ever sees ciphertext.',
+    ctaFor: 'Download for',
+    ctaAny: 'Download',
+    ctaMobile: 'Get it for your computer',
+    other: 'All platforms',
+    meta: ['free', 'open source, AGPL-3.0'],
+    sceneLabel:
+      'Animation: text copied on a Windows PC travels encrypted along a wire and appears in the paste window on a MacBook.',
+  },
+
+  scene: {
+    devA: 'work-pc · Windows',
+    devB: 'macbook · macOS',
+    devPw: 'shared history',
+    copied: 'copied',
+    payloads: [
+      {
+        from: 'a',
+        doc: 'Bringing the server up is one command: |docker compose up -d|, then check the log.',
+        row: { kind: 'code', text: 'docker compose up -d', meta: 'work-pc · Notepad · now · 20 chars' },
+      },
+      {
+        from: 'b',
+        doc: '#chart',
+        row: { kind: 'image', text: 'Weekly active devices', meta: 'macbook · Screenshot · now · 1200×739 · 42 KB' },
+      },
+      {
+        from: 'a',
+        doc: 'Repo for the review: |https://github.com/erneywhite/clipwire| (main branch).',
+        row: { kind: 'link', text: 'https://github.com/erneywhite/clipwire', meta: 'work-pc · Firefox · now' },
+      },
+      {
+        from: 'b',
+        doc: 'Works for me. |Meeting moved to Thursday, 15:00. Room 4B|',
+        row: { kind: 'text', text: 'Meeting moved to Thursday, 15:00. Room 4B', meta: 'macbook · Mail · now · 41 chars' },
+      },
+      {
+        from: 'a',
+        doc: '#file',
+        row: { kind: 'file', text: 'report-q3.pdf', meta: 'work-pc · Explorer · now · 2.4 MB' },
+      },
+    ] as { from: 'a' | 'b'; doc: string; row: Row }[],
+    fileName: 'report-q3.pdf',
+    fileSize: '2.4 MB',
+    chartTitle: 'Weekly active devices',
+    rows: [
+      { kind: 'link', text: 'https://docs.rs/iroh/latest/iroh/', meta: 'macbook · Safari · 40 min' },
+      { kind: 'text', text: 'Thanks! I will send the slides before lunch.', meta: 'work-pc · Teams · 1 h' },
+      { kind: 'text', text: 'Riga, Brīvības iela 40', meta: 'macbook · Maps · 2 h' },
+    ] as Row[],
+  },
+
+  paste: {
+    search: 'Search clipboard',
+    history: 'History',
+    pinned: 'Pinned',
+    hints: ['↵ paste', '␣ preview', 'Ctrl P pin', 'Del delete'],
+  },
+
+  how: {
+    title: 'What travels over the wire',
+    lead: 'Whatever you copy shows up on your other devices a moment later, in a history you can search.',
+    steps: [
+      {
+        key: 'rich',
+        title: 'Text, with formatting',
+        body: 'Copying from a browser, Word or a mail client keeps the HTML and RTF. Enter pastes it formatted, Shift+Enter pastes plain text.',
+      },
+      {
+        key: 'image',
+        title: 'Images',
+        body: 'Screenshots and pictures arrive as lossless PNG with a large thumbnail. Space opens the full image, Ctrl+E opens the editor.',
+      },
+      {
+        key: 'files',
+        title: 'Files and folders',
+        body: 'A card with the name and size appears everywhere at once. Files up to 100 MB (adjustable) are uploaded encrypted right away. Larger ones come straight from the source computer when you paste.',
+      },
+      {
+        key: 'links',
+        title: 'Links',
+        body: "Space shows a card built from the page's og: tags. The page itself never runs, and links that look single-use (reset, token, magic login) are not fetched at all.",
+      },
+    ],
+    // Карточки-спутники вокруг демонстрации: детали, которые не влезли в неё саму.
+    sats: {
+      rich: [
+        { icon: 'text', title: 'HTML', sub: 'from Chrome', pos: 'tl' },
+        { icon: 'code', title: 'Shift+Enter', sub: 'plain text only', pos: 'tr' },
+        { icon: 'text', title: 'RTF', sub: 'from Word', pos: 'br' },
+      ],
+      image: [
+        { icon: 'image', title: 'Lossless PNG', sub: '1200×739 · 42 KB', pos: 'tr' },
+        { icon: 'file', title: 'Image 2026-11-16 14-05-09.png', sub: 'pasted into a folder as a file', pos: 'bl' },
+        { icon: 'image', title: 'Ctrl+E', sub: 'arrow, blur, crop, text', pos: 'br' },
+      ],
+      files: [
+        { icon: 'folder', title: 'clipwire-site/', sub: '38 files, .gitignore honoured', pos: 'tl' },
+        { icon: 'arrow', title: 'Direct', sub: 'from the source when it is online', pos: 'tr' },
+        { icon: 'lock', title: 'Encrypted parts', sub: 'server disk, S3 or SFTP', pos: 'br' },
+      ],
+      links: [
+        { icon: 'link', title: 'og:title · og:image', sub: 'first 512 KB of HTML only', pos: 'tl' },
+        { icon: 'arrow', title: 'Open in browser', sub: 'one click from the card', pos: 'tr' },
+        { icon: 'x', title: 'localhost, 192.168.x.x', sub: 'never fetched', pos: 'br' },
+      ],
+    } as Record<string, { icon: string; title: string; sub: string; pos: string }[]>,
+    rich: {
+      heading: 'Release notes',
+      items: ['Paste window opens next to the cursor', 'Pins sync across devices', 'Exclusions for files and folders'],
+      plain: 'plain text',
+      formatted: 'formatted',
+    },
+    files: {
+      card: 'clipwire-demo.mp4',
+      size: '186 MB',
+      waiting: 'card arrived, waiting for paste',
+      pulling: 'pasting: pulled from work-pc directly',
+      done: 'pasted',
+    },
+    links: {
+      okUrl: 'https://github.com/erneywhite/clipwire',
+      okTitle: 'erneywhite/clipwire',
+      okDesc: 'Shared clipboard for your computers, through your own server.',
+      badUrl: 'https://accounts.example.com/reset?token=8f2c…',
+      badNote: 'looks single-use, not fetched',
+    },
+  },
+
+  security: {
+    title: 'The server only sees noise',
+    lead: 'Each entry is encrypted on the device with the group key. The key lives in the invitation code and on your devices, never on the server.',
+    secret: 'DB_PASSWORD=sunflower-orbit-42',
+    server: 'your server',
+    stages: ['on work-pc', 'on the server', 'on macbook'],
+    points: [
+      'The local history is encrypted too: DPAPI on Windows, Keychain on macOS, Secret Service on Linux.',
+      'Content that password managers mark as private never leaves the device.',
+      'Lost a laptop? Remove it from the group: the key is replaced and the other devices get the new one.',
+    ],
+  },
+
+  exclusions: {
+    title: 'Not everything should travel',
+    lead: 'Rules decide what stays on this computer: by extension, name, mask or size. System clutter is dropped out of the box, and password managers are excluded by default.',
+    note: 'With “Honour .gitignore” on, a copied project folder leaves behind whatever its .gitignore lists, such as .env and build output.',
+    gate: 'exclusions',
+    sent: 'sent',
+    items: [
+      { label: 'notes.md', pass: true },
+      { label: 'Thumbs.db', pass: false, why: 'system file' },
+      { label: 'screenshot.png', pass: true },
+      { label: '.env', pass: false, why: '.gitignore' },
+      { label: 'Meeting at 15:00', pass: true },
+      { label: 'KeePassXC', pass: false, why: 'password manager' },
+      { label: 'invoice.pdf', pass: true },
+      { label: 'node_modules/', pass: false, why: '.gitignore' },
+      { label: '~$report.docx', pass: false, why: 'lock file' },
+      { label: 'deploy.sh', pass: true },
+      { label: '.DS_Store', pass: false, why: 'system file' },
+    ],
+  },
+
+  server: {
+    title: 'One container. Your server.',
+    lead: 'The server is a single Docker container with an iroh relay built in. It is set up from a Docker panel, no SSH needed.',
+    facts: [
+      'On the same network devices connect directly. Everywhere else traffic goes through your relay.',
+      'Files are kept on the server disk, in S3-compatible storage or on SFTP.',
+      'Devices that were off pick up what they missed from a short mailbox with a retention period.',
+      'No server yet? The app works as a local clipboard history on one computer.',
+    ],
+    guide: 'Server setup guide',
+    guideHref: 'https://github.com/erneywhite/clipwire#self-hosted-server',
+    file: 'docker-compose.yml',
+    copy: 'Copy',
+    copiedOk: 'Copied',
+  },
+
+  local: {
+    title: 'Works without a server too',
+    lead: 'Install it on one computer and skip the server: Clipwire becomes a clipboard history that never loses anything. Search, pins, previews and the paste window all work offline.',
+    facts: [
+      'With history set to “Forever” every copy stays, encrypted on disk.',
+      'Copied files are kept as links to the originals, so the history does not fill up the disk.',
+      'On 43,000 entries a search for a rare word takes about 0.2 s.',
+      'Connect a server later: the last 50 entries go to the group, and the local history stays.',
+    ],
+    keep: 'Keep history',
+    retention: ['Day', 'Week', 'Month', 'Year', 'Forever'],
+    device: 'work-pc · no server',
+    rows: [
+      { kind: 'text', text: 'Thanks! I will send the slides before lunch.', meta: 'Teams · today' },
+      { kind: 'code', text: 'git log --oneline -20', meta: 'Terminal · yesterday' },
+      { kind: 'link', text: 'https://github.com/erneywhite/clipwire', meta: 'Firefox · 12 Nov' },
+      { kind: 'image', text: 'Weekly active devices', meta: 'Paint · 3 Oct' },
+      { kind: 'text', text: 'Wi-Fi at the cottage: Lisma-5G', meta: 'Notepad · July 2026' },
+      { kind: 'file', text: 'tax-return-2025.pdf', meta: 'Explorer · March 2026' },
+      { kind: 'code', text: 'ssh-keygen -t ed25519 -C "laptop"', meta: 'Terminal · December 2025' },
+      { kind: 'text', text: 'Order #4471, delivery Friday', meta: 'Mail · June 2025' },
+    ] as Row[],
+  },
+
+  try: {
+    title: 'Try the paste window',
+    lead: 'Ctrl+Shift+V opens it next to the mouse cursor (Cmd+Shift+V on macOS). This copy works right here: arrows, Enter, Space for preview, or just start typing.',
+    target: 'Your document',
+    targetEmpty: 'Select an entry and press Enter. It lands here.',
+    focusHint: 'Click the window, then use the keyboard',
+    noResults: 'Nothing found',
+    shots: [
+      { src: '/img/preview.png', alt: 'Paste window with an image preview', caption: 'Preview opens next to the list' },
+      { src: '/img/settings-sync.png', alt: 'Sync settings: create a group or join one', caption: 'Join a group with an invitation code' },
+      { src: '/img/settings-exclusions.png', alt: 'Exclusions settings', caption: 'Exclusions for files, folders and programs' },
+    ],
+    rows: [
+      { kind: 'code', text: 'docker compose pull && docker compose up -d', meta: 'work-pc · Terminal · now · 44 chars' },
+      { kind: 'link', text: 'https://github.com/erneywhite/clipwire', meta: 'This device · Firefox · 2 min' },
+      { kind: 'text', text: 'Thanks! I will send the slides before lunch.', meta: 'macbook · Mail · 9 min · 45 chars' },
+      { kind: 'text', text: 'Meeting moved to Thursday, 15:00. Room 4B', meta: 'work-pc · Outlook · 14 min', tag: 'HTML' },
+      { kind: 'image', text: 'Weekly active devices', meta: 'This device · Paint · 20 min · 1200×739' },
+      { kind: 'file', text: 'report-q3.pdf', meta: 'linux-box · Files · 1 h · 2.4 MB' },
+      { kind: 'folder', text: 'clipwire-site', meta: 'work-pc · Explorer · 2 h · 38 files' },
+      { kind: 'text', text: 'Riga, Brīvības iela 40', meta: 'macbook · Maps · yesterday' },
+    ] as Row[],
+  },
+
+  download: {
+    title: 'Download Clipwire',
+    lead: 'One installer per system. The app updates itself when a new version is out.',
+    latest: 'Latest release',
+    systems: [
+      { os: 'windows', name: 'Windows', req: 'x64', files: [{ label: 'Installer (.exe)', suffix: '_windows_x64-setup.exe' }] },
+      { os: 'macos', name: 'macOS', req: '13 Ventura or newer, Apple Silicon and Intel', files: [{ label: 'Disk image (.dmg)', suffix: '_macos_universal.dmg' }] },
+      {
+        os: 'linux',
+        name: 'Linux',
+        req: 'x86-64, X11 and Wayland',
+        files: [
+          { label: 'Debian, Ubuntu (.deb)', suffix: '_linux_amd64.deb' },
+          { label: 'AppImage', suffix: '_linux_amd64.AppImage' },
+        ],
+      },
+    ],
+    serverLine: 'Server image',
+    allReleases: 'All releases and changelog',
+    yours: 'your system',
+  },
+
+  faq: {
+    title: 'Questions',
+    items: [
+      {
+        q: 'Is Clipwire free?',
+        a: 'Yes. Clipwire is free and open source under AGPL-3.0, with no paid tier and no account. If it saves you time, you can support the author on Ko-fi.',
+      },
+      {
+        q: 'Do I need my own server?',
+        a: 'Not on a single computer: without a server Clipwire is a local clipboard history. To sync between computers you run the server, which is one Docker container, or join a group on a server someone already runs with a group creation code.',
+      },
+      {
+        q: 'Can the server read my clipboard?',
+        a: 'No. Every entry is end-to-end encrypted with the group key before it leaves the device. The key lives on your devices and in the invitation code, the server stores and forwards only ciphertext.',
+      },
+      {
+        q: 'Does it work outside my local network?',
+        a: 'Yes. Devices on the same network connect directly, everywhere else traffic goes through the relay built into your server, so a laptop on the road still syncs with the PC at home.',
+      },
+      {
+        q: 'Which systems are supported?',
+        a: 'Windows (x64), macOS 13 Ventura or newer on Apple Silicon and Intel, and Linux x86-64 on X11 and Wayland: GNOME, KDE Plasma, Sway, Hyprland and others. There are no phone apps.',
+      },
+      {
+        q: 'What can it sync?',
+        a: 'Plain and formatted text (HTML and RTF), images, files and folders. Files up to 100 MB are uploaded right away by default, larger ones are pulled from the source computer when you paste. Files can be stored on the server disk, in S3-compatible storage or on SFTP.',
+      },
+      {
+        q: 'How is it different from Universal Clipboard or Paste?',
+        a: 'Universal Clipboard works only between Apple devices, and Paste is a paid app for Apple platforms. Clipwire connects Windows, macOS and Linux through a server you control, is free, and can import your history from Paste.',
+      },
+    ],
+  },
+
+  support: {
+    title: 'Free, made by one person',
+    body: 'Clipwire is free and has no paid tier. If it saves you time, you can support the author on Ko-fi.',
+    kofi: 'Support on Ko-fi',
+    issues: 'Found a bug or have an idea? Tell about it in Issues.',
+    issuesLink: 'Open Issues',
+  },
+
+  footer: { license: 'AGPL-3.0', source: 'Source code' },
+};
+
+export type Strings = typeof en;
+
+const ru: Strings = {
+  htmlLang: 'ru',
+  title: 'Clipwire · общий буфер обмена для Windows, macOS и Linux через свой сервер',
+  description:
+    'Бесплатный общий буфер обмена с открытым кодом для Windows, macOS и Linux. Текст, картинки и файлы идут через собственный сервер и шифруются от устройства до устройства.',
+  skip: 'К содержимому',
+  nav: { how: 'Как работает', security: 'Шифрование', server: 'Свой сервер', download: 'Скачать', support: 'Поддержать' },
+  langSwitch: { label: 'English', href: '/', short: 'EN' },
+  rail: {
+    label: 'Разделы страницы',
+    items: [
+      ['top', 'Начало'],
+      ['how', 'Как работает'],
+      ['security', 'Шифрование'],
+      ['exclusions', 'Исключения'],
+      ['server', 'Свой сервер'],
+      ['local', 'Без сервера'],
+      ['try', 'Попробовать'],
+      ['download', 'Скачать'],
+      ['faq', 'Вопросы'],
+      ['support', 'Поддержать'],
+    ],
+  },
+
+  hero: {
+    a: 'Копируешь здесь.',
+    b: 'Вставляешь там.',
+    lead:
+      'Общий буфер обмена для Windows, macOS и Linux. Текст, картинки и файлы идут через собственный сервер и шифруются ещё на устройстве. Сервер видит только шифротекст.',
+    ctaFor: 'Скачать для',
+    ctaAny: 'Скачать',
+    ctaMobile: 'Скачать на компьютер',
+    other: 'Все системы',
+    meta: ['бесплатно', 'открытый код, AGPL-3.0'],
+    sceneLabel:
+      'Анимация: текст, скопированный на компьютере с Windows, зашифрованным уходит по проводу и появляется в окне вставки на MacBook.',
+  },
+
+  scene: {
+    devA: 'work-pc · Windows',
+    devB: 'macbook · macOS',
+    devPw: 'общая история',
+    copied: 'скопировано',
+    payloads: [
+      {
+        from: 'a',
+        doc: 'Сервер поднимается одной командой: |docker compose up -d|, дальше смотрим лог.',
+        row: { kind: 'code', text: 'docker compose up -d', meta: 'work-pc · Блокнот · сейчас · 20 симв.' },
+      },
+      {
+        from: 'b',
+        doc: '#chart',
+        row: { kind: 'image', text: 'Устройства за неделю', meta: 'macbook · Снимок экрана · сейчас · 1200×739 · 42 КБ' },
+      },
+      {
+        from: 'a',
+        doc: 'Репозиторий для ревью: |https://github.com/erneywhite/clipwire| (ветка main).',
+        row: { kind: 'link', text: 'https://github.com/erneywhite/clipwire', meta: 'work-pc · Firefox · сейчас' },
+      },
+      {
+        from: 'b',
+        doc: 'Мне подходит. |Встреча переносится на четверг, 15:00. Переговорная 4B|',
+        row: { kind: 'text', text: 'Встреча переносится на четверг, 15:00. Переговорная 4B', meta: 'macbook · Почта · сейчас · 54 симв.' },
+      },
+      {
+        from: 'a',
+        doc: '#file',
+        row: { kind: 'file', text: 'report-q3.pdf', meta: 'work-pc · Проводник · сейчас · 2,4 МБ' },
+      },
+    ],
+    fileName: 'report-q3.pdf',
+    fileSize: '2,4 МБ',
+    chartTitle: 'Устройства за неделю',
+    rows: [
+      { kind: 'link', text: 'https://docs.rs/iroh/latest/iroh/', meta: 'macbook · Safari · 40 мин' },
+      { kind: 'text', text: 'Спасибо! Слайды пришлю до обеда.', meta: 'work-pc · Teams · 1 ч' },
+      { kind: 'text', text: 'Рига, Brīvības iela 40', meta: 'macbook · Карты · 2 ч' },
+    ],
+  },
+
+  paste: {
+    search: 'Поиск по буферу',
+    history: 'История',
+    pinned: 'Закреплённые',
+    hints: ['↵ вставить', '␣ предпросмотр', 'Ctrl P закрепить', 'Del удалить'],
+  },
+
+  how: {
+    title: 'Что едет по проводу',
+    lead: 'Всё скопированное через мгновение появляется на остальных устройствах, в истории с поиском.',
+    steps: [
+      {
+        key: 'rich',
+        title: 'Текст с оформлением',
+        body: 'Из браузера, Word или почты текст приходит вместе с HTML и RTF. Enter вставляет его с оформлением, Shift+Enter без него.',
+      },
+      {
+        key: 'image',
+        title: 'Картинки',
+        body: 'Скриншоты и картинки приходят в PNG без потерь, с крупной миниатюрой. Пробел открывает картинку целиком, Ctrl+E открывает редактор.',
+      },
+      {
+        key: 'files',
+        title: 'Файлы и папки',
+        body: 'Карточка с именем и размером сразу появляется на всех устройствах. Файлы до 100 МБ (порог настраивается) сразу заливаются зашифрованными. Крупные приходят прямо с исходного компьютера в момент вставки.',
+      },
+      {
+        key: 'links',
+        title: 'Ссылки',
+        body: 'По пробелу открывается карточка из og:-тегов страницы. Сама страница не исполняется, а ссылки, похожие на одноразовые (reset, token, вход по ссылке), вообще не загружаются.',
+      },
+    ],
+    sats: {
+      rich: [
+        { icon: 'text', title: 'HTML', sub: 'из Chrome', pos: 'tl' },
+        { icon: 'code', title: 'Shift+Enter', sub: 'только текст', pos: 'tr' },
+        { icon: 'text', title: 'RTF', sub: 'из Word', pos: 'br' },
+      ],
+      image: [
+        { icon: 'image', title: 'PNG без потерь', sub: '1200×739 · 42 КБ', pos: 'tr' },
+        { icon: 'file', title: 'Снимок 2026-11-16 14-05-09.png', sub: 'вставка в папку файлом', pos: 'bl' },
+        { icon: 'image', title: 'Ctrl+E', sub: 'стрелка, размытие, обрезка, текст', pos: 'br' },
+      ],
+      files: [
+        { icon: 'folder', title: 'clipwire-site/', sub: '38 файлов, с учётом .gitignore', pos: 'tl' },
+        { icon: 'arrow', title: 'Напрямую', sub: 'с источника, пока он в сети', pos: 'tr' },
+        { icon: 'lock', title: 'Зашифрованные части', sub: 'диск сервера, S3 или SFTP', pos: 'br' },
+      ],
+      links: [
+        { icon: 'link', title: 'og:title · og:image', sub: 'только первые 512 КБ HTML', pos: 'tl' },
+        { icon: 'arrow', title: 'Открыть в браузере', sub: 'в один клик из карточки', pos: 'tr' },
+        { icon: 'x', title: 'localhost, 192.168.x.x', sub: 'не загружаются никогда', pos: 'br' },
+      ],
+    },
+    rich: {
+      heading: 'Что нового',
+      items: ['Окно вставки открывается у курсора', 'Закрепы синхронизируются', 'Исключения для файлов и папок'],
+      plain: 'без оформления',
+      formatted: 'с оформлением',
+    },
+    files: {
+      card: 'clipwire-demo.mp4',
+      size: '186 МБ',
+      waiting: 'карточка пришла, файл ждёт вставки',
+      pulling: 'вставка: файл идёт напрямую с work-pc',
+      done: 'вставлено',
+    },
+    links: {
+      okUrl: 'https://github.com/erneywhite/clipwire',
+      okTitle: 'erneywhite/clipwire',
+      okDesc: 'Общий буфер обмена для твоих компьютеров через свой сервер.',
+      badUrl: 'https://accounts.example.com/reset?token=8f2c…',
+      badNote: 'похоже на одноразовую, не загружается',
+    },
+  },
+
+  security: {
+    title: 'Сервер видит только шум',
+    lead: 'Каждая запись шифруется на устройстве ключом группы. Ключ есть в коде приглашения и на устройствах, на сервере его нет.',
+    secret: 'DB_PASSWORD=sunflower-orbit-42',
+    server: 'свой сервер',
+    stages: ['на work-pc', 'на сервере', 'на macbook'],
+    points: [
+      'Локальная история тоже зашифрована: DPAPI на Windows, связка ключей на macOS, Secret Service на Linux.',
+      'То, что менеджеры паролей помечают как секретное, с устройства не уходит.',
+      'Ноутбук потерян? Его можно удалить из группы: ключ сменится, остальные устройства получат новый.',
+    ],
+  },
+
+  exclusions: {
+    title: 'Не всё нужно отправлять',
+    lead: 'Правила решают, что остаётся на этом компьютере: по расширению, имени, маске или размеру. Системный мусор отсекается сразу, менеджеры паролей исключены по умолчанию.',
+    note: 'С включённым учётом .gitignore папка проекта уезжает без того, что в нём перечислено: без .env, сборок и прочего.',
+    gate: 'исключения',
+    sent: 'отправлено',
+    items: [
+      { label: 'notes.md', pass: true },
+      { label: 'Thumbs.db', pass: false, why: 'системный файл' },
+      { label: 'screenshot.png', pass: true },
+      { label: '.env', pass: false, why: '.gitignore' },
+      { label: 'Встреча в 15:00', pass: true },
+      { label: 'KeePassXC', pass: false, why: 'менеджер паролей' },
+      { label: 'invoice.pdf', pass: true },
+      { label: 'node_modules/', pass: false, why: '.gitignore' },
+      { label: '~$report.docx', pass: false, why: 'файл блокировки' },
+      { label: 'deploy.sh', pass: true },
+      { label: '.DS_Store', pass: false, why: 'системный файл' },
+    ],
+  },
+
+  server: {
+    title: 'Один контейнер. Свой сервер.',
+    lead: 'Весь сервер помещается в один Docker-контейнер со встроенным relay iroh. Ставится из Docker-панели, SSH не нужен.',
+    facts: [
+      'В одной сети устройства соединяются напрямую, в остальных случаях идут через свой relay.',
+      'Файлы хранятся на диске сервера, в S3-совместимом хранилище или на SFTP.',
+      'Выключенные устройства забирают пропущенное из короткого почтового ящика со сроком хранения.',
+      'Сервера пока нет? Программа работает как локальная история буфера на одном компьютере.',
+    ],
+    guide: 'Как поставить сервер',
+    guideHref: 'https://github.com/erneywhite/clipwire/blob/main/README.ru.md#свой-сервер',
+    file: 'docker-compose.yml',
+    copy: 'Копировать',
+    copiedOk: 'Скопировано',
+  },
+
+  local: {
+    title: 'Работает и без сервера',
+    lead: 'Поставь на один компьютер и обойдись без сервера: Clipwire станет историей буфера, в которой ничего не теряется. Поиск, закрепы, предпросмотр и окно вставки работают без сети.',
+    facts: [
+      'С хранением «Всегда» остаётся каждая копия, зашифрованная на диске.',
+      'Скопированные файлы хранятся ссылками на оригиналы, поэтому история не забивает диск.',
+      'Поиск редкого слова по 43 тысячам записей занимает около 0,2 с.',
+      'Сервер можно подключить позже: последние 50 записей уйдут в группу, локальная история останется.',
+    ],
+    keep: 'Хранить историю',
+    retention: ['День', 'Неделя', 'Месяц', 'Год', 'Всегда'],
+    device: 'work-pc · без сервера',
+    rows: [
+      { kind: 'text', text: 'Спасибо! Слайды пришлю до обеда.', meta: 'Teams · сегодня' },
+      { kind: 'code', text: 'git log --oneline -20', meta: 'Терминал · вчера' },
+      { kind: 'link', text: 'https://github.com/erneywhite/clipwire', meta: 'Firefox · 12 нояб.' },
+      { kind: 'image', text: 'Устройства за неделю', meta: 'Paint · 3 окт.' },
+      { kind: 'text', text: 'Wi-Fi на даче: Lisma-5G', meta: 'Блокнот · июль 2026' },
+      { kind: 'file', text: 'tax-return-2025.pdf', meta: 'Проводник · март 2026' },
+      { kind: 'code', text: 'ssh-keygen -t ed25519 -C "laptop"', meta: 'Терминал · декабрь 2025' },
+      { kind: 'text', text: 'Заказ №4471, доставка в пятницу', meta: 'Почта · июнь 2025' },
+    ],
+  },
+
+  try: {
+    title: 'Попробуй окно вставки',
+    lead: 'Ctrl+Shift+V открывает его рядом с курсором мыши (на macOS Cmd+Shift+V). Эта копия работает прямо здесь: стрелки, Enter, пробел для предпросмотра или просто начни печатать.',
+    target: 'Твой документ',
+    targetEmpty: 'Выбери запись и нажми Enter. Она окажется здесь.',
+    focusHint: 'Щёлкни по окну и управляй с клавиатуры',
+    noResults: 'Ничего не нашлось',
+    shots: [
+      { src: '/img/preview.png', alt: 'Окно вставки с предпросмотром картинки', caption: 'Предпросмотр открывается рядом со списком' },
+      { src: '/img/settings-sync.png', alt: 'Настройки синхронизации: создать группу или войти в неё', caption: 'Вход в группу по коду приглашения' },
+      { src: '/img/settings-exclusions.png', alt: 'Настройки исключений', caption: 'Исключения для файлов, папок и программ' },
+    ],
+    rows: [
+      { kind: 'code', text: 'docker compose pull && docker compose up -d', meta: 'work-pc · Терминал · сейчас · 44 симв.' },
+      { kind: 'link', text: 'https://github.com/erneywhite/clipwire', meta: 'Это устройство · Firefox · 2 мин' },
+      { kind: 'text', text: 'Спасибо! Слайды пришлю до обеда.', meta: 'macbook · Почта · 9 мин · 32 симв.' },
+      { kind: 'text', text: 'Встреча переносится на четверг, 15:00. Переговорная 4B', meta: 'work-pc · Outlook · 14 мин', tag: 'HTML' },
+      { kind: 'image', text: 'Устройства за неделю', meta: 'Это устройство · Paint · 20 мин · 1200×739' },
+      { kind: 'file', text: 'report-q3.pdf', meta: 'linux-box · Файлы · 1 ч · 2,4 МБ' },
+      { kind: 'folder', text: 'clipwire-site', meta: 'work-pc · Проводник · 2 ч · 38 файлов' },
+      { kind: 'text', text: 'Рига, Brīvības iela 40', meta: 'macbook · Карты · вчера' },
+    ],
+  },
+
+  download: {
+    title: 'Скачать Clipwire',
+    lead: 'Один установщик на систему. Новые версии программа ставит сама.',
+    latest: 'Последний выпуск',
+    systems: [
+      { os: 'windows', name: 'Windows', req: 'x64', files: [{ label: 'Установщик (.exe)', suffix: '_windows_x64-setup.exe' }] },
+      { os: 'macos', name: 'macOS', req: '13 Ventura и новее, Apple Silicon и Intel', files: [{ label: 'Образ диска (.dmg)', suffix: '_macos_universal.dmg' }] },
+      {
+        os: 'linux',
+        name: 'Linux',
+        req: 'x86-64, X11 и Wayland',
+        files: [
+          { label: 'Debian, Ubuntu (.deb)', suffix: '_linux_amd64.deb' },
+          { label: 'AppImage', suffix: '_linux_amd64.AppImage' },
+        ],
+      },
+    ],
+    serverLine: 'Образ сервера',
+    allReleases: 'Все выпуски и список изменений',
+    yours: 'твоя система',
+  },
+
+  faq: {
+    title: 'Вопросы',
+    items: [
+      {
+        q: 'Clipwire бесплатный?',
+        a: 'Да. Clipwire бесплатный, с открытым кодом под AGPL-3.0, без платной версии и без учётной записи. Если он экономит время, автора можно поддержать на Ko-fi.',
+      },
+      {
+        q: 'Нужен ли свой сервер?',
+        a: 'Для одного компьютера не нужен: без сервера Clipwire работает как локальная история буфера. Чтобы синхронизировать несколько компьютеров, ставится сервер, это один Docker-контейнер. Можно и войти в группу на чужом сервере по коду создания группы.',
+      },
+      {
+        q: 'Может ли сервер прочитать мой буфер?',
+        a: 'Нет. Каждая запись шифруется ключом группы ещё на устройстве. Ключ есть только на устройствах и в коде приглашения, сервер хранит и пересылает один шифротекст.',
+      },
+      {
+        q: 'Работает ли вне домашней сети?',
+        a: 'Да. В одной сети устройства соединяются напрямую, в остальных случаях идут через relay, встроенный в сервер. Ноутбук в поездке синхронизируется с домашним компьютером.',
+      },
+      {
+        q: 'Какие системы поддерживаются?',
+        a: 'Windows (x64), macOS 13 Ventura и новее на Apple Silicon и Intel, Linux x86-64 на X11 и Wayland: GNOME, KDE Plasma, Sway, Hyprland и другие. Приложений для телефонов нет.',
+      },
+      {
+        q: 'Что синхронизируется?',
+        a: 'Обычный текст и текст с оформлением (HTML и RTF), картинки, файлы и папки. Файлы до 100 МБ по умолчанию сразу заливаются в хранилище, крупные приходят с исходного компьютера в момент вставки. Файлы хранятся на диске сервера, в S3-совместимом хранилище или на SFTP.',
+      },
+      {
+        q: 'Чем отличается от Universal Clipboard и Paste?',
+        a: 'Universal Clipboard работает только между устройствами Apple, Paste платный и тоже только для Apple. Clipwire связывает Windows, macOS и Linux через собственный сервер, бесплатный и умеет забрать историю из Paste.',
+      },
+    ],
+  },
+
+  support: {
+    title: 'Бесплатно, делает один человек',
+    body: 'Clipwire бесплатный, платной версии нет. Если он экономит тебе время, можно поддержать автора на Ko-fi.',
+    kofi: 'Поддержать на Ko-fi',
+    issues: 'Нашёл ошибку или есть идея? Расскажи о ней в Issues.',
+    issuesLink: 'Открыть Issues',
+  },
+
+  footer: { license: 'AGPL-3.0', source: 'Исходный код' },
+};
+
+export const strings: Record<Lang, Strings> = { en, ru };

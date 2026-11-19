@@ -1,0 +1,613 @@
+---
+import Base from '../layouts/Base.astro';
+import PasteWindow from './PasteWindow.astro';
+import Logo from './Logo.astro';
+import { strings, type Lang } from '../i18n/strings';
+import { svg, glyph } from '../lib/icons';
+import { buildVersion, assetUrl, REPO } from '../lib/release';
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = strings[lang];
+const v = buildVersion();
+const home = lang === 'ru' ? '/ru/' : '/';
+
+// Документ на work-pc: |…| — выделенный фрагмент.
+const docHtml = (doc: string) =>
+  doc.replace(/\|([^|]+)\|/, '<mark class="sel-mark">$1</mark>');
+
+const compose = [
+  ['k', 'services:'],
+  ['k', '  clipwire:'],
+  ['kv', '    image: ', `ghcr.io/erneywhite/clipwire-server:${v}`],
+  ['kv', '    restart: ', 'unless-stopped'],
+  ['kv', '    read_only: ', 'true'],
+  ['k', '    environment:'],
+  ['kv', '      CLIPWIRE_PUBLIC_URL: ', 'https://clip.example.com'],
+  ['k', '    ports:'],
+  ['s', '      - ', '"127.0.0.1:3340:3340"'],
+  ['s', '      - ', '"7843:7843/udp"'],
+  ['k', '    volumes:'],
+  ['s', '      - ', 'clipwire-data:/data'],
+  ['k', 'volumes:'],
+  ['k', '  clipwire-data:'],
+];
+
+// Данные для сцены в браузере: строки окна вставки и значки к ним.
+// Структурированные данные для поисковиков и ИИ: программа, сайт и вопросы.
+const pageUrl = Astro.site ? new URL(lang === 'ru' ? '/ru/' : '/', Astro.site).href : undefined;
+const jsonLd = JSON.stringify({
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'SoftwareApplication',
+      name: 'Clipwire',
+      description: t.description,
+      applicationCategory: 'UtilitiesApplication',
+      operatingSystem: 'Windows, macOS, Linux',
+      softwareVersion: v,
+      license: 'https://www.gnu.org/licenses/agpl-3.0.html',
+      isAccessibleForFree: true,
+      offers: { '@type': 'Offer', price: '0', priceCurrency: 'EUR' },
+      downloadUrl: `https://github.com/${REPO}/releases/latest`,
+      codeRepository: `https://github.com/${REPO}`,
+      url: pageUrl,
+      image: Astro.site ? new URL('/img/social-preview.png', Astro.site).href : undefined,
+      screenshot: Astro.site ? new URL('/img/preview.png', Astro.site).href : undefined,
+      inLanguage: ['en', 'ru'],
+      author: { '@type': 'Person', name: 'Erney White', url: 'https://github.com/erneywhite' },
+      featureList: t.how.steps.map((s) => s.title).concat(t.security.title, t.local.title),
+    },
+    {
+      '@type': 'WebSite',
+      name: 'Clipwire',
+      url: Astro.site?.href,
+      inLanguage: t.htmlLang,
+    },
+    {
+      '@type': 'FAQPage',
+      inLanguage: t.htmlLang,
+      mainEntity: t.faq.items.map((f) => ({
+        '@type': 'Question',
+        name: f.q,
+        acceptedAnswer: { '@type': 'Answer', text: f.a },
+      })),
+    },
+  ],
+});
+
+const sceneData = JSON.stringify({
+  rows: t.scene.payloads.map((p) => p.row),
+  from: t.scene.payloads.map((p) => p.from),
+  glyph,
+  tryRows: t.try.rows,
+  copied: t.scene.copied,
+  noResults: t.try.noResults,
+  targetEmpty: t.try.targetEmpty,
+  version: v,
+  repo: REPO,
+  hero: { ctaFor: t.hero.ctaFor, ctaAny: t.hero.ctaAny, ctaMobile: t.hero.ctaMobile },
+  yours: t.download.yours,
+});
+---
+
+<Base t={t}>
+  <script type="application/ld+json" slot="head" set:html={jsonLd} />
+  <a class="skip" href="#main">{t.skip}</a>
+
+  <header class="top" data-top>
+    <nav class="top-in" aria-label="Clipwire">
+      <a class="brand" href={home}><Logo /><span>Clipwire</span></a>
+      <a class="nav-l" href="#how">{t.nav.how}</a>
+      <a class="nav-l" href="#security">{t.nav.security}</a>
+      <a class="nav-l" href="#server">{t.nav.server}</a>
+      <a class="nav-l" href="#support">{t.nav.support}</a>
+      <a class="nav-gh" href={`https://github.com/${REPO}`} aria-label="GitHub">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02a9.6 9.6 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2Z"/></svg>
+      </a>
+      <a class="nav-lang" href={t.langSwitch.href} hreflang={t.langSwitch.href === '/' ? 'en' : 'ru'} aria-label={t.langSwitch.label}>{t.langSwitch.short}</a>
+      <a class="btn btn-s btn-sm nav-dl" href="#download">{t.nav.download}</a>
+    </nav>
+  </header>
+
+  <!-- Полоса прокрутки с рисками разделов (десктоп) -->
+  <nav class="rail" data-rail aria-label={t.rail.label}>
+    <span class="rail-track" aria-hidden="true"><span class="rail-fill" data-rail-fill></span></span>
+    {
+      t.rail.items.map(([id, label]) => (
+        <button type="button" class="rail-tick" data-rail-tick data-target={id} aria-label={label}>
+          <span class="rail-tip" aria-hidden="true">{label}</span>
+        </button>
+      ))
+    }
+  </nav>
+
+  <main id="main">
+    <!-- ── Главный экран ── -->
+    <section class="hero" id="top" data-hero>
+      <div class="hero-copy">
+        <h1 class="hero-h">
+          <span class="hero-a">{t.hero.a}</span>
+          <span class="hero-b">{t.hero.b}</span>
+        </h1>
+        <p class="hero-lead">{t.hero.lead}</p>
+        <div class="hero-cta">
+          <a class="btn btn-p" href="#download" data-cta>
+            <Fragment set:html={svg('download')} />
+            <span data-cta-label>{t.hero.ctaAny}</span>
+          </a>
+          <a class="btn btn-s" href="#download">{t.hero.other}</a>
+        </div>
+        <p class="hero-meta">
+          <b data-version>{v}</b>
+          {t.hero.meta.map((m) => <span>· {m}</span>)}
+        </p>
+      </div>
+
+      <div class="scene" data-scene role="img" aria-label={t.hero.sceneLabel}>
+        {
+          (['a', 'b'] as const).map((side) => (
+            <div class:list={['dev', 'dev-src', `dev-${side}`]} data-dev={side}>
+              <span class="dev-label">
+                <i class="dot" />
+                {side === 'a' ? t.scene.devA : t.scene.devB}
+              </span>
+              <div class="docs">
+                {t.scene.payloads.map((p, i) =>
+                  p.from !== side ? null : (
+                    <div class:list={['doc', { on: i === t.scene.payloads.findIndex((q) => q.from === side) }]} data-doc={i}>
+                      {p.doc === '#chart' ? (
+                        <div class="doc-card chart-card sel-card">
+                          <span class="chart-title">{t.scene.chartTitle}</span>
+                          <span class="chart" aria-hidden="true">
+                            <i /><i /><i /><i /><i /><i /><i />
+                          </span>
+                        </div>
+                      ) : p.doc === '#file' ? (
+                        <div class="doc-card file-card sel-card">
+                          <span class="file-ic" set:html={svg('file')} />
+                          <span>
+                            <b>{t.scene.fileName}</b>
+                            <small>{t.scene.fileSize}</small>
+                          </span>
+                        </div>
+                      ) : (
+                        <p class="doc-text" set:html={docHtml(p.doc)} />
+                      )}
+                    </div>
+                  ),
+                )}
+              </div>
+              <div class="keys">
+                <kbd data-k1>{side === 'a' ? 'Ctrl' : '⌘'}</kbd>
+                <kbd data-k2>C</kbd>
+                <span class="copied" data-copied>{t.scene.copied}</span>
+              </div>
+            </div>
+          ))
+        }
+
+        <svg class="wire" data-wire aria-hidden="true">
+          {
+            (['a', 'b'] as const).map((side) => (
+              <g data-wire-g={side}>
+                <path class="wire-base" data-base d="" />
+                <path class="wire-glow" data-glow d="" />
+                <circle class="wire-end" data-end1 r="5" cx="0" cy="0" />
+                <circle class="wire-end" data-end2 r="5" cx="0" cy="0" />
+              </g>
+            ))
+          }
+        </svg>
+        <div class="packet" data-packet aria-hidden="true">
+          <Fragment set:html={svg('lock')} />
+          <span data-packet-text>········</span>
+        </div>
+
+        <div class="dev dev-pw" data-dev-pw>
+          <span class="dev-label dev-label-b"><Fragment set:html={svg('lock', 'ic lock-ic')} />{t.scene.devPw}</span>
+          <PasteWindow t={t} rows={t.scene.rows} id="hero-pw" />
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Что едет по проводу ── -->
+    <section class="how" id="how">
+      <div class="how-grid">
+        <div class="how-sticky">
+          <h2 class="sec-h">{t.how.title}</h2>
+          <p class="sec-lead">{t.how.lead}</p>
+          <ol class="how-steps">
+            {
+              t.how.steps.map((s, i) => (
+                <li class:list={['how-step', { on: i === 0 }]} data-step={s.key}>
+                  <span class="how-n">{String(i + 1).padStart(2, '0')}</span>
+                  <span>
+                    <b>{s.title}</b>
+                    <span class="how-body">{s.body}</span>
+                  </span>
+                </li>
+              ))
+            }
+          </ol>
+        </div>
+
+        <div class="how-panels">
+          {
+            t.how.steps.map((s) => (
+              <article class="panel" data-panel={s.key}>
+                <header class="panel-cap">
+                  <h3>{s.title}</h3>
+                  <p>{s.body}</p>
+                </header>
+
+                <div class="collage">
+                {s.key === 'rich' && (
+                  <div class="demo demo-rich" data-demo="rich">
+                    <div class="rich-src">
+                      <b class="rich-h">{t.how.rich.heading}</b>
+                      <ul>
+                        {t.how.rich.items.map((it) => (
+                          <li>{it}</li>
+                        ))}
+                      </ul>
+                    </div>
+                    <div class="rich-out">
+                      <div class="rich-keys">
+                        <kbd class="on" data-rk="enter">↵ Enter</kbd>
+                        <kbd data-rk="shift">⇧ Shift + ↵</kbd>
+                      </div>
+                      <div class="rich-doc">
+                        <div class="rich-fmt" data-rich-fmt>
+                          <b class="rich-h">{t.how.rich.heading}</b>
+                          <ul>
+                            {t.how.rich.items.map((it) => (
+                              <li>{it}</li>
+                            ))}
+                          </ul>
+                        </div>
+                        <div class="rich-plain" data-rich-plain>
+                          <p>{t.how.rich.heading}</p>
+                          {t.how.rich.items.map((it) => (
+                            <p>{it}</p>
+                          ))}
+                        </div>
+                      </div>
+                      <span class="rich-mode" data-rich-mode data-a={t.how.rich.formatted} data-b={t.how.rich.plain}>
+                        {t.how.rich.formatted}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {s.key === 'image' && (
+                  <figure class="demo demo-shot" data-demo="image">
+                    <img src="/img/preview.png" width="802" height="522" alt={t.try.shots[0].alt} loading="lazy" decoding="async" />
+                    <figcaption>
+                      <kbd>␣</kbd> {t.try.shots[0].caption}
+                    </figcaption>
+                  </figure>
+                )}
+
+                {s.key === 'files' && (
+                  <div class="demo demo-files" data-demo="files">
+                    <div class="mini-dev">
+                      <span class="dev-label">
+                        <i class="dot" />
+                        work-pc
+                      </span>
+                      <div class="fcard">
+                        <span class="file-ic" set:html={svg('file')} />
+                        <span>
+                          <b>{t.how.files.card}</b>
+                          <small>{t.how.files.size}</small>
+                        </span>
+                      </div>
+                    </div>
+                    <div class="files-link" aria-hidden="true">
+                      <span class="files-beam" data-files-beam />
+                    </div>
+                    <div class="mini-dev">
+                      <span class="dev-label">
+                        <i class="dot" />
+                        macbook
+                      </span>
+                      <div class="fcard fcard-b" data-fcard>
+                        <span class="file-ic" set:html={svg('file')} />
+                        <span class="fcard-body">
+                          <b>{t.how.files.card}</b>
+                          <small data-fstate data-w={t.how.files.waiting} data-p={t.how.files.pulling} data-d={t.how.files.done}>
+                            {t.how.files.waiting}
+                          </small>
+                          <span class="fbar">
+                            <span data-fbar />
+                          </span>
+                        </span>
+                      </div>
+                      <kbd class="files-key" data-fkey>
+                        ↵
+                      </kbd>
+                    </div>
+                  </div>
+                )}
+
+                {s.key === 'links' && (
+                  <div class="demo demo-links" data-demo="links">
+                    <div class="lrow">
+                      <span class="pw-glyph" set:html={svg('link')} />
+                      <span class="lurl">{t.how.links.okUrl}</span>
+                      <kbd data-lkey>␣</kbd>
+                    </div>
+                    <div class="lcard" data-lcard>
+                      <span class="lcard-img" aria-hidden="true">
+                        <Logo />
+                      </span>
+                      <span class="lcard-body">
+                        <b>{t.how.links.okTitle}</b>
+                        <span>{t.how.links.okDesc}</span>
+                        <small>github.com</small>
+                      </span>
+                    </div>
+                    <div class="lrow lrow-bad" data-lbad>
+                      <span class="pw-glyph" set:html={svg('link')} />
+                      <span class="lurl">{t.how.links.badUrl}</span>
+                      <span class="lbad-note">{t.how.links.badNote}</span>
+                    </div>
+                  </div>
+                )}
+                  <div class="sats" aria-hidden="true">
+                    {t.how.sats[s.key].map((sat, k) => (
+                      <div class:list={['sat', `sat-${sat.pos}`]} data-sat data-speed={[1, -0.7, 0.5][k]}>
+                        <span class="sat-ic" set:html={svg(sat.icon)} />
+                        <span class="sat-body">
+                          <b>{sat.title}</b>
+                          <small>{sat.sub}</small>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </article>
+            ))
+          }
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Шифрование ── -->
+    <section class="sec security" id="security">
+      <div class="sec-head">
+        <h2 class="sec-h">{t.security.title}</h2>
+        <p class="sec-lead">{t.security.lead}</p>
+      </div>
+      <div class="crypt" data-crypt>
+        <div class="crypt-node" data-cn="a">
+          <span class="dev-label"><i class="dot"></i>{t.security.stages[0]}</span>
+          <code class="crypt-val" data-cv="a">{t.security.secret}</code>
+        </div>
+        <span class="crypt-line" data-cl="1"><i></i></span>
+        <div class="crypt-node crypt-server" data-cn="s">
+          <span class="dev-label"><Fragment set:html={svg('lock', 'ic lock-ic')} />{t.security.stages[1]}</span>
+          <code class="crypt-val crypt-cipher" data-cv="s" data-secret={t.security.secret}>········</code>
+        </div>
+        <span class="crypt-line" data-cl="2"><i></i></span>
+        <div class="crypt-node" data-cn="b">
+          <span class="dev-label"><i class="dot"></i>{t.security.stages[2]}</span>
+          <code class="crypt-val" data-cv="b">········</code>
+        </div>
+      </div>
+      <ul class="points">
+        {t.security.points.map((p) => <li><Fragment set:html={svg('check')} /><span>{p}</span></li>)}
+      </ul>
+    </section>
+
+    <!-- ── Исключения ── -->
+    <section class="sec excl" id="exclusions">
+      <div class="sec-head">
+        <h2 class="sec-h">{t.exclusions.title}</h2>
+        <p class="sec-lead">{t.exclusions.lead}</p>
+      </div>
+      <div class="lane" data-lane aria-hidden="true">
+        <span class="lane-gate" data-gate><span>{t.exclusions.gate}</span></span>
+        <span class="lane-sent">{t.exclusions.sent} →</span>
+        {
+          t.exclusions.items.map((it) => (
+            <span class:list={['chip', { pass: it.pass }]} data-chip data-pass={String(it.pass)}>
+              <span class="chip-l">{it.label}</span>
+              {!it.pass && <span class="chip-why">{it.why}</span>}
+            </span>
+          ))
+        }
+      </div>
+      <p class="excl-note">{t.exclusions.note}</p>
+    </section>
+
+    <!-- ── Свой сервер ── -->
+    <section class="sec server" id="server">
+      <div class="server-grid">
+        <div>
+          <h2 class="sec-h">{t.server.title}</h2>
+          <p class="sec-lead">{t.server.lead}</p>
+          <ul class="facts">
+            {t.server.facts.map((f) => <li>{f}</li>)}
+          </ul>
+          <a class="link-arrow" href={t.server.guideHref}>{t.server.guide}<Fragment set:html={svg('arrow')} /></a>
+        </div>
+        <figure class="code" data-code>
+          <figcaption>
+            <span>{t.server.file}</span>
+            <button type="button" class="copy-btn" data-copy data-ok={t.server.copiedOk}>
+              <Fragment set:html={svg('copy')} />
+              <span>{t.server.copy}</span>
+            </button>
+          </figcaption>
+          <pre><code>{compose.map(([kind, a, b]) => (
+            <span class="cl">{kind === 'k' ? <span class="ck">{a}</span> : <><span class="ck">{a}</span><span class={kind === 's' ? 'cs' : 'cv'}>{b}</span></>}{'\n'}</span>
+          ))}</code></pre>
+        </figure>
+      </div>
+    </section>
+
+    <!-- ── Без сервера ── -->
+    <section class="sec local" id="local">
+      <div class="local-grid">
+        <div class="local-vis" data-local>
+          <div class="keep">
+            <span class="keep-h">{t.local.keep}</span>
+            <div class="seg" data-seg>
+              <span class="seg-thumb" data-seg-thumb aria-hidden="true" />
+              {t.local.retention.map((r, i) => (
+                <span class:list={['seg-o', { on: i === t.local.retention.length - 1 }]} data-seg-o>{r}</span>
+              ))}
+            </div>
+          </div>
+          <div class="dev local-dev">
+            <span class="dev-label"><i class="dot dot-local" />{t.local.device}</span>
+            <div class="pw local-pw" aria-hidden="true">
+              <div class="local-track" data-local-track>
+                {[0, 1].map(() => (
+                  <ul class="pw-list">
+                    {t.local.rows.map((r) => (
+                      <li class="pw-row">
+                        <span class="pw-glyph" set:html={svg(r.kind)} />
+                        <span class="pw-body">
+                          {r.kind === 'image' ? (
+                            <span class="pw-thumb">
+                              <span class="mini-chart">
+                                <i /><i /><i /><i /><i /><i /><i />
+                              </span>
+                            </span>
+                          ) : (
+                            <span class:list={['pw-text', { mono: r.kind === 'code' }]}>{r.text}</span>
+                          )}
+                          <span class="pw-meta">{r.meta}</span>
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <h2 class="sec-h">{t.local.title}</h2>
+          <p class="sec-lead">{t.local.lead}</p>
+          <ul class="facts">
+            {t.local.facts.map((f) => <li>{f}</li>)}
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Окно вставки вживую ── -->
+    <section class="sec try" id="try">
+      <div class="sec-head">
+        <h2 class="sec-h">{t.try.title}</h2>
+        <p class="sec-lead">{t.try.lead}</p>
+      </div>
+      <div class="try-stage" data-try>
+        <PasteWindow t={t} rows={t.try.rows} id="try-pw" selected={0} numbered interactive />
+        <div class="try-preview" data-try-preview hidden></div>
+        <div class="try-target">
+          <span class="dev-label">{t.try.target}</span>
+          <div class="try-doc" data-try-doc aria-live="polite"><span class="try-empty">{t.try.targetEmpty}</span></div>
+        </div>
+      </div>
+      <div class="shots">
+        {
+          t.try.shots.slice(1).map((s) => (
+            <figure class="shot">
+              <img src={s.src} alt={s.alt} width="902" height="722" loading="lazy" decoding="async" />
+              <figcaption>{s.caption}</figcaption>
+            </figure>
+          ))
+        }
+      </div>
+    </section>
+
+    <!-- ── Скачать ── -->
+    <section class="sec download" id="download">
+      <div class="sec-head">
+        <h2 class="sec-h">{t.download.title}</h2>
+        <p class="sec-lead">{t.download.lead} <span class="mono-note">{t.download.latest}: <b data-version>{v}</b></span></p>
+      </div>
+      <div class="os-grid">
+        {
+          t.download.systems.map((s) => (
+            <article class="os" data-os={s.os}>
+              <header>
+                <h3>{s.name}</h3>
+                <span class="os-yours">{t.download.yours}</span>
+              </header>
+              <p class="os-req">{s.req}</p>
+              <div class="os-files">
+                {s.files.map((f, i) => (
+                  <a class:list={['btn', i === 0 ? 'btn-p' : 'btn-s', 'btn-file']} href={assetUrl(v, f.suffix)} data-suffix={f.suffix}>
+                    <Fragment set:html={svg('download')} />
+                    {f.label}
+                  </a>
+                ))}
+              </div>
+            </article>
+          ))
+        }
+      </div>
+      <p class="dl-more">
+        {t.download.serverLine}: <code>ghcr.io/erneywhite/clipwire-server</code>
+        <span class="sep">·</span>
+        <a href={`https://github.com/${REPO}/releases`}>{t.download.allReleases}</a>
+      </p>
+    </section>
+
+    <!-- ── Вопросы ── -->
+    <section class="sec faq" id="faq">
+      <div class="faq-grid">
+        <h2 class="sec-h">{t.faq.title}</h2>
+        <div class="faq-list">
+          {
+            t.faq.items.map((f, i) => (
+              <details class:list={['faq-item', { 'is-open': i === 0 }]} open={i === 0} data-faq>
+                <summary>
+                  <h3>{f.q}</h3>
+                  <span class="faq-mark" aria-hidden="true" />
+                </summary>
+                <div class="faq-a">
+                  <p>{f.a}</p>
+                </div>
+              </details>
+            ))
+          }
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Поддержка ── -->
+    <section class="sec support" id="support">
+      <div class="support-in">
+        <h2 class="sec-h">{t.support.title}</h2>
+        <p class="sec-lead">{t.support.body}</p>
+        <div class="support-cta">
+          <a class="btn btn-p" href="https://ko-fi.com/erneywhite">{t.support.kofi}</a>
+          <a class="btn btn-s" href={`https://github.com/${REPO}/issues`}>{t.support.issuesLink}</a>
+        </div>
+        <p class="support-note">{t.support.issues}</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span class="foot-brand"><Logo /> Clipwire</span>
+    <span>© 2026 Erney White</span>
+    <a href={`https://github.com/${REPO}/blob/main/LICENSE`}>{t.footer.license}</a>
+    <a href={`https://github.com/${REPO}`}>{t.footer.source}</a>
+    <a href={t.langSwitch.href}>{t.langSwitch.label}</a>
+  </footer>
+
+  <script type="application/json" id="scene-data" set:html={sceneData} />
+  <script>
+    import '../scripts/main';
+  </script>
+</Base>

@@ -1,0 +1,64 @@
+---
+// Копия окна вставки на HTML: разметка и классы повторяют Popup.svelte и EntryRow.svelte.
+import type { Row, Strings } from '../i18n/strings';
+import { svg } from '../lib/icons';
+
+interface Props {
+  t: Strings;
+  rows: Row[];
+  id?: string;
+  selected?: number;
+  numbered?: boolean;
+  interactive?: boolean;
+}
+const { t, rows, id, selected = -1, numbered = false, interactive = false } = Astro.props;
+---
+
+<div class:list={['pw', { 'pw-live': interactive }]} id={id} data-pw>
+  <div class="pw-search">
+    <Fragment set:html={svg('search')} />
+    {
+      interactive ? (
+        <input type="text" placeholder={t.paste.search} aria-label={t.paste.search} autocomplete="off" spellcheck="false" data-pw-input />
+      ) : (
+        <span>{t.paste.search}</span>
+      )
+    }
+  </div>
+  <div class="pw-tabs" aria-hidden="true">
+    <span class="on">{t.paste.history}</span>
+    <span>{t.paste.pinned}</span>
+    <span class="pw-kinds">
+      <Fragment set:html={svg('text')} /><Fragment set:html={svg('link')} /><Fragment set:html={svg('image')} /><Fragment set:html={svg('file')} />
+    </span>
+  </div>
+  <ul class="pw-list" data-pw-list data-lenis-prevent={interactive ? '' : undefined} role={interactive ? 'listbox' : undefined} aria-label={interactive ? t.paste.history : undefined}>
+    {
+      rows.map((r, i) => (
+        <li
+          class:list={['pw-row', { sel: i === selected }]}
+          data-kind={r.kind}
+          role={interactive ? 'option' : undefined}
+          aria-selected={interactive ? String(i === selected) : undefined}
+        >
+          <span class="pw-glyph" set:html={svg(r.kind === 'folder' ? 'folder' : r.kind)} />
+          <span class="pw-body">
+            {r.kind === 'image' ? (
+              <span class="pw-thumb" aria-label={r.text}>
+                <span class="mini-chart" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /></span>
+              </span>
+            ) : (
+              <span class:list={['pw-text', { mono: r.kind === 'code' }]}>{r.text}</span>
+            )}
+            <span class="pw-meta">
+              {r.tag && <b class="pw-tag">{r.tag}</b>}
+              {r.meta}
+            </span>
+          </span>
+          {numbered && i < 9 && <span class="pw-num">{i + 1}</span>}
+        </li>
+      ))
+    }
+  </ul>
+  <div class="pw-hints" aria-hidden="true">{t.paste.hints.map((h) => <span>{h}</span>)}</div>
+</div>

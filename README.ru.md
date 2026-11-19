@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <b>Русский</b>
+  <a href="README.md">English</a> · <b>Русский</b> · <a href="https://clipwire.erney.monster/ru/">Сайт</a>
 </p>
 
 <p align="center">
@@ -966,6 +966,8 @@ CLIPWIRE_SFTP_HOST=127.0.0.1 CLIPWIRE_SFTP_PORT=2222 CLIPWIRE_SFTP_USER=... CLIP
   [Linux](docs/linux.md) и исходники оформления
   (`docs/brand/`).
 - `deploy/`: compose-файлы и пример обратного прокси для сервера.
+- `site/`: [сайт](https://clipwire.erney.monster/ru/) (Astro и GSAP, статическая сборка). Как собрать и выложить,
+  написано в [site/README.md](site/README.md).
 
 ## Поддержка
 
