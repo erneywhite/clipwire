@@ -36,32 +36,42 @@ const en = {
   scene: {
     devA: 'work-pc · Windows',
     devB: 'macbook · macOS',
+    devPw: 'shared history',
     copied: 'copied',
     payloads: [
       {
+        from: 'a',
         doc: 'Bringing the server up is one command: |docker compose up -d|, then check the log.',
         row: { kind: 'code', text: 'docker compose up -d', meta: 'work-pc · Notepad · now · 20 chars' },
       },
       {
+        from: 'b',
+        doc: '#chart',
+        row: { kind: 'image', text: 'Weekly active devices', meta: 'macbook · Screenshot · now · 1200×739 · 42 KB' },
+      },
+      {
+        from: 'a',
         doc: 'Repo for the review: |https://github.com/erneywhite/clipwire| (main branch).',
         row: { kind: 'link', text: 'https://github.com/erneywhite/clipwire', meta: 'work-pc · Firefox · now' },
       },
       {
-        doc: '#chart',
-        row: { kind: 'image', text: 'Weekly active devices', meta: 'work-pc · Paint · now · 1200×739 · 42 KB' },
+        from: 'b',
+        doc: 'Works for me. |Meeting moved to Thursday, 15:00. Room 4B|',
+        row: { kind: 'text', text: 'Meeting moved to Thursday, 15:00. Room 4B', meta: 'macbook · Mail · now · 41 chars' },
       },
       {
+        from: 'a',
         doc: '#file',
         row: { kind: 'file', text: 'report-q3.pdf', meta: 'work-pc · Explorer · now · 2.4 MB' },
       },
-    ] as { doc: string; row: Row }[],
+    ] as { from: 'a' | 'b'; doc: string; row: Row }[],
     fileName: 'report-q3.pdf',
     fileSize: '2.4 MB',
     chartTitle: 'Weekly active devices',
     rows: [
-      { kind: 'text', text: 'Meeting moved to Thursday, 15:00. Room 4B', meta: 'macbook · Mail · 12 min' },
       { kind: 'link', text: 'https://docs.rs/iroh/latest/iroh/', meta: 'macbook · Safari · 40 min' },
       { kind: 'text', text: 'Thanks! I will send the slides before lunch.', meta: 'work-pc · Teams · 1 h' },
+      { kind: 'text', text: 'Riga, Brīvības iela 40', meta: 'macbook · Maps · 2 h' },
     ] as Row[],
   },
 
@@ -165,6 +175,8 @@ const en = {
     guide: 'Server setup guide',
     guideHref: 'https://github.com/erneywhite/clipwire#self-hosted-server',
     file: 'docker-compose.yml',
+    copy: 'Copy',
+    copiedOk: 'Copied',
   },
 
   try: {
@@ -252,21 +264,31 @@ const ru: Strings = {
   scene: {
     devA: 'work-pc · Windows',
     devB: 'macbook · macOS',
+    devPw: 'общая история',
     copied: 'скопировано',
     payloads: [
       {
+        from: 'a',
         doc: 'Сервер поднимается одной командой: |docker compose up -d|, дальше смотрим лог.',
         row: { kind: 'code', text: 'docker compose up -d', meta: 'work-pc · Блокнот · сейчас · 20 симв.' },
       },
       {
+        from: 'b',
+        doc: '#chart',
+        row: { kind: 'image', text: 'Устройства за неделю', meta: 'macbook · Снимок экрана · сейчас · 1200×739 · 42 КБ' },
+      },
+      {
+        from: 'a',
         doc: 'Репозиторий для ревью: |https://github.com/erneywhite/clipwire| (ветка main).',
         row: { kind: 'link', text: 'https://github.com/erneywhite/clipwire', meta: 'work-pc · Firefox · сейчас' },
       },
       {
-        doc: '#chart',
-        row: { kind: 'image', text: 'Устройства за неделю', meta: 'work-pc · Paint · сейчас · 1200×739 · 42 КБ' },
+        from: 'b',
+        doc: 'Мне подходит. |Встреча переносится на четверг, 15:00. Переговорная 4B|',
+        row: { kind: 'text', text: 'Встреча переносится на четверг, 15:00. Переговорная 4B', meta: 'macbook · Почта · сейчас · 54 симв.' },
       },
       {
+        from: 'a',
         doc: '#file',
         row: { kind: 'file', text: 'report-q3.pdf', meta: 'work-pc · Проводник · сейчас · 2,4 МБ' },
       },
@@ -275,9 +297,9 @@ const ru: Strings = {
     fileSize: '2,4 МБ',
     chartTitle: 'Устройства за неделю',
     rows: [
-      { kind: 'text', text: 'Встреча переносится на четверг, 15:00. Переговорная 4B', meta: 'macbook · Почта · 12 мин' },
       { kind: 'link', text: 'https://docs.rs/iroh/latest/iroh/', meta: 'macbook · Safari · 40 мин' },
       { kind: 'text', text: 'Спасибо! Слайды пришлю до обеда.', meta: 'work-pc · Teams · 1 ч' },
+      { kind: 'text', text: 'Рига, Brīvības iela 40', meta: 'macbook · Карты · 2 ч' },
     ],
   },
 
@@ -381,6 +403,8 @@ const ru: Strings = {
     guide: 'Как поставить сервер',
     guideHref: 'https://github.com/erneywhite/clipwire/blob/main/README.ru.md#свой-сервер',
     file: 'docker-compose.yml',
+    copy: 'Копировать',
+    copiedOk: 'Скопировано',
   },
 
   try: {

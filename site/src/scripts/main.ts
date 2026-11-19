@@ -6,8 +6,9 @@ import { MotionPathPlugin } from 'gsap/MotionPathPlugin';
 import { DrawSVGPlugin } from 'gsap/DrawSVGPlugin';
 import { ScrambleTextPlugin } from 'gsap/ScrambleTextPlugin';
 import { Flip } from 'gsap/Flip';
+import { SplitText } from 'gsap/SplitText';
 
-gsap.registerPlugin(ScrollTrigger, MotionPathPlugin, DrawSVGPlugin, ScrambleTextPlugin, Flip);
+gsap.registerPlugin(ScrollTrigger, MotionPathPlugin, DrawSVGPlugin, ScrambleTextPlugin, Flip, SplitText);
 
 type Row = { kind: string; text: string; meta: string; tag?: string };
 type Data = {
@@ -117,18 +118,22 @@ applyVersion(data.version);
   if (latest && /^\d+\.\d+\.\d+$/.test(latest) && latest !== data.version) applyVersion(latest);
 })();
 
-// ── Главный экран: провод ──────────────────────────────────────────────
+// ── Главный экран: два устройства копируют в одну общую историю ────────
+type Side = 'a' | 'b';
 const scene = $('[data-scene]');
-const devA = $('[data-dev-a]');
-const devB = $('[data-dev-b]');
+const devs: Record<Side, HTMLElement> = { a: $('[data-dev="a"]'), b: $('[data-dev="b"]') };
+const devPw = $('[data-dev-pw]');
 const wire = $<SVGSVGElement>('[data-wire]');
-const wireBase = $<SVGPathElement>('[data-wire-base]');
-const wireGlow = $<SVGPathElement>('[data-wire-glow]');
-const endA = $<SVGCircleElement>('[data-wire-a]');
-const endB = $<SVGCircleElement>('[data-wire-b]');
+const wires = Object.fromEntries(
+  (['a', 'b'] as Side[]).map((side) => {
+    const g = $(`[data-wire-g="${side}"]`);
+    return [side, { base: $<SVGPathElement>('[data-base]', g), glow: $<SVGPathElement>('[data-glow]', g), e1: $('[data-end1]', g), e2: $('[data-end2]', g) }];
+  }),
+) as Record<Side, { base: SVGPathElement; glow: SVGPathElement; e1: Element; e2: Element }>;
 const packet = $('[data-packet]');
 const packetText = $('[data-packet-text]');
 const heroList = $('#hero-pw [data-pw-list]');
+const sideOf = (n: number) => (data as unknown as { from: Side[] }).from[n];
 
 /** Ломаная с закруглёнными углами, как провод на знаке. */
 function roundedPath(pts: [number, number][], r = 16) {
@@ -137,8 +142,8 @@ function roundedPath(pts: [number, number][], r = 16) {
     const [px, py] = pts[i - 1];
     const [x, y] = pts[i];
     const [nx, ny] = pts[i + 1];
-    const l1 = Math.hypot(x - px, y - py);
-    const l2 = Math.hypot(nx - x, ny - y);
+    const l1 = Math.hypot(x - px, y - py) || 1;
+    const l2 = Math.hypot(nx - x, ny - y) || 1;
     const rr = Math.min(r, l1 / 2, l2 / 2);
     const ax = x - ((x - px) / l1) * rr;
     const ay = y - ((y - py) / l1) * rr;
@@ -152,39 +157,45 @@ function roundedPath(pts: [number, number][], r = 16) {
 
 function layoutWire() {
   const s = scene.getBoundingClientRect();
-  const a = devA.getBoundingClientRect();
-  const b = devB.getBoundingClientRect();
+  const pw = devPw.getBoundingClientRect();
   wire.setAttribute('viewBox', `0 0 ${s.width} ${s.height}`);
-  const stacked = getComputedStyle(devA).position !== 'absolute';
-  let pts: [number, number][];
-  if (stacked) {
-    // Телефон: устройства друг под другом, провод сверху вниз с одной ступенькой.
-    const x1 = a.left - s.left + a.width * 0.28;
-    const x2 = b.left - s.left + b.width * 0.62;
-    const y1 = a.bottom - s.top;
-    const y2 = b.top - s.top;
+  const stacked = getComputedStyle(devs.a).position !== 'absolute';
+  const X = (r: DOMRect, f: number) => r.left - s.left + r.width * f;
+  (['a', 'b'] as Side[]).forEach((side) => {
+    const r = devs[side].getBoundingClientRect();
+    let x1: number, y1: number, x2: number, y2: number;
+    if (!stacked) {
+      // Десктоп: оба устройства сверху, провода сходятся в верх общей истории.
+      x1 = X(r, side === 'a' ? 0.32 : 0.68);
+      y1 = r.bottom - s.top;
+      x2 = X(pw, side === 'a' ? 0.3 : 0.7);
+      y2 = pw.top - s.top;
+    } else if (side === 'a') {
+      // Телефон: work-pc над историей, macbook под ней.
+      x1 = X(r, 0.5);
+      y1 = r.bottom - s.top;
+      x2 = X(pw, 0.84);
+      y2 = pw.top - s.top;
+    } else {
+      x1 = X(r, 0.5);
+      y1 = r.top - s.top;
+      x2 = X(pw, 0.84);
+      y2 = pw.bottom - s.top;
+    }
     const mid = (y1 + y2) / 2;
-    pts = [[x1, y1], [x1, mid], [x2, mid], [x2, y2]];
-  } else {
-    // Десктоп: из-под первого устройства вниз и вправо, в бок второго.
-    const x1 = a.left - s.left + Math.min(a.width * 0.3, b.left - a.left - 28);
-    const y1 = a.bottom - s.top;
-    const x2 = b.left - s.left;
-    const y2 = Math.max(b.top - s.top + 92, y1 + 40);
-    pts = [[x1, y1], [x1, y2], [x2, y2]];
-  }
-  const d = roundedPath(pts, 18);
-  wireBase.setAttribute('d', d);
-  wireGlow.setAttribute('d', d);
-  endA.setAttribute('cx', String(pts[0][0]));
-  endA.setAttribute('cy', String(pts[0][1]));
-  const e = pts[pts.length - 1];
-  endB.setAttribute('cx', String(e[0]));
-  endB.setAttribute('cy', String(e[1]));
+    const d = roundedPath([[x1, y1], [x1, mid], [x2, mid], [x2, y2]], 18);
+    const w = wires[side];
+    w.base.setAttribute('d', d);
+    w.glow.setAttribute('d', d);
+    w.e1.setAttribute('cx', String(x1));
+    w.e1.setAttribute('cy', String(y1));
+    w.e2.setAttribute('cx', String(x2));
+    w.e2.setAttribute('cy', String(y2));
+  });
 }
 
-function insertHeroRow(i: number, animate: boolean) {
-  const r = data.rows[i % data.rows.length];
+function insertHeroRow(n: number, animate: boolean) {
+  const r = data.rows[n];
   const li = document.createElement('li');
   li.className = 'pw-row sel';
   li.innerHTML = rowHtml(r);
@@ -194,39 +205,46 @@ function insertHeroRow(i: number, animate: boolean) {
   while (heroList.children.length > 6) heroList.lastElementChild!.remove();
   if (state) {
     Flip.from(state, {
-      duration: 0.5,
+      duration: 0.6,
       ease: 'power3.out',
-      onEnter: (els) => gsap.fromTo(els, { autoAlpha: 0, y: -10 }, { autoAlpha: 1, y: 0, duration: 0.45, ease: 'power3.out' }),
+      onEnter: (els) => gsap.fromTo(els, { autoAlpha: 0, y: -10 }, { autoAlpha: 1, y: 0, duration: 0.5, ease: 'power3.out' }),
     });
   }
 }
 
-const docs = $$('[data-doc]');
-const k1 = $('[data-k1]');
-const k2 = $('[data-k2]');
-const copied = $('[data-copied]');
-
-function showDoc(i: number) {
-  docs.forEach((d) => d.classList.toggle('on', Number(d.dataset.doc) === i));
-  return docs[i];
-}
+const docOf = (n: number) => $(`[data-doc="${n}"]`);
+const currentDoc = (side: Side) => $('.doc.on', devs[side]);
 
 let heroTl: gsap.core.Timeline | null = null;
 let heroVisible = true;
 let heroStarted = false;
 
 function heroCycle(i: number) {
-  const n = i % docs.length;
+  const n = i % data.rows.length;
+  const side = sideOf(n);
+  const dev = devs[side];
+  const w = wires[side];
   layoutWire();
-  const doc = showDoc(n);
+  const prev = currentDoc(side);
+  const doc = docOf(n);
   const mark = doc.querySelector<HTMLElement>('.sel-mark');
   const card = doc.querySelector<HTMLElement>('.sel-card');
+  const k1 = $('[data-k1]', dev);
+  const k2 = $('[data-k2]', dev);
+  const copied = $('[data-copied]', dev);
   const cipher = Array.from({ length: 12 }, (_, k) => HEX[(n * 7 + k * 5) % 16]).join('');
 
   const tl = gsap.timeline({ onComplete: () => heroCycle(i + 1), defaults: { ease: 'power2.out' } });
-  tl.fromTo(doc, { autoAlpha: 0, y: 6 }, { autoAlpha: 1, y: 0, duration: 0.4 });
-  if (mark) tl.fromTo(mark, { backgroundSize: '0% 100%' }, { backgroundSize: '100% 100%', duration: 0.55, ease: 'power1.inOut' }, '+=0.2');
-  if (card) tl.call(() => card.classList.add('picked'), undefined, '+=0.3');
+  if (prev !== doc) {
+    tl.to(prev, { autoAlpha: 0, duration: 0.3 })
+      .call(() => {
+        prev.classList.remove('on');
+        doc.classList.add('on');
+      })
+      .fromTo(doc, { autoAlpha: 0, y: 6 }, { autoAlpha: 1, y: 0, duration: 0.4 });
+  }
+  if (mark) tl.fromTo(mark, { backgroundSize: '0% 100%' }, { backgroundSize: '100% 100%', duration: 0.6, ease: 'power1.inOut' }, '+=0.25');
+  if (card) tl.call(() => card.classList.add('picked'), undefined, '+=0.35');
   tl.call(() => k1.classList.add('down'), undefined, '+=0.25')
     .call(() => k2.classList.add('down'), undefined, '+=0.12')
     .to(copied, { autoAlpha: 1, duration: 0.2 })
@@ -237,28 +255,29 @@ function heroCycle(i: number) {
     .addLabel('go')
     .set(packetText, { textContent: '········' }, 'go')
     .fromTo(packet, { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.15 }, 'go')
-    .fromTo(wireGlow, { drawSVG: '0% 0%' }, { drawSVG: '0% 100%', duration: 1.2, ease: 'power1.inOut' }, 'go')
-    .to(packet, { motionPath: { path: wireBase, align: wireBase, alignOrigin: [0.5, 0.5] }, duration: 1.2, ease: 'power1.inOut' }, 'go')
-    .to(packetText, { duration: 1.1, scrambleText: { text: cipher, chars: HEX, speed: 0.7 } }, 'go')
+    .fromTo(w.glow, { drawSVG: '0% 0%' }, { drawSVG: '0% 100%', duration: 1.3, ease: 'power1.inOut' }, 'go')
+    .to(packet, { motionPath: { path: w.base, align: w.base, alignOrigin: [0.5, 0.5] }, duration: 1.3, ease: 'power1.inOut' }, 'go')
+    .to(packetText, { duration: 1.2, scrambleText: { text: cipher, chars: HEX, speed: 0.7 } }, 'go')
     .to(packet, { autoAlpha: 0, duration: 0.15 })
     .call(() => insertHeroRow(n, true))
-    .to(wireGlow, { drawSVG: '100% 100%', duration: 0.6, ease: 'power2.inOut' }, '<')
-    .to(copied, { autoAlpha: 0, duration: 0.2 }, '<')
-    .to(doc, { autoAlpha: 0, duration: 0.3 }, '+=1.8')
-    .call(() => {
-      card?.classList.remove('picked');
-      if (mark) gsap.set(mark, { backgroundSize: '0% 100%' });
-    });
+    .to(w.glow, { drawSVG: '100% 100%', duration: 0.6, ease: 'power2.inOut' }, '<')
+    .to(copied, { autoAlpha: 0, duration: 0.25 }, '<')
+    .addLabel('rest', '+=1.4');
+  // Выделение гаснет: устройство ждёт своей очереди с обычным текстом.
+  if (mark) tl.to(mark, { backgroundSize: '0% 100%', duration: 0.4, ease: 'power1.inOut' }, 'rest');
+  if (card) tl.call(() => card.classList.remove('picked'), undefined, 'rest');
+  tl.to({}, { duration: 0.35 });
   heroTl = tl;
   if (!heroVisible) tl.pause();
 }
 
 function heroStatic() {
   layoutWire();
-  showDoc(0);
-  gsap.set(docs[0], { autoAlpha: 1 });
-  gsap.set(wireGlow, { drawSVG: '0% 100%' });
-  if (!heroList.querySelector('.sel')) insertHeroRow(0, false);
+  gsap.set(wires.a.glow, { drawSVG: '0% 100%' });
+  if (!heroList.querySelector('.sel')) {
+    insertHeroRow(1, false);
+    insertHeroRow(0, false);
+  }
 }
 
 // ── Разделы по прокрутке ───────────────────────────────────────────────
@@ -275,34 +294,39 @@ function demoTimelines(narrow: boolean) {
   const [kEnter, kShift] = $$('[data-rk]');
   const rtl = gsap.timeline({ repeat: -1, paused: true });
   rtl
-    .set(plain, { autoAlpha: 0 })
-    .set(fmt, { autoAlpha: 1 })
+    .set(plain, { autoAlpha: 0, filter: 'blur(4px)' })
+    .set(fmt, { autoAlpha: 1, filter: 'blur(0px)' })
     .call(() => {
       kEnter.classList.add('on');
       kShift.classList.remove('on');
       mode.textContent = mode.dataset.a!;
     })
-    .addLabel('flip', '+=2.4')
+    .addLabel('flip', '+=2.6')
     .call(() => {
       kShift.classList.add('on');
       kEnter.classList.remove('on');
       mode.textContent = mode.dataset.b!;
     }, undefined, 'flip')
-    .to(fmt, { autoAlpha: 0, duration: 0.25 }, 'flip')
-    .to(plain, { autoAlpha: 1, duration: 0.25 }, 'flip')
-    .to({}, { duration: 2.4 })
-    .to(plain, { autoAlpha: 0, duration: 0.25 })
-    .to(fmt, { autoAlpha: 1, duration: 0.25 }, '<');
+    .to(fmt, { autoAlpha: 0, filter: 'blur(4px)', duration: 0.45, ease: 'power2.inOut' }, 'flip')
+    .to(plain, { autoAlpha: 1, filter: 'blur(0px)', duration: 0.5, ease: 'power2.inOut' }, 'flip+=0.3')
+    .addLabel('back', '+=2.6')
+    .call(() => {
+      kEnter.classList.add('on');
+      kShift.classList.remove('on');
+      mode.textContent = mode.dataset.a!;
+    }, undefined, 'back')
+    .to(plain, { autoAlpha: 0, filter: 'blur(4px)', duration: 0.45, ease: 'power2.inOut' }, 'back')
+    .to(fmt, { autoAlpha: 1, filter: 'blur(0px)', duration: 0.5, ease: 'power2.inOut' }, 'back+=0.3');
   ScrollTrigger.create({ trigger: rich, start: 'top 85%', end: 'bottom 15%', onToggle: (s) => (s.isActive ? rtl.play() : rtl.pause()) });
 
-  // Картинка: один раз проявляется.
-  gsap.from('[data-demo="image"]', {
-    autoAlpha: 0,
-    y: 24,
-    duration: 0.7,
-    ease: 'power3.out',
-    scrollTrigger: { trigger: '[data-demo="image"]', start: 'top 85%', once: true },
-  });
+  // Каждая демонстрация плавно проявляется вместе с прокруткой.
+  $$('[data-panel] .demo').forEach((d) =>
+    gsap.fromTo(
+      d,
+      { autoAlpha: 0.15, y: 56, scale: 0.97 },
+      { autoAlpha: 1, y: 0, scale: 1, ease: 'none', scrollTrigger: { trigger: d, start: 'top 95%', end: 'top 50%', scrub: 0.8 } },
+    ),
+  );
 
   // Файл: карточка сразу, сам файл в момент вставки.
   const files = $('[data-demo="files"]');
@@ -318,20 +342,20 @@ function demoTimelines(narrow: boolean) {
     .set(fbar, { scaleX: 0 })
     .set(beam, { [axis]: 0, transformOrigin: narrow ? 'center top' : 'left center' })
     .call(() => (fstate.textContent = fstate.dataset.w!))
-    .to(beam, { [axis]: 1, duration: 0.35, ease: 'power2.out' }, 0.3)
-    .to(fcard, { autoAlpha: 1, y: 0, duration: 0.4, ease: 'power3.out' }, '>-0.05')
-    .to(beam, { autoAlpha: 0, duration: 0.3 }, '+=0.2')
+    .to(beam, { [axis]: 1, duration: 0.55, ease: 'power2.inOut' }, 0.3)
+    .to(fcard, { autoAlpha: 1, y: 0, duration: 0.6, ease: 'power3.out' }, '>-0.1')
+    .to(beam, { autoAlpha: 0, duration: 0.45 }, '+=0.2')
     .call(() => fkey.classList.add('down'), undefined, '+=1.1')
     .call(() => {
       fkey.classList.remove('down');
       fstate.textContent = fstate.dataset.p!;
     }, undefined, '+=0.18')
     .set(beam, { autoAlpha: 1, [axis]: 0 })
-    .to(beam, { [axis]: 1, duration: 0.35 })
-    .to(fbar, { scaleX: 1, duration: 1.8, ease: 'none' }, '<')
+    .to(beam, { [axis]: 1, duration: 0.5, ease: 'power2.inOut' })
+    .to(fbar, { scaleX: 1, duration: 2.2, ease: 'power1.inOut' }, '<')
     .call(() => (fstate.textContent = fstate.dataset.d!))
-    .to(beam, { autoAlpha: 0, duration: 0.3 }, '<')
-    .to(fcard, { autoAlpha: 0, duration: 0.35 }, '+=1.8')
+    .to(beam, { autoAlpha: 0, duration: 0.45 }, '<')
+    .to(fcard, { autoAlpha: 0, y: -6, duration: 0.5, ease: 'power2.inOut' }, '+=1.8')
     .set(beam, { autoAlpha: 1 });
   ScrollTrigger.create({ trigger: files, start: 'top 85%', end: 'bottom 15%', onToggle: (s) => (s.isActive ? ftl.play() : ftl.pause()) });
 
@@ -345,9 +369,9 @@ function demoTimelines(narrow: boolean) {
     .set([lcard, lbad], { autoAlpha: 0, y: 8 })
     .call(() => lkey.classList.add('down'), undefined, 0.6)
     .call(() => lkey.classList.remove('down'), undefined, 0.78)
-    .to(lcard, { autoAlpha: 1, y: 0, duration: 0.4, ease: 'power3.out' }, 0.85)
-    .to(lbad, { autoAlpha: 1, y: 0, duration: 0.4, ease: 'power3.out' }, '+=1.2')
-    .to([lcard, lbad], { autoAlpha: 0, duration: 0.35 }, '+=2.6');
+    .to(lcard, { autoAlpha: 1, y: 0, duration: 0.6, ease: 'power3.out' }, 0.85)
+    .to(lbad, { autoAlpha: 1, y: 0, duration: 0.6, ease: 'power3.out' }, '+=1.2')
+    .to([lcard, lbad], { autoAlpha: 0, y: -6, duration: 0.5, ease: 'power2.inOut', stagger: 0.1 }, '+=2.6');
   ScrollTrigger.create({ trigger: links, start: 'top 85%', end: 'bottom 15%', onToggle: (s) => (s.isActive ? ltl.play() : ltl.pause()) });
 }
 
@@ -363,26 +387,86 @@ function stepTriggers() {
 }
 
 // Шифрование: секрет уходит, на сервере шум, на втором устройстве снова секрет.
-function cryptTimeline(pinIt: boolean) {
+// Шум не стоит на месте: пока блок на экране, символы всё время перешифровываются.
+const NOISE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const randChar = () => NOISE[(Math.random() * NOISE.length) | 0];
+
+function cryptTimeline(pinIt: boolean, still: boolean) {
   const section = $('#security');
   const cs = $('[data-cv="s"]');
   const cb = $('[data-cv="b"]');
   const secret = cs.dataset.secret!;
   const [l1, l2] = $$('[data-cl] i');
-  const axis = pinIt ? 'scaleX' : getComputedStyle(l1.parentElement!).width === '3px' ? 'scaleY' : 'scaleX';
+  const points = $$('#security .points li');
+  const axis = getComputedStyle(l1.parentElement!).width === '3px' ? 'scaleY' : 'scaleX';
+  const N = CIPHER.length;
+  const L = secret.length;
+  const noise = Array.from({ length: N }, randChar);
+  const st = { l1: 0, fill: 0, l2: 0, dec: 0 };
+  const mutate = (k: number) => {
+    for (let i = 0; i < k; i++) noise[(Math.random() * N) | 0] = randChar();
+  };
+  const render = () => {
+    gsap.set(l1, { [axis]: st.l1 });
+    gsap.set(l2, { [axis]: st.l2 });
+    const nf = Math.round(N * st.fill);
+    cs.textContent = nf ? noise.slice(0, nf).join('') : '········';
+    const nd = Math.round(L * st.dec);
+    cb.textContent = st.dec > 0 ? secret.slice(0, nd) + noise.slice(0, L - nd).join('') : '········';
+  };
+
+  if (still) {
+    Object.assign(st, { l1: 1, fill: 1, l2: 1, dec: 1 });
+    render();
+    return;
+  }
+
+  // Заголовок и подзаголовок проявляются по словам вместе с прокруткой.
+  const split = SplitText.create(['#security .sec-h', '#security .sec-lead'], { type: 'words' });
+  gsap.fromTo(
+    split.words,
+    { autoAlpha: 0.12, y: 10 },
+    {
+      autoAlpha: 1,
+      y: 0,
+      stagger: 0.05,
+      ease: 'none',
+      scrollTrigger: { trigger: '#security .sec-head', start: 'top 90%', end: 'top 40%', scrub: 0.8 },
+    },
+  );
+
   const tl = gsap.timeline({
     defaults: { ease: 'none' },
+    onUpdate: () => {
+      mutate(3);
+      render();
+    },
     scrollTrigger: pinIt
-      ? { trigger: section, start: 'top top+=72', end: '+=900', pin: true, scrub: 0.6 }
+      ? { trigger: section, start: 'top top+=72', end: '+=1100', pin: true, scrub: 0.8 }
       : { trigger: '[data-crypt]', start: 'top 75%', once: true },
   });
-  tl.set(cs, { textContent: '········' })
-    .set(cb, { textContent: '········' })
-    .to(l1, { [axis]: 1, duration: 1 })
-    .to(cs, { duration: 1.4, scrambleText: { text: CIPHER, chars: CIPHER, speed: 0.5 } })
-    .to(l2, { [axis]: 1, duration: 1 })
-    .to(cb, { duration: 1.4, scrambleText: { text: secret, chars: CIPHER, speed: 0.5 } });
-  if (!pinIt) tl.duration(3.2);
+  tl.to(st, { l1: 1, duration: 1 })
+    .to(st, { fill: 1, duration: 1.2 })
+    .to(st, { l2: 1, duration: 1 })
+    .to(st, { dec: 1, duration: 1.6 })
+    .fromTo(points, { autoAlpha: 0.15, y: 16 }, { autoAlpha: 1, y: 0, stagger: 0.25, duration: 0.8, ease: 'power1.out' }, '-=1.2');
+  if (!pinIt) tl.duration(4);
+  render();
+
+  let timer = 0;
+  ScrollTrigger.create({
+    trigger: section,
+    start: 'top bottom',
+    end: 'bottom top',
+    onToggle: (s) => {
+      clearInterval(timer);
+      if (s.isActive)
+        timer = window.setInterval(() => {
+          mutate(4);
+          render();
+        }, 90);
+    },
+  });
 }
 
 // Исключения: поток копирований, лишнее отсекается у ворот.
@@ -394,13 +478,14 @@ function buildLane() {
   const chips = $$('[data-chip]', lane);
   const laneW = lane.clientWidth;
   const gateX = gate.offsetLeft;
-  const v = laneW < 600 ? 120 : 190; // пикселей в секунду
+  const v = Math.min(300, Math.max(120, laneW * 0.2)); // пикселей в секунду, от ширины дорожки
   const tl = gsap.timeline({ repeat: -1, paused: true });
   let t = 0;
   chips.forEach((chip) => {
     const w = chip.offsetWidth;
     const pass = chip.dataset.pass === 'true';
-    const toGate = (gateX - 8 + w + 12) / v;
+    // Путь до ворот у всех фишек одинаковый (gateX + 4), значит и время одно: скорость общая.
+    const toGate = (gateX + 4) / v;
     tl.set(chip, { x: -w - 12, y: 0, autoAlpha: 1 }, t)
       .call(() => chip.classList.remove('blocked', 'through'), undefined, t)
       .to(chip, { x: gateX - w - 8, duration: toGate, ease: 'none' }, t);
@@ -545,6 +630,33 @@ function initTry() {
   render();
 }
 
+// Копирование compose-файла.
+$$<HTMLButtonElement>('[data-copy]').forEach((btn) => {
+  const label = $('span', btn);
+  const idle = label.textContent;
+  btn.addEventListener('click', async () => {
+    const text = $('pre', btn.closest('figure')!).textContent!.replace(/\n+$/, '\n');
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.append(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    label.textContent = btn.dataset.ok!;
+    btn.classList.add('done');
+    window.setTimeout(() => {
+      label.textContent = idle;
+      btn.classList.remove('done');
+    }, 1800);
+  });
+});
+
 // ── Запуск ─────────────────────────────────────────────────────────────
 initTry();
 
@@ -562,9 +674,7 @@ mm.add(
     if (!motion) {
       heroStatic();
       laneStatic();
-      gsap.set('[data-cl] i', { scaleX: 1, scaleY: 1 });
-      $('[data-cv="s"]').textContent = CIPHER;
-      $('[data-cv="b"]').textContent = $('[data-cv="s"]').dataset.secret!;
+      cryptTimeline(false, true);
       return;
     }
     // Сцена главного экрана: стоит, пока её не видно.
@@ -583,7 +693,7 @@ mm.add(
       },
     });
     demoTimelines(narrow);
-    cryptTimeline(wide);
+    cryptTimeline(wide, false);
     buildLane();
     gsap.from('[data-code] .cl', {
       autoAlpha: 0,

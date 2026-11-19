@@ -22,6 +22,14 @@ body {
   font-size: var(--text-m);
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
+  /* Выделение отключено: на анимированных блоках оно ложится поверх и режет глаз. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+input,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
 }
 h1,
 h2,
@@ -276,7 +284,7 @@ pre {
 /* сцена */
 .scene {
   position: relative;
-  height: 690px;
+  height: 770px;
 }
 .dev {
   position: absolute;
@@ -308,19 +316,30 @@ pre {
   background: var(--c-ok);
   box-shadow: 0 0 0 3px rgb(95 191 134 / 0.15);
 }
-.dev-a {
-  left: 0;
-  top: 36px;
-  width: min(330px, 47%);
+.dev-src {
+  top: 30px;
+  width: 46%;
   padding: var(--space-5);
   z-index: 2;
 }
+.dev-a {
+  left: 0;
+}
 .dev-b {
   right: 0;
-  bottom: 28px;
-  width: min(380px, 56%);
+}
+.dev-pw {
+  left: 20%;
+  right: 20%;
+  bottom: 30px;
   z-index: 2;
+}
+.dev-pw > .pw {
+  border-radius: var(--radius-xl);
   overflow: hidden;
+}
+.dev-pw .dev-label {
+  color: var(--c-wire);
 }
 .docs {
   display: grid;
@@ -343,7 +362,7 @@ pre {
   background-color: transparent;
   background-image: linear-gradient(var(--c-wire-soft), var(--c-wire-soft));
   background-repeat: no-repeat;
-  background-size: 100% 100%;
+  background-size: 0% 100%;
   border-radius: 3px;
   padding: 1px 2px;
   box-decoration-break: clone;
@@ -767,7 +786,7 @@ kbd.down {
   gap: var(--space-5);
 }
 .panel {
-  min-height: 78vh;
+  min-height: 62vh;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -789,7 +808,13 @@ kbd.down {
   background: var(--c-bg);
   border: 1px solid var(--c-border);
   border-radius: var(--radius-xl);
-  padding: clamp(16px, 3vw, 32px);
+  padding: clamp(16px, 3vw, 40px);
+  min-height: min(420px, 52vh);
+  display: grid;
+  align-content: center;
+}
+.demo-shot {
+  min-height: 0;
 }
 
 /* rich */
@@ -1219,10 +1244,48 @@ kbd.down {
   min-width: 0;
 }
 .code figcaption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
   font: var(--text-xs) var(--font-mono);
   color: var(--c-muted);
-  padding: var(--space-3) var(--space-5);
+  padding: var(--space-2) var(--space-3) var(--space-2) var(--space-5);
   border-bottom: 1px solid var(--c-border);
+}
+.copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 12px;
+  border-radius: var(--radius-m);
+  border: 1px solid var(--c-border);
+  background: var(--c-surface);
+  color: var(--c-text);
+  font: 500 var(--text-xs) var(--font-mono);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    border-color var(--dur-fast) ease,
+    color var(--dur-fast) ease,
+    transform var(--dur-fast) var(--ease-out);
+}
+.copy-btn .ic {
+  width: 14px;
+  height: 14px;
+}
+.copy-btn:active {
+  transform: scale(0.97);
+}
+.copy-btn.done {
+  border-color: var(--c-wire-line);
+  color: var(--c-wire);
+}
+@media (hover: hover) and (pointer: fine) {
+  .copy-btn:hover {
+    border-color: var(--c-muted);
+  }
 }
 .code pre {
   padding: var(--space-5);
@@ -1489,6 +1552,31 @@ kbd.down {
   height: 20px;
 }
 
+/* ── Большие мониторы (2K и шире) ── */
+@media (min-width: 1800px) {
+  :root {
+    --max: 1680px;
+    --text-xs: 12.5px;
+    --text-s: 14px;
+    --text-m: 16.5px;
+    --text-l: 20px;
+    --text-display: 104px;
+    --text-2xl: 60px;
+  }
+  .scene {
+    height: 860px;
+  }
+  #hero-pw .pw-list {
+    height: 320px;
+  }
+  .rich-plain {
+    font-size: 14px;
+  }
+  .code pre {
+    font-size: 15px;
+  }
+}
+
 /* ── Планшет и телефон ── */
 @media (max-width: 1023px) {
   .hero {
@@ -1496,7 +1584,7 @@ kbd.down {
     min-height: 0;
   }
   .scene {
-    max-width: 640px;
+    max-width: 720px;
     width: 100%;
     margin: 0 auto;
   }
@@ -1531,14 +1619,23 @@ kbd.down {
     gap: 84px;
     padding: 30px 0 34px;
   }
-  .dev-a,
-  .dev-b {
+  .dev-src,
+  .dev-pw {
     position: relative;
     left: auto;
     right: auto;
     top: auto;
     bottom: auto;
     width: 100%;
+  }
+  .dev-a {
+    order: 1;
+  }
+  .dev-pw {
+    order: 2;
+  }
+  .dev-b {
+    order: 3;
   }
   #hero-pw .pw-list {
     height: 214px;

@@ -38,6 +38,7 @@ const compose = [
 // Данные для сцены в браузере: строки окна вставки и значки к ним.
 const sceneData = JSON.stringify({
   rows: t.scene.payloads.map((p) => p.row),
+  from: t.scene.payloads.map((p) => p.from),
   glyph,
   tryRows: t.try.rows,
   copied: t.scene.copied,
@@ -91,51 +92,67 @@ const sceneData = JSON.stringify({
       </div>
 
       <div class="scene" data-scene role="img" aria-label={t.hero.sceneLabel}>
-        <div class="dev dev-a" data-dev-a>
-          <span class="dev-label"><i class="dot"></i>{t.scene.devA}</span>
-          <div class="docs">
-            {
-              t.scene.payloads.map((p, i) => (
-                <div class:list={['doc', { on: i === 0 }]} data-doc={i}>
-                  {p.doc === '#chart' ? (
-                    <div class="doc-card chart-card sel-card">
-                      <span class="chart-title">{t.scene.chartTitle}</span>
-                      <span class="chart" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /></span>
+        {
+          (['a', 'b'] as const).map((side) => (
+            <div class:list={['dev', 'dev-src', `dev-${side}`]} data-dev={side}>
+              <span class="dev-label">
+                <i class="dot" />
+                {side === 'a' ? t.scene.devA : t.scene.devB}
+              </span>
+              <div class="docs">
+                {t.scene.payloads.map((p, i) =>
+                  p.from !== side ? null : (
+                    <div class:list={['doc', { on: i === t.scene.payloads.findIndex((q) => q.from === side) }]} data-doc={i}>
+                      {p.doc === '#chart' ? (
+                        <div class="doc-card chart-card sel-card">
+                          <span class="chart-title">{t.scene.chartTitle}</span>
+                          <span class="chart" aria-hidden="true">
+                            <i /><i /><i /><i /><i /><i /><i />
+                          </span>
+                        </div>
+                      ) : p.doc === '#file' ? (
+                        <div class="doc-card file-card sel-card">
+                          <span class="file-ic" set:html={svg('file')} />
+                          <span>
+                            <b>{t.scene.fileName}</b>
+                            <small>{t.scene.fileSize}</small>
+                          </span>
+                        </div>
+                      ) : (
+                        <p class="doc-text" set:html={docHtml(p.doc)} />
+                      )}
                     </div>
-                  ) : p.doc === '#file' ? (
-                    <div class="doc-card file-card sel-card">
-                      <span class="file-ic" set:html={svg('file')} />
-                      <span>
-                        <b>{t.scene.fileName}</b>
-                        <small>{t.scene.fileSize}</small>
-                      </span>
-                    </div>
-                  ) : (
-                    <p class="doc-text" set:html={docHtml(p.doc)} />
-                  )}
-                </div>
-              ))
-            }
-          </div>
-          <div class="keys">
-            <kbd data-k1>Ctrl</kbd><kbd data-k2>C</kbd>
-            <span class="copied" data-copied>{t.scene.copied}</span>
-          </div>
-        </div>
+                  ),
+                )}
+              </div>
+              <div class="keys">
+                <kbd data-k1>{side === 'a' ? 'Ctrl' : '⌘'}</kbd>
+                <kbd data-k2>C</kbd>
+                <span class="copied" data-copied>{t.scene.copied}</span>
+              </div>
+            </div>
+          ))
+        }
 
         <svg class="wire" data-wire aria-hidden="true">
-          <path class="wire-base" data-wire-base d="" />
-          <path class="wire-glow" data-wire-glow d="" />
-          <circle class="wire-end" data-wire-a r="5" cx="0" cy="0" />
-          <circle class="wire-end" data-wire-b r="5" cx="0" cy="0" />
+          {
+            (['a', 'b'] as const).map((side) => (
+              <g data-wire-g={side}>
+                <path class="wire-base" data-base d="" />
+                <path class="wire-glow" data-glow d="" />
+                <circle class="wire-end" data-end1 r="5" cx="0" cy="0" />
+                <circle class="wire-end" data-end2 r="5" cx="0" cy="0" />
+              </g>
+            ))
+          }
         </svg>
         <div class="packet" data-packet aria-hidden="true">
           <Fragment set:html={svg('lock')} />
           <span data-packet-text>········</span>
         </div>
 
-        <div class="dev dev-b" data-dev-b>
-          <span class="dev-label dev-label-b"><i class="dot"></i>{t.scene.devB}</span>
+        <div class="dev dev-pw" data-dev-pw>
+          <span class="dev-label dev-label-b"><Fragment set:html={svg('lock', 'ic lock-ic')} />{t.scene.devPw}</span>
           <PasteWindow t={t} rows={t.scene.rows} id="hero-pw" />
         </div>
       </div>
@@ -351,7 +368,13 @@ const sceneData = JSON.stringify({
           <a class="link-arrow" href={t.server.guideHref}>{t.server.guide}<Fragment set:html={svg('arrow')} /></a>
         </div>
         <figure class="code" data-code>
-          <figcaption>{t.server.file}</figcaption>
+          <figcaption>
+            <span>{t.server.file}</span>
+            <button type="button" class="copy-btn" data-copy data-ok={t.server.copiedOk}>
+              <Fragment set:html={svg('copy')} />
+              <span>{t.server.copy}</span>
+            </button>
+          </figcaption>
           <pre><code>{compose.map(([kind, a, b]) => (
             <span class="cl">{kind === 'k' ? <span class="ck">{a}</span> : <><span class="ck">{a}</span><span class={kind === 's' ? 'cs' : 'cv'}>{b}</span></>}{'\n'}</span>
           ))}</code></pre>

@@ -63,5 +63,5 @@
   --dur-base: 220ms;
 
   --gutter: clamp(16px, 4vw, 48px);
-  --max: 1280px;
+  --max: 1440px;
 }
