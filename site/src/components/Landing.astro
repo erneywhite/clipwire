@@ -21,7 +21,8 @@ const docHtml = (doc: string) =>
 const compose = [
   ['k', 'services:'],
   ['k', '  clipwire:'],
-  ['kv', '    image: ', `ghcr.io/erneywhite/clipwire-server:${v}`],
+  // Версия образа помечена data-version: в браузере её подменяет последний выпуск с GitHub.
+  ['img', '    image: ', 'ghcr.io/erneywhite/clipwire-server:'],
   ['kv', '    restart: ', 'unless-stopped'],
   ['kv', '    read_only: ', 'true'],
   ['k', '    environment:'],
@@ -444,7 +445,7 @@ const sceneData = JSON.stringify({
             </button>
           </figcaption>
           <pre><code>{compose.map(([kind, a, b]) => (
-            <span class="cl">{kind === 'k' ? <span class="ck">{a}</span> : <><span class="ck">{a}</span><span class={kind === 's' ? 'cs' : 'cv'}>{b}</span></>}{'\n'}</span>
+            <span class="cl">{kind === 'k' ? <span class="ck">{a}</span> : kind === 'img' ? <><span class="ck">{a}</span><span class="cv">{b}<span data-version>{v}</span></span></> : <><span class="ck">{a}</span><span class={kind === 's' ? 'cs' : 'cv'}>{b}</span></>}{'\n'}</span>
           ))}</code></pre>
         </figure>
       </div>
