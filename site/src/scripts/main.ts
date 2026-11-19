@@ -8,6 +8,7 @@ import { ScrambleTextPlugin } from 'gsap/ScrambleTextPlugin';
 import { Flip } from 'gsap/Flip';
 import { SplitText } from 'gsap/SplitText';
 import Lenis from 'lenis';
+import { fetchStats, mergeStats, showStars, showDownloads, type Stats, type OsKey } from '../lib/stats';
 import 'lenis/dist/lenis.css';
 
 gsap.registerPlugin(ScrollTrigger, MotionPathPlugin, DrawSVGPlugin, ScrambleTextPlugin, Flip, SplitText);
@@ -92,32 +93,79 @@ if (os === 'mobile') {
 }
 applyVersion(data.version);
 
-// Сайт заливается руками и может отстать от выпусков: спрашиваем GitHub о
-// последней версии и подменяем ссылки. Не ответил — остаются ссылки сборки.
-(async () => {
-  const key = 'clipwire-latest';
-  let latest: string | null = null;
+// Сайт заливается руками и может отстать от выпусков, поэтому цифры и версия берутся
+// не только из сборки. Порядок источников:
+// 1) /stats.json на нашем же домене — его раз в час пишет tools/refresh-stats.py по Cron;
+// 2) если файла нет или он старше 6 часов — GitHub API напрямую (ответ живёт до конца сессии);
+// 3) последний удачный ответ, сохранённый в этом браузере, и цифры сборки.
+// Загрузки по каждой ОС берутся наибольшие из известных, так что вниз они не прыгают.
+const nf = new Intl.NumberFormat(document.documentElement.lang);
+const pr = new Intl.PluralRules(document.documentElement.lang);
+const extra = data as unknown as { dlForms: Record<string, string>; stats: Stats };
+
+function applyStats(s: Stats) {
+  if (s.latest && s.latest !== data.version) applyVersion(s.latest);
+  const star = document.querySelector<HTMLElement>('[data-stars]');
+  if (star && s.stars !== null) {
+    star.hidden = !showStars(s.stars);
+    $('[data-stars-n]', star).textContent = nf.format(s.stars);
+  }
+  if (s.downloads) {
+    const on = showDownloads(s.downloads);
+    $$('[data-dl]').forEach((el) => {
+      const n = s.downloads![el.dataset.dl as OsKey] ?? 0;
+      el.hidden = !on;
+      $('[data-dl-n]', el).textContent = nf.format(n);
+      $('[data-dl-w]', el).textContent = extra.dlForms[pr.select(n)] ?? extra.dlForms.other;
+    });
+  }
+}
+
+const readStats = (store: Storage, key: string): Stats | null => {
   try {
-    latest = sessionStorage.getItem(key);
+    return JSON.parse(store.getItem(key) || 'null');
   } catch {
-    /* хранилище недоступно — просто спросим */
+    return null; // хранилище недоступно или испорчено
   }
-  if (!latest) {
-    try {
-      const r = await fetch(`https://api.github.com/repos/${data.repo}/releases/latest`, {
-        headers: { Accept: 'application/vnd.github+json' },
-      });
-      if (r.ok) latest = String((await r.json()).tag_name || '').replace(/^v/, '') || null;
-    } catch {
-      /* нет сети или лимит API */
-    }
-    try {
-      if (latest) sessionStorage.setItem(key, latest);
-    } catch {
-      /* не важно */
-    }
+};
+const writeStats = (store: Storage, key: string, s: Stats) => {
+  try {
+    store.setItem(key, JSON.stringify(s));
+  } catch {
+    /* не важно */
   }
-  if (latest && /^\d+\.\d+\.\d+$/.test(latest) && latest !== data.version) applyVersion(latest);
+};
+
+const STATS_FILE_MAX_AGE = 6 * 3600; // секунд: старше — файл, видимо, перестал обновляться
+
+async function siteStats(): Promise<(Stats & { updated?: number }) | null> {
+  try {
+    const r = await fetch('/stats.json', { cache: 'no-cache' });
+    if (!r.ok || !(r.headers.get('content-type') || '').includes('json')) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+(async () => {
+  const SESSION = 'clipwire-gh';
+  const LAST = 'clipwire-gh-last';
+  const stored = readStats(localStorage, LAST);
+  // Сразу показываем лучшее из известного, потом уточняем.
+  applyStats(mergeStats(stored, extra.stats));
+
+  const file = await siteStats();
+  const fileFresh = !!file && typeof file.updated === 'number' && Date.now() / 1000 - file.updated < STATS_FILE_MAX_AGE;
+  let fresh: Stats | null = fileFresh ? file : readStats(sessionStorage, SESSION);
+  if (!fresh) {
+    fresh = await fetchStats(data.repo).catch(() => null);
+    if (fresh && (fresh.latest || fresh.stars !== null)) writeStats(sessionStorage, SESSION, fresh);
+    else fresh = null;
+  }
+  const best = mergeStats(fresh, file, stored, extra.stats);
+  if (fresh || file) writeStats(localStorage, LAST, mergeStats(fresh, file, stored));
+  applyStats(best);
 })();
 
 // ── Главный экран: два устройства копируют в одну общую историю ────────

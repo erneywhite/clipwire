@@ -285,6 +285,8 @@ const en = {
     serverLine: 'Server image',
     allReleases: 'All releases and changelog',
     yours: 'your system',
+    // Формы слова для Intl.PluralRules: one / other (англ.), one / few / many / other (рус.).
+    countForms: { one: 'download', other: 'downloads' } as Record<string, string>,
   },
 
   faq: {
@@ -330,6 +332,7 @@ const en = {
   },
 
   footer: { license: 'AGPL-3.0', source: 'Source code' },
+  stars: 'stars on GitHub',
 };
 
 export type Strings = typeof en;
@@ -608,6 +611,7 @@ const ru: Strings = {
     serverLine: 'Образ сервера',
     allReleases: 'Все выпуски и список изменений',
     yours: 'твоя система',
+    countForms: { one: 'загрузка', few: 'загрузки', many: 'загрузок', other: 'загрузки' },
   },
 
   faq: {
@@ -653,6 +657,7 @@ const ru: Strings = {
   },
 
   footer: { license: 'AGPL-3.0', source: 'Исходный код' },
+  stars: 'звёзд на GitHub',
 };
 
 export const strings: Record<Lang, Strings> = { en, ru };

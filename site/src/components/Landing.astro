@@ -4,7 +4,8 @@ import PasteWindow from './PasteWindow.astro';
 import Logo from './Logo.astro';
 import { strings, type Lang } from '../i18n/strings';
 import { svg, glyph } from '../lib/icons';
-import { buildVersion, assetUrl, REPO } from '../lib/release';
+import { buildVersion, assetUrl, REPO, buildStats } from '../lib/release';
+import { showStars, showDownloads, type OsKey } from '../lib/stats';
 
 interface Props {
   lang: Lang;
@@ -13,6 +14,13 @@ const { lang } = Astro.props;
 const t = strings[lang];
 const v = buildVersion();
 const home = lang === 'ru' ? '/ru/' : '/';
+const stats = await buildStats();
+const nf = new Intl.NumberFormat(t.htmlLang);
+const pr = new Intl.PluralRules(t.htmlLang);
+const dlWord = (n: number) => t.download.countForms[pr.select(n)] ?? t.download.countForms.other;
+const dlOf = (os: string) => stats.downloads?.[os as OsKey] ?? 0;
+const starsOn = showStars(stats.stars);
+const dlOn = showDownloads(stats.downloads);
 
 // Документ на work-pc: |…| — выделенный фрагмент.
 const docHtml = (doc: string) =>
@@ -91,6 +99,8 @@ const sceneData = JSON.stringify({
   repo: REPO,
   hero: { ctaFor: t.hero.ctaFor, ctaAny: t.hero.ctaAny, ctaMobile: t.hero.ctaMobile },
   yours: t.download.yours,
+  dlForms: t.download.countForms,
+  stats,
 });
 ---
 
@@ -106,7 +116,12 @@ const sceneData = JSON.stringify({
       <a class="nav-l" href="#server">{t.nav.server}</a>
       <a class="nav-l" href="#support">{t.nav.support}</a>
       <a class="nav-gh" href={`https://github.com/${REPO}`} aria-label="GitHub">
+        
         <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02a9.6 9.6 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2Z"/></svg>
+        <span class="gh-stars" data-stars hidden={!starsOn} aria-label={t.stars}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 3.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.2-4.1 5.8-.8z"/></svg>
+          <b data-stars-n>{starsOn ? nf.format(stats.stars!) : ''}</b>
+        </span>
       </a>
       <a class="nav-lang" href={t.langSwitch.href} hreflang={t.langSwitch.href === '/' ? 'en' : 'ru'} aria-label={t.langSwitch.label}>{t.langSwitch.short}</a>
       <a class="btn btn-s btn-sm nav-dl" href="#download">{t.nav.download}</a>
@@ -544,6 +559,10 @@ const sceneData = JSON.stringify({
                 <span class="os-yours">{t.download.yours}</span>
               </header>
               <p class="os-req">{s.req}</p>
+              <p class="os-dl" data-dl={s.os} hidden={!dlOn}>
+                <Fragment set:html={svg('download')} />
+                <span data-dl-n>{nf.format(dlOf(s.os))}</span> <span data-dl-w>{dlWord(dlOf(s.os))}</span>
+              </p>
               <div class="os-files">
                 {s.files.map((f, i) => (
                   <a class:list={['btn', i === 0 ? 'btn-p' : 'btn-s', 'btn-file']} href={assetUrl(v, f.suffix)} data-suffix={f.suffix}>
