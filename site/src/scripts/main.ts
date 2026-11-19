@@ -694,6 +694,73 @@ if (!reduceQuery.matches) {
   gsap.ticker.lagSmoothing(0);
 }
 
+// ── Полоса прокрутки с рисками разделов ───────────────────────────────
+// Риска стоит там, где раздел начинается на странице; клик плавно доводит до него,
+// полосу можно тащить. Работает только на десктопе с мышью (см. CSS).
+function initRail() {
+  const rail = $('[data-rail]');
+  if (!window.matchMedia('(min-width: 1024px) and (pointer: fine)').matches) return;
+  document.documentElement.classList.add('has-rail');
+  const fill = $('[data-rail-fill]');
+  const ticks = $$<HTMLButtonElement>('[data-rail-tick]');
+  const targets = ticks.map((b) => document.getElementById(b.dataset.target!)!);
+  const HEADER = 72;
+  const maxScroll = () => Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+  const topOf = (i: number) => (i === 0 ? 0 : Math.min(maxScroll(), targets[i].getBoundingClientRect().top + window.scrollY - HEADER));
+
+  const update = () => {
+    const p = Math.min(1, Math.max(0, window.scrollY / maxScroll()));
+    fill.style.transform = `scaleY(${p})`;
+    let active = 0;
+    targets.forEach((el, i) => {
+      if (el.getBoundingClientRect().top <= window.innerHeight * 0.4) active = i;
+    });
+    // В самом низу страницы последний раздел активен, даже если он невысокий.
+    if (p > 0.995) active = targets.length - 1;
+    ticks.forEach((b, i) => {
+      b.classList.toggle('on', i === active);
+      if (i === active) b.setAttribute('aria-current', 'true');
+      else b.removeAttribute('aria-current');
+    });
+  };
+  const layout = () => {
+    const m = maxScroll();
+    ticks.forEach((b, i) => (b.style.top = `${(topOf(i) / m) * 100}%`));
+    update();
+  };
+  const easeOutQuart = (t: number) => 1 - Math.pow(1 - t, 4);
+  const go = (y: number) => {
+    if (lenis) lenis.scrollTo(y, { duration: 1.1, easing: easeOutQuart });
+    else window.scrollTo({ top: y, behavior: 'auto' });
+  };
+  ticks.forEach((b, i) => b.addEventListener('click', () => go(topOf(i))));
+
+  // Перетаскивание и клик по самой полосе.
+  let dragging = false;
+  const seek = (e: PointerEvent) => {
+    const r = rail.getBoundingClientRect();
+    const p = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+    if (lenis) lenis.scrollTo(p * maxScroll(), { immediate: true });
+    else window.scrollTo(0, p * maxScroll());
+  };
+  rail.addEventListener('pointerdown', (e) => {
+    if ((e.target as Element).closest('[data-rail-tick]')) return;
+    dragging = true;
+    rail.setPointerCapture(e.pointerId);
+    seek(e);
+  });
+  rail.addEventListener('pointermove', (e) => dragging && seek(e));
+  const stop = () => (dragging = false);
+  rail.addEventListener('pointerup', stop);
+  rail.addEventListener('pointercancel', stop);
+
+  window.addEventListener('scroll', update, { passive: true });
+  ScrollTrigger.addEventListener('refresh', layout);
+  window.addEventListener('resize', layout);
+  layout();
+}
+initRail();
+
 // ── Запуск ─────────────────────────────────────────────────────────────
 initTry();
 

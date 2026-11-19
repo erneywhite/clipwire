@@ -224,6 +224,121 @@ pre {
   }
 }
 
+/* ── Полоса прокрутки с рисками разделов ── */
+.rail {
+  display: none;
+}
+@media (min-width: 1024px) and (pointer: fine) {
+  html.has-rail {
+    scrollbar-width: none;
+  }
+  html.has-rail::-webkit-scrollbar {
+    display: none;
+  }
+  html.has-rail .rail {
+    display: block;
+    position: fixed;
+    z-index: 45;
+    right: 14px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 32px;
+    height: min(64vh, 560px);
+    cursor: pointer;
+    touch-action: none;
+  }
+}
+.rail-track {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 2px;
+  background: var(--c-border);
+  overflow: hidden;
+}
+.rail-fill {
+  position: absolute;
+  inset: 0;
+  background: var(--c-wire);
+  transform-origin: center top;
+  transform: scaleY(0);
+}
+.rail-tick {
+  position: absolute;
+  left: 0;
+  width: 32px;
+  height: 16px;
+  margin-top: -8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.rail-tick::before {
+  content: '';
+  position: absolute;
+  top: 7px;
+  left: 50%;
+  width: 14px;
+  height: 2px;
+  margin-left: -7px;
+  border-radius: 2px;
+  background: var(--c-muted);
+  transition:
+    width var(--dur-base) var(--ease-out),
+    margin-left var(--dur-base) var(--ease-out),
+    background-color var(--dur-base) ease;
+}
+.rail-tick.on::before {
+  width: 24px;
+  margin-left: -12px;
+  background: var(--c-wire);
+}
+.rail-tick:focus-visible {
+  outline-offset: 0;
+}
+.rail-tip {
+  position: absolute;
+  right: 38px;
+  top: 50%;
+  transform: translate(6px, -50%);
+  opacity: 0;
+  pointer-events: none;
+  white-space: nowrap;
+  font: var(--text-xs) var(--font-mono);
+  color: var(--c-text);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-s);
+  padding: 4px 8px;
+  transition:
+    opacity 120ms ease,
+    transform 180ms var(--ease-out);
+}
+.rail-tick.on .rail-tip {
+  color: var(--c-wire);
+  border-color: var(--c-wire-line);
+}
+.rail-tick:focus-visible .rail-tip {
+  opacity: 1;
+  transform: translate(0, -50%);
+}
+@media (hover: hover) and (pointer: fine) {
+  .rail-tick:hover::before {
+    background: var(--c-text);
+  }
+  .rail-tick.on:hover::before {
+    background: var(--c-wire);
+  }
+  .rail-tick:hover .rail-tip {
+    opacity: 1;
+    transform: translate(0, -50%);
+  }
+}
+
 /* ── Главный экран ── */
 .hero {
   max-width: var(--max);

@@ -18,6 +18,20 @@ const en = {
   skip: 'Skip to content',
   nav: { how: 'How it works', security: 'Encryption', server: 'Self-hosting', download: 'Download', support: 'Support' },
   langSwitch: { label: 'Русский', href: '/ru/', short: 'RU' },
+  rail: {
+    label: 'Page sections',
+    items: [
+      ['top', 'Start'],
+      ['how', 'How it works'],
+      ['security', 'Encryption'],
+      ['exclusions', 'Exclusions'],
+      ['server', 'Self-hosting'],
+      ['local', 'Without a server'],
+      ['try', 'Try it'],
+      ['download', 'Download'],
+      ['support', 'Support'],
+    ] as [string, string][],
+  },
 
   hero: {
     a: 'Copy here.',
@@ -293,6 +307,20 @@ const ru: Strings = {
   skip: 'К содержимому',
   nav: { how: 'Как работает', security: 'Шифрование', server: 'Свой сервер', download: 'Скачать', support: 'Поддержать' },
   langSwitch: { label: 'English', href: '/', short: 'EN' },
+  rail: {
+    label: 'Разделы страницы',
+    items: [
+      ['top', 'Начало'],
+      ['how', 'Как работает'],
+      ['security', 'Шифрование'],
+      ['exclusions', 'Исключения'],
+      ['server', 'Свой сервер'],
+      ['local', 'Без сервера'],
+      ['try', 'Попробовать'],
+      ['download', 'Скачать'],
+      ['support', 'Поддержать'],
+    ],
+  },
 
   hero: {
     a: 'Копируешь здесь.',

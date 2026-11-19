@@ -69,9 +69,21 @@ const sceneData = JSON.stringify({
     </nav>
   </header>
 
+  <!-- Полоса прокрутки с рисками разделов (десктоп) -->
+  <nav class="rail" data-rail aria-label={t.rail.label}>
+    <span class="rail-track" aria-hidden="true"><span class="rail-fill" data-rail-fill></span></span>
+    {
+      t.rail.items.map(([id, label]) => (
+        <button type="button" class="rail-tick" data-rail-tick data-target={id} aria-label={label}>
+          <span class="rail-tip" aria-hidden="true">{label}</span>
+        </button>
+      ))
+    }
+  </nav>
+
   <main id="main">
     <!-- ── Главный экран ── -->
-    <section class="hero" data-hero>
+    <section class="hero" id="top" data-hero>
       <div class="hero-copy">
         <h1 class="hero-h">
           <span class="hero-a">{t.hero.a}</span>
