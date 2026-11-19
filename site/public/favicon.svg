@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Clipwire: два листа, соединённые проводом. Иконка приложения. -->
+  <rect width="256" height="256" rx="58" fill="#1c1e22"/>
+  <path d="M58 28 H118 L146 56 V148 Q146 166 128 166 H58 Q40 166 40 148 V46 Q40 28 58 28 Z" fill="#1c1e22" stroke="#e9e6df" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M118 28 V56 H146 Z" fill="#e9e6df" stroke="#e9e6df" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M128 90 H188 L216 118 V210 Q216 228 198 228 H128 Q110 228 110 210 V108 Q110 90 128 90 Z" fill="#1c1e22" stroke="#e9e6df" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M188 90 V118 H216 Z" fill="#e9e6df" stroke="#e9e6df" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M72 66 V112 Q72 130 90 130 H146 Q164 130 164 148 V178" fill="none" stroke="#e2a63b" stroke-width="15" stroke-linecap="round"/>
+  <circle cx="72" cy="64" r="14" fill="#e2a63b"/>
+  <circle cx="164" cy="182" r="14" fill="#e2a63b"/>
+</svg>

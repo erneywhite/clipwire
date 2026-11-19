@@ -1,0 +1,67 @@
+/* Hallmark · genre: atmospheric · macrostructure: Feature Stack (hero: live scene) · theme: custom
+ * vibe: "графитовая утилита, янтарный провод" · paper #141518 · accent #e2a63b amber
+ * display + body: Onest · mono: JetBrains Mono · axes: dark / geometric-sans / warm
+ * Цвета взяты из темы «Графит» приложения (apps/desktop/src/styles/tokens.css). */
+
+@import '@fontsource/onest/400.css';
+@import '@fontsource/onest/500.css';
+@import '@fontsource/onest/600.css';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+
+:root {
+  color-scheme: dark;
+
+  --c-page: #141518;
+  --c-bg: #1c1e22;
+  --c-surface: #26292e;
+  --c-hover: #2a2d33;
+  --c-sel: #2f2c24;
+  --c-border: #34373d;
+  --c-border-soft: #26292e;
+  --c-text: #e9e6df;
+  --c-text-2: #c9c5bc;
+  --c-muted: #9a978f;
+  --c-faint: #6d6a63;
+  --c-wire: #e2a63b;
+  --c-wire-soft: rgb(226 166 59 / 0.16);
+  --c-wire-line: rgb(226 166 59 / 0.55);
+  --c-on-wire: #1c1e22;
+  --c-ok: #5fbf86;
+  --c-danger: #e0675f;
+  --c-danger-soft: rgb(224 103 95 / 0.14);
+
+  --font-ui: 'Onest', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  --text-xs: 11.5px;
+  --text-s: 13px;
+  --text-m: 15px;
+  --text-l: 18px;
+  --text-xl: clamp(22px, 1.6vw + 14px, 28px);
+  --text-2xl: clamp(32px, 3.4vw + 14px, 52px);
+  --text-display: clamp(44px, 5.6vw + 10px, 84px);
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 72px;
+  --space-9: 120px;
+
+  --radius-s: 6px;
+  --radius-m: 8px;
+  --radius-l: 12px;
+  --radius-xl: 16px;
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --dur-fast: 140ms;
+  --dur-base: 220ms;
+
+  --gutter: clamp(16px, 4vw, 48px);
+  --max: 1280px;
+}
