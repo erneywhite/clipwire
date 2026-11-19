@@ -107,6 +107,29 @@ const en = {
         body: "Space shows a card built from the page's og: tags. The page itself never runs, and links that look single-use (reset, token, magic login) are not fetched at all.",
       },
     ],
+    // Карточки-спутники вокруг демонстрации: детали, которые не влезли в неё саму.
+    sats: {
+      rich: [
+        { icon: 'text', title: 'HTML', sub: 'from Chrome', pos: 'tl' },
+        { icon: 'code', title: 'Shift+Enter', sub: 'plain text only', pos: 'tr' },
+        { icon: 'text', title: 'RTF', sub: 'from Word', pos: 'br' },
+      ],
+      image: [
+        { icon: 'image', title: 'Lossless PNG', sub: '1200×739 · 42 KB', pos: 'tr' },
+        { icon: 'file', title: 'Image 2026-11-16 14-05-09.png', sub: 'pasted into a folder as a file', pos: 'bl' },
+        { icon: 'image', title: 'Ctrl+E', sub: 'arrow, blur, crop, text', pos: 'br' },
+      ],
+      files: [
+        { icon: 'folder', title: 'clipwire-site/', sub: '38 files, .gitignore honoured', pos: 'tl' },
+        { icon: 'arrow', title: 'Direct', sub: 'from the source when it is online', pos: 'tr' },
+        { icon: 'lock', title: 'Encrypted parts', sub: 'server disk, S3 or SFTP', pos: 'br' },
+      ],
+      links: [
+        { icon: 'link', title: 'og:title · og:image', sub: 'first 512 KB of HTML only', pos: 'tl' },
+        { icon: 'arrow', title: 'Open in browser', sub: 'one click from the card', pos: 'tr' },
+        { icon: 'x', title: 'localhost, 192.168.x.x', sub: 'never fetched', pos: 'br' },
+      ],
+    } as Record<string, { icon: string; title: string; sub: string; pos: string }[]>,
     rich: {
       heading: 'Release notes',
       items: ['Paste window opens next to the cursor', 'Pins sync across devices', 'Exclusions for files and folders'],
@@ -359,6 +382,28 @@ const ru: Strings = {
         body: 'По пробелу открывается карточка из og:-тегов страницы. Сама страница не исполняется, а ссылки, похожие на одноразовые (reset, token, вход по ссылке), вообще не загружаются.',
       },
     ],
+    sats: {
+      rich: [
+        { icon: 'text', title: 'HTML', sub: 'из Chrome', pos: 'tl' },
+        { icon: 'code', title: 'Shift+Enter', sub: 'только текст', pos: 'tr' },
+        { icon: 'text', title: 'RTF', sub: 'из Word', pos: 'br' },
+      ],
+      image: [
+        { icon: 'image', title: 'PNG без потерь', sub: '1200×739 · 42 КБ', pos: 'tr' },
+        { icon: 'file', title: 'Снимок 2026-11-16 14-05-09.png', sub: 'вставка в папку файлом', pos: 'bl' },
+        { icon: 'image', title: 'Ctrl+E', sub: 'стрелка, размытие, обрезка, текст', pos: 'br' },
+      ],
+      files: [
+        { icon: 'folder', title: 'clipwire-site/', sub: '38 файлов, с учётом .gitignore', pos: 'tl' },
+        { icon: 'arrow', title: 'Напрямую', sub: 'с источника, пока он в сети', pos: 'tr' },
+        { icon: 'lock', title: 'Зашифрованные части', sub: 'диск сервера, S3 или SFTP', pos: 'br' },
+      ],
+      links: [
+        { icon: 'link', title: 'og:title · og:image', sub: 'только первые 512 КБ HTML', pos: 'tl' },
+        { icon: 'arrow', title: 'Открыть в браузере', sub: 'в один клик из карточки', pos: 'tr' },
+        { icon: 'x', title: 'localhost, 192.168.x.x', sub: 'не загружаются никогда', pos: 'br' },
+      ],
+    },
     rich: {
       heading: 'Что нового',
       items: ['Окно вставки открывается у курсора', 'Закрепы синхронизируются', 'Исключения для файлов и папок'],

@@ -321,6 +321,19 @@ function demoTimelines(narrow: boolean) {
     .to(fmt, { autoAlpha: 1, filter: 'blur(0px)', duration: 0.5, ease: 'power2.inOut' }, 'back+=0.3');
   ScrollTrigger.create({ trigger: rich, start: 'top 85%', end: 'bottom 15%', onToggle: (s) => (s.isActive ? rtl.play() : rtl.pause()) });
 
+  // Спутники коллажа: на десктопе плывут с разной скоростью (параллакс).
+  if (!narrow && window.matchMedia('(min-width: 1024px)').matches) {
+    $$('[data-sat]').forEach((sat) => {
+      const k = Number(sat.dataset.speed);
+      // Сдвиг идёт всю дорогу через экран, а проявление только в начале:
+      // пока демонстрация в середине экрана, спутники видны полностью.
+      gsap
+        .timeline({ scrollTrigger: { trigger: sat.closest('.collage'), start: 'top bottom', end: 'bottom top', scrub: 1 } })
+        .fromTo(sat, { y: 40 * k }, { y: -40 * k, ease: 'none', duration: 1 }, 0)
+        .fromTo(sat, { autoAlpha: 0 }, { autoAlpha: 1, ease: 'none', duration: 0.22 }, 0.06);
+    });
+  }
+
   // Каждая демонстрация плавно проявляется вместе с прокруткой.
   $$('[data-panel] .demo').forEach((d) =>
     gsap.fromTo(

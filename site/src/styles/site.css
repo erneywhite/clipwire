@@ -780,7 +780,7 @@ kbd.down {
   gap: var(--space-5);
 }
 .panel {
-  min-height: 62vh;
+  min-height: 58vh;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -809,6 +809,75 @@ kbd.down {
 }
 .demo-shot {
   min-height: 0;
+}
+
+/* коллаж: демонстрация и карточки-спутники вокруг неё */
+.collage {
+  position: relative;
+  padding: 44px 36px;
+}
+.sats {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.sat {
+  position: absolute;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  max-width: 300px;
+  padding: 10px 14px 10px 10px;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-l);
+  box-shadow: 0 18px 40px -18px rgb(0 0 0 / 0.7);
+}
+.sat-ic {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-m);
+  background: var(--c-sel);
+  color: var(--c-wire);
+  flex: none;
+}
+.sat-ic .ic {
+  width: 17px;
+  height: 17px;
+}
+.sat-body {
+  display: grid;
+  min-width: 0;
+}
+.sat-body b {
+  font-weight: 500;
+  font-size: var(--text-s);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sat-body small {
+  font: var(--text-xs) var(--font-mono);
+  color: var(--c-muted);
+}
+.sat-tl {
+  top: 0;
+  left: 0;
+}
+.sat-tr {
+  top: 4px;
+  right: 0;
+}
+.sat-bl {
+  bottom: 0;
+  left: 8px;
+}
+.sat-br {
+  bottom: 2px;
+  right: 12px;
 }
 
 /* rich */
@@ -1686,6 +1755,21 @@ kbd.down {
   }
   .panel-cap {
     display: block;
+  }
+  .collage {
+    padding: 0;
+  }
+  .sats {
+    position: static;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+  }
+  .sat {
+    position: static;
+    box-shadow: none;
+    max-width: 100%;
   }
   .points {
     grid-template-columns: minmax(0, 1fr);

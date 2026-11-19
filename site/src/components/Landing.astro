@@ -188,6 +188,7 @@ const sceneData = JSON.stringify({
                   <p>{s.body}</p>
                 </header>
 
+                <div class="collage">
                 {s.key === 'rich' && (
                   <div class="demo demo-rich" data-demo="rich">
                     <div class="rich-src">
@@ -301,6 +302,18 @@ const sceneData = JSON.stringify({
                     </div>
                   </div>
                 )}
+                  <div class="sats" aria-hidden="true">
+                    {t.how.sats[s.key].map((sat, k) => (
+                      <div class:list={['sat', `sat-${sat.pos}`]} data-sat data-speed={[1, -0.7, 0.5][k]}>
+                        <span class="sat-ic" set:html={svg(sat.icon)} />
+                        <span class="sat-body">
+                          <b>{sat.title}</b>
+                          <small>{sat.sub}</small>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               </article>
             ))
           }
