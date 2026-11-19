@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <b>English</b> · <a href="README.ru.md">Русский</a>
+  <b>English</b> · <a href="README.ru.md">Русский</a> · <a href="https://clipwire.erney.monster">Website</a>
 </p>
 
 <p align="center">
@@ -963,6 +963,8 @@ two clients can run on one machine.
   [Linux](docs/linux.md) and the brand sources (`docs/brand/`).
   These documents are in Russian.
 - `deploy/`: compose files and a reverse proxy example for the server.
+- `site/`: the [website](https://clipwire.erney.monster) (Astro and GSAP, a static build). How to build and
+  publish it is in [site/README.md](site/README.md), in Russian.
 
 ## Support
 
