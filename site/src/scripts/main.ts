@@ -8,6 +8,7 @@ import { ScrambleTextPlugin } from 'gsap/ScrambleTextPlugin';
 import { Flip } from 'gsap/Flip';
 import { SplitText } from 'gsap/SplitText';
 import Lenis from 'lenis';
+import { fetchStats, showStars, showDownloads, type Stats, type OsKey } from '../lib/stats';
 import 'lenis/dist/lenis.css';
 
 gsap.registerPlugin(ScrollTrigger, MotionPathPlugin, DrawSVGPlugin, ScrambleTextPlugin, Flip, SplitText);
@@ -92,32 +93,48 @@ if (os === 'mobile') {
 }
 applyVersion(data.version);
 
-// Сайт заливается руками и может отстать от выпусков: спрашиваем GitHub о
-// последней версии и подменяем ссылки. Не ответил — остаются ссылки сборки.
+// Сайт заливается руками и может отстать от выпусков: спрашиваем GitHub о последнем
+// выпуске, звёздах и загрузках и подменяем ссылки и цифры. Ответ живёт до конца сессии
+// браузера, так что лимит API в 60 запросов в час не мешает. Не ответил — остаётся сборка.
+const nf = new Intl.NumberFormat(document.documentElement.lang);
+const pr = new Intl.PluralRules(document.documentElement.lang);
+const dlForms = (data as unknown as { dlForms: Record<string, string> }).dlForms;
+
+function applyStats(s: Stats) {
+  if (s.latest && s.latest !== data.version) applyVersion(s.latest);
+  const star = document.querySelector<HTMLElement>('[data-stars]');
+  if (star && s.stars !== null) {
+    star.hidden = !showStars(s.stars);
+    $('[data-stars-n]', star).textContent = nf.format(s.stars);
+  }
+  if (s.downloads) {
+    const on = showDownloads(s.downloads);
+    $$('[data-dl]').forEach((el) => {
+      const n = s.downloads![el.dataset.dl as OsKey] ?? 0;
+      el.hidden = !on;
+      $('[data-dl-n]', el).textContent = nf.format(n);
+      $('[data-dl-w]', el).textContent = dlForms[pr.select(n)] ?? dlForms.other;
+    });
+  }
+}
+
 (async () => {
-  const key = 'clipwire-latest';
-  let latest: string | null = null;
+  const key = 'clipwire-gh';
+  let s: Stats | null = null;
   try {
-    latest = sessionStorage.getItem(key);
+    s = JSON.parse(sessionStorage.getItem(key) || 'null');
   } catch {
     /* хранилище недоступно — просто спросим */
   }
-  if (!latest) {
+  if (!s) {
+    s = await fetchStats(data.repo).catch(() => null);
     try {
-      const r = await fetch(`https://api.github.com/repos/${data.repo}/releases/latest`, {
-        headers: { Accept: 'application/vnd.github+json' },
-      });
-      if (r.ok) latest = String((await r.json()).tag_name || '').replace(/^v/, '') || null;
-    } catch {
-      /* нет сети или лимит API */
-    }
-    try {
-      if (latest) sessionStorage.setItem(key, latest);
+      if (s && (s.latest || s.stars !== null)) sessionStorage.setItem(key, JSON.stringify(s));
     } catch {
       /* не важно */
     }
   }
-  if (latest && /^\d+\.\d+\.\d+$/.test(latest) && latest !== data.version) applyVersion(latest);
+  if (s) applyStats(s);
 })();
 
 // ── Главный экран: два устройства копируют в одну общую историю ────────

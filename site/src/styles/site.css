@@ -48,6 +48,9 @@ ol {
 a {
   color: inherit;
 }
+[hidden] {
+  display: none !important;
+}
 img {
   max-width: 100%;
   height: auto;
@@ -188,9 +191,29 @@ pre {
   color: var(--c-text);
 }
 .nav-gh {
-  display: grid;
-  place-items: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   color: var(--c-muted);
+  text-decoration: none;
+}
+.gh-stars {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: 500 var(--text-xs) var(--font-mono);
+  color: var(--c-text-2);
+  border: 1px solid var(--c-border);
+  border-radius: 999px;
+  padding: 2px 8px 2px 6px;
+}
+.nav-gh .gh-stars svg {
+  width: 12px;
+  height: 12px;
+  color: var(--c-wire);
+}
+.gh-stars b {
+  font-weight: 500;
 }
 .nav-gh svg {
   width: 20px;
@@ -1716,12 +1739,28 @@ kbd.down {
 .os.mine .os-yours {
   display: inline-block;
 }
+.os-dl {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font: var(--text-xs) var(--font-mono);
+  color: var(--c-muted);
+}
+.os-dl .ic {
+  width: 14px;
+  height: 14px;
+}
+.os-dl [data-dl-n] {
+  color: var(--c-text-2);
+}
 .os-req {
   color: var(--c-muted);
   font-size: var(--text-s);
-  flex: 1;
 }
 .os-files {
+  /* Кнопки прижаты к низу: счётчик загрузок во всех карточках стоит на одной высоте. */
+  margin-top: auto;
+  padding-top: var(--space-2);
   display: grid;
   gap: var(--space-2);
 }
