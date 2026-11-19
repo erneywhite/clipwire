@@ -93,10 +93,12 @@ if (os === 'mobile') {
 }
 applyVersion(data.version);
 
-// Сайт заливается руками и может отстать от выпусков: спрашиваем GitHub о последнем
-// выпуске, звёздах и загрузках и подменяем ссылки и цифры. Свежий ответ живёт до конца
-// сессии (лимит API в 60 запросов в час не мешает), последний удачный хранится в браузере
-// дальше: если GitHub не ответил, показываем его, а не старые цифры сборки.
+// Сайт заливается руками и может отстать от выпусков, поэтому цифры и версия берутся
+// не только из сборки. Порядок источников:
+// 1) /stats.json на нашем же домене — его раз в час пишет tools/refresh-stats.py по Cron;
+// 2) если файла нет или он старше 6 часов — GitHub API напрямую (ответ живёт до конца сессии);
+// 3) последний удачный ответ, сохранённый в этом браузере, и цифры сборки.
+// Загрузки по каждой ОС берутся наибольшие из известных, так что вниз они не прыгают.
 const nf = new Intl.NumberFormat(document.documentElement.lang);
 const pr = new Intl.PluralRules(document.documentElement.lang);
 const extra = data as unknown as { dlForms: Record<string, string>; stats: Stats };
@@ -134,21 +136,36 @@ const writeStats = (store: Storage, key: string, s: Stats) => {
   }
 };
 
+const STATS_FILE_MAX_AGE = 6 * 3600; // секунд: старше — файл, видимо, перестал обновляться
+
+async function siteStats(): Promise<(Stats & { updated?: number }) | null> {
+  try {
+    const r = await fetch('/stats.json', { cache: 'no-cache' });
+    if (!r.ok || !(r.headers.get('content-type') || '').includes('json')) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
 (async () => {
   const SESSION = 'clipwire-gh';
   const LAST = 'clipwire-gh-last';
   const stored = readStats(localStorage, LAST);
-  // Сразу показываем лучшее из известного, потом, если надо, уточняем ответом GitHub.
+  // Сразу показываем лучшее из известного, потом уточняем.
   applyStats(mergeStats(stored, extra.stats));
-  let fresh = readStats(sessionStorage, SESSION);
+
+  const file = await siteStats();
+  const fileFresh = !!file && typeof file.updated === 'number' && Date.now() / 1000 - file.updated < STATS_FILE_MAX_AGE;
+  let fresh: Stats | null = fileFresh ? file : readStats(sessionStorage, SESSION);
   if (!fresh) {
     fresh = await fetchStats(data.repo).catch(() => null);
-    if (fresh && (fresh.latest || fresh.stars !== null)) {
-      writeStats(sessionStorage, SESSION, fresh);
-      writeStats(localStorage, LAST, mergeStats(fresh, stored));
-    }
+    if (fresh && (fresh.latest || fresh.stars !== null)) writeStats(sessionStorage, SESSION, fresh);
+    else fresh = null;
   }
-  if (fresh) applyStats(mergeStats(fresh, stored, extra.stats));
+  const best = mergeStats(fresh, file, stored, extra.stats);
+  if (fresh || file) writeStats(localStorage, LAST, mergeStats(fresh, file, stored));
+  applyStats(best);
 })();
 
 // ── Главный экран: два устройства копируют в одну общую историю ────────
