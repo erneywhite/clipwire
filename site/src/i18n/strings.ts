@@ -12,9 +12,9 @@ export interface Row {
 
 const en = {
   htmlLang: 'en',
-  title: 'Clipwire · a shared clipboard through your own server',
+  title: 'Clipwire · Self-hosted clipboard sync for Windows, macOS and Linux',
   description:
-    'Free shared clipboard for Windows, macOS and Linux. Copy on one computer, paste on another. Text, images and files go through your own server, end-to-end encrypted.',
+    'Free open-source clipboard sync for Windows, macOS and Linux. Copy on one computer, paste on another: text, images and files go through your own server, end-to-end encrypted.',
   skip: 'Skip to content',
   nav: { how: 'How it works', security: 'Encryption', server: 'Self-hosting', download: 'Download', support: 'Support' },
   langSwitch: { label: 'Русский', href: '/ru/', short: 'RU' },
@@ -29,6 +29,7 @@ const en = {
       ['local', 'Without a server'],
       ['try', 'Try it'],
       ['download', 'Download'],
+      ['faq', 'Questions'],
       ['support', 'Support'],
     ] as [string, string][],
   },
@@ -286,6 +287,40 @@ const en = {
     yours: 'your system',
   },
 
+  faq: {
+    title: 'Questions',
+    items: [
+      {
+        q: 'Is Clipwire free?',
+        a: 'Yes. Clipwire is free and open source under AGPL-3.0, with no paid tier and no account. If it saves you time, you can support the author on Ko-fi.',
+      },
+      {
+        q: 'Do I need my own server?',
+        a: 'Not on a single computer: without a server Clipwire is a local clipboard history. To sync between computers you run the server, which is one Docker container, or join a group on a server someone already runs with a group creation code.',
+      },
+      {
+        q: 'Can the server read my clipboard?',
+        a: 'No. Every entry is end-to-end encrypted with the group key before it leaves the device. The key lives on your devices and in the invitation code, the server stores and forwards only ciphertext.',
+      },
+      {
+        q: 'Does it work outside my local network?',
+        a: 'Yes. Devices on the same network connect directly, everywhere else traffic goes through the relay built into your server, so a laptop on the road still syncs with the PC at home.',
+      },
+      {
+        q: 'Which systems are supported?',
+        a: 'Windows (x64), macOS 13 Ventura or newer on Apple Silicon and Intel, and Linux x86-64 on X11 and Wayland: GNOME, KDE Plasma, Sway, Hyprland and others. There are no phone apps.',
+      },
+      {
+        q: 'What can it sync?',
+        a: 'Plain and formatted text (HTML and RTF), images, files and folders. Files up to 100 MB are uploaded right away by default, larger ones are pulled from the source computer when you paste. Files can be stored on the server disk, in S3-compatible storage or on SFTP.',
+      },
+      {
+        q: 'How is it different from Universal Clipboard or Paste?',
+        a: 'Universal Clipboard works only between Apple devices, and Paste is a paid app for Apple platforms. Clipwire connects Windows, macOS and Linux through a server you control, is free, and can import your history from Paste.',
+      },
+    ],
+  },
+
   support: {
     title: 'Free, made by one person',
     body: 'Clipwire is free and has no paid tier. If it saves you time, you can support the author on Ko-fi.',
@@ -301,9 +336,9 @@ export type Strings = typeof en;
 
 const ru: Strings = {
   htmlLang: 'ru',
-  title: 'Clipwire · общий буфер обмена через свой сервер',
+  title: 'Clipwire · общий буфер обмена для Windows, macOS и Linux через свой сервер',
   description:
-    'Бесплатный общий буфер обмена для Windows, macOS и Linux. Копируешь на одном компьютере, вставляешь на другом. Текст, картинки и файлы идут через собственный сервер с шифрованием от устройства до устройства.',
+    'Бесплатный общий буфер обмена с открытым кодом для Windows, macOS и Linux. Текст, картинки и файлы идут через собственный сервер и шифруются от устройства до устройства.',
   skip: 'К содержимому',
   nav: { how: 'Как работает', security: 'Шифрование', server: 'Свой сервер', download: 'Скачать', support: 'Поддержать' },
   langSwitch: { label: 'English', href: '/', short: 'EN' },
@@ -318,6 +353,7 @@ const ru: Strings = {
       ['local', 'Без сервера'],
       ['try', 'Попробовать'],
       ['download', 'Скачать'],
+      ['faq', 'Вопросы'],
       ['support', 'Поддержать'],
     ],
   },
@@ -572,6 +608,40 @@ const ru: Strings = {
     serverLine: 'Образ сервера',
     allReleases: 'Все выпуски и список изменений',
     yours: 'твоя система',
+  },
+
+  faq: {
+    title: 'Вопросы',
+    items: [
+      {
+        q: 'Clipwire бесплатный?',
+        a: 'Да. Clipwire бесплатный, с открытым кодом под AGPL-3.0, без платной версии и без учётной записи. Если он экономит время, автора можно поддержать на Ko-fi.',
+      },
+      {
+        q: 'Нужен ли свой сервер?',
+        a: 'Для одного компьютера не нужен: без сервера Clipwire работает как локальная история буфера. Чтобы синхронизировать несколько компьютеров, ставится сервер, это один Docker-контейнер. Можно и войти в группу на чужом сервере по коду создания группы.',
+      },
+      {
+        q: 'Может ли сервер прочитать мой буфер?',
+        a: 'Нет. Каждая запись шифруется ключом группы ещё на устройстве. Ключ есть только на устройствах и в коде приглашения, сервер хранит и пересылает один шифротекст.',
+      },
+      {
+        q: 'Работает ли вне домашней сети?',
+        a: 'Да. В одной сети устройства соединяются напрямую, в остальных случаях идут через relay, встроенный в сервер. Ноутбук в поездке синхронизируется с домашним компьютером.',
+      },
+      {
+        q: 'Какие системы поддерживаются?',
+        a: 'Windows (x64), macOS 13 Ventura и новее на Apple Silicon и Intel, Linux x86-64 на X11 и Wayland: GNOME, KDE Plasma, Sway, Hyprland и другие. Приложений для телефонов нет.',
+      },
+      {
+        q: 'Что синхронизируется?',
+        a: 'Обычный текст и текст с оформлением (HTML и RTF), картинки, файлы и папки. Файлы до 100 МБ по умолчанию сразу заливаются в хранилище, крупные приходят с исходного компьютера в момент вставки. Файлы хранятся на диске сервера, в S3-совместимом хранилище или на SFTP.',
+      },
+      {
+        q: 'Чем отличается от Universal Clipboard и Paste?',
+        a: 'Universal Clipboard работает только между устройствами Apple, Paste платный и тоже только для Apple. Clipwire связывает Windows, macOS и Linux через собственный сервер, бесплатный и умеет забрать историю из Paste.',
+      },
+    ],
   },
 
   support: {

@@ -36,6 +36,48 @@ const compose = [
 ];
 
 // Данные для сцены в браузере: строки окна вставки и значки к ним.
+// Структурированные данные для поисковиков и ИИ: программа, сайт и вопросы.
+const pageUrl = Astro.site ? new URL(lang === 'ru' ? '/ru/' : '/', Astro.site).href : undefined;
+const jsonLd = JSON.stringify({
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'SoftwareApplication',
+      name: 'Clipwire',
+      description: t.description,
+      applicationCategory: 'UtilitiesApplication',
+      operatingSystem: 'Windows, macOS, Linux',
+      softwareVersion: v,
+      license: 'https://www.gnu.org/licenses/agpl-3.0.html',
+      isAccessibleForFree: true,
+      offers: { '@type': 'Offer', price: '0', priceCurrency: 'EUR' },
+      downloadUrl: `https://github.com/${REPO}/releases/latest`,
+      codeRepository: `https://github.com/${REPO}`,
+      url: pageUrl,
+      image: Astro.site ? new URL('/img/social-preview.png', Astro.site).href : undefined,
+      screenshot: Astro.site ? new URL('/img/preview.png', Astro.site).href : undefined,
+      inLanguage: ['en', 'ru'],
+      author: { '@type': 'Person', name: 'Erney White', url: 'https://github.com/erneywhite' },
+      featureList: t.how.steps.map((s) => s.title).concat(t.security.title, t.local.title),
+    },
+    {
+      '@type': 'WebSite',
+      name: 'Clipwire',
+      url: Astro.site?.href,
+      inLanguage: t.htmlLang,
+    },
+    {
+      '@type': 'FAQPage',
+      inLanguage: t.htmlLang,
+      mainEntity: t.faq.items.map((f) => ({
+        '@type': 'Question',
+        name: f.q,
+        acceptedAnswer: { '@type': 'Answer', text: f.a },
+      })),
+    },
+  ],
+});
+
 const sceneData = JSON.stringify({
   rows: t.scene.payloads.map((p) => p.row),
   from: t.scene.payloads.map((p) => p.from),
@@ -52,6 +94,7 @@ const sceneData = JSON.stringify({
 ---
 
 <Base t={t}>
+  <script type="application/ld+json" slot="head" set:html={jsonLd} />
   <a class="skip" href="#main">{t.skip}</a>
 
   <header class="top" data-top>
@@ -477,7 +520,7 @@ const sceneData = JSON.stringify({
         {
           t.try.shots.slice(1).map((s) => (
             <figure class="shot">
-              <img src={s.src} alt={s.alt} loading="lazy" decoding="async" />
+              <img src={s.src} alt={s.alt} width="902" height="722" loading="lazy" decoding="async" />
               <figcaption>{s.caption}</figcaption>
             </figure>
           ))
@@ -517,6 +560,26 @@ const sceneData = JSON.stringify({
         <span class="sep">·</span>
         <a href={`https://github.com/${REPO}/releases`}>{t.download.allReleases}</a>
       </p>
+    </section>
+
+    <!-- ── Вопросы ── -->
+    <section class="sec faq" id="faq">
+      <div class="faq-grid">
+        <h2 class="sec-h">{t.faq.title}</h2>
+        <div class="faq-list">
+          {
+            t.faq.items.map((f, i) => (
+              <details class="faq-item" open={i === 0}>
+                <summary>
+                  <h3>{f.q}</h3>
+                  <span class="faq-mark" aria-hidden="true" />
+                </summary>
+                <p>{f.a}</p>
+              </details>
+            ))
+          }
+        </div>
+      </div>
     </section>
 
     <!-- ── Поддержка ── -->
