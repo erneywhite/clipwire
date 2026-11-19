@@ -179,6 +179,30 @@ const en = {
     copiedOk: 'Copied',
   },
 
+  local: {
+    title: 'Works without a server too',
+    lead: 'Install it on one computer and skip the server: Clipwire becomes a clipboard history that never loses anything. Search, pins, previews and the paste window all work offline.',
+    facts: [
+      'With history set to “Forever” every copy stays, encrypted on disk.',
+      'Copied files are kept as links to the originals, so the history does not fill up the disk.',
+      'On 43,000 entries a search for a rare word takes about 0.2 s.',
+      'Connect a server later: the last 50 entries go to the group, and the local history stays.',
+    ],
+    keep: 'Keep history',
+    retention: ['Day', 'Week', 'Month', 'Year', 'Forever'],
+    device: 'work-pc · no server',
+    rows: [
+      { kind: 'text', text: 'Thanks! I will send the slides before lunch.', meta: 'Teams · today' },
+      { kind: 'code', text: 'git log --oneline -20', meta: 'Terminal · yesterday' },
+      { kind: 'link', text: 'https://github.com/erneywhite/clipwire', meta: 'Firefox · 12 Nov' },
+      { kind: 'image', text: 'Weekly active devices', meta: 'Paint · 3 Oct' },
+      { kind: 'text', text: 'Wi-Fi at the cottage: Lisma-5G', meta: 'Notepad · July 2026' },
+      { kind: 'file', text: 'tax-return-2025.pdf', meta: 'Explorer · March 2026' },
+      { kind: 'code', text: 'ssh-keygen -t ed25519 -C "laptop"', meta: 'Terminal · December 2025' },
+      { kind: 'text', text: 'Order #4471, delivery Friday', meta: 'Mail · June 2025' },
+    ] as Row[],
+  },
+
   try: {
     title: 'Try the paste window',
     lead: 'Ctrl+Shift+V opens it next to the mouse cursor (Cmd+Shift+V on macOS). This copy works right here: arrows, Enter, Space for preview, or just start typing.',
@@ -405,6 +429,30 @@ const ru: Strings = {
     file: 'docker-compose.yml',
     copy: 'Копировать',
     copiedOk: 'Скопировано',
+  },
+
+  local: {
+    title: 'Работает и без сервера',
+    lead: 'Поставь на один компьютер и обойдись без сервера: Clipwire станет историей буфера, в которой ничего не теряется. Поиск, закрепы, предпросмотр и окно вставки работают без сети.',
+    facts: [
+      'С хранением «Всегда» остаётся каждая копия, зашифрованная на диске.',
+      'Скопированные файлы хранятся ссылками на оригиналы, поэтому история не забивает диск.',
+      'Поиск редкого слова по 43 тысячам записей занимает около 0,2 с.',
+      'Сервер можно подключить позже: последние 50 записей уйдут в группу, локальная история останется.',
+    ],
+    keep: 'Хранить историю',
+    retention: ['День', 'Неделя', 'Месяц', 'Год', 'Всегда'],
+    device: 'work-pc · без сервера',
+    rows: [
+      { kind: 'text', text: 'Спасибо! Слайды пришлю до обеда.', meta: 'Teams · сегодня' },
+      { kind: 'code', text: 'git log --oneline -20', meta: 'Терминал · вчера' },
+      { kind: 'link', text: 'https://github.com/erneywhite/clipwire', meta: 'Firefox · 12 нояб.' },
+      { kind: 'image', text: 'Устройства за неделю', meta: 'Paint · 3 окт.' },
+      { kind: 'text', text: 'Wi-Fi на даче: Lisma-5G', meta: 'Блокнот · июль 2026' },
+      { kind: 'file', text: 'tax-return-2025.pdf', meta: 'Проводник · март 2026' },
+      { kind: 'code', text: 'ssh-keygen -t ed25519 -C "laptop"', meta: 'Терминал · декабрь 2025' },
+      { kind: 'text', text: 'Заказ №4471, доставка в пятницу', meta: 'Почта · июнь 2025' },
+    ],
   },
 
   try: {

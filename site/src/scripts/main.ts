@@ -403,8 +403,9 @@ function cryptTimeline(pinIt: boolean, still: boolean) {
   const L = secret.length;
   const noise = Array.from({ length: N }, randChar);
   const st = { l1: 0, fill: 0, l2: 0, dec: 0 };
-  const mutate = (k: number) => {
-    for (let i = 0; i < k; i++) noise[(Math.random() * N) | 0] = randChar();
+  // Весь шум перешифровывается каждый тик: выглядит как непрерывное шифрование.
+  const mutate = () => {
+    for (let i = 0; i < N; i++) noise[i] = randChar();
   };
   const render = () => {
     gsap.set(l1, { [axis]: st.l1 });
@@ -437,10 +438,7 @@ function cryptTimeline(pinIt: boolean, still: boolean) {
 
   const tl = gsap.timeline({
     defaults: { ease: 'none' },
-    onUpdate: () => {
-      mutate(3);
-      render();
-    },
+    onUpdate: render,
     scrollTrigger: pinIt
       ? { trigger: section, start: 'top top+=72', end: '+=1100', pin: true, scrub: 0.8 }
       : { trigger: '[data-crypt]', start: 'top 75%', once: true },
@@ -453,20 +451,16 @@ function cryptTimeline(pinIt: boolean, still: boolean) {
   if (!pinIt) tl.duration(4);
   render();
 
+  // Мелькает и без прокрутки: таймер работает, пока блок виден на экране.
   let timer = 0;
-  ScrollTrigger.create({
-    trigger: section,
-    start: 'top bottom',
-    end: 'bottom top',
-    onToggle: (s) => {
-      clearInterval(timer);
-      if (s.isActive)
-        timer = window.setInterval(() => {
-          mutate(4);
-          render();
-        }, 90);
-    },
-  });
+  new IntersectionObserver(([e]) => {
+    clearInterval(timer);
+    if (e.isIntersecting)
+      timer = window.setInterval(() => {
+        mutate();
+        render();
+      }, 70);
+  }).observe(section);
 }
 
 // Исключения: поток копирований, лишнее отсекается у ворот.
@@ -479,7 +473,7 @@ function buildLane() {
   const laneW = lane.clientWidth;
   const gateX = gate.offsetLeft;
   const v = Math.min(300, Math.max(120, laneW * 0.2)); // пикселей в секунду, от ширины дорожки
-  const tl = gsap.timeline({ repeat: -1, paused: true });
+  const tl = gsap.timeline({ repeat: -1 });
   let t = 0;
   chips.forEach((chip) => {
     const w = chip.offsetWidth;
@@ -507,7 +501,6 @@ function buildLane() {
   });
   tl.to({}, { duration: 0.6 });
   laneTl = tl;
-  ScrollTrigger.create({ trigger: lane, start: 'top 90%', end: 'bottom 10%', onToggle: (s) => (s.isActive ? tl.play() : tl.pause()) });
 }
 
 function laneStatic() {
@@ -630,6 +623,24 @@ function initTry() {
   render();
 }
 
+// Без сервера: переключатель уезжает на «Всегда», а история бесконечно тянется в прошлое.
+function localScene() {
+  const thumb = $('[data-seg-thumb]');
+  const opts = $$('[data-seg-o]');
+  const last = opts.length - 1;
+  const mark = (i: number) => opts.forEach((o, k) => o.classList.toggle('on', k === i));
+  gsap.set(thumb, { xPercent: 0 });
+  mark(0);
+  const seg = gsap.timeline({ scrollTrigger: { trigger: '[data-local]', start: 'top 75%', once: true } });
+  opts.forEach((_, i) => {
+    if (!i) return;
+    seg.to(thumb, { xPercent: i * 100, duration: 0.32, ease: 'power2.inOut', onStart: () => mark(i) }, i === 1 ? 0.2 : '+=0.12');
+  });
+  seg.call(() => mark(last));
+  // Список из двух одинаковых половин: сдвиг ровно на половину даёт бесшовный круг.
+  gsap.to('[data-local-track]', { yPercent: -50, duration: 40, ease: 'none', repeat: -1 });
+}
+
 // Копирование compose-файла.
 $$<HTMLButtonElement>('[data-copy]').forEach((btn) => {
   const label = $('span', btn);
@@ -695,6 +706,7 @@ mm.add(
     demoTimelines(narrow);
     cryptTimeline(wide, false);
     buildLane();
+    localScene();
     gsap.from('[data-code] .cl', {
       autoAlpha: 0,
       x: -6,

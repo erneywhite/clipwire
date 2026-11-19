@@ -382,6 +382,58 @@ const sceneData = JSON.stringify({
       </div>
     </section>
 
+    <!-- ── Без сервера ── -->
+    <section class="sec local" id="local">
+      <div class="local-grid">
+        <div class="local-vis" data-local>
+          <div class="keep">
+            <span class="keep-h">{t.local.keep}</span>
+            <div class="seg" data-seg>
+              <span class="seg-thumb" data-seg-thumb aria-hidden="true" />
+              {t.local.retention.map((r, i) => (
+                <span class:list={['seg-o', { on: i === t.local.retention.length - 1 }]} data-seg-o>{r}</span>
+              ))}
+            </div>
+          </div>
+          <div class="dev local-dev">
+            <span class="dev-label"><i class="dot dot-local" />{t.local.device}</span>
+            <div class="pw local-pw" aria-hidden="true">
+              <div class="local-track" data-local-track>
+                {[0, 1].map(() => (
+                  <ul class="pw-list">
+                    {t.local.rows.map((r) => (
+                      <li class="pw-row">
+                        <span class="pw-glyph" set:html={svg(r.kind)} />
+                        <span class="pw-body">
+                          {r.kind === 'image' ? (
+                            <span class="pw-thumb">
+                              <span class="mini-chart">
+                                <i /><i /><i /><i /><i /><i /><i />
+                              </span>
+                            </span>
+                          ) : (
+                            <span class:list={['pw-text', { mono: r.kind === 'code' }]}>{r.text}</span>
+                          )}
+                          <span class="pw-meta">{r.meta}</span>
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <h2 class="sec-h">{t.local.title}</h2>
+          <p class="sec-lead">{t.local.lead}</p>
+          <ul class="facts">
+            {t.local.facts.map((f) => <li>{f}</li>)}
+          </ul>
+        </div>
+      </div>
+    </section>
+
     <!-- ── Окно вставки вживую ── -->
     <section class="sec try" id="try">
       <div class="sec-head">
