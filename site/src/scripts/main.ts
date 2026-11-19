@@ -656,6 +656,44 @@ function localScene() {
   gsap.to('[data-local-track]', { yPercent: -50, duration: 40, ease: 'none', repeat: -1 });
 }
 
+// Вопросы: ответ плавно разворачивается и сворачивается по высоте.
+// Значок меняется сразу по нажатию, при «меньше движения» всё как у обычного <details>.
+$$<HTMLDetailsElement>('[data-faq]').forEach((d) => {
+  const sum = $('summary', d);
+  const body = $('.faq-a', d);
+  sum.addEventListener('click', (e) => {
+    if (reduceQuery.matches) {
+      d.classList.toggle('is-open', !d.open);
+      return;
+    }
+    e.preventDefault();
+    gsap.killTweensOf(body);
+    const refresh = () => ScrollTrigger.refresh();
+    if (d.classList.contains('is-open')) {
+      d.classList.remove('is-open');
+      gsap.to(body, {
+        height: 0,
+        autoAlpha: 0,
+        duration: 0.32,
+        ease: 'power2.inOut',
+        onComplete: () => {
+          d.open = false;
+          gsap.set(body, { clearProps: 'height,opacity,visibility' });
+          refresh();
+        },
+      });
+    } else {
+      d.classList.add('is-open');
+      d.open = true;
+      gsap.fromTo(
+        body,
+        { height: 0, autoAlpha: 0 },
+        { height: 'auto', autoAlpha: 1, duration: 0.42, ease: 'power3.out', clearProps: 'height', onComplete: refresh },
+      );
+    }
+  });
+});
+
 // Копирование compose-файла.
 $$<HTMLButtonElement>('[data-copy]').forEach((btn) => {
   const label = $('span', btn);

@@ -1811,8 +1811,11 @@ kbd.down {
 .faq-mark::after {
   transform: rotate(90deg);
 }
-.faq-item[open] .faq-mark::after {
+.faq-item.is-open .faq-mark::after {
   transform: rotate(0deg);
+}
+.faq-a {
+  overflow: hidden;
 }
 .faq-item p {
   padding: 0 var(--space-7) var(--space-5) 0;

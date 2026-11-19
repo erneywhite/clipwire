@@ -569,12 +569,14 @@ const sceneData = JSON.stringify({
         <div class="faq-list">
           {
             t.faq.items.map((f, i) => (
-              <details class="faq-item" open={i === 0}>
+              <details class:list={['faq-item', { 'is-open': i === 0 }]} open={i === 0} data-faq>
                 <summary>
                   <h3>{f.q}</h3>
                   <span class="faq-mark" aria-hidden="true" />
                 </summary>
-                <p>{f.a}</p>
+                <div class="faq-a">
+                  <p>{f.a}</p>
+                </div>
               </details>
             ))
           }
