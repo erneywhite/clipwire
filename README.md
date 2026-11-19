@@ -958,8 +958,7 @@ two clients can run on one machine.
 - `crates/clipwire-server`: the server with the built-in iroh-relay, device groups, item delivery
   and history with a TTL.
 - `crates/clipwire-core`: item format, encryption, server codes and invitations.
-- `docs/`: [architecture](docs/architecture.md), [research of existing tools](docs/research.md),
-  [files-transfer](docs/files-transfer.md), [devices](docs/devices.md),
+- `docs/`: [architecture](docs/architecture.md), [files-transfer](docs/files-transfer.md), [devices](docs/devices.md),
   [storage](docs/storage.md), [history storage](docs/history-storage.md), [updates](docs/updates.md), [macOS](docs/macos.md),
   [Linux](docs/linux.md) and the brand sources (`docs/brand/`).
   These documents are in Russian.
