@@ -32,7 +32,7 @@ const { t, rows, id, selected = -1, numbered = false, interactive = false } = As
       <Fragment set:html={svg('text')} /><Fragment set:html={svg('link')} /><Fragment set:html={svg('image')} /><Fragment set:html={svg('file')} />
     </span>
   </div>
-  <ul class="pw-list" data-pw-list role={interactive ? 'listbox' : undefined} aria-label={interactive ? t.paste.history : undefined}>
+  <ul class="pw-list" data-pw-list data-lenis-prevent={interactive ? '' : undefined} role={interactive ? 'listbox' : undefined} aria-label={interactive ? t.paste.history : undefined}>
     {
       rows.map((r, i) => (
         <li

@@ -10,7 +10,6 @@ body {
   overflow-x: clip;
 }
 html {
-  scroll-behavior: smooth;
   scroll-padding-top: 80px;
   -webkit-text-size-adjust: 100%;
 }
@@ -63,11 +62,6 @@ pre {
   outline: 2px solid var(--c-wire);
   outline-offset: 3px;
   border-radius: 4px;
-}
-@media (prefers-reduced-motion: reduce) {
-  html {
-    scroll-behavior: auto;
-  }
 }
 
 .skip {

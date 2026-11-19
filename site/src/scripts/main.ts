@@ -7,6 +7,8 @@ import { DrawSVGPlugin } from 'gsap/DrawSVGPlugin';
 import { ScrambleTextPlugin } from 'gsap/ScrambleTextPlugin';
 import { Flip } from 'gsap/Flip';
 import { SplitText } from 'gsap/SplitText';
+import Lenis from 'lenis';
+import 'lenis/dist/lenis.css';
 
 gsap.registerPlugin(ScrollTrigger, MotionPathPlugin, DrawSVGPlugin, ScrambleTextPlugin, Flip, SplitText);
 
@@ -273,7 +275,7 @@ function heroCycle(i: number) {
 
 function heroStatic() {
   layoutWire();
-  gsap.set(wires.a.glow, { drawSVG: '0% 100%' });
+  gsap.set([wires.a.glow, wires.b.glow], { drawSVG: '0% 100%' });
   if (!heroList.querySelector('.sel')) {
     insertHeroRow(1, false);
     insertHeroRow(0, false);
@@ -668,6 +670,17 @@ $$<HTMLButtonElement>('[data-copy]').forEach((btn) => {
   });
 });
 
+// ── Плавная прокрутка ─────────────────────────────────────────────────
+// Lenis сглаживает колесо мыши, а прокрутка остаётся родной: position: sticky
+// и ScrollTrigger работают как обычно. При «меньше движения» не включается.
+let lenis: Lenis | null = null;
+if (!reduceQuery.matches) {
+  lenis = new Lenis({ lerp: 0.09, anchors: { offset: -72 }, autoRaf: false });
+  lenis.on('scroll', ScrollTrigger.update);
+  gsap.ticker.add((time) => lenis?.raf(time * 1000));
+  gsap.ticker.lagSmoothing(0);
+}
+
 // ── Запуск ─────────────────────────────────────────────────────────────
 initTry();
 
@@ -691,6 +704,9 @@ mm.add(
     // Сцена главного экрана: стоит, пока её не видно.
     if (!heroStarted) {
       heroStarted = true;
+      // Оба провода гаснут до первого копирования, иначе второй светится,
+      // пока до него не дойдёт очередь.
+      gsap.set([wires.a.glow, wires.b.glow], { drawSVG: '0% 0%' });
       heroCycle(0);
     }
     ScrollTrigger.create({
