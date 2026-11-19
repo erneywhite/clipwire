@@ -629,7 +629,7 @@ function localScene() {
   const opts = $$('[data-seg-o]');
   const last = opts.length - 1;
   const mark = (i: number) => opts.forEach((o, k) => o.classList.toggle('on', k === i));
-  gsap.set(thumb, { xPercent: 0 });
+  gsap.set(thumb, { left: 4, x: 0, y: 0, xPercent: 0 });
   mark(0);
   const seg = gsap.timeline({ scrollTrigger: { trigger: '[data-local]', start: 'top 75%', once: true } });
   opts.forEach((_, i) => {
