@@ -152,7 +152,10 @@ async fn fake_app(home: &Path, log: Log) -> JoinHandle<()> {
     }
     #[cfg(unix)]
     {
-        let path = home.join("mcp").join(format!("sock-{tag}"));
+        // Временная папка на macOS длиннее лимита пути сокета (104 байта),
+        // поэтому сокет теста лежит в /tmp; мост берёт путь из файла канала.
+        let path = std::path::PathBuf::from(format!("/tmp/cwmcp-{tag}.sock"));
+        let _ = std::fs::remove_file(&path);
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         std::fs::write(endpoint_file(home), format!("{}\n", path.display())).unwrap();
         tokio::spawn(async move {
