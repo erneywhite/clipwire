@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use clipwire_core::{BlobId, Content, DeviceId, FileRef, Item, SourceApp};
+use clipwire_core::{BlobId, Content, DeviceId, Ext, ExtList, FileRef, Item, ItemId, SourceApp};
 use tokio::sync::mpsc;
 
 use crate::blobs::{Blobs, Transfer};
@@ -211,6 +211,44 @@ fn entry_of_pin(item: Item, me: DeviceId) -> Entry {
     }
 }
 
+/// Сведения своего копирования, кроме содержимого.
+#[derive(Debug, Clone, Default)]
+struct Marks {
+    /// Приложение, из которого скопировано.
+    source: Option<SourceApp>,
+    /// Дополнительные метки записи и элемента группы (например,
+    /// `ext::AI_ORIGIN`). Заменяют метки с теми же номерами.
+    extra: Vec<Ext>,
+    /// Тихая запись (сохранение через MCP): без звука копирования и без
+    /// отсрочки автообновления, интерфейсу — только «история изменилась».
+    quiet: bool,
+}
+
+impl Marks {
+    fn source(source: Option<SourceApp>) -> Self {
+        Self {
+            source,
+            ..Self::default()
+        }
+    }
+
+    /// Поставить сведения записи истории.
+    fn apply(&self, entry: &mut Entry) {
+        if let Some(app) = &self.source {
+            entry.set_source_app(app);
+        }
+        put_exts(entry.ext_list_mut(), &self.extra);
+    }
+}
+
+/// Добавить метки в список, заменяя те, что уже есть под теми же номерами.
+fn put_exts(list: &mut Vec<Ext>, extra: &[Ext]) {
+    for x in extra {
+        list.retain(|e| e.tag != x.tag);
+        list.push(x.clone());
+    }
+}
+
 /// Копирование на этом устройстве: решить, как передаются файлы, отправить
 /// в группу, записать в историю и сообщить интерфейсу.
 #[derive(Clone)]
@@ -247,8 +285,8 @@ impl Copier {
     /// архивируются в фоне: обработчик буфера ОС ждать этого не должен.
     /// Запись с папкой появляется в истории сразу, без размера, а в группу
     /// уходит, когда обход и архив готовы; тогда же запись обновляется.
-    /// `source` — приложение, из которого скопировано.
-    fn dispatch(&self, content: Content, send: bool, source: Option<SourceApp>) {
+    /// `marks` — приложение, из которого скопировано, и прочие метки.
+    fn dispatch(&self, content: Content, send: bool, marks: Marks) {
         if self.is_cancelled() {
             return;
         }
@@ -262,12 +300,12 @@ impl Copier {
         let prepare = send && self.blobs.is_some();
         let limit = self.limit_mb.load(Ordering::Relaxed);
         if prepare && needs_scan(&content, limit) {
-            let early = self.record_local(content.clone(), source.as_ref());
+            let early = self.record_local(content.clone(), &marks);
             let me = self.clone();
             self.rt.spawn_blocking(move || {
                 if let Some((content, reused)) = me.prepare(content, limit) {
-                    me.send(&content, true, reused, source.as_ref());
-                    me.update_local(early, content, source.as_ref());
+                    me.send(&content, true, reused, &marks);
+                    me.update_local(early, content, &marks);
                 }
             });
             return;
@@ -280,10 +318,10 @@ impl Copier {
         } else {
             (content, false)
         };
-        if !self.send(&content, send, reused, source.as_ref()) {
+        if !self.send(&content, send, reused, &marks) {
             return;
         }
-        self.record_local(content, source.as_ref());
+        self.record_local(content, &marks);
     }
 
     /// Виртуальные файлы, дочитанные после того, как буфер сменился: в
@@ -291,15 +329,13 @@ impl Copier {
     /// чтобы не перекрыть то, что скопировали позже. `false` — не записано.
     // shortcut: в группу такие файлы не уходят вовсе (движок шлёт только
     // текущий элемент); если понадобится — отправлять их как запись истории.
-    fn record_late(&self, content: Content, source: Option<SourceApp>, seen_ms: i64) -> bool {
+    fn record_late(&self, content: Content, marks: &Marks, seen_ms: i64) -> bool {
         if self.is_cancelled() {
             return false;
         }
         let mut entry = local_entry(self.device, &self.device_name, content);
         entry.seen_ms = seen_ms;
-        if let Some(app) = &source {
-            entry.set_source_app(app);
-        }
+        marks.apply(&mut entry);
         let thumb = thumb_if_new(&self.history, &entry);
         let added = self
             .history
@@ -421,25 +457,36 @@ impl Copier {
 
     /// Отправить и записать без подготовки файлов (тесты: готовое содержимое).
     #[cfg(test)]
-    fn finish(&self, content: Content, send: bool, source: Option<SourceApp>) {
-        if !self.send(&content, send, false, source.as_ref()) {
+    fn finish(&self, content: Content, send: bool, marks: Marks) {
+        if !self.send(&content, send, false, &marks) {
             return;
         }
-        self.record_local(content, source.as_ref());
+        self.record_local(content, &marks);
+    }
+
+    /// Тихо записать в историю и отправить в группу (`marks.quiet`), не
+    /// трогая буфер, и вернуть id записи: [`Service::save`].
+    fn save(&self, content: Content, send: bool, marks: Marks) -> Result<ItemId> {
+        let hash = content.hash();
+        self.dispatch(content, send, marks);
+        if self.is_cancelled() {
+            anyhow::bail!("сервис снимается, запись не сохранилась");
+        }
+        self.history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .id_by_hash(&hash)
+            .ok_or_else(|| anyhow::anyhow!("запись не сохранилась в историю"))
     }
 
     /// Записать своё копирование в историю и сообщить окнам. Возвращает id и
-    /// время записи (для [`Copier::update_local`]).
-    fn record_local(
-        &self,
-        content: Content,
-        source: Option<&SourceApp>,
-    ) -> (clipwire_core::ItemId, i64) {
+    /// время записи (для [`Copier::update_local`]). Тихая запись
+    /// (`marks.quiet`) сообщает только [`UiEvent::HistoryMerged`]: без звука
+    /// и без признака активности человека.
+    fn record_local(&self, content: Content, marks: &Marks) -> (ItemId, i64) {
         let started = std::time::Instant::now();
         let mut entry = local_entry(self.device, &self.device_name, content.clone());
-        if let Some(app) = source {
-            entry.set_source_app(app);
-        }
+        marks.apply(&mut entry);
         let key = (entry.id, entry.seen_ms);
         record(&self.history, entry);
         let took = started.elapsed();
@@ -449,8 +496,12 @@ impl Copier {
                 "запись в историю заняла долго"
             );
         }
-        (self.on_event)(UiEvent::Copied(content));
-        (self.on_event)(UiEvent::NewEntry);
+        if marks.quiet {
+            (self.on_event)(UiEvent::HistoryMerged(1));
+        } else {
+            (self.on_event)(UiEvent::Copied(content));
+            (self.on_event)(UiEvent::NewEntry);
+        }
         key
     }
 
@@ -458,19 +509,12 @@ impl Copier {
     /// маршрутом. Запись успели удалить — не возвращать. Такое же
     /// содержимое уже есть отдельной записью (ту же папку копировали
     /// раньше) — черновая строка убирается, а прежняя поднимается.
-    fn update_local(
-        &self,
-        (id, seen_ms): (clipwire_core::ItemId, i64),
-        content: Content,
-        source: Option<&SourceApp>,
-    ) {
+    fn update_local(&self, (id, seen_ms): (ItemId, i64), content: Content, marks: &Marks) {
         if self.is_cancelled() {
             return;
         }
         let mut entry = local_entry(self.device, &self.device_name, content);
-        if let Some(app) = source {
-            entry.set_source_app(app);
-        }
+        marks.apply(&mut entry);
         {
             let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
             if h.get(id).is_none() {
@@ -511,14 +555,24 @@ impl Copier {
             Some(e) if e.local && may_send(send_kinds(), &e.content) => {
                 if matches!(e.content, Content::Files(_)) {
                     let me = self.clone();
-                    let source = e.source_app();
+                    // Метка ИИ остаётся на записи и уходит с элементом.
+                    let marks = Marks {
+                        source: e.source_app(),
+                        extra: e
+                            .ext
+                            .iter()
+                            .filter(|x| x.tag == clipwire_core::item::ext::AI_ORIGIN)
+                            .cloned()
+                            .collect(),
+                        quiet: false,
+                    };
                     let key = (e.id, e.seen_ms);
                     self.rt.spawn_blocking(move || {
                         let limit = me.limit_mb.load(Ordering::Relaxed);
                         if let Some((content, reused)) = me.prepare(e.content, limit) {
                             tracing::info!("досылаю файлы, не ушедшие до выхода");
-                            me.send(&content, true, reused, source.as_ref());
-                            me.update_local(key, content, source.as_ref());
+                            me.send(&content, true, reused, &marks);
+                            me.update_local(key, content, &marks);
                         }
                     });
                     return;
@@ -544,13 +598,7 @@ impl Copier {
     /// Отправить в группу (`send`). `reused` — файлы прежней записи (см.
     /// [`Outgoing::reused`]): их архивы не удалять. `false` — сервис
     /// снимается, дальше ничего не делать.
-    fn send(
-        &self,
-        content: &Content,
-        send: bool,
-        reused: bool,
-        source: Option<&SourceApp>,
-    ) -> bool {
+    fn send(&self, content: &Content, send: bool, reused: bool, marks: &Marks) -> bool {
         if send {
             let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
             // Отмена проверяется под тем же замком, которым её берёт `cancel`:
@@ -576,8 +624,14 @@ impl Copier {
                     }
                     pushed.insert(content.hash(), content.clone());
                 }
-                let mut out = Outgoing::new(content.clone(), source);
+                let mut out =
+                    Outgoing::with_ext(content.clone(), marks.source.as_ref(), &marks.extra);
                 out.reused = reused;
+                // Тихая запись (сохранение через MCP) у получателей идёт
+                // только в историю: буфер не трогается ни здесь, ни там.
+                if marks.quiet {
+                    out.set_history_only();
+                }
                 // Пометка — до передачи движку: в сети он отправляет сразу и
                 // снимает её по `Event::Pushed`. Поставленная после, она
                 // появлялась уже после отправки и досылалась при каждом запуске.
@@ -947,7 +1001,7 @@ impl Service {
                         return false;
                     }
                     let source = owner.as_deref().and_then(crate::source_app::lookup);
-                    copier.record_late(content, source, started_ms)
+                    copier.record_late(content, &Marks::source(source), started_ms)
                 })
             };
             let opts = {
@@ -1002,7 +1056,7 @@ impl Service {
                 let source = owner.as_deref().and_then(crate::source_app::lookup);
                 // Загрузки в очередь ставит движок, когда элемент на самом деле
                 // уходит в группу (см. `Engine::push`).
-                copier.dispatch(content, true, source);
+                copier.dispatch(content, true, Marks::source(source));
             })?
         };
 
@@ -1091,12 +1145,54 @@ impl Service {
     /// `source` — приложение-источник (у вставки из истории — из записи): оно
     /// уходит в группу вместе с элементом.
     pub fn copy(&self, content: Content, source: Option<SourceApp>) -> Result<()> {
+        self.copy_marked(content, source, Vec::new())
+    }
+
+    /// [`Service::copy`] с дополнительными метками записи (`extra`), которые
+    /// сохраняются в истории и уходят в группу вместе с элементом: например,
+    /// `ext::AI_ORIGIN` у записи, которую положил ИИ-инструмент, или у
+    /// вставки такой записи из истории. Метки с теми же номерами заменяются.
+    pub fn copy_marked(
+        &self,
+        content: Content,
+        source: Option<SourceApp>,
+        extra: Vec<Ext>,
+    ) -> Result<()> {
         self.guard.wrote(&content);
         clipboard::write(&content)?;
         if let Some(c) = &self.copier {
-            c.dispatch(content, !self.paused(), source);
+            let marks = Marks {
+                source,
+                extra,
+                quiet: false,
+            };
+            c.dispatch(content, !self.paused(), marks);
         }
         Ok(())
+    }
+
+    /// Добавить в историю (наверх) и в группу, не трогая системный буфер:
+    /// так сохраняет запись ИИ-инструмент через MCP. Без звука копирования.
+    /// Такое содержимое уже есть — запись поднимается, метки из `extra`
+    /// заменяют прежние. Возвращает id записи в истории.
+    // shortcut: id ищется по хэшу содержимого после записи; у файлов хэш
+    // меняется при подготовке к отправке, поэтому для файлов (их MCP пока не
+    // сохраняет) брать id из `record_local`.
+    pub fn save(
+        &self,
+        content: Content,
+        source: Option<SourceApp>,
+        extra: Vec<Ext>,
+    ) -> Result<ItemId> {
+        let Some(c) = &self.copier else {
+            anyhow::bail!("сервис не запущен");
+        };
+        let marks = Marks {
+            source,
+            extra,
+            quiet: true,
+        };
+        c.save(content, !self.paused(), marks)
     }
 
     /// Остановить: слежение снимается, движок дошлёт очередь и закроется.
@@ -1203,10 +1299,13 @@ fn apply_pin_files(
     Ok(!moved.is_empty())
 }
 
-/// Сведения элемента без подписи: подпись не ходит внутри элементов.
+/// Сведения элемента без подписи: подпись не ходит внутри элементов. Метка
+/// «только для истории» (`ext::HISTORY_ONLY`) тоже снимается: она нужна
+/// одной доставке, а в записи истории осталась бы и при повторной отправке.
 fn without_note(ext: &[clipwire_core::Ext]) -> Vec<clipwire_core::Ext> {
     let mut v = ext.to_vec();
     crate::history::strip_note(&mut v);
+    v.retain(|e| e.tag != clipwire_core::item::ext::HISTORY_ONLY);
     v
 }
 
@@ -1827,9 +1926,89 @@ mod tests {
             engine_mark.clear_if(&h);
             seen
         });
-        c.finish(Content::Text("раз".into()), true, None);
+        c.finish(Content::Text("раз".into()), true, Marks::default());
         assert!(engine.join().unwrap(), "пометка стоит до передачи движку");
         assert_eq!(mark.get(), None, "после отправки пометки нет");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Метка ИИ (`extra`) ложится и в историю, и в элемент для группы; тихая
+    /// запись не даёт звука и признака копирования человеком.
+    #[tokio::test]
+    async fn extra_marks_reach_history_and_group_quietly() {
+        let d = tmp("ai-marks");
+        let (tx, mut rx) = mpsc::channel::<Outgoing>(4);
+        let history = Arc::new(Mutex::new(History::open(&d.join("h")).unwrap()));
+        let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let ev = events.clone();
+        let c = Copier {
+            tx: Arc::new(Mutex::new(Some(tx))),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            history: history.clone(),
+            device: DeviceId([1; 32]),
+            device_name: "тест".into(),
+            on_event: Arc::new(move |e| {
+                let name = match e {
+                    UiEvent::Copied(_) => "copied",
+                    UiEvent::NewEntry => "new",
+                    UiEvent::HistoryMerged(_) => "merged",
+                    _ => "other",
+                };
+                ev.lock().unwrap().push(name);
+            }),
+            blobs: None,
+            limit_mb: Arc::new(AtomicU64::new(1)),
+            rt: tokio::runtime::Handle::current(),
+            mark: None,
+            fingerprints: Default::default(),
+            pushed: Default::default(),
+        };
+        let origin = clipwire_core::AiOrigin {
+            client: "claude-code".into(),
+        };
+        let mut probe = Outgoing::from(Content::Text("x".into()));
+        probe.set_ai_origin(&origin);
+        let marks = Marks {
+            source: None,
+            extra: probe.ext.clone(),
+            quiet: true,
+        };
+        let id = c
+            .save(Content::Text("от ИИ".into()), true, marks.clone())
+            .unwrap();
+        let out = rx.recv().await.unwrap();
+        assert_eq!(out.ai_origin(), Some(origin.clone()), "метка ушла в группу");
+        assert!(out.history_only(), "у получателей — только в историю");
+        {
+            let h = history.lock().unwrap();
+            assert_eq!(h.find(&Content::Text("от ИИ".into())).unwrap().id, id);
+            let entry = h.get(id).unwrap();
+            assert_eq!(entry.ai_origin(), Some(origin.clone()));
+            assert!(!entry.history_only(), "в своей истории метки доставки нет");
+            assert_eq!(h.row(id).unwrap().card.ai_origin(), Some(origin.clone()));
+        }
+        assert_eq!(*events.lock().unwrap(), vec!["merged"], "без звука");
+        // Обычное копирование по-прежнему со звуком и уходит в буфер получателя.
+        c.dispatch(Content::Text("сам".into()), true, Marks::default());
+        assert!(!rx.recv().await.unwrap().history_only());
+        assert_eq!(*events.lock().unwrap(), vec!["merged", "copied", "new"]);
+        // Повторное сохранение того же текста: та же запись, тихо, метка на месте.
+        let again = c.save(Content::Text("от ИИ".into()), false, marks).unwrap();
+        assert_eq!(again, id);
+        assert_eq!(
+            history.lock().unwrap().get(id).unwrap().ai_origin(),
+            Some(origin)
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["merged", "copied", "new", "merged"]
+        );
+        // Снятый сервис не сохраняет.
+        c.cancel();
+        assert!(
+            c.save(Content::Text("поздно".into()), false, Marks::default())
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -1918,7 +2097,11 @@ mod tests {
             exe: "notepad.exe".into(),
             icon_png: Vec::new(),
         };
-        c.finish(Content::Text("до".into()), true, Some(app.clone()));
+        c.finish(
+            Content::Text("до".into()),
+            true,
+            Marks::source(Some(app.clone())),
+        );
         // В движок уходит и приложение-источник.
         assert_eq!(
             rx.recv().await,
@@ -1928,8 +2111,8 @@ mod tests {
         let late = c.clone();
         c.cancel();
         assert_eq!(rx.recv().await, None, "канал закрыт, хотя копия жива");
-        late.finish(Content::Text("после".into()), true, None);
-        late.dispatch(Content::Text("ещё".into()), false, None);
+        late.finish(Content::Text("после".into()), true, Marks::default());
+        late.dispatch(Content::Text("ещё".into()), false, Marks::default());
         let h = history.lock().unwrap();
         assert_eq!(h.len(), 1);
         assert!(h.find(&Content::Text("после".into())).is_none());
@@ -1984,10 +2167,10 @@ mod tests {
             _ => None,
         };
 
-        let early = c.record_local(folder("C:/a", 0), None);
+        let early = c.record_local(folder("C:/a", 0), &Marks::default());
         assert_eq!(size_of(&history.lock().unwrap(), early.0), Some(0));
-        c.record_local(Content::Text("позже".into()), None);
-        c.update_local(early, folder("C:/a", 500), None);
+        c.record_local(Content::Text("позже".into()), &Marks::default());
+        c.update_local(early, folder("C:/a", 500), &Marks::default());
         {
             let h = history.lock().unwrap();
             assert_eq!(h.len(), 2);
@@ -2001,8 +2184,8 @@ mod tests {
         assert_eq!(new.load(Ordering::SeqCst), 2, "обновление звука не даёт");
 
         // Ту же папку скопировали снова: черновая строка не дублирует прежнюю.
-        let again = c.record_local(folder("C:/a", 0), None);
-        c.update_local(again, folder("C:/a", 500), None);
+        let again = c.record_local(folder("C:/a", 0), &Marks::default());
+        c.update_local(again, folder("C:/a", 500), &Marks::default());
         {
             let h = history.lock().unwrap();
             assert_eq!(h.len(), 2);
@@ -2011,9 +2194,9 @@ mod tests {
         }
 
         // Черновую удалили, пока шёл обход.
-        let gone = c.record_local(folder("C:/b", 0), None);
+        let gone = c.record_local(folder("C:/b", 0), &Marks::default());
         history.lock().unwrap().delete(gone.0).unwrap();
-        c.update_local(gone, folder("C:/b", 7), None);
+        c.update_local(gone, folder("C:/b", 7), &Marks::default());
         assert_eq!(history.lock().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(d);
     }
@@ -2060,7 +2243,7 @@ mod tests {
         let first = |path: &std::path::Path| {
             let (got, reused) = c.prepare(copy(path), 1).unwrap();
             assert!(!reused);
-            c.record_local(got.clone(), None);
+            c.record_local(got.clone(), &Marks::default());
             let Content::Files(f) = &got else {
                 unreachable!()
             };
@@ -2086,7 +2269,7 @@ mod tests {
         assert!(!reused, "файл изменился");
 
         // Закреплённую запись не берём.
-        c.record_local(changed_file.clone(), None);
+        c.record_local(changed_file.clone(), &Marks::default());
         blobs.enqueue(vec![
             blobs
                 .upload_job(match &changed_file {
@@ -2115,7 +2298,7 @@ mod tests {
         assert_eq!(again, changed_file);
 
         // Загрузки нет ни в очереди, ни на сервере.
-        c.record_local(changed.clone(), None);
+        c.record_local(changed.clone(), &Marks::default());
         assert!(blobs.queued().iter().all(|j| j.blob != blob_of(&changed)));
         assert!(!c.prepare(copy(&dir), 1).unwrap().1, "загрузки нет");
         let _ = std::fs::remove_dir_all(d);
@@ -2156,9 +2339,13 @@ mod tests {
             exe: "notepad.exe".into(),
             icon_png: Vec::new(),
         };
-        c.dispatch(Content::Text("раз".into()), false, Some(app.clone()));
-        c.dispatch(Content::Text("раз".into()), false, None);
-        c.dispatch(Content::Text("два".into()), false, None);
+        c.dispatch(
+            Content::Text("раз".into()),
+            false,
+            Marks::source(Some(app.clone())),
+        );
+        c.dispatch(Content::Text("раз".into()), false, Marks::default());
+        c.dispatch(Content::Text("два".into()), false, Marks::default());
         assert_eq!(copied.load(Ordering::SeqCst), 3);
         assert_eq!(new.load(Ordering::SeqCst), 3, "повтор тоже звучит");
         assert_eq!(
@@ -2226,7 +2413,7 @@ mod tests {
             p2p: false,
         };
         let late = Content::Files(vec![file]);
-        assert!(c.record_late(late.clone(), None, started));
+        assert!(c.record_late(late.clone(), &Marks::default(), started));
         assert_eq!(merged.load(Ordering::SeqCst), 1);
         let h = history.lock().unwrap();
         let list = h.list("", false, 10);
@@ -2243,7 +2430,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
         // Снятый сервис не пишет.
         c.cancel();
-        assert!(!c.record_late(Content::Text("x".into()), None, started));
+        assert!(!c.record_late(Content::Text("x".into()), &Marks::default(), started));
         let _ = std::fs::remove_dir_all(d);
     }
 

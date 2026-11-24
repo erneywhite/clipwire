@@ -5,6 +5,7 @@
 //! было тестировать отдельно и переиспользовать в любом клиенте.
 
 pub mod admin;
+pub mod ai;
 pub mod blob;
 pub mod crypto;
 pub mod delete;
@@ -20,6 +21,6 @@ pub use admin::AdminKey;
 pub use blob::BlobId;
 pub use crypto::{GroupId, GroupKey, JoinSecret, SealedItem};
 pub use invite::{AdminServerInfo, GroupInviteCode, Invite, ServerCode, ServerInfo};
-pub use item::{Content, DeviceId, Ext, ExtList, FileRef, Item, ItemId, SourceApp};
+pub use item::{AiOrigin, Content, DeviceId, Ext, ExtList, FileRef, Item, ItemId, SourceApp};
 pub use pin::{PinId, PinState};
 pub use storage::{GroupConfig, StorageConfig};

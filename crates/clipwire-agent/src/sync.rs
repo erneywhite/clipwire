@@ -168,9 +168,19 @@ pub struct Outgoing {
 impl Outgoing {
     /// Содержимое и, если известно, приложение, из которого скопировано.
     pub fn new(content: Content, source: Option<&SourceApp>) -> Self {
+        Self::with_ext(content, source, &[])
+    }
+
+    /// [`Outgoing::new`] и дополнительные метки (`extra`, например
+    /// `ext::AI_ORIGIN`); метки с теми же номерами заменяются.
+    pub fn with_ext(content: Content, source: Option<&SourceApp>, extra: &[Ext]) -> Self {
         let mut out = Self::from(content);
         if let Some(app) = source {
             out.ext_set(clipwire_core::item::ext::SOURCE_APP, app);
+        }
+        for x in extra {
+            out.ext.retain(|e| e.tag != x.tag);
+            out.ext.push(x.clone());
         }
         out
     }
@@ -1863,11 +1873,15 @@ impl Engine {
     /// Чужой элемент для буфера. Скопированный раньше, чем `window` назад
     /// (запоздалая доставка или старый элемент, выданный за новый), идёт
     /// только в историю: время копирования лежит под шифрованием, сервер его
-    /// не подделает.
+    /// не подделает. Элемент «только для истории» (`ext::HISTORY_ONLY`:
+    /// сохранение ИИ-инструмента через MCP) в буфер не идёт никогда.
     fn accept(&mut self, item: Item, window: Duration) {
         self.note_places(&item);
         let id = item.id;
-        if is_fresh(&item, now_ms(), window) {
+        if item.history_only() {
+            tracing::info!("элемент сохранён без записи в буфер, кладу только в историю");
+            self.emit(Event::History(vec![item]));
+        } else if is_fresh(&item, now_ms(), window) {
             self.emit(Event::Incoming(item));
         } else {
             tracing::info!("элемент скопирован давно, кладу только в историю");
@@ -2456,6 +2470,21 @@ mod tests {
         assert!(clip.is_empty());
         assert_eq!(hist, texts(&[now - 3000, now - 2000]));
         assert_eq!(e.cursor, Some(own.id));
+    }
+
+    #[test]
+    fn history_only_item_skips_clipboard() {
+        let now = now_ms();
+        let (mut e, mut rx) = engine(None);
+        // Свежий элемент с меткой «только история» (сохранение через MCP).
+        let mut item = Item::backdated(DeviceId([2; 32]), Content::Text(now.to_string()), now);
+        item.set_history_only();
+        e.deliver(&key().seal(&item).unwrap());
+        // Такой же без метки — в буфер.
+        e.deliver(&sealed(2, now + 1));
+        let (clip, hist) = drain(&mut rx);
+        assert_eq!(clip, texts(&[now + 1]));
+        assert_eq!(hist, texts(&[now]));
     }
 
     #[test]

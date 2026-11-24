@@ -74,6 +74,23 @@
           "x": 14,
           "y": 18
         }
+      },
+      {
+        "label": "consent",
+        "create": false,
+        "title": "Clipwire — доступ ИИ",
+        "url": "index.html",
+        "width": 460,
+        "height": 360,
+        "visible": false,
+        "center": true,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": false,
+        "decorations": false,
+        "shadow": true,
+        "focus": true,
+        "backgroundColor": "#1c1e22"
       }
     ]
   },

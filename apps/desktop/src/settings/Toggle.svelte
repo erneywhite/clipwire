@@ -6,6 +6,7 @@
     hint = '',
     disabled = false,
     inline = false,
+    beforechange,
     onchange,
   }: {
     checked?: boolean
@@ -14,8 +15,20 @@
     disabled?: boolean
     /** Короткий вид для ряда переключателей: тумблер слева от подписи. */
     inline?: boolean
+    /**
+     * Вызывается до переключения с новым значением. false — переключатель
+     * остаётся как был и onchange не вызывается (например, сначала спросить).
+     */
+    beforechange?: (v: boolean) => boolean
     onchange?: (v: boolean) => void
   } = $props()
+
+  // Клик (и пробел с клавиатуры, он тоже даёт click) уже перевернул галочку в
+  // DOM; preventDefault возвращает её обратно, и change не наступает.
+  function veto(e: MouseEvent) {
+    const next = (e.currentTarget as HTMLInputElement).checked
+    if (beforechange && beforechange(next) === false) e.preventDefault()
+  }
 </script>
 
 <label class="row" class:disabled class:inline>
@@ -28,6 +41,7 @@
     role="switch"
     bind:checked
     {disabled}
+    onclick={veto}
     onchange={() => onchange?.(checked)}
   />
 </label>

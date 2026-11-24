@@ -6,7 +6,8 @@ import settings from './i18n-en/settings.ts'
 import popup from './i18n-en/popup.ts'
 import panels from './i18n-en/panels.ts'
 import lib from './i18n-en/lib.ts'
+import ai from './i18n-en/ai.ts'
 
-const en: Record<string, string> = { ...settings, ...popup, ...panels, ...lib }
+const en: Record<string, string> = { ...settings, ...popup, ...panels, ...lib, ...ai }
 
 export default en

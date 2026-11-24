@@ -122,6 +122,23 @@ pub fn thumbnail(png: &[u8]) -> Result<Vec<u8>> {
     thumb_of(decode_png(png)?)
 }
 
+/// PNG с длинной стороной не больше `max_side` (для ИИ-инструментов через
+/// MCP). Картинка, которая и так не больше, отдаётся как есть, без
+/// перекодирования; размеры при этом всё равно проверяются по заголовку с
+/// теми же пределами, что у [`decode_png`]: PNG-бомба не декодируется.
+pub fn downscale(png: &[u8], max_side: u32) -> Result<Vec<u8>> {
+    let max_side = max_side.max(1);
+    let mut r = image::ImageReader::with_format(Cursor::new(png), image::ImageFormat::Png);
+    r.limits(limits());
+    let (w, h) = r
+        .into_dimensions()
+        .context(tr("заголовок картинки не читается"))?;
+    if w.max(h) <= max_side {
+        return Ok(png.to_vec());
+    }
+    scale_to(decode_png(png)?, max_side)
+}
+
 /// Файлы-картинки больше этого не открываем ради миниатюры и предпросмотра.
 pub const MAX_IMAGE_FILE: u64 = 64 * 1024 * 1024;
 
@@ -167,8 +184,13 @@ pub fn thumbnail_file(path: &std::path::Path) -> Result<Vec<u8>> {
 }
 
 fn thumb_of(img: RgbaImage) -> Result<Vec<u8>> {
+    scale_to(img, THUMB_SIDE)
+}
+
+/// Уменьшить до длинной стороны `side` (не увеличивая) и сохранить в PNG.
+fn scale_to(img: RgbaImage, side: u32) -> Result<Vec<u8>> {
     let (w, h) = img.dimensions();
-    let scale = (THUMB_SIDE as f32 / w.max(h) as f32).min(1.0);
+    let scale = (side as f32 / w.max(h) as f32).min(1.0);
     let (tw, th) = (
         ((w as f32 * scale).round() as u32).max(1),
         ((h as f32 * scale).round() as u32).max(1),
@@ -284,6 +306,18 @@ mod tests {
         std::fs::write(&path, &bomb).unwrap();
         assert!(thumbnail_file(&path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn downscale_limits_long_side_and_rejects_bomb() {
+        let png = encode_png(1600, 900, &checker(1600, 900)).unwrap();
+        let small = decode_png(&downscale(&png, 1024).unwrap()).unwrap();
+        assert_eq!(small.dimensions(), (1024, 576));
+        // Уже не больше — те же байты, без перекодирования.
+        let little = encode_png(40, 24, &checker(40, 24)).unwrap();
+        assert_eq!(downscale(&little, 1024).unwrap(), little);
+        assert!(downscale(&png_bomb(), 1024).is_err());
+        assert!(downscale(b"not a png", 1024).is_err());
     }
 
     #[test]

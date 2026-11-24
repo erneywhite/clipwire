@@ -6,7 +6,8 @@
     "settings",
     "popup",
     "preview",
-    "editor"
+    "editor",
+    "consent"
   ],
   "permissions": [
     "core:default",

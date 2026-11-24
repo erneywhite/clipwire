@@ -102,6 +102,132 @@ pub struct Settings {
     pub exclusion_rules: Vec<crate::exclusions::Rule>,
     /// Учитывать `.gitignore` внутри скопированных папок.
     pub use_gitignore: bool,
+    /// Доступ ИИ-инструментов к истории через MCP.
+    pub ai: AiSettings,
+}
+
+/// Доступ ИИ-инструментов (Claude Code, Codex, Cursor…) к истории через MCP.
+/// По умолчанию выключен; включённый показывает за неделю только текст и
+/// ссылки, без похожего на пароли и ключи, и только на чтение.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiSettings {
+    pub enabled: bool,
+    /// За сколько последних дней ИИ видит историю; 0 — всю. Закрепы видны
+    /// всегда.
+    pub history_days: u32,
+    /// Какие виды записей видны ИИ.
+    pub kinds: AiKinds,
+    /// Скрывать записи, похожие на пароли и ключи
+    /// ([`crate::ai_access::looks_secret`]).
+    pub hide_secrets: bool,
+    /// ИИ может добавлять записи (`save_to_clipboard_history`,
+    /// `copy_to_clipboard`).
+    pub allow_write: bool,
+    /// Спрашивать человека, прежде чем ИИ положит текст в системный буфер.
+    pub confirm_clipboard: bool,
+    /// Клиенты, которым человек ответил: разрешён (и как) или отказано.
+    pub clients: Vec<AiClient>,
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            history_days: 7,
+            kinds: AiKinds::default(),
+            hide_secrets: true,
+            allow_write: false,
+            confirm_clipboard: true,
+            clients: Vec::new(),
+        }
+    }
+}
+
+impl AiSettings {
+    /// С какого времени (мс Unix) записи видны ИИ; `None` — вся история.
+    pub fn visible_since(&self, now_ms: i64) -> Option<i64> {
+        (self.history_days > 0)
+            .then(|| now_ms.saturating_sub(i64::from(self.history_days) * 86_400_000))
+    }
+
+    /// Сохранённый ответ про клиента с таким именем.
+    pub fn client(&self, name: &str) -> Option<&AiClient> {
+        self.clients.iter().find(|c| c.name == name)
+    }
+}
+
+/// Какие виды записей видны ИИ (см. [`clipwire_core::ai::AiKind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiKinds {
+    pub text: bool,
+    pub rich: bool,
+    pub links: bool,
+    pub images: bool,
+    pub files: bool,
+    pub folders: bool,
+}
+
+impl Default for AiKinds {
+    fn default() -> Self {
+        Self {
+            text: true,
+            rich: true,
+            links: true,
+            images: false,
+            files: false,
+            folders: false,
+        }
+    }
+}
+
+impl AiKinds {
+    /// Разрешён ли этот вид.
+    pub fn allows(self, kind: clipwire_core::ai::AiKind) -> bool {
+        use clipwire_core::ai::AiKind;
+        match kind {
+            AiKind::Text => self.text,
+            AiKind::Rich => self.rich,
+            AiKind::Link => self.links,
+            AiKind::Image => self.images,
+            AiKind::File => self.files,
+            AiKind::Folder => self.folders,
+        }
+    }
+
+    /// Разрешённые виды по порядку [`clipwire_core::ai::AiKind::ALL`].
+    pub fn list(self) -> Vec<clipwire_core::ai::AiKind> {
+        clipwire_core::ai::AiKind::ALL
+            .into_iter()
+            .filter(|k| self.allows(*k))
+            .collect()
+    }
+}
+
+/// ИИ-клиент, о котором человек уже ответил. Имя — то, каким клиент назвался
+/// в MCP (`clientInfo.name`); подделать его может любая программа того же
+/// пользователя ОС.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiClient {
+    pub name: String,
+    pub access: clipwire_core::ai::AiAccess,
+    /// Когда разрешён или запрещён, мс Unix.
+    pub added_ms: i64,
+    /// Когда последний раз обращался, мс Unix.
+    pub last_ms: i64,
+}
+
+impl Default for AiClient {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            access: clipwire_core::ai::AiAccess::Denied,
+            added_ms: 0,
+            last_ms: 0,
+        }
+    }
 }
 
 /// Что с этого устройства уходит на другие устройства группы. Выключенное
@@ -169,6 +295,7 @@ impl Default for Settings {
             send_kinds: SendKinds::default(),
             exclusion_rules: crate::exclusions::defaults(),
             use_gitignore: false,
+            ai: AiSettings::default(),
         }
     }
 }
@@ -375,6 +502,35 @@ mod tests {
         assert!(s.image_as_file);
         let s: Settings = serde_json::from_str(r#"{"image_as_file":false}"#).unwrap();
         assert!(!s.image_as_file);
+        // Доступ ИИ — выключен и в старом файле без поля; часть полей —
+        // остальные по умолчанию.
+        assert_eq!(s.ai, AiSettings::default());
+        assert!(!s.ai.enabled && s.ai.hide_secrets && !s.ai.allow_write);
+        assert_eq!(s.ai.history_days, 7);
+        let s: Settings = serde_json::from_str(
+            r#"{"ai":{"enabled":true,"kinds":{"images":true},
+                "clients":[{"name":"claude-code","access":"read_write","last_ms":5}]}}"#,
+        )
+        .unwrap();
+        assert!(s.ai.enabled && s.ai.confirm_clipboard);
+        assert!(s.ai.kinds.text && s.ai.kinds.images && !s.ai.kinds.files);
+        let c = s.ai.client("claude-code").unwrap();
+        assert_eq!(c.access, clipwire_core::ai::AiAccess::ReadWrite);
+        assert_eq!((c.added_ms, c.last_ms), (0, 5));
+    }
+
+    #[test]
+    fn ai_window_and_kinds() {
+        use clipwire_core::ai::AiKind;
+        let mut ai = AiSettings::default();
+        assert_eq!(ai.visible_since(10 * 86_400_000), Some(3 * 86_400_000));
+        ai.history_days = 0;
+        assert_eq!(ai.visible_since(10 * 86_400_000), None);
+        assert_eq!(
+            ai.kinds.list(),
+            vec![AiKind::Text, AiKind::Rich, AiKind::Link]
+        );
+        assert!(!ai.kinds.allows(AiKind::Folder));
     }
 
     #[test]

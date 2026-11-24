@@ -3,6 +3,7 @@
   // чтобы превью выглядело ровно как настоящее окно.
   import type { Entry } from './api'
   import AppTag from './AppTag.svelte'
+  import AiTag from './AiTag.svelte'
   import NoteEdit from './NoteEdit.svelte'
   import { t } from './i18n'
   import { deviceName } from './platform'
@@ -93,6 +94,7 @@
   aria-posinset={setsize === undefined ? undefined : index + 1}
   aria-setsize={setsize}
   class:sel={selected}
+  class:ai={!!item.by_ai}
   onclick={onselect}
   ondblclick={onpaste}
   oncontextmenu={(e) => {
@@ -157,7 +159,7 @@
       <span class="text" class:mono={kind === 'code'}>{item.text}</span>
     {/if}
     <span class="meta" class:failed={!!progress?.error}
-      >{device}{#if item.source_app}&nbsp;· <AppTag app={item.source_app} />{/if} · {meta}</span
+      >{device}{#if item.by_ai}&nbsp;· <AiTag client={item.by_ai} />{/if}{#if item.source_app}&nbsp;· <AppTag app={item.source_app} />{/if} · {meta}</span
     >
     {#if progress}
       <span
@@ -234,6 +236,18 @@
   li.sel {
     background: var(--c-sel);
     box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--c-accent) 55%, transparent);
+  }
+  /* Запись от ИИ-инструмента: полоса 2 px слева цветом акцента темы, чтобы
+   * строка выделялась среди остальных; чей это ИИ, говорит цветная метка в
+   * строке меты. Тень-рамка выбранной строки идёт второй в том же списке,
+   * иначе одно правило перебило бы другое. */
+  li.ai {
+    box-shadow: inset 2px 0 0 var(--c-accent);
+  }
+  li.ai.sel {
+    box-shadow:
+      inset 2px 0 0 var(--c-accent),
+      inset 0 0 0 1px color-mix(in oklch, var(--c-accent) 55%, transparent);
   }
   .glyph svg {
     width: 18px;

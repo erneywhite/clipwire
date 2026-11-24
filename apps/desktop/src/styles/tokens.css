@@ -32,6 +32,10 @@
   --dur-fast: 120ms;
 }
 
+/* --c-ai — метка записей, которые добавил ИИ-инструмент: фиолетовый, чтобы не
+ * путать с акцентом темы и цветами состояния. Подпись цветом --c-ai держит
+ * контраст не меньше 5,4:1 (AA) и на --c-ai-soft, и на любом фоне своей темы. */
+
 /* ── Графит: тёмная утилита, янтарный акцент ── */
 :root[data-theme='graphite'] {
   --font-ui: 'Onest', system-ui, sans-serif;
@@ -49,6 +53,8 @@
   --c-accent: #e2a63b;
   --c-on-accent: #1c1e22;
   --c-danger: #e0675f;
+  --c-ai: #b89af2;
+  --c-ai-soft: #302a3d;
 }
 :root[data-theme='graphite'][data-mode='light'] {
   --c-ok: #2b8a52;
@@ -62,6 +68,8 @@
   --c-accent: #a8700f;
   --c-on-accent: #ffffff;
   --c-danger: #b3362e;
+  --c-ai: #6e42bd;
+  --c-ai-soft: #efe8f9;
 }
 
 /* ── Бумага: тёплая бумага, чернильный синий ── */
@@ -81,6 +89,8 @@
   --c-accent: #2d55c8;
   --c-on-accent: #ffffff;
   --c-danger: #b3362e;
+  --c-ai: #7b3aa8;
+  --c-ai-soft: #f3e8f2;
 }
 :root[data-theme='paper'][data-mode='dark'] {
   --c-ok: #73c08f;
@@ -94,6 +104,8 @@
   --c-accent: #8aa6f2;
   --c-on-accent: #14161c;
   --c-danger: #e0756d;
+  --c-ai: #cfa0ea;
+  --c-ai-soft: #352b39;
 }
 
 /* ── Сигнал: холодный, мятный акцент ── */
@@ -113,6 +125,8 @@
   --c-accent: #46cfa3;
   --c-on-accent: #0b1513;
   --c-danger: #e46c64;
+  --c-ai: #b9a2f6;
+  --c-ai-soft: #221f33;
 }
 :root[data-theme='signal'][data-mode='light'] {
   --c-ok: #11805f;
@@ -126,6 +140,8 @@
   --c-accent: #11805f;
   --c-on-accent: #ffffff;
   --c-danger: #b3362e;
+  --c-ai: #6a3fc0;
+  --c-ai-soft: #ece6f8;
 }
 
 /* Цвета состояния — те же, что у провода на иконке в трее
