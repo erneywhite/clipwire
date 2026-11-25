@@ -1176,7 +1176,7 @@
           <button onclick={(e) => togglePin(preview?.entry, below(e.currentTarget)).then(openPreview)}>
             {preview.entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
-          <button class="danger" onclick={(e) => askRemove(preview?.entry, below(e.currentTarget))}>{t('Удалить')}</button>
+          <button class="danger icon" title={t('Удалить')} aria-label={t('Удалить')} onclick={(e) => askRemove(preview?.entry, below(e.currentTarget))}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12M10.5 11v5M13.5 11v5" /></svg></button>
         </div>
       {:else if preview.entry.kind === 'files'}
         {@const entry = preview.entry}
@@ -1246,7 +1246,7 @@
           <button onclick={(e) => togglePin(entry, below(e.currentTarget)).then(openPreview)}>
             {entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
-          <button class="danger" onclick={(e) => askRemove(entry, below(e.currentTarget))}>{t('Удалить')}</button>
+          <button class="danger icon" title={t('Удалить')} aria-label={t('Удалить')} onclick={(e) => askRemove(entry, below(e.currentTarget))}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12M10.5 11v5M13.5 11v5" /></svg></button>
         </div>
       {:else}
       {#if preview.entry.html || isUrl(preview.entry.text)}
@@ -1292,7 +1292,7 @@
           <button onclick={(e) => togglePin(preview?.entry, below(e.currentTarget)).then(openPreview)}>
             {preview.entry.pinned ? t('Открепить') : t('Закрепить')}
           </button>
-          <button class="danger" onclick={(e) => askRemove(preview?.entry, below(e.currentTarget))}>{t('Удалить')}</button>
+          <button class="danger icon" title={t('Удалить')} aria-label={t('Удалить')} onclick={(e) => askRemove(preview?.entry, below(e.currentTarget))}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12M10.5 11v5M13.5 11v5" /></svg></button>
         {/if}
       </div>
       {/if}
@@ -1791,6 +1791,23 @@
   }
   .actions button.danger {
     color: var(--c-danger);
+  }
+  /* «Удалить» — иконка в конце ряда: с подписью четыре кнопки не влезали в
+     строку и она уезжала на вторую. */
+  .actions button.icon {
+    margin-left: auto;
+    display: grid;
+    place-items: center;
+    padding: 6px 8px;
+  }
+  .actions button.icon svg {
+    width: 18px;
+    height: 18px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
   .actions button.primary {
     background: var(--c-accent);
