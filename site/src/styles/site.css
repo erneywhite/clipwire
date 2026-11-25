@@ -1313,6 +1313,382 @@ kbd.down {
   margin-top: 3px;
 }
 
+/* ── ИИ-инструменты ── */
+.ai-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+  gap: clamp(32px, 5vw, 80px);
+  align-items: start;
+}
+.ai-set {
+  margin-top: var(--space-6);
+  background: var(--c-bg);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-xl);
+  padding: var(--space-4) var(--space-5);
+  display: grid;
+  gap: var(--space-3);
+}
+.ai-set-h {
+  font-weight: 500;
+}
+.ai-kinds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+}
+.ai-kind {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--text-s);
+  color: var(--c-muted);
+}
+.ai-kind.on {
+  color: var(--c-text);
+}
+.tg {
+  position: relative;
+  width: 26px;
+  height: 15px;
+  border-radius: 999px;
+  background: var(--c-border);
+  flex: none;
+}
+.tg::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--c-muted);
+}
+.tg.on,
+.ai-kind.on .tg {
+  background: var(--c-wire);
+}
+.tg.on::after,
+.ai-kind.on .tg::after {
+  left: 13px;
+  background: var(--c-on-wire);
+}
+.ai-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  font-size: var(--text-s);
+  color: var(--c-text-2);
+  border-top: 1px solid var(--c-border-soft);
+  padding-top: var(--space-3);
+}
+.ai-val {
+  font: var(--text-xs) var(--font-mono);
+  color: var(--c-wire);
+  border: 1px solid var(--c-wire-line);
+  border-radius: var(--radius-s);
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+.ai-limit {
+  margin-top: var(--space-5);
+  font-size: var(--text-s);
+  color: var(--c-muted);
+  border-left: 2px solid var(--c-wire-line);
+  padding-left: var(--space-3);
+}
+
+/* сцена */
+.ai-scene {
+  display: grid;
+  /* minmax(0, …): длинные строки (SQL в журнале) не распирают колонку. */
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
+  min-width: 0;
+}
+.ai-log,
+.ai-log > ul,
+.ai-log > ul > li {
+  min-width: 0;
+}
+.ai-ask {
+  background: var(--c-bg);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-xl);
+  padding: var(--space-4) var(--space-5);
+  display: grid;
+  gap: var(--space-2);
+}
+.ai-client {
+  justify-self: start;
+  font: 500 var(--text-xs) var(--font-mono);
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--brand, var(--c-ai)) 18%, transparent);
+  color: color-mix(in oklch, var(--brand, var(--c-ai)) 62%, var(--c-text));
+}
+.ai-says {
+  display: grid;
+}
+.ai-say {
+  grid-area: 1 / 1;
+  font-size: var(--text-l);
+  visibility: hidden;
+}
+.ai-say.on {
+  visibility: visible;
+}
+.ai-ans {
+  font: var(--text-s) var(--font-mono);
+  color: var(--c-ok);
+  min-height: 1.5em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  visibility: hidden;
+}
+.ai-mid {
+  position: relative;
+}
+.ai-pw {
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-xl);
+}
+.ai-q {
+  color: var(--c-text);
+  font-family: var(--font-mono);
+}
+.ai-caret {
+  width: 1px;
+  height: 16px;
+  background: var(--c-wire);
+  margin-left: 1px;
+  visibility: hidden;
+}
+.ai-list {
+  height: 320px;
+}
+.ai-list .pw-row {
+  transition:
+    opacity var(--dur-base) ease,
+    background-color var(--dur-base) ease;
+}
+.ai-list.searching .pw-row:not([data-flag='hit']) {
+  opacity: 0.35;
+}
+.ai-list.searching .pw-row[data-flag='hit'] {
+  background: var(--c-sel);
+  box-shadow: inset 0 0 0 1px var(--c-wire-line);
+}
+.ai-list.searching .pw-row[data-flag='secret'],
+.ai-list.searching .pw-row[data-flag='off'] {
+  opacity: 1;
+}
+.ai-veil {
+  position: absolute;
+  inset: 3px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-m);
+  background: color-mix(in oklch, var(--c-bg) 86%, transparent);
+  border: 1px dashed var(--c-border);
+  font: var(--text-xs) var(--font-mono);
+  color: var(--c-muted);
+  opacity: 0;
+  transition: opacity var(--dur-base) ease;
+}
+.ai-list.searching .ai-veil {
+  opacity: 1;
+}
+.ai-tag {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  padding: 0 4px;
+  margin-right: 6px;
+  border-radius: 4px;
+  background: color-mix(in oklch, var(--brand, var(--c-ai)) 18%, transparent);
+  color: color-mix(in oklch, var(--brand, var(--c-ai)) 62%, var(--c-text));
+}
+.ai-tag .sep {
+  opacity: 0.7;
+}
+
+/* окно согласия, как в программе */
+.consent {
+  position: absolute;
+  z-index: 3;
+  left: 50%;
+  top: 50%;
+  width: min(420px, 92%);
+  transform: translate(-50%, -50%);
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-l);
+  padding: var(--space-5);
+  box-shadow: 0 24px 60px -20px rgb(0 0 0 / 0.75);
+  display: grid;
+  gap: var(--space-3);
+  visibility: hidden;
+}
+.consent-h {
+  font-weight: 600;
+  line-height: 1.35;
+}
+.consent p {
+  font-size: var(--text-s);
+  color: var(--c-text-2);
+}
+.consent pre {
+  font-size: var(--text-s);
+  background: var(--c-bg);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-m);
+  padding: var(--space-3);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.consent-btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.cbtn {
+  font-size: var(--text-s);
+  font-weight: 500;
+  padding: 6px 12px;
+  border-radius: var(--radius-m);
+  border: 1px solid var(--c-border);
+  white-space: nowrap;
+}
+.cbtn.primary {
+  background: var(--c-wire);
+  border-color: var(--c-wire);
+  color: var(--c-on-wire);
+}
+.cbtn.danger {
+  color: var(--c-danger);
+}
+.cbtn.pressed {
+  transform: scale(0.96);
+  box-shadow: 0 0 0 3px var(--c-wire-soft);
+}
+
+/* журнал */
+.ai-log {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-2);
+}
+.ai-log > ul {
+  display: grid;
+  gap: 4px;
+  min-height: 84px;
+}
+/* Как журнал в программе (settings/AiTools.svelte): одна карточка, строки через
+ * разделитель, новые сверху; время, клиент с инструментом и запрос под ними,
+ * справа итог. Итог со списком записей — ссылка, раскрывает их под строкой. */
+.ai-log-h {
+  font-size: var(--text-s);
+  color: var(--c-muted);
+}
+.ai-log > ul {
+  display: flex;
+  flex-direction: column-reverse;
+  justify-content: flex-end;
+  min-height: 0;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-l);
+  padding: 2px var(--space-4);
+}
+.ai-log > ul > li {
+  padding: 10px 0;
+}
+/* Порядок обратный (новые сверху), поэтому линия — снизу у каждой видимой строки,
+ * кроме самой старой. Заглушка и ещё не случившиеся строки не в счёт. */
+.ai-log > ul > li:not([hidden]) ~ li:not([hidden]) {
+  border-bottom: 1px solid var(--c-border);
+}
+.log-empty {
+  font-size: var(--text-s);
+  color: var(--c-muted);
+}
+.log-row {
+  display: grid;
+  grid-template-columns: 9ch minmax(0, 1fr) minmax(0, auto);
+  gap: var(--space-3);
+  align-items: baseline;
+}
+.log-at {
+  font: var(--text-xs) var(--font-mono);
+  color: var(--c-muted);
+}
+.log-main {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.log-what,
+.log-query,
+.log-res,
+.log-items li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.log-what {
+  font-size: var(--text-s);
+  font-weight: 600;
+  color: var(--c-text);
+}
+.log-tool {
+  font-family: var(--font-mono);
+}
+.log-query {
+  font: var(--text-xs) var(--font-mono);
+  color: var(--c-muted);
+}
+.log-res {
+  font: var(--text-xs) var(--font-mono);
+  color: var(--c-muted);
+  text-align: right;
+  justify-self: end;
+  max-width: 100%;
+}
+button.log-res {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--c-wire);
+}
+button.log-res:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.log-arrow {
+  display: inline-block;
+  transition: transform var(--dur-base) var(--ease-out);
+}
+button.log-res[aria-expanded='true'] .log-arrow {
+  transform: rotate(180deg);
+}
+.log-items {
+  margin: 8px 0 0 calc(9ch + var(--space-3));
+  padding: 2px var(--space-3);
+  border-left: 2px solid var(--c-border);
+  font-size: var(--text-s);
+  color: var(--c-text);
+  overflow: hidden;
+}
+.log-items li {
+  padding: 2px 0;
+}
+
 /* ── Исключения ── */
 .lane {
   position: relative;
@@ -1960,7 +2336,8 @@ kbd.down {
   .how-grid,
   .server-grid,
   .local-grid,
-  .faq-grid {
+  .faq-grid,
+  .ai-grid {
     grid-template-columns: minmax(0, 1fr);
   }
   .how-sticky {
@@ -2031,6 +2408,24 @@ kbd.down {
   }
   .demo-rich {
     grid-template-columns: minmax(0, 1fr);
+  }
+  .log-row {
+    grid-template-columns: 6ch minmax(0, 1fr);
+  }
+  /* На телефоне итог встаёт под клиентом с инструментом, иначе не помещается. */
+  .log-res {
+    grid-column: 2;
+    justify-self: start;
+    text-align: left;
+  }
+  .log-items {
+    margin-left: calc(6ch + var(--space-3));
+  }
+  .log-client {
+    display: none;
+  }
+  .ai-list {
+    height: auto;
   }
   .demo-files {
     grid-template-columns: minmax(0, 1fr);

@@ -686,6 +686,137 @@ function initTry() {
   render();
 }
 
+// ИИ-инструменты: агент спрашивает, человек разрешает, Clipwire отдаёт только разрешённое.
+// Один таймлайн по кругу; работает, пока блок на экране.
+function aiScene(still: boolean) {
+  const root = $('[data-ai]');
+  const say1 = $('[data-ai-say="1"]', root);
+  const say2 = $('[data-ai-say="2"]', root);
+  const ans = $('[data-ai-ans]', root);
+  const q = $('[data-ai-q]', root);
+  const caret = $('[data-ai-caret]', root);
+  const list = $('[data-ai-list]', root);
+  const c1 = $('[data-consent="1"]', root);
+  const c2 = $('[data-consent="2"]', root);
+  const logRows = $$('[data-log-row]', root);
+  const logEmpty = $('[data-log-empty]', root);
+  const tpl = $<HTMLTemplateElement>('[data-ai-new]', root);
+  const query = 'select';
+  const press = (c: HTMLElement) => $('[data-press]', c);
+
+  const addRow = () => {
+    list.querySelector('.ai-new')?.remove();
+    list.prepend(tpl.content.firstElementChild!.cloneNode(true));
+  };
+  const collapse = () =>
+    $$<HTMLButtonElement>('[data-log-toggle]', root).forEach((b) => {
+      b.setAttribute('aria-expanded', 'false');
+      b.title = b.dataset.show!;
+      (b.closest('li')!.querySelector('.log-items') as HTMLElement).hidden = true;
+    });
+  const showLog = (i: number) => {
+    logEmpty.hidden = true;
+    logRows[i].hidden = false;
+    gsap.fromTo(logRows[i], { autoAlpha: 0, y: -6 }, { autoAlpha: 1, y: 0, duration: 0.35, ease: 'power2.out' });
+  };
+  const reset = () => {
+    collapse();
+    list.querySelector('.ai-new')?.remove();
+    list.classList.remove('searching');
+    say1.classList.add('on');
+    say2.classList.remove('on');
+    q.textContent = '';
+    [c1, c2].forEach((c) => press(c).classList.remove('pressed'));
+    gsap.set([ans, c1, c2], { autoAlpha: 0 });
+    // Вторая просьба скрыта через autoAlpha: класс .on её не перебьёт, GSAP ставит visibility сам.
+    gsap.set(say1, { autoAlpha: 1, y: 0 });
+    gsap.set(say2, { autoAlpha: 0, y: 0 });
+    // Строки журнала, которых ещё не было, убраны из раскладки: новые встают сверху.
+    logRows.forEach((r) => (r.hidden = true));
+    logEmpty.hidden = false;
+  };
+
+  if (still) {
+    // Готовый кадр: поиск выполнен, запись от ИИ в истории, журнал заполнен.
+    reset();
+    list.classList.add('searching');
+    q.textContent = query;
+    gsap.set(ans, { autoAlpha: 1 });
+    logRows.forEach((r) => (r.hidden = false));
+    logEmpty.hidden = true;
+    addRow();
+    return;
+  }
+
+  const tl = gsap.timeline({ repeat: -1, repeatDelay: 0.4, paused: true, defaults: { ease: 'power2.out' }, onRepeat: reset });
+  tl.call(reset)
+    .fromTo(say1, { autoAlpha: 0, y: 8 }, { autoAlpha: 1, y: 0, duration: 0.45 })
+    // Первый вызов нового клиента — окно согласия.
+    .fromTo(c1, { autoAlpha: 0, scale: 0.96 }, { autoAlpha: 1, scale: 1, duration: 0.35 }, '+=0.5')
+    .call(() => press(c1).classList.add('pressed'), undefined, '+=1.6')
+    .to(c1, { autoAlpha: 0, scale: 0.98, duration: 0.3 }, '+=0.25')
+    .call(() => showLog(0), undefined, '<0.1')
+    // Поиск: печатает запрос, находит нужное, ключ и картинка скрыты.
+    .set(caret, { autoAlpha: 1 })
+    .addLabel('type')
+    .set(caret, { autoAlpha: 0 }, `type+=${(query.length * 0.1 + 0.15).toFixed(2)}`)
+    .call(() => list.classList.add('searching'))
+    .call(() => showLog(1), undefined, '+=0.2')
+    .to(ans, { autoAlpha: 1, duration: 0.4 }, '+=0.5')
+    .call(() => showLog(2), undefined, '<')
+    // Вторая просьба: положить текст в буфер, снова с согласия.
+    .to(say1, { autoAlpha: 0, y: -6, duration: 0.3 }, '+=2')
+    .to(ans, { autoAlpha: 0, duration: 0.3 }, '<')
+    .call(() => {
+      say1.classList.remove('on');
+      say2.classList.add('on');
+      list.classList.remove('searching');
+      q.textContent = '';
+    })
+    .fromTo(say2, { autoAlpha: 0, y: 8 }, { autoAlpha: 1, y: 0, duration: 0.45 })
+    .fromTo(c2, { autoAlpha: 0, scale: 0.96 }, { autoAlpha: 1, scale: 1, duration: 0.35 }, '+=0.5')
+    .call(() => press(c2).classList.add('pressed'), undefined, '+=1.5')
+    .to(c2, { autoAlpha: 0, scale: 0.98, duration: 0.3 }, '+=0.25')
+    .call(() => {
+      addRow();
+      gsap.fromTo(list.querySelector('.ai-new'), { autoAlpha: 0, y: -10 }, { autoAlpha: 1, y: 0, duration: 0.5, ease: 'power3.out' });
+    })
+    .call(() => showLog(3), undefined, '<0.1')
+    .to({}, { duration: 3 });
+  // Результат в журнале раскрывает, какие записи получил ИИ, как в программе.
+  // Пока что-то раскрыто, сцена стоит: иначе следующий круг спрячет журнал.
+  let visible = false;
+  $$<HTMLButtonElement>('[data-log-toggle]', root).forEach((b) =>
+    b.addEventListener('click', () => {
+      const items = b.closest('li')!.querySelector('.log-items') as HTMLElement;
+      const open = b.getAttribute('aria-expanded') !== 'true';
+      b.setAttribute('aria-expanded', String(open));
+      b.title = open ? b.dataset.hide! : b.dataset.show!;
+      items.hidden = !open;
+      if (open) gsap.fromTo(items, { height: 0, autoAlpha: 0 }, { height: 'auto', autoAlpha: 1, duration: 0.3, ease: 'power3.out', clearProps: 'height' });
+      const anyOpen = $$('[data-log-toggle][aria-expanded="true"]', root).length > 0;
+      if (anyOpen) tl.pause();
+      else if (visible) tl.resume();
+    }),
+  );
+
+  // Запрос печатается по буквам.
+  for (let i = 1; i <= query.length; i++) tl.call(() => (q.textContent = query.slice(0, i)), undefined, `type+=${(i * 0.1).toFixed(2)}`);
+  aiTl = tl;
+  ScrollTrigger.create({
+    trigger: root,
+    start: 'top 90%',
+    end: 'bottom 10%',
+    onToggle: (s) => {
+      visible = s.isActive;
+      const anyOpen = $$('[data-log-toggle][aria-expanded="true"]', root).length > 0;
+      if (s.isActive && !anyOpen) tl.play();
+      else tl.pause();
+    },
+  });
+}
+let aiTl: gsap.core.Timeline | null = null;
+
 // Без сервера: переключатель уезжает на «Всегда», а история бесконечно тянется в прошлое.
 function localScene() {
   const thumb = $('[data-seg-thumb]');
@@ -911,6 +1042,7 @@ mm.add(
       heroStatic();
       laneStatic();
       cryptTimeline(false, true);
+      aiScene(true);
       return;
     }
     // Сцена главного экрана: стоит, пока её не видно.
@@ -935,6 +1067,7 @@ mm.add(
     cryptTimeline(wide, false);
     buildLane();
     localScene();
+    aiScene(false);
     gsap.from('[data-code] .cl', {
       autoAlpha: 0,
       x: -6,
@@ -964,4 +1097,4 @@ document.fonts?.ready.then(() => {
 });
 
 // Для проверки в разработке: доступ к таймлайну сцены из консоли.
-if (import.meta.env.DEV) (window as unknown as { __cw: object }).__cw = { hero: () => heroTl, lane: () => laneTl, lenis: () => lenis };
+if (import.meta.env.DEV) (window as unknown as { __cw: object }).__cw = { hero: () => heroTl, lane: () => laneTl, lenis: () => lenis, ai: () => aiTl };

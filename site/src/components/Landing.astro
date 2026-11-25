@@ -67,7 +67,7 @@ const jsonLd = JSON.stringify({
       screenshot: Astro.site ? new URL('/img/preview.png', Astro.site).href : undefined,
       inLanguage: ['en', 'ru'],
       author: { '@type': 'Person', name: 'Erney White', url: 'https://github.com/erneywhite' },
-      featureList: t.how.steps.map((s) => s.title).concat(t.security.title, t.local.title),
+      featureList: t.how.steps.map((s) => s.title).concat(t.security.title, t.ai.title, t.local.title),
     },
     {
       '@type': 'WebSite',
@@ -417,6 +417,155 @@ const sceneData = JSON.stringify({
       <ul class="points">
         {t.security.points.map((p) => <li><Fragment set:html={svg('check')} /><span>{p}</span></li>)}
       </ul>
+    </section>
+
+    <!-- ── ИИ-инструменты (MCP) ── -->
+    <section class="sec ai" id="ai">
+      <div class="ai-grid">
+        <div class="ai-copy">
+          <h2 class="sec-h">{t.ai.title}</h2>
+          <p class="sec-lead">{t.ai.lead}</p>
+          <div class="ai-set">
+            <b class="ai-set-h">{t.ai.seesTitle}</b>
+            <ul class="ai-kinds">
+              {t.ai.kinds.map(([label, on]) => (
+                <li class:list={['ai-kind', { on }]}>
+                  <i class="tg" aria-hidden="true" />
+                  <span>{label}</span>
+                </li>
+              ))}
+            </ul>
+            <div class="ai-line">
+              <span>{t.ai.historyFor}</span>
+              <span class="ai-val">{t.ai.historyValue}</span>
+            </div>
+            <div class="ai-line">
+              <span>{t.ai.hideSecrets}</span>
+              <i class="tg on" aria-hidden="true" />
+            </div>
+          </div>
+          <ul class="facts">
+            {t.ai.facts.map((f) => <li>{f}</li>)}
+          </ul>
+          <p class="ai-limit">{t.ai.limit}</p>
+          <a class="link-arrow" href={t.ai.guideHref}>{t.ai.guide}<Fragment set:html={svg('arrow')} /></a>
+        </div>
+
+        <div class="ai-scene" data-ai>
+          <div class="ai-ask" aria-hidden="true">
+            <span class="ai-client" style="--brand: var(--c-claude)">{t.ai.client}</span>
+            <div class="ai-says">
+              <p class="ai-say on" data-ai-say="1">{t.ai.ask1}</p>
+              <p class="ai-say" data-ai-say="2">{t.ai.ask2}</p>
+            </div>
+            <p class="ai-ans" data-ai-ans>{t.ai.answer}</p>
+          </div>
+
+          <div class="ai-mid" aria-hidden="true">
+            <div class="pw ai-pw">
+              <div class="pw-search">
+                <Fragment set:html={svg('search')} />
+                <span class="ai-q" data-ai-q></span><span class="ai-caret" data-ai-caret></span>
+              </div>
+              <div class="pw-tabs">
+                <span class="on">{t.paste.history}</span>
+                <span>{t.paste.pinned}</span>
+              </div>
+              <ul class="pw-list ai-list" data-ai-list>
+                {t.ai.rows.map((r) => (
+                  <li class="pw-row" data-flag={r.flag}>
+                    <span class="pw-glyph" set:html={svg(r.kind)} />
+                    <span class="pw-body">
+                      {r.kind === 'image' ? (
+                        <span class="pw-thumb">
+                          <span class="mini-chart"><i /><i /><i /><i /><i /><i /><i /></span>
+                        </span>
+                      ) : (
+                        <span class:list={['pw-text', { mono: r.kind === 'code' }]}>{r.text}</span>
+                      )}
+                      <span class="pw-meta">{r.meta}</span>
+                    </span>
+                    {r.flag === 'secret' && <span class="ai-veil">{t.ai.hiddenSecret}</span>}
+                    {r.flag === 'off' && <span class="ai-veil">{t.ai.imagesOff}</span>}
+                  </li>
+                ))}
+              </ul>
+              <template data-ai-new>
+                <li class="pw-row sel ai-new">
+                  <span class="pw-glyph" set:html={svg('code')} />
+                  <span class="pw-body">
+                    <span class="pw-text mono">{t.ai.putText}</span>
+                    <span class="pw-meta">
+                      <span class="ai-tag" style="--brand: var(--c-claude)">{t.ai.aiLabel}<span class="sep">·</span>{t.ai.client}</span>
+                      {t.ai.newMeta}
+                    </span>
+                  </span>
+                </li>
+              </template>
+            </div>
+
+            <div class="consent" data-consent="1">
+              <b class="consent-h">{t.ai.consent1Title}</b>
+              <p>{t.ai.consent1Body}</p>
+              <div class="consent-btns">
+                <span class="cbtn primary">{t.ai.readOnly}</span>
+                <span class="cbtn" data-press>{t.ai.readWrite}</span>
+                <span class="cbtn danger">{t.ai.deny}</span>
+              </div>
+            </div>
+            <div class="consent" data-consent="2">
+              <b class="consent-h">{t.ai.consent2Title}</b>
+              <pre>{t.ai.putText}</pre>
+              <div class="consent-btns">
+                <span class="cbtn primary" data-press>{t.ai.put}</span>
+                <span class="cbtn">{t.ai.decline}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="ai-log">
+            <span class="ai-log-h">{t.ai.logTitle}</span>
+            <ul data-ai-log>
+              <li class="log-empty" data-log-empty>{t.ai.logEmpty}</li>
+              {t.ai.log.map((e) => (
+                <li data-log-row>
+                  <div class="log-row">
+                    <span class="log-at">{e.at}</span>
+                    <span class="log-main">
+                      <span class="log-what">
+                        <span class="log-client">{t.ai.client}</span> <span class="log-tool">{e.tool}</span>
+                      </span>
+                      {e.query && <span class="log-query">{e.query}</span>}
+                    </span>
+                    {e.items.length ? (
+                      <button
+                        type="button"
+                        class="log-res"
+                        aria-expanded="false"
+                        data-log-toggle
+                        data-show={t.ai.showItems}
+                        data-hide={t.ai.hideItems}
+                        title={t.ai.showItems}
+                      >
+                        {e.res} <span class="log-arrow" aria-hidden="true">▾</span>
+                      </button>
+                    ) : (
+                      <span class="log-res">{e.res}</span>
+                    )}
+                  </div>
+                  {e.items.length > 0 && (
+                    <ul class="log-items" hidden>
+                      {e.items.map((it) => (
+                        <li>{it}</li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- ── Исключения ── -->
