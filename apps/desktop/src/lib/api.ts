@@ -58,6 +58,8 @@ export interface AiClient {
   added_ms: number
   /** Когда последний раз обращался, мс Unix. */
   last_ms: number
+  /** Программа, которая запустила мост (путь); null — ответ дан до 0.10.2 или программа не определилась. */
+  program: string | null
 }
 
 /** Какие виды записей видны ИИ. */
@@ -583,6 +585,11 @@ export interface ConsentDto {
   chars: number
   /** Запись для ИИ разрешена в настройках: можно предложить «Чтение и запись». */
   allow_write: boolean
+  /** Программа клиента (путь, невидимые символы — метками); null — не определилась. */
+  program: string | null
+  /** Под этим именем уже отвечали про другую программу, previous — какую (null — не определилась). */
+  program_changed: boolean
+  previous: string | null
 }
 
 /** Ответ на вопрос: read/read_write/deny — о доступе, accept/decline — о буфере. */
@@ -599,6 +606,10 @@ export interface AiLogEntry {
   ids: string[]
   /** Короткий итог: сколько найдено, «скрыто», «отклонено»… */
   result: string
+  /** Программа клиента (путь) или null. */
+  program: string | null
+  /** Сколько одинаковых обращений подряд собрано в строку; at_ms — время последнего. */
+  count: number
 }
 
 export const api = {  settings: () => invoke<Settings>('get_settings'),
@@ -732,6 +743,7 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
    * Доступ запомненного ИИ-клиента и «забыть клиента». Список клиентов
    * save_settings не меняет: новое состояние приходит событием settings-changed.
    */
-  aiClientAccess: (name: string, access: AiAccess) => invoke<void>('ai_client_access', { name, access }),
-  aiClientRemove: (name: string) => invoke<void>('ai_client_remove', { name }),
+  aiClientAccess: (name: string, program: string | null, access: AiAccess) =>
+    invoke<void>('ai_client_access', { name, program, access }),
+  aiClientRemove: (name: string, program: string | null) => invoke<void>('ai_client_remove', { name, program }),
 }

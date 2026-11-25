@@ -81,4 +81,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Threading",
     # Канал MCP: чей процесс держит канал (`GetNamedPipeServerProcessId`).
     "Win32_System_Pipes",
+    # Канал MCP: какая программа запустила мост (родитель по снимку процессов).
+    "Win32_System_Diagnostics_ToolHelp",
 ] }

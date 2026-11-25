@@ -792,28 +792,43 @@ access question stays open anyway, so answer it and repeat the request. A clipbo
 client cancels is dropped together with its window. At most 8 questions wait in the queue; beyond
 that a client gets a "busy" error right away.
 
+The question window shows which program started the bridge, for example
+`C:\Users\…\claude.exe` or `/usr/local/bin/node`. The answer is remembered for the pair of name
+and program. If another program connects under the same name, Clipwire asks again and shows both,
+the earlier one and the current one. Denying it does not take access away from the real client.
+When the program cannot be determined, the window says **program unknown**. Clients allowed
+before 0.10.2 had no program; the first program that connects after the update is bound to them.
+
 With **Ask before putting text on the clipboard** off, `copy_to_clipboard` shows a system
 notification with the start of the text. If the text looks like a password or token, the
 notification shows only its length.
 
-**Connected clients** lists every client with its access and when it was last used. Access can be
+**Connected clients** lists every client with its program, access and when it was last used. Access can be
 switched between **No access**, **Read** and **Read and write**, and **Revoke** removes the client
 from the list, so it asks again next time.
 
 **Access log** shows the last 100 requests: time, client, tool and result (search queries and saved
-text cut to 80 characters). The log is stored encrypted on this device, keeps at most 1000 rows, and
-clearing the history does not touch it. **Clear log** empties it.
+text cut to 80 characters); the client's program is in the tooltip. Identical requests in a row are
+folded into one row marked "×N". Refusals (access turned off, client denied) are logged at most once
+a minute per client name. The log is stored encrypted on this device, and clearing the history does
+not touch it. It keeps at most 1000 rows about requests that returned entries (a search with
+results, an entry, the pins) and at most 500 other rows, so a stream of refusals cannot push out
+what the AI actually read. **Clear log** empties it.
 
 ### Limits
 
 - What the AI reads goes to the model, usually to the AI provider's cloud. The Clipwire end-to-end
   encryption ends here: the entry leaves the device in the clear inside the AI client's request.
   Allow only the kinds and the period you are fine sharing.
-- Clients are told apart by the name they report in MCP (`clientInfo.name`). Clipwire cannot check
-  it: any program running under your OS account can start the bridge and use the name of a client
-  you already allowed. Invisible characters are removed from the name, so two clients cannot
-  look the same in the list. On macOS and Linux the bridge talks only to a socket owned by your
-  own user, as it does with the named pipe on Windows.
+- Clients are told apart by the name they report in MCP (`clientInfo.name`) and by the program
+  that started the bridge. The name cannot be checked, the program backs it up: another program
+  using the name of a known client gets a new question instead of that client's access. This
+  makes impersonation harder but does not stop malware running under your OS account: it can
+  start the AI client itself or replace its file. The program is found as the parent of the bridge
+  process (shells like `cmd` and `sh` are skipped), and this does not always work. Invisible
+  characters are removed from the name, so two clients cannot look the same in the list. On macOS
+  and Linux the bridge talks only to a socket owned by your own user, as it does with the named
+  pipe on Windows.
 - The **AI** label marks only what came through MCP. An agent that has a terminal can write to the
   clipboard with ordinary system tools, and such an entry looks like your own copy.
 - The secrets filter is a heuristic: it knows common key formats and looks for random-looking

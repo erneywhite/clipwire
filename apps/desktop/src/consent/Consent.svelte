@@ -132,6 +132,15 @@
       {#if req.kind === 'client'}
         <h1 tabindex="-1" bind:this={safeFocus}>{t('«{client}» просит доступ к истории буфера', { client: req.client })}</h1>
         {#if req.client_version}<p class="mono muted">{t('версия {version}', { version: req.client_version })}</p>{/if}
+        {#if req.program_changed}
+          <p class="warn small" role="note">
+            {t('Под этим именем уже подключалась другая программа. Если вы не запускали новый ИИ-инструмент, откажите.')}
+          </p>
+          <p class="mono small program selectable">{t('Раньше: {program}', { program: req.previous ?? t('программа не определена') })}</p>
+          <p class="mono small program selectable">{t('Сейчас: {program}', { program: req.program ?? t('программа не определена') })}</p>
+        {:else}
+          <p class="mono small program selectable">{t('Программа: {program}', { program: req.program ?? t('программа не определена') })}</p>
+        {/if}
         <p>{t('Он сможет искать по истории и читать записи, которые разрешены в настройках. Прочитанное уходит в модель ИИ, обычно в облако.')}</p>
         {#if req.allow_write}
           <p class="muted">{t('С доступом на запись он сможет добавлять записи в историю и класть текст в буфер обмена.')}</p>
@@ -206,6 +215,10 @@
   }
   .small {
     font-size: var(--text-s);
+  }
+  .program {
+    margin: 0;
+    overflow-wrap: anywhere;
   }
   .mono {
     font-family: var(--font-mono);
