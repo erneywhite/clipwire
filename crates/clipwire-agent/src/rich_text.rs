@@ -37,7 +37,7 @@ pub fn html_to_text(html: &str) -> String {
         rest = &rest[gt + 1..];
         if !closing && matches!(name.as_str(), "script" | "style" | "head" | "title") {
             let close = format!("</{name}");
-            rest = match rest.to_ascii_lowercase().find(&close) {
+            rest = match find_ascii_ci(rest, &close) {
                 Some(i) => rest[i..].find('>').map_or("", |j| &rest[i + j + 1..]),
                 None => "",
             };
@@ -58,6 +58,18 @@ pub fn html_to_text(html: &str) -> String {
         .join("\n")
 }
 
+/// Первое вхождение `needle` (ASCII в нижнем регистре) в `hay` без учёта
+/// регистра, без копии остатка: на каждом `<script>` переводить в нижний
+/// регистр весь остаток — квадрат на длинном HTML с множеством тегов.
+/// Начало `needle` — ASCII, так что найденный индекс — граница символа.
+fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return Some(0);
+    }
+    h.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
+}
+
 /// Сущности HTML: основные именованные и числовые.
 fn decode_entities(s: &str) -> String {
     if !s.contains('&') {
@@ -68,8 +80,12 @@ fn decode_entities(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let decoded = rest[1..]
-            .find(';')
+        // `;` ищется только в первых байтах: имя сущности короткое, а поиск
+        // по всему остатку на каждом `&` дал бы квадрат на «&&&…».
+        let decoded = rest.as_bytes()[1..]
+            .iter()
+            .take(11)
+            .position(|&b| b == b';')
             .filter(|&e| e <= 10)
             .and_then(|e| entity(&rest[1..=e]).map(|c| (c, e + 2)));
         match decoded {
@@ -241,6 +257,35 @@ mod tests {
             "Логин admin\nПароль Tr0ub4dor&3\na <b> Ж A"
         );
         assert_eq!(html_to_text("просто & текст"), "просто & текст");
+    }
+
+    #[test]
+    fn html_closing_tag_any_case() {
+        assert_eq!(
+            html_to_text("a<SCRIPT>x</ScRiPt >б<Style>y</STYLE>в"),
+            "aбв"
+        );
+        assert_eq!(
+            html_to_text("&amp;&verylongname;&#1046;"),
+            "&&verylongname;Ж"
+        );
+    }
+
+    /// Много тегов-скриптов и `&` без `;` не дают квадратичной работы.
+    #[test]
+    fn html_adversarial_input_is_linear() {
+        let t0 = std::time::Instant::now();
+        let scripts = "<script></script>".repeat(30_000);
+        assert_eq!(html_to_text(&scripts), "");
+        let amps = "&".repeat(300_000);
+        assert_eq!(html_to_text(&amps).len(), amps.len());
+        let names = "&ammmmmmmmmmmmmmmmmmmmmmmmmmmmmmm".repeat(10_000);
+        assert_eq!(html_to_text(&names), names);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            t0.elapsed()
+        );
     }
 
     #[test]
