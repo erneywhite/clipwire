@@ -1,7 +1,8 @@
 <script lang="ts">
   // Предпросмотр одного файла: начало текста, PDF во встроенном просмотрщике
-  // WebView, видео и аудио с плеером. Файл читается через asset-протокол, доступ
-  // к нему Rust открывает только для файлов из истории и с подходящей сигнатурой.
+  // WebView, видео и аудио с плеером. Файл читается через протокол `cwfile`: Rust
+  // открывает его только для файлов из истории с подходящей сигнатурой и только
+  // пока файл открыт здесь, адрес — одноразовый токен.
   // Файл с другого устройства показывается так же, когда скачан (по пути в
   // кэше); пока не скачан — карточка с кнопкой «Скачать». Так же и свой файл,
   // который пропал с места, но есть на сервере. Файл больше порога и папка
@@ -35,7 +36,7 @@
   let failed = $state('')
   let mediaError = $state(false)
   let media: HTMLMediaElement | undefined = $state()
-  const src = $derived(convertFileSrc(path))
+  const src = $derived(info?.token ? convertFileSrc(info.token, 'cwfile') : '')
 
   // Открыли — сразу играет. Закрыли — сразу тишина: Chromium не глушит
   // плеер, убранный со страницы, он доигрывает, пока его не соберёт GC.
@@ -67,12 +68,24 @@
     mediaError = false
     // Не скачанный файл читать нечем: показывается карточка, а не ошибка.
     if (!ready) return
+    let token: string | null = null
+    let gone = false
     api
       .filePreview(want)
       .then((p) => {
-        if (want === path) info = p
+        token = p.token
+        // Ушли с файла раньше ответа — сразу закрываем открытое.
+        if (gone || want !== path) {
+          if (token) api.filePreviewClose(token).catch(() => {})
+          return
+        }
+        info = p
       })
       .catch((e) => (failed = String(e)))
+    return () => {
+      gone = true
+      if (token) api.filePreviewClose(token).catch(() => {})
+    }
   })
 </script>
 
