@@ -483,6 +483,11 @@ mod tests {
             Some(Rotation::Rekeyed(vec![9u8; 100]))
         );
         assert_eq!(s.rotation(&g, &x).unwrap(), Some(Rotation::Excluded));
+        // Relay: отправитель в новой группе, `d` ждёт пакет — участники;
+        // исключённый `x` — нет (в relay он только гость).
+        assert!(s.is_relay_member(&r).unwrap());
+        assert!(s.is_relay_member(&d).unwrap());
+        assert!(!s.is_relay_member(&x).unwrap());
         assert_eq!(s.rotation(&g2, &d).unwrap(), None);
         // Повторная смена — отказ; карточка в старую группу больше не пишется.
         assert!(refused(s.rekey(&g, &r, &g2, &env, 60, &LIMITS).unwrap()));
