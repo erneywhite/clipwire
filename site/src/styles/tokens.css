@@ -29,6 +29,11 @@
   --c-on-wire: #1c1e22;
   --c-ok: #5fbf86;
   --c-local: #4a9be0;
+  /* Метка ИИ как в программе (apps/desktop/src/styles/tokens.css, lib/aiBrand.ts):
+   * фирменный цвет Claude и фиолетовый для незнакомых клиентов. */
+  --c-claude: #d97757;
+  --c-ai: #b89af2;
+  --c-ai-soft: #302a3d;
   --c-danger: #e0675f;
   --c-danger-soft: rgb(224 103 95 / 0.14);
 

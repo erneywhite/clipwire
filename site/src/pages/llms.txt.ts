@@ -23,6 +23,7 @@ Clipwire is a free, open-source (AGPL-3.0) shared clipboard for desktop computer
 - Paste window next to the mouse cursor with search, pins, previews and an image editor.
 - Exclusions by file extension, name, mask or size; honours .gitignore in copied folders; password managers excluded by default.
 - Can import history from Paste (macOS).
+- AI tools over MCP (since 0.10.0): Claude Code, Codex, Cursor, Claude Desktop, VS Code and other MCP clients can search the clipboard history and, if the user allows, save text to it. Off by default; the user chooses entry kinds and how many days of history the AI sees; entries that look like passwords and keys are hidden; new clients and clipboard writes need the user's consent; every request goes to an access log. The MCP server is the Clipwire executable itself started with --mcp.
 - Alternative to Apple Universal Clipboard and Paste that works across Windows, macOS and Linux.
 
 ## Links
