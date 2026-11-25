@@ -160,7 +160,7 @@ pub fn sanitize_name(name: &str) -> String {
 /// текста, нулевой ширины и т. п. В имени файла они прячут настоящее
 /// расширение: «отчёт\u{202E}fdp.exe» выглядит как «отчётexe.pdf».
 /// Список — все символы Cf по Unicode 16.
-fn is_format_char(c: char) -> bool {
+pub fn is_format_char(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'

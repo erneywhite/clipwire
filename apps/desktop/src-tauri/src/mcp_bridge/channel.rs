@@ -224,7 +224,28 @@ async fn connect_inner(endpoint: &str) -> std::io::Result<Box<dyn Stream>> {
 #[cfg(unix)]
 async fn connect_inner(endpoint: &str) -> std::io::Result<Box<dyn Stream>> {
     let s = tokio::net::UnixStream::connect(endpoint).await?;
+    // Как с каналом Windows: путь из файла адреса мог устареть или быть
+    // подменён, и сокет по нему слушает другой пользователь. Запросы и имя
+    // ИИ-клиента отдаём только процессу своего пользователя.
+    check_peer_is_current_user(&s)?;
     Ok(Box::new(s))
+}
+
+/// Сервер сокета работает от того же пользователя, что и мост
+/// (`SO_PEERCRED` на Linux, `getpeereid` на macOS — через tokio).
+#[cfg(unix)]
+fn check_peer_is_current_user(s: &tokio::net::UnixStream) -> std::io::Result<()> {
+    let peer = s.peer_cred()?.uid();
+    // SAFETY: geteuid без аргументов и не может завершиться ошибкой.
+    let me = unsafe { libc::geteuid() };
+    if peer == me {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("the socket belongs to another user (uid {peer})"),
+        ))
+    }
 }
 
 /// Сбой обмена и успел ли запрос уйти в канал целиком.
@@ -542,5 +563,24 @@ mod tests {
             ),
             "AI access is turned off in Clipwire settings → AI tools."
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    /// Сокет своего пользователя проверку проходит. Сокет чужого uid без
+    /// root в тесте не создать, отказ здесь не проверяется.
+    #[tokio::test]
+    async fn own_socket_passes_peer_check() {
+        let path = PathBuf::from(format!("/tmp/cwmcp-peer-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let s = tokio::net::UnixStream::connect(&path).await.unwrap();
+        check_peer_is_current_user(&s).unwrap();
+        assert!(connect(path.to_str().unwrap()).await.is_ok());
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
     }
 }
