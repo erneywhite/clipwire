@@ -150,10 +150,16 @@ fn resolve_home(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Path
 
 async fn serve_stdio(home: PathBuf) -> anyhow::Result<()> {
     tracing::info!("мост MCP, каталог данных {}", home.display());
-    let service = Bridge::new(home)
-        .serve(rmcp::transport::stdio())
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP initialize: {e}"))?;
+    let service = match Bridge::new(home).serve(rmcp::transport::stdio()).await {
+        Ok(s) => s,
+        // Клиент закрыл stdin, не начав разговор: так делают проверки
+        // «сервер запускается?» (`claude mcp list` и подобные). Это не ошибка.
+        Err(rmcp::service::ServerInitializeError::ConnectionClosed(_)) => {
+            tracing::info!("клиент закрыл соединение до initialize");
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow::anyhow!("MCP initialize: {e}")),
+    };
     service.waiting().await?;
     Ok(())
 }

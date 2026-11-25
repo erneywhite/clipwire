@@ -19,6 +19,11 @@ mod updates;
 
 use std::sync::{Arc, Mutex};
 
+// Одна копия программы — только в выпуске (см. `run`): отладочная сборка
+// живёт рядом с установленной. Чтобы cargo не считал зависимость лишней.
+#[cfg(debug_assertions)]
+use tauri_plugin_single_instance as _;
+
 use clipwire_agent::history::{History, now_ms};
 use clipwire_agent::service::{Service, UiEvent};
 use clipwire_agent::settings::Settings;
@@ -614,6 +619,15 @@ pub fn run() {
     if popup::use_xwayland() {
         // SAFETY: начало main, других потоков ещё нет.
         unsafe { std::env::set_var("GDK_BACKEND", "x11") };
+    }
+    // WebKitGTK с отрисовкой через DMA-BUF на части видеокарт (VirtualBox,
+    // VMware, NVIDIA) показывает пустое окно: окно есть, содержимого нет.
+    // Без DMA-BUF рисует через общую память — чуть медленнее, для нашего
+    // интерфейса незаметно. Своё значение пользователя не трогаем.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        // SAFETY: начало main, других потоков ещё нет.
+        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
     }
     // Linux: секреты под ключом из Secret Service (gnome-keyring, KWallet).
     // Подписи, как на маке, тут нет, поэтому и у `tauri dev` тоже.
