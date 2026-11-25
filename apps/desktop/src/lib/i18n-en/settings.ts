@@ -403,5 +403,11 @@ const en: Record<string, string> = {
   "Выключенное остаётся в истории этого устройства, но на другие не уходит. Если среди скопированного есть выключенное, например папка рядом с файлами, не отправляется ничего.": "Turned-off items stay in this device's history but aren't sent to others. If a copy includes something turned off, such as a folder next to files, nothing is sent.",
   "Звук при вставке": "Paste sound",
   "Другой щелчок, пониже, когда вставляете запись из окна Clipwire.": "A different, lower click when you paste an entry from the Clipwire window.",
+  "Сменить ключ администратора сервера": "Change the server admin key",
+  "Если у удалённого устройства был код сервера администратора, он и дальше даёт ему управлять сервером: удалять группы, менять токен доступа и настройки, выдавать коды создания группы. Новый ключ сохранится на этом устройстве, новый код сервера появится здесь, на других устройствах администратора его нужно будет ввести заново.": "If the removed device had the server admin code, it can still manage the server with it: delete groups, change the access token and settings, issue group creation codes. The new key is saved on this device and the new server code appears here; enter it again on your other admin devices.",
+  "Внимание: если у удалённого устройства был ключ администратора сервера, он у него остался, и с ним можно удалять группы, менять токен доступа и настройки сервера. Попросите администратора сервера сменить ключ администратора и токен доступа.": "Warning: if the removed device had the server admin key, it still has it and can delete groups and change the access token and server settings. Ask the server administrator to change the admin key and the access token.",
+  "Нет связи с сервером": "No connection to the server",
+  "Устройство удалено, но ключ администратора сервера не сменился: {e}. Смените его в разделе «Сервер».": "The device was removed, but the server admin key was not changed: {e}. Change it in the Server section.",
+  "Меняю ключ администратора сервера…": "Changing the server admin key…",
 }
 export default en

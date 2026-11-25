@@ -336,7 +336,12 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 // IPv4-совместимые ::a.b.c.d (устарели) и прочее в ::/96
                 || s[..6] == [0, 0, 0, 0, 0, 0]
                 // документация 2001:db8::/32
-                || (s[0] == 0x2001 && s[1] == 0x0db8))
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                // Teredo 2001::/32: туннель, адрес внутри не проверить
+                || (s[0] == 0x2001 && s[1] == 0)
+                // NAT64 для локальных сетей 64:ff9b:1::/48 (RFC 8215): за
+                // ним может стоять любой IPv4, в том числе частный
+                || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1))
         }
     }
 }
@@ -618,7 +623,13 @@ fn decode_entities(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let Some(end) = rest[..rest.len().min(12)].find(';') else {
+        // Ищем по байтам: срез строки по 12-му байту мог прийтись на середину
+        // буквы («R&D отдел») и уронить разбор. `;` — ASCII, так что `end`
+        // всегда на границе символа.
+        let Some(end) = rest.as_bytes()[..rest.len().min(12)]
+            .iter()
+            .position(|&b| b == b';')
+        else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -776,6 +787,11 @@ mod tests {
             "http://[::ffff:192.168.0.1]/",
             "http://[64:ff9b::a00:1]/",
             "http://[2002:c0a8:101::1]/",
+            // NAT64 для локальных сетей и Teredo: внутри может быть что угодно.
+            "http://[64:ff9b:1::a00:1]/",
+            "http://[64:ff9b:1:ffff::1]/",
+            "http://[2001::1]/",
+            "http://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/",
             "ftp://example.com/",
         ] {
             assert!(check_target(&u(s)).is_err(), "{s}");
@@ -786,6 +802,9 @@ mod tests {
             "http://100.128.0.1/",
             "http://172.32.0.1/",
             "http://[2606:4700::1111]/",
+            // Соседи исключённых диапазонов остаются публичными.
+            "http://[2001:4860:4860::8888]/",
+            "http://[64:ff9b:2::1]/",
             "http://localhost.example.com/",
         ] {
             assert!(check_target(&u(s)).is_ok(), "{s}");
@@ -885,6 +904,18 @@ mod tests {
         assert_eq!(m.description.as_deref(), Some("Описание без og"));
         assert_eq!(m.image.as_deref(), Some("/img/card.png"));
         assert_eq!(m.site.as_deref(), Some("GitHub"));
+    }
+
+    /// `&` без `;` перед многобайтной буквой: срез по 12-му байту попадал в
+    /// середину буквы, и разбор падал.
+    #[test]
+    fn ampersand_before_multibyte_text_does_not_panic() {
+        assert_eq!(decode_entities("R&D отдел"), "R&D отдел");
+        assert_eq!(decode_entities("&ёёёёёё;"), "&ёёёёёё;");
+        assert_eq!(decode_entities("a&b€€€€ &amp; c"), "a&b€€€€ & c");
+        assert_eq!(decode_entities("Т&amp;Д"), "Т&Д");
+        let m = parse_meta(r#"<meta property="og:title" content="R&D отдел">"#);
+        assert_eq!(m.title.as_deref(), Some("R&D отдел"));
     }
 
     #[test]
