@@ -219,7 +219,9 @@ uploaded a few minutes later by the devices that have them on disk or in the cac
 ends up without its file for another reason (the server lost it, an upload failed), a device that
 has the file repairs it the same way. Clipwire 0.7 apps keep the old location after such a
 repair and report the file as missing until they are updated. One run of the app repairs at
-most 1 GiB and 50 files; if pins hold more, the rest is repaired after the next start.
+most 1 GiB and 50 files; if pins hold more, the rest is repaired after the next start. A file
+that never left your device (copied while sync was paused, its kind is off in "What to send",
+or it matches a "Don't send" rule) is not uploaded by someone else's pin.
 
 Known rough edges. A file over the limit that was uploaded for a pin is deleted from the server
 right after the pin is removed, while the entry keeps its new location without direct transfer:

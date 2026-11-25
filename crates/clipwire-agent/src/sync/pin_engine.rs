@@ -1234,11 +1234,13 @@ impl Engine {
                         };
                         // Здесь содержимого закрепа нет, только своя запись:
                         // у своей — её файлы и есть «содержимое».
+                        let share = own && s.may_send_own(&item.content);
                         pin_files::repair_picks(
                             files,
                             own.then_some(files.as_slice()),
                             |x| held.contains(&x) && !missing.contains(&x),
                             limit_mb,
+                            share,
                             &files_dir,
                         )
                         .is_some_and(|(_, picks)| !picks.is_empty())
@@ -1269,7 +1271,8 @@ impl Engine {
     /// Содержимому с сервера доверяем только в том, где лежат файлы: у своей
     /// записи пути, имена и время берутся из истории (`pin_files::trusted_files`),
     /// свои файлы заливаются только с согласия владельца
-    /// (`pin_files::may_repair_own`), чужие пути не трогаются вовсе. Всё —
+    /// (`pin_files::may_repair_own`: уже были в группе или их можно отправить
+    /// сейчас по настройкам), чужие пути не трогаются вовсе. Всё —
     /// в пределах бюджета починки на запуск.
     async fn pin_repair(
         &mut self,
@@ -1312,18 +1315,20 @@ impl Engine {
         let plan = self
             .src(move |s| {
                 let limit_mb = s.upload_limit_mb();
-                let local = s
-                    .file_item(&hash)
-                    .filter(|(_, own)| *own)
-                    .and_then(|(i, _)| match i.content {
-                        Content::Files(f) => Some(f),
-                        _ => None,
-                    });
+                let own = s.file_item(&hash).filter(|(_, own)| *own);
+                let share = own
+                    .as_ref()
+                    .is_some_and(|(i, _)| s.may_send_own(&i.content));
+                let local = own.and_then(|(i, _)| match i.content {
+                    Content::Files(f) => Some(f),
+                    _ => None,
+                });
                 let plan = pin_files::repair_picks(
                     &remote_files,
                     local.as_deref(),
                     |x| held.contains(&x) && !missing.contains(&x),
                     limit_mb,
+                    share,
                     &files_dir,
                 );
                 plan.map(|p| (p, local))
