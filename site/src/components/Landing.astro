@@ -451,8 +451,8 @@ const sceneData = JSON.stringify({
           <a class="link-arrow" href={t.ai.guideHref}>{t.ai.guide}<Fragment set:html={svg('arrow')} /></a>
         </div>
 
-        <div class="ai-scene" data-ai aria-hidden="true">
-          <div class="ai-ask">
+        <div class="ai-scene" data-ai>
+          <div class="ai-ask" aria-hidden="true">
             <span class="ai-client" style="--brand: var(--c-claude)">{t.ai.client}</span>
             <div class="ai-says">
               <p class="ai-say on" data-ai-say="1">{t.ai.ask1}</p>
@@ -461,7 +461,7 @@ const sceneData = JSON.stringify({
             <p class="ai-ans" data-ai-ans>{t.ai.answer}</p>
           </div>
 
-          <div class="ai-mid">
+          <div class="ai-mid" aria-hidden="true">
             <div class="pw ai-pw">
               <div class="pw-search">
                 <Fragment set:html={svg('search')} />
@@ -526,12 +526,39 @@ const sceneData = JSON.stringify({
           <div class="ai-log">
             <span class="dev-label">{t.ai.logTitle}</span>
             <ul data-ai-log>
-              {t.ai.log.map(([tool, res], i) => (
+              {t.ai.log.map((e) => (
                 <li>
-                  <span>{['10:42', '10:42', '10:43'][i]}</span>
-                  <span>{t.ai.client}</span>
-                  <span>{tool}</span>
-                  <span class="ai-res">{res}</span>
+                  <div class="log-row">
+                    <span class="log-at">{e.at}</span>
+                    <span class="log-main">
+                      <span class="log-what">
+                        <span class="log-client">{t.ai.client}</span> {e.tool}
+                      </span>
+                      {e.query && <span class="log-query">{e.query}</span>}
+                    </span>
+                    {e.items.length ? (
+                      <button
+                        type="button"
+                        class="log-res"
+                        aria-expanded="false"
+                        data-log-toggle
+                        data-show={t.ai.showItems}
+                        data-hide={t.ai.hideItems}
+                        title={t.ai.showItems}
+                      >
+                        {e.res} <span class="log-arrow" aria-hidden="true">▾</span>
+                      </button>
+                    ) : (
+                      <span class="log-res">{e.res}</span>
+                    )}
+                  </div>
+                  {e.items.length > 0 && (
+                    <ul class="log-items" hidden>
+                      {e.items.map((it) => (
+                        <li>{it}</li>
+                      ))}
+                    </ul>
+                  )}
                 </li>
               ))}
             </ul>

@@ -698,7 +698,7 @@ function aiScene(still: boolean) {
   const list = $('[data-ai-list]', root);
   const c1 = $('[data-consent="1"]', root);
   const c2 = $('[data-consent="2"]', root);
-  const logRows = $$('[data-ai-log] li', root);
+  const logRows = $$('[data-ai-log] > li', root);
   const tpl = $<HTMLTemplateElement>('[data-ai-new]', root);
   const query = 'select';
   const press = (c: HTMLElement) => $('[data-press]', c);
@@ -707,7 +707,14 @@ function aiScene(still: boolean) {
     list.querySelector('.ai-new')?.remove();
     list.prepend(tpl.content.firstElementChild!.cloneNode(true));
   };
+  const collapse = () =>
+    $$<HTMLButtonElement>('[data-log-toggle]', root).forEach((b) => {
+      b.setAttribute('aria-expanded', 'false');
+      b.title = b.dataset.show!;
+      (b.closest('li')!.querySelector('.log-items') as HTMLElement).hidden = true;
+    });
   const reset = () => {
+    collapse();
     list.querySelector('.ai-new')?.remove();
     list.classList.remove('searching');
     say1.classList.add('on');
@@ -765,10 +772,37 @@ function aiScene(still: boolean) {
     })
     .to(logRows[2], { autoAlpha: 1, y: 0, duration: 0.35 }, '<0.1')
     .to({}, { duration: 3 });
+  // Результат в журнале раскрывает, какие записи получил ИИ, как в программе.
+  // Пока что-то раскрыто, сцена стоит: иначе следующий круг спрячет журнал.
+  let visible = false;
+  $$<HTMLButtonElement>('[data-log-toggle]', root).forEach((b) =>
+    b.addEventListener('click', () => {
+      const items = b.closest('li')!.querySelector('.log-items') as HTMLElement;
+      const open = b.getAttribute('aria-expanded') !== 'true';
+      b.setAttribute('aria-expanded', String(open));
+      b.title = open ? b.dataset.hide! : b.dataset.show!;
+      items.hidden = !open;
+      if (open) gsap.fromTo(items, { height: 0, autoAlpha: 0 }, { height: 'auto', autoAlpha: 1, duration: 0.3, ease: 'power3.out', clearProps: 'height' });
+      const anyOpen = $$('[data-log-toggle][aria-expanded="true"]', root).length > 0;
+      if (anyOpen) tl.pause();
+      else if (visible) tl.resume();
+    }),
+  );
+
   // Запрос печатается по буквам.
   for (let i = 1; i <= query.length; i++) tl.call(() => (q.textContent = query.slice(0, i)), undefined, `type+=${(i * 0.1).toFixed(2)}`);
   aiTl = tl;
-  ScrollTrigger.create({ trigger: root, start: 'top 90%', end: 'bottom 10%', onToggle: (s) => (s.isActive ? tl.play() : tl.pause()) });
+  ScrollTrigger.create({
+    trigger: root,
+    start: 'top 90%',
+    end: 'bottom 10%',
+    onToggle: (s) => {
+      visible = s.isActive;
+      const anyOpen = $$('[data-log-toggle][aria-expanded="true"]', root).length > 0;
+      if (s.isActive && !anyOpen) tl.play();
+      else tl.pause();
+    },
+  });
 }
 let aiTl: gsap.core.Timeline | null = null;
 

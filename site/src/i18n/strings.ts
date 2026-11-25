@@ -225,10 +225,12 @@ const en = {
     imagesOff: 'images are off for AI',
     logTitle: 'Access log',
     log: [
-      ['search_clipboard', '1 found'],
-      ['get_clipboard_item', 'ok'],
-      ['copy_to_clipboard', 'accepted'],
-    ] as [string, string][],
+      { at: '10:42', tool: 'search_clipboard', query: 'select', res: '1 found', items: ["SELECT id, total FROM orders WHERE paid_at > now() - interval '1 day'"] },
+      { at: '10:42', tool: 'get_clipboard_item', query: '', res: 'ok', items: ["SELECT id, total FROM orders WHERE paid_at > now() - interval '1 day'"] },
+      { at: '10:43', tool: 'copy_to_clipboard', query: 'docker compose logs -f clipwire', res: 'accepted', items: [] },
+    ] as { at: string; tool: string; query: string; res: string; items: string[] }[],
+    showItems: 'Show which entries the AI received',
+    hideItems: 'Hide entries',
     newMeta: 'work-pc · now · 31 chars',
     rows: [
       { kind: 'text', text: 'Thanks! I will send the slides before lunch.', meta: 'work-pc · Teams · 2 h', flag: '' },
@@ -614,10 +616,12 @@ const ru: Strings = {
     imagesOff: 'картинки для ИИ выключены',
     logTitle: 'Журнал обращений',
     log: [
-      ['search_clipboard', 'найдена 1'],
-      ['get_clipboard_item', 'ок'],
-      ['copy_to_clipboard', 'принято'],
+      { at: '10:42', tool: 'search_clipboard', query: 'select', res: 'найдена 1', items: ["SELECT id, total FROM orders WHERE paid_at > now() - interval '1 day'"] },
+      { at: '10:42', tool: 'get_clipboard_item', query: '', res: 'ок', items: ["SELECT id, total FROM orders WHERE paid_at > now() - interval '1 day'"] },
+      { at: '10:43', tool: 'copy_to_clipboard', query: 'docker compose logs -f clipwire', res: 'принято', items: [] },
     ],
+    showItems: 'Показать, какие записи получил ИИ',
+    hideItems: 'Скрыть записи',
     newMeta: 'work-pc · сейчас · 31 симв.',
     rows: [
       { kind: 'text', text: 'Спасибо! Слайды пришлю до обеда.', meta: 'work-pc · Teams · 2 ч', flag: '' },
