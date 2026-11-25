@@ -68,8 +68,15 @@ const HKEY_LABEL: &[u8] = b"clipwire/history/hkey/v1";
 const ICON_LABEL: &[u8] = b"clipwire/history/icon/v1";
 /// Метка ключа журнала обращений ИИ (таблица `ai_log`) и её AAD.
 const AI_LOG_LABEL: &[u8] = b"clipwire/history/ai-log/v1";
-/// Сколько последних обращений ИИ хранит журнал.
-pub const AI_LOG_KEEP: usize = 1000;
+/// Сколько последних строк журнала обращений ИИ, выдавших данные (поиск с
+/// результатом, запись, закрепы), хранится.
+pub const AI_LOG_KEEP_READS: usize = 1000;
+/// Сколько последних остальных строк журнала (отказы, статус, ошибки)
+/// хранится. Свой предел у каждой части: поток отказов от чужой программы не
+/// вытеснит строки о том, что ИИ на самом деле прочитал.
+pub const AI_LOG_KEEP_OTHER: usize = 500;
+/// Сколько строк журнала обращений ИИ бывает всего.
+pub const AI_LOG_KEEP: usize = AI_LOG_KEEP_READS + AI_LOG_KEEP_OTHER;
 /// Метка ключа истории для пометки нечитаемых строк (`cards.broken`).
 const KEYCHECK_LABEL: &[u8] = b"clipwire/history/keycheck/v1";
 
@@ -604,6 +611,85 @@ pub struct AiLogEntry {
     pub ids: Vec<String>,
     /// Итог коротко: «5 записей», «скрыто», «отказано»…
     pub result: String,
+    /// Программа клиента (путь), если её удалось узнать.
+    #[serde(default)]
+    pub program: Option<String>,
+    /// Сколько одинаковых обращений подряд собрано в эту строку; `at_ms` —
+    /// время последнего.
+    #[serde(default = "one")]
+    pub count: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
+/// Строка журнала до 0.10.2: без программы и счётчика. postcard не знает
+/// имён полей и не подставляет значения по умолчанию, поэтому старые строки
+/// разбираются этой структурой.
+#[derive(Deserialize)]
+struct AiLogEntryV1 {
+    at_ms: i64,
+    client: String,
+    tool: String,
+    query: Option<String>,
+    ids: Vec<String>,
+    result: String,
+}
+
+impl AiLogEntry {
+    /// То же обращение, что `other`: всё, кроме времени и счётчика.
+    pub fn same_event(&self, other: &AiLogEntry) -> bool {
+        self.client == other.client
+            && self.program == other.program
+            && self.tool == other.tool
+            && self.query == other.query
+            && self.ids == other.ids
+            && self.result == other.result
+    }
+
+    /// Строка из postcard: новая раскладка или раскладка до 0.10.2.
+    fn decode(plain: &[u8]) -> Option<Self> {
+        if let Ok(e) = postcard::from_bytes::<AiLogEntry>(plain) {
+            return Some(e);
+        }
+        let v1 = postcard::from_bytes::<AiLogEntryV1>(plain).ok()?;
+        Some(Self {
+            at_ms: v1.at_ms,
+            client: v1.client,
+            tool: v1.tool,
+            query: v1.query,
+            ids: v1.ids,
+            result: v1.result,
+            program: None,
+            count: 1,
+        })
+    }
+}
+
+/// Часть журнала обращений ИИ со своим пределом строк.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiLogBudget {
+    /// Обращение выдало данные из истории ([`AI_LOG_KEEP_READS`]).
+    Reads,
+    /// Всё остальное ([`AI_LOG_KEEP_OTHER`]).
+    Other,
+}
+
+impl AiLogBudget {
+    fn keep(self) -> usize {
+        match self {
+            Self::Reads => AI_LOG_KEEP_READS,
+            Self::Other => AI_LOG_KEEP_OTHER,
+        }
+    }
+
+    fn sql(self) -> i64 {
+        match self {
+            Self::Reads => 1,
+            Self::Other => 0,
+        }
+    }
 }
 
 /// Значок PNG; `None` — в базе его нет.
@@ -1045,6 +1131,7 @@ impl History {
             tracing::warn!("история от более новой версии Clipwire (схема {version})");
         }
         conn.execute_batch(CREATE_REST)?;
+        ai_log_columns(&conn);
         let h = Self::bare(conn, &key, path);
         h.reconcile();
         Ok(h)
@@ -2632,9 +2719,8 @@ impl History {
         XChaCha20Poly1305::new_from_slice(&self.ai_log_key).expect("ключ 32 байта")
     }
 
-    /// Добавить строку в журнал обращений ИИ. Хранятся последние
-    /// [`AI_LOG_KEEP`] строк. Очистка истории журнал не трогает.
-    pub fn ai_log_add(&mut self, entry: &AiLogEntry) -> Result<()> {
+    /// Зашифровать строку журнала: в `data` — nonce и шифротекст подряд.
+    fn ai_log_seal(&self, entry: &AiLogEntry) -> Result<Vec<u8>> {
         let plain = postcard::to_stdvec(entry)?;
         let mut nonce = [0u8; 24];
         getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("нет случайных байтов: {e}"))?;
@@ -2648,19 +2734,59 @@ impl History {
                 },
             )
             .map_err(|_| anyhow::anyhow!("не удалось зашифровать"))?;
-        // В `data` — nonce и шифротекст подряд.
         let mut data = nonce.to_vec();
         data.extend_from_slice(&sealed);
+        Ok(data)
+    }
+
+    /// Добавить строку в журнал обращений ИИ. То же обращение, что последняя
+    /// строка журнала ([`AiLogEntry::same_event`], та же часть), не добавляет
+    /// строку, а увеличивает её счётчик. В каждой части хранятся последние
+    /// строки до её предела ([`AiLogBudget`]). Очистка истории журнал не
+    /// трогает.
+    pub fn ai_log_add(&mut self, entry: &AiLogEntry, budget: AiLogBudget) -> Result<()> {
         let tx = self.tx()?;
-        self.conn.execute(
-            "INSERT INTO ai_log (at_ms, data) VALUES (?1, ?2)",
-            rusqlite::params![entry.at_ms, data],
-        )?;
-        self.conn.execute(
-            "DELETE FROM ai_log WHERE id NOT IN
-                 (SELECT id FROM ai_log ORDER BY id DESC LIMIT ?1)",
-            [sql_limit(AI_LOG_KEEP)],
-        )?;
+        let last = self
+            .conn
+            .query_row(
+                "SELECT id, data, reads FROM ai_log ORDER BY id DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let cipher = self.ai_log_cipher();
+        let prev = last.and_then(|(id, data, reads)| {
+            let e = ai_log_open(&cipher, &data)?;
+            (reads == budget.sql() && e.same_event(entry)).then_some((id, e))
+        });
+        if let Some((id, prev)) = prev {
+            let merged = AiLogEntry {
+                count: prev.count.saturating_add(entry.count.max(1)),
+                ..entry.clone()
+            };
+            let data = self.ai_log_seal(&merged)?;
+            self.conn.execute(
+                "UPDATE ai_log SET at_ms = ?1, data = ?2 WHERE id = ?3",
+                rusqlite::params![merged.at_ms, data, id],
+            )?;
+        } else {
+            let data = self.ai_log_seal(entry)?;
+            self.conn.execute(
+                "INSERT INTO ai_log (at_ms, data, reads) VALUES (?1, ?2, ?3)",
+                rusqlite::params![entry.at_ms, data, budget.sql()],
+            )?;
+            self.conn.execute(
+                "DELETE FROM ai_log WHERE reads = ?1 AND id NOT IN
+                     (SELECT id FROM ai_log WHERE reads = ?1 ORDER BY id DESC LIMIT ?2)",
+                rusqlite::params![budget.sql(), sql_limit(budget.keep())],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2676,22 +2802,7 @@ impl History {
             let mut rows = st.query([sql_limit(limit)])?;
             let mut out = Vec::new();
             while let Some(r) = rows.next()? {
-                let data = r.get_ref(0)?.as_blob()?;
-                if data.len() < 24 {
-                    continue;
-                }
-                let (nonce, ct) = data.split_at(24);
-                let nonce: [u8; 24] = nonce.try_into().expect("24 байта");
-                let Ok(plain) = cipher.decrypt(
-                    &XNonce::from(nonce),
-                    Payload {
-                        msg: ct,
-                        aad: AI_LOG_LABEL,
-                    },
-                ) else {
-                    continue;
-                };
-                if let Ok(e) = postcard::from_bytes::<AiLogEntry>(&plain) {
+                if let Some(e) = ai_log_open(&cipher, r.get_ref(0)?.as_blob()?) {
                     out.push(e);
                 }
             }
@@ -2739,6 +2850,40 @@ impl History {
             false
         });
         (blobs, paths)
+    }
+}
+
+/// Расшифровать строку журнала обращений ИИ (`None` — другой ключ, мусор).
+fn ai_log_open(cipher: &XChaCha20Poly1305, data: &[u8]) -> Option<AiLogEntry> {
+    if data.len() < 24 {
+        return None;
+    }
+    let (nonce, ct) = data.split_at(24);
+    let nonce: [u8; 24] = nonce.try_into().expect("24 байта");
+    let plain = cipher
+        .decrypt(
+            &XNonce::from(nonce),
+            Payload {
+                msg: ct,
+                aad: AI_LOG_LABEL,
+            },
+        )
+        .ok()?;
+    AiLogEntry::decode(&plain)
+}
+
+/// Колонка `reads` журнала обращений ИИ (часть журнала, [`AiLogBudget`]),
+/// если её нет: база до 0.10.2. Старые строки попадают в «остальные». Не
+/// вышло (база только для чтения) — журнал не пишется, история работает.
+fn ai_log_columns(conn: &Connection) {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('ai_log') WHERE name = 'reads'")
+        .and_then(|mut st| st.exists([]));
+    if let Ok(false) = has
+        && let Err(e) =
+            conn.execute_batch("ALTER TABLE ai_log ADD COLUMN reads INTEGER NOT NULL DEFAULT 0")
+    {
+        tracing::warn!("журнал обращений ИИ не обновился: {e:#}");
     }
 }
 
@@ -4572,13 +4717,15 @@ mod tests {
             query: Some(format!("секретный запрос {i}")),
             ids: vec![format!("id{i}")],
             result: "1 запись".into(),
+            program: None,
+            count: 1,
         };
-        for i in 0..(AI_LOG_KEEP as i64 + 5) {
-            h.ai_log_add(&row(i)).unwrap();
+        for i in 0..(AI_LOG_KEEP_READS as i64 + 5) {
+            h.ai_log_add(&row(i), AiLogBudget::Reads).unwrap();
         }
         let all = h.ai_log_list(usize::MAX);
-        assert_eq!(all.len(), AI_LOG_KEEP);
-        assert_eq!(all[0], row(AI_LOG_KEEP as i64 + 4), "новые первыми");
+        assert_eq!(all.len(), AI_LOG_KEEP_READS);
+        assert_eq!(all[0], row(AI_LOG_KEEP_READS as i64 + 4), "новые первыми");
         assert_eq!(h.ai_log_list(3).len(), 3);
         // Очистка истории журнал не трогает.
         text(&mut h, "x", 1);
@@ -4593,6 +4740,116 @@ mod tests {
         assert_eq!(h.ai_log_list(1)[0].client, "claude-code");
         h.ai_log_clear().unwrap();
         assert!(h.ai_log_list(10).is_empty());
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn ai_row(at: i64, client: &str, result: &str) -> AiLogEntry {
+        AiLogEntry {
+            at_ms: at,
+            client: client.into(),
+            tool: "connect".into(),
+            query: None,
+            ids: Vec::new(),
+            result: result.into(),
+            program: Some("/usr/bin/claude".into()),
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn ai_log_collapses_repeats_and_keeps_reads_apart() {
+        let mut h = History::in_memory();
+        // Одинаковые обращения подряд — одна строка со счётчиком и временем
+        // последнего.
+        for i in 0..5 {
+            h.ai_log_add(&ai_row(i, "x", "отказано"), AiLogBudget::Other)
+                .unwrap();
+        }
+        let log = h.ai_log_list(10);
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].count, log[0].at_ms), (5, 4));
+        // Другой итог, программа или часть журнала — новая строка.
+        h.ai_log_add(&ai_row(5, "x", "доступ выключен"), AiLogBudget::Other)
+            .unwrap();
+        let mut other_program = ai_row(6, "x", "доступ выключен");
+        other_program.program = None;
+        h.ai_log_add(&other_program, AiLogBudget::Other).unwrap();
+        h.ai_log_add(&other_program, AiLogBudget::Reads).unwrap();
+        let counts: Vec<u32> = h.ai_log_list(10).iter().map(|e| e.count).collect();
+        assert_eq!(counts, [1, 1, 1, 5]);
+
+        // Поток разных отказов вытесняет только «остальные» строки: строки
+        // с выданными данными остаются.
+        let mut read = ai_row(10, "claude", "записей: 3");
+        read.tool = "search_clipboard".into();
+        read.ids = vec!["a".into(), "b".into(), "c".into()];
+        h.ai_log_add(&read, AiLogBudget::Reads).unwrap();
+        for i in 0..(AI_LOG_KEEP_OTHER as i64 * 3) {
+            h.ai_log_add(
+                &ai_row(100 + i, &format!("spam{i}"), "отказано"),
+                AiLogBudget::Other,
+            )
+            .unwrap();
+        }
+        let log = h.ai_log_list(usize::MAX);
+        assert_eq!(log.len(), AI_LOG_KEEP_OTHER + 2);
+        assert!(log.iter().any(|e| e == &read));
+        assert!(log.iter().any(|e| e == &other_program));
+    }
+
+    /// Строки журнала, записанные до 0.10.2 (без программы и счётчика),
+    /// читаются, и колонка `reads` добавляется к старой таблице.
+    #[test]
+    fn ai_log_reads_rows_and_table_from_before_counter() {
+        #[derive(Serialize)]
+        struct V1<'a> {
+            at_ms: i64,
+            client: &'a str,
+            tool: &'a str,
+            query: Option<&'a str>,
+            ids: Vec<&'a str>,
+            result: &'a str,
+        }
+        let plain = postcard::to_stdvec(&V1 {
+            at_ms: 7,
+            client: "codex",
+            tool: "get_clipboard_item",
+            query: None,
+            ids: vec!["id1"],
+            result: "выдано",
+        })
+        .unwrap();
+        let e = AiLogEntry::decode(&plain).unwrap();
+        assert_eq!((e.at_ms, e.count, e.program.as_deref()), (7, 1, None));
+        assert_eq!(e.ids, ["id1"]);
+        // Новая строка разбирается целиком.
+        let row = ai_row(1, "x", "y");
+        let again = AiLogEntry::decode(&postcard::to_stdvec(&row).unwrap()).unwrap();
+        assert_eq!(again, row);
+
+        // Таблица старой раскладки: колонка появляется при открытии, старая
+        // строка остаётся и читается.
+        let dir = tmp("ai-log-v1");
+        let h = History::open(&dir).unwrap();
+        let data = h.ai_log_seal(&row).unwrap();
+        h.conn
+            .execute_batch(
+                "DROP TABLE ai_log;
+                 CREATE TABLE ai_log (id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, data BLOB NOT NULL);",
+            )
+            .unwrap();
+        h.conn
+            .execute(
+                "INSERT INTO ai_log (at_ms, data) VALUES (1, ?1)",
+                rusqlite::params![data],
+            )
+            .unwrap();
+        drop(h);
+        let mut h = History::open(&dir).unwrap();
+        assert_eq!(h.ai_log_list(10), std::slice::from_ref(&row));
+        h.ai_log_add(&row, AiLogBudget::Other).unwrap();
+        assert_eq!(h.ai_log_list(10)[0].count, 2);
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
     }

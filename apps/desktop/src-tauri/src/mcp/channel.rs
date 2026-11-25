@@ -119,16 +119,17 @@ impl Bound {
         &self.endpoint
     }
 
-    /// Принимать соединения и обслуживать каждое своей задачей. Не
-    /// возвращается, пока канал работает; остановка этой задачи закрывает и
-    /// все соединения (как выход приложения).
-    pub async fn run<S: Session>(mut self, make: impl Fn() -> S + Send + 'static) {
+    /// Принимать соединения и обслуживать каждое своей задачей. `make`
+    /// получает номер процесса на том конце (`None` — система не сказала).
+    /// Не возвращается, пока канал работает; остановка этой задачи закрывает
+    /// и все соединения (как выход приложения).
+    pub async fn run<S: Session>(mut self, make: impl Fn(Option<u32>) -> S + Send + 'static) {
         let mut conns = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 accepted = self.inner.accept() => match accepted {
                     Ok(conn) => {
-                        let s = make();
+                        let s = make(imp::peer_pid(&conn));
                         conns.spawn(async move { serve(conn, s).await });
                     }
                     Err(e) => {
@@ -196,7 +197,7 @@ mod imp {
         EqualSid, GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
         TOKEN_USER, TokenUser,
     };
-    use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
     use windows::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -320,6 +321,15 @@ mod imp {
             let b = &*(mine.as_ptr() as *const TOKEN_USER);
             EqualSid(a.User.Sid, b.User.Sid).is_ok()
         }
+    }
+
+    /// Процесс, который подключился к экземпляру канала.
+    pub fn peer_pid(pipe: &NamedPipeServer) -> Option<u32> {
+        use std::os::windows::io::AsRawHandle;
+        let mut pid = 0u32;
+        // SAFETY: `pipe` — подключённый серверный экземпляр канала.
+        unsafe { GetNamedPipeClientProcessId(HANDLE(pipe.as_raw_handle()), &mut pid) }.ok()?;
+        (pid != 0).then_some(pid)
     }
 
     /// SID текущего пользователя строкой (`S-1-5-21-…`).
@@ -496,6 +506,13 @@ mod imp {
         UnixStream::connect(endpoint).await.is_ok()
     }
 
+    /// Процесс на том конце сокета (SO_PEERCRED на Linux, LOCAL_PEEREPID
+    /// на macOS).
+    pub fn peer_pid(sock: &UnixStream) -> Option<u32> {
+        let pid = sock.peer_cred().ok()?.pid()?;
+        u32::try_from(pid).ok().filter(|&p| p != 0)
+    }
+
     #[cfg(test)]
     pub async fn connect(endpoint: &str) -> Result<Client> {
         Ok(UnixStream::connect(endpoint).await?)
@@ -547,7 +564,12 @@ mod tests {
             let mode = std::fs::metadata(&endpoint).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        let server = tokio::spawn(bound.run(|| Echo));
+        let peer = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = peer.clone();
+        let server = tokio::spawn(bound.run(move |pid| {
+            *seen.lock().unwrap() = Some(pid);
+            Echo
+        }));
 
         let mut c = connect(&endpoint).await.unwrap();
         // Канал держит наш же процесс: проверка владельца его пропускает.
@@ -571,6 +593,8 @@ mod tests {
                 access: AiAccess::Read
             }
         );
+        // На том конце — наш же процесс.
+        assert_eq!(*peer.lock().unwrap(), Some(Some(std::process::id())));
         write_msg(&mut c, &AiRequest::Status).await.unwrap();
         let r: AiResponse = read_msg(&mut c).await.unwrap().unwrap();
         assert_eq!(

@@ -5,15 +5,16 @@
 //! согласия, сервис, настройки, уведомления), идёт через [`Host`]. Так его
 //! можно проверить на настоящей истории без окон.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clipwire_agent::ai_access::{AiPolicy, HiddenBy, ai_text, kinds_of, looks_secret, summary};
-use clipwire_agent::history::{self, AiLogEntry, History, HistoryReader, now_ms};
+use clipwire_agent::history::{self, AiLogBudget, AiLogEntry, History, HistoryReader, now_ms};
 use clipwire_agent::i18n::{tr, trf};
-use clipwire_agent::settings::AiSettings;
+use clipwire_agent::settings::{AiSettings, ClientMatch};
 use clipwire_core::ai::{
     AI_PROTOCOL, AiAccess, AiError, AiFile, AiItem, AiKind, AiRequest, AiResponse, AiStatus,
     AiSummary, DEFAULT_MAX_IMAGE_SIDE, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT,
@@ -38,6 +39,50 @@ const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const LOG_QUERY_CHARS: usize = 80;
 /// Длина имени клиента, которую мы храним и показываем.
 const CLIENT_NAME_CHARS: usize = 64;
+/// Отказ (доступ выключен, клиенту отказано) попадает в журнал не чаще
+/// раза за столько мс на имя клиента: программа, которая стучится в канал
+/// без конца, не забивает журнал.
+pub const REFUSAL_LOG_EVERY_MS: i64 = 60_000;
+/// Сколько имён помнит [`LogGate`].
+const LOG_GATE_NAMES: usize = 1024;
+
+/// Когда какое имя клиента последний раз попало в журнал с отказом.
+#[derive(Default)]
+pub struct LogGate(Mutex<HashMap<String, i64>>);
+
+impl LogGate {
+    /// Записать ли отказ клиенту `client` в момент `now` (мс).
+    pub fn allow(&self, client: &str, now: i64) -> bool {
+        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = |t: i64| (0..REFUSAL_LOG_EVERY_MS).contains(&(now - t));
+        if m.get(client).is_some_and(|&t| fresh(t)) {
+            return false;
+        }
+        // Имён много (каждое соединение называется по-своему): старые
+        // забываются, память не растёт.
+        if m.len() >= LOG_GATE_NAMES {
+            m.retain(|_, t| fresh(*t));
+            if m.len() >= LOG_GATE_NAMES {
+                m.clear();
+            }
+        }
+        m.insert(client.to_string(), now);
+        true
+    }
+}
+
+/// Вопрос человеку про клиента, которого настройки не знают.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAsk {
+    pub name: String,
+    pub version: String,
+    /// Предлагать ли «Чтение и запись».
+    pub allow_write: bool,
+    /// Программа клиента (путь); `None` — не определилась.
+    pub program: Option<String>,
+    /// Под этим именем уже отвечали про другую программу (внутри — какую).
+    pub changed: Option<Option<String>>,
+}
 
 /// История и папка скачанных файлов: всё, что нужно для чтения.
 #[derive(Clone)]
@@ -66,9 +111,7 @@ pub trait Host: Send + Sync + 'static {
     /// `Busy` — вопросов в очереди и так слишком много.
     fn ask_client(
         &self,
-        client: &str,
-        version: &str,
-        allow_write: bool,
+        ask: ClientAsk,
     ) -> impl Future<Output = Result<Option<AiAccess>, Busy>> + Send;
     /// Спросить, можно ли клиенту положить `text` в буфер. Нет ответа — нет.
     fn ask_clipboard(
@@ -76,10 +119,16 @@ pub trait Host: Send + Sync + 'static {
         client: &str,
         text: &str,
     ) -> impl Future<Output = Result<bool, Busy>> + Send;
-    /// Запомнить ответ про клиента (`settings.ai.clients`).
-    fn remember_client(&self, name: &str, access: AiAccess);
+    /// Запомнить ответ про клиента из программы `program`
+    /// (`settings.ai.clients`, [`AiSettings::remember_client`]).
+    fn remember_client(&self, name: &str, program: Option<&str>, access: AiAccess);
+    /// Привязать к программе ответ, данный без неё
+    /// ([`AiSettings::bind_program`]).
+    fn bind_program(&self, name: &str, program: &str);
     /// Клиент обратился: обновить `last_ms` (с отложенным сохранением).
-    fn touch_client(&self, name: &str);
+    fn touch_client(&self, name: &str, program: Option<&str>);
+    /// Сколько отказов уже записано в журнал ([`LogGate`]).
+    fn log_gate(&self) -> &LogGate;
     /// Добавить в историю и группу без буфера (`Service::save`).
     fn save(&self, content: Content, extra: Vec<Ext>) -> anyhow::Result<ItemId>;
     /// В буфер, историю и группу (`Service::copy_marked`).
@@ -93,10 +142,19 @@ pub trait Host: Send + Sync + 'static {
     fn logged(&self);
 }
 
-/// Кто на этом соединении: имя из `Hello`.
+/// Кто на этом соединении: имя из `Hello` и программа на том конце.
 #[derive(Debug, Clone)]
 struct Client {
     name: String,
+    program: Option<String>,
+}
+
+/// Программа на том конце соединения: номер процесса, пока не спросили
+/// систему, потом путь ([`super::peer::program_of`]).
+#[derive(Debug, Clone)]
+enum Peer {
+    Pid(u32),
+    Known(Option<String>),
 }
 
 /// `Hello` с верным протоколом, пришедший при выключенном доступе: клиента
@@ -112,14 +170,53 @@ pub struct Conn<H: Host> {
     host: Arc<H>,
     client: Option<Client>,
     greeted: Option<Greeting>,
+    peer: Peer,
 }
 
 impl<H: Host> Conn<H> {
+    /// Соединение, программа которого неизвестна.
     pub fn new(host: Arc<H>) -> Self {
+        Self::with_program(host, None)
+    }
+
+    /// Соединение от процесса `pid` (`None` — система не сказала).
+    pub fn from_peer(host: Arc<H>, pid: Option<u32>) -> Self {
+        let mut c = Self::new(host);
+        if let Some(pid) = pid {
+            c.peer = Peer::Pid(pid);
+        }
+        c
+    }
+
+    /// Соединение от известной программы.
+    pub fn with_program(host: Arc<H>, program: Option<String>) -> Self {
         Self {
             host,
             client: None,
             greeted: None,
+            peer: Peer::Known(program),
+        }
+    }
+
+    /// Программа на том конце: систему спрашиваем один раз на соединение.
+    async fn program(&mut self) -> Option<String> {
+        if let Peer::Pid(pid) = self.peer {
+            let found = tokio::task::spawn_blocking(move || super::peer::program_of(pid))
+                .await
+                .ok()
+                .flatten();
+            if found.is_none() {
+                tracing::debug!("программа клиента MCP (процесс {pid}) не определилась");
+            }
+            self.peer = Peer::Known(found);
+        }
+        self.known_program()
+    }
+
+    fn known_program(&self) -> Option<String> {
+        match &self.peer {
+            Peer::Known(p) => p.clone(),
+            Peer::Pid(_) => None,
         }
     }
 
@@ -128,18 +225,29 @@ impl<H: Host> Conn<H> {
         let tool = tool_name(&req);
         let query = log_query(&req);
         let (resp, ids) = self.answer(req).await;
-        let client = match (&self.client, &self.greeted) {
-            (Some(c), _) => c.name.clone(),
-            (None, Some(g)) => g.name.clone(),
-            (None, None) => "?".into(),
+        let (client, program) = match (&self.client, &self.greeted) {
+            (Some(c), _) => (c.name.clone(), c.program.clone()),
+            (None, Some(g)) => (g.name.clone(), self.known_program()),
+            (None, None) => ("?".into(), self.known_program()),
+        };
+        let at_ms = now_ms();
+        if is_refusal(&resp) && !self.host.log_gate().allow(&client, at_ms) {
+            return resp;
+        }
+        let budget = if gave_data(&resp) {
+            AiLogBudget::Reads
+        } else {
+            AiLogBudget::Other
         };
         let entry = AiLogEntry {
-            at_ms: now_ms(),
+            at_ms,
             client,
             tool: tool.into(),
             query,
             ids,
             result: log_result(&resp),
+            program,
+            count: 1,
         };
         let store = self.host.store();
         let added = tokio::task::spawn_blocking(move || {
@@ -147,7 +255,7 @@ impl<H: Host> Conn<H> {
                 .history
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .ai_log_add(&entry)
+                .ai_log_add(&entry, budget)
         })
         .await;
         match added {
@@ -201,13 +309,14 @@ impl<H: Host> Conn<H> {
         // Доступ — из настроек на каждый запрос: отозванный в настройках
         // клиент теряет доступ сразу, без переподключения.
         let access = ai
-            .client(&client.name)
+            .client(&client.name, client.program.as_deref())
             .map(|c| c.access)
             .unwrap_or_default();
         if !access.can_read() {
             return (not_approved(), Vec::new());
         }
-        self.host.touch_client(&client.name);
+        self.host
+            .touch_client(&client.name, client.program.as_deref());
         let policy = AiPolicy::new(&ai, &self.host.ignored_apps(), now_ms());
         match req {
             AiRequest::Hello { .. } => unreachable!("Hello разобран выше"),
@@ -304,7 +413,7 @@ impl<H: Host> Conn<H> {
                         return (disabled(), Vec::new());
                     }
                     let access = ai
-                        .client(&client.name)
+                        .client(&client.name, client.program.as_deref())
                         .map(|c| c.access)
                         .unwrap_or_default();
                     if !access.can_read() {
@@ -354,24 +463,51 @@ impl<H: Host> Conn<H> {
     }
 
     /// Пустить клиента на это соединение: доступ из настроек, а нового
-    /// клиента спросить у человека и запомнить ответ. Возвращает доступ по
-    /// настройкам после ответа: их могли поменять, пока окно было открыто.
-    /// `Busy` — вопрос не задан, клиент на соединение не поставлен.
+    /// клиента спросить у человека и запомнить ответ. Новый — это и знакомое
+    /// имя из другой программы: ответ привязан к имени и программе
+    /// ([`AiSettings::match_client`]). Возвращает доступ по настройкам после
+    /// ответа: их могли поменять, пока окно было открыто. `Busy` — вопрос не
+    /// задан, клиент на соединение не поставлен.
     async fn admit(&mut self, name: &str, version: &str) -> Result<AiAccess, Busy> {
+        let program = self.program().await;
         let ai = self.host.ai_settings();
+        let changed = match ai.match_client(name, program.as_deref()) {
+            ClientMatch::Known => None,
+            ClientMatch::Bind => {
+                // Разрешён до привязки к программам: эта программа пришла
+                // первой, ответ теперь за ней.
+                if let Some(p) = program.clone() {
+                    let (host, n) = (self.host.clone(), name.to_string());
+                    let _ = tokio::task::spawn_blocking(move || host.bind_program(&n, &p)).await;
+                }
+                None
+            }
+            ClientMatch::Changed { before } => Some(Some(before)),
+            ClientMatch::New => Some(None),
+        };
         // Не ответил вовремя — ничего не запоминаем: отказ только на это
         // соединение.
-        if ai.client(name).is_none() {
+        if let Some(changed) = changed {
             // Вопрос и запоминание ответа — своей задачей: у ИИ-клиента срок
             // вызова бывает короче нашего (у Codex 60 с), и когда мост бросит
             // соединение, окно не должно закрыться перед человеком. Ответ,
             // данный позже, запомнится, и следующий вызов пройдёт без вопроса.
             let host = self.host.clone();
-            let (n, v, w) = (name.to_string(), version.to_string(), ai.allow_write);
+            let ask = ClientAsk {
+                name: name.to_string(),
+                version: version.to_string(),
+                allow_write: ai.allow_write,
+                program: program.clone(),
+                changed,
+            };
             let asking = tokio::spawn(async move {
-                if let Some(a) = host.ask_client(&n, &v, w).await? {
+                let (n, p) = (ask.name.clone(), ask.program.clone());
+                if let Some(a) = host.ask_client(ask).await? {
                     // Сохранение настроек — запись на диск.
-                    let _ = tokio::task::spawn_blocking(move || host.remember_client(&n, a)).await;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        host.remember_client(&n, p.as_deref(), a)
+                    })
+                    .await;
                 }
                 Ok::<(), Busy>(())
             });
@@ -379,16 +515,19 @@ impl<H: Host> Conn<H> {
                 return Err(busy);
             }
         }
-        self.client = Some(Client { name: name.into() });
         let access = self
             .host
             .ai_settings()
-            .client(name)
+            .client(name, program.as_deref())
             .map(|c| c.access)
             .unwrap_or_default();
         if access.can_read() {
-            self.host.touch_client(name);
+            self.host.touch_client(name, program.as_deref());
         }
+        self.client = Some(Client {
+            name: name.into(),
+            program,
+        });
         Ok(access)
     }
 
@@ -767,6 +906,31 @@ fn not_approved() -> AiResponse {
     )
 }
 
+/// Отказ, который мог прийти от программы, стучащейся без спроса: доступ
+/// выключен или клиенту отказано. Такие пишутся не чаще [`LogGate`].
+fn is_refusal(resp: &AiResponse) -> bool {
+    matches!(
+        resp,
+        AiResponse::Hello {
+            access: AiAccess::Denied,
+            ..
+        } | AiResponse::Error {
+            code: AiError::Disabled | AiError::NotApproved,
+            ..
+        }
+    )
+}
+
+/// Обращение выдало данные из истории: такие строки журнала хранятся
+/// отдельно от остальных ([`AiLogBudget::Reads`]).
+fn gave_data(resp: &AiResponse) -> bool {
+    match resp {
+        AiResponse::Items { items, .. } => !items.is_empty(),
+        AiResponse::Item(_) => true,
+        _ => false,
+    }
+}
+
 /// Имя инструмента MCP для журнала.
 fn tool_name(req: &AiRequest) -> &'static str {
     match req {
@@ -840,8 +1004,11 @@ mod tests {
         /// Очередь окна согласия полна: на вопросы — `Busy`.
         busy: AtomicBool,
         asked: Mutex<Vec<String>>,
+        /// Последний вопрос про клиента целиком.
+        last_ask: Mutex<Option<ClientAsk>>,
         notices: Mutex<Vec<String>>,
         copied: Mutex<Vec<String>>,
+        gate: LogGate,
     }
 
     impl Fake {
@@ -862,6 +1029,8 @@ mod tests {
                 asked: Mutex::new(Vec::new()),
                 notices: Mutex::new(Vec::new()),
                 copied: Mutex::new(Vec::new()),
+                last_ask: Mutex::new(None),
+                gate: LogGate::default(),
             })
         }
 
@@ -887,16 +1056,12 @@ mod tests {
         fn status(&self) -> AppStatus {
             AppStatus::default()
         }
-        async fn ask_client(
-            &self,
-            client: &str,
-            _: &str,
-            _: bool,
-        ) -> Result<Option<AiAccess>, Busy> {
+        async fn ask_client(&self, ask: ClientAsk) -> Result<Option<AiAccess>, Busy> {
             if self.busy.load(Ordering::Relaxed) {
                 return Err(Busy);
             }
-            self.asked.lock().unwrap().push(client.into());
+            self.asked.lock().unwrap().push(ask.name.clone());
+            *self.last_ask.lock().unwrap() = Some(ask);
             tokio::time::sleep(self.client_delay).await;
             Ok(self.answer)
         }
@@ -909,15 +1074,19 @@ mod tests {
             }
             Ok(self.clipboard_ok)
         }
-        fn remember_client(&self, name: &str, access: AiAccess) {
-            self.ai.lock().unwrap().clients.push(AiClient {
-                name: name.into(),
-                access,
-                added_ms: 1,
-                last_ms: 1,
-            });
+        fn remember_client(&self, name: &str, program: Option<&str>, access: AiAccess) {
+            self.ai
+                .lock()
+                .unwrap()
+                .remember_client(name, program, access, 1);
         }
-        fn touch_client(&self, _: &str) {}
+        fn bind_program(&self, name: &str, program: &str) {
+            self.ai.lock().unwrap().bind_program(name, program);
+        }
+        fn touch_client(&self, _: &str, _: Option<&str>) {}
+        fn log_gate(&self) -> &LogGate {
+            &self.gate
+        }
         fn save(&self, content: Content, extra: Vec<Ext>) -> anyhow::Result<ItemId> {
             let mut e = history::local_entry(clipwire_core::DeviceId([1; 32]), "ПК", content);
             e.ext = extra;
@@ -1010,6 +1179,7 @@ mod tests {
             access: AiAccess::ReadWrite,
             added_ms: 1,
             last_ms: 1,
+            program: None,
         });
         let host = Fake::new(&dir, ai);
         host.busy.store(true, Ordering::Relaxed);
@@ -1082,7 +1252,7 @@ mod tests {
             host.ai
                 .lock()
                 .unwrap()
-                .client("claude-code")
+                .client("claude-code", None)
                 .unwrap()
                 .access,
             AiAccess::Read
@@ -1131,13 +1301,13 @@ mod tests {
             AiError::Disabled
         );
 
-        // В журнале — каждое обращение, новые первыми, с отказами.
+        // В журнале — каждое обращение, новые первыми, с отказами. Второй
+        // отказ тому же клиенту в ту же минуту не записан.
         let log = host.store.history.lock().unwrap().ai_log_list(100);
         let tools: Vec<_> = log.iter().map(|e| e.tool.as_str()).collect();
         assert_eq!(
             tools,
             [
-                "clipwire_status",
                 "search_clipboard",
                 "connect",
                 "save_to_clipboard_history",
@@ -1149,9 +1319,10 @@ mod tests {
                 "search_clipboard",
             ]
         );
-        assert_eq!(log[7].ids.len(), 2);
-        assert_eq!(log[6].query.as_deref(), Some("заметка"));
-        assert_eq!(log[9].client, "?");
+        assert_eq!(log[6].ids.len(), 2);
+        assert_eq!(log[5].query.as_deref(), Some("заметка"));
+        assert_eq!(log[8].client, "?");
+        assert!(log.iter().all(|e| e.count == 1));
         drop(conn);
         drop(again);
         let _ = std::fs::remove_dir_all(dir);
@@ -1176,6 +1347,8 @@ mod tests {
             asked: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             copied: Mutex::new(Vec::new()),
+            last_ask: Mutex::new(None),
+            gate: LogGate::default(),
         });
         let mut conn = Conn::new(host.clone());
         conn.handle(hello()).await;
@@ -1229,6 +1402,8 @@ mod tests {
             asked: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             copied: Mutex::new(Vec::new()),
+            last_ask: Mutex::new(None),
+            gate: LogGate::default(),
         });
         let mut conn2 = Conn::new(declining.clone());
         conn2.handle(hello()).await;
@@ -1265,7 +1440,14 @@ mod tests {
                 access: AiAccess::Denied
             }
         );
-        assert!(declining.ai.lock().unwrap().client("cursor").is_none());
+        assert!(
+            declining
+                .ai
+                .lock()
+                .unwrap()
+                .client("cursor", None)
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1319,6 +1501,8 @@ mod tests {
             asked: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             copied: Mutex::new(Vec::new()),
+            last_ask: Mutex::new(None),
+            gate: LogGate::default(),
         });
         let mut conn = Conn::new(w.clone());
         conn.handle(hello()).await;
@@ -1349,19 +1533,23 @@ mod tests {
             asked: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             copied: Mutex::new(Vec::new()),
+            last_ask: Mutex::new(None),
+            gate: LogGate::default(),
         });
         let mut conn = Conn::new(host.clone());
         let cut = tokio::time::timeout(std::time::Duration::from_millis(20), conn.handle(hello()));
         assert!(cut.await.is_err(), "ответ пришёл раньше человека");
         drop(conn);
         for _ in 0..100 {
-            if host.ai_settings().client("claude-code").is_some() {
+            if host.ai_settings().client("claude-code", None).is_some() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(
-            host.ai_settings().client("claude-code").map(|c| c.access),
+            host.ai_settings()
+                .client("claude-code", None)
+                .map(|c| c.access),
             Some(AiAccess::Read)
         );
         // Следующее соединение человека уже не спрашивает.
@@ -1370,6 +1558,184 @@ mod tests {
         assert_eq!(host.asked.lock().unwrap().len(), 1);
         drop(again);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Ответ привязан к программе: то же имя из другой программы спрашивается
+    /// заново с обеими программами, отказ ей не трогает настоящего клиента,
+    /// ответ без программы (до 0.10.2) привязывается к первой пришедшей.
+    #[tokio::test]
+    async fn client_is_bound_to_program() {
+        let dir = tmp("program");
+        let host = Fake::new(&dir, enabled());
+        let claude = Some(r"C:\Users\u\.local\bin\claude.exe".to_string());
+        let evil = Some(r"C:\Users\u\AppData\Local\Temp\x.exe".to_string());
+        let mut a = Conn::with_program(host.clone(), claude.clone());
+        assert!(matches!(
+            a.handle(hello()).await,
+            AiResponse::Hello {
+                access: AiAccess::Read,
+                ..
+            }
+        ));
+        let ask = host.last_ask.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            (ask.program.clone(), ask.changed.clone()),
+            (claude.clone(), None)
+        );
+        // Чужая программа с тем же именем: новый вопрос, видно обе программы.
+        let evil_host = Arc::new(Fake {
+            answer: Some(AiAccess::Denied),
+            ai: Mutex::new(host.ai_settings()),
+            store: host.store.clone(),
+            clipboard_ok: true,
+            revoke_write_on_ask: false,
+            client_delay: std::time::Duration::ZERO,
+            busy: AtomicBool::new(false),
+            asked: Mutex::new(Vec::new()),
+            notices: Mutex::new(Vec::new()),
+            copied: Mutex::new(Vec::new()),
+            last_ask: Mutex::new(None),
+            gate: LogGate::default(),
+        });
+        let mut b = Conn::with_program(evil_host.clone(), evil.clone());
+        assert_eq!(
+            b.handle(hello()).await,
+            AiResponse::Hello {
+                protocol: AI_PROTOCOL,
+                access: AiAccess::Denied
+            }
+        );
+        let ask = evil_host.last_ask.lock().unwrap().clone().unwrap();
+        assert_eq!(ask.program, evil);
+        assert_eq!(ask.changed, Some(claude.clone()));
+        assert_eq!(code(&b.handle(search("")).await), AiError::NotApproved);
+        // Настоящий клиент читает дальше, без вопроса.
+        let ai = evil_host.ai_settings();
+        assert_eq!(
+            ai.client("claude-code", claude.as_deref()).unwrap().access,
+            AiAccess::Read
+        );
+        *host.ai.lock().unwrap() = ai;
+        let mut a2 = Conn::with_program(host.clone(), claude.clone());
+        assert!(matches!(
+            a2.handle(search("")).await,
+            AiResponse::Error { .. }
+        ));
+        a2.handle(hello()).await;
+        assert!(matches!(
+            a2.handle(search("")).await,
+            AiResponse::Items { .. }
+        ));
+        assert_eq!(host.asked.lock().unwrap().len(), 1);
+        // Программа не определилась — тоже вопрос.
+        let mut c = Conn::new(evil_host.clone());
+        c.handle(hello()).await;
+        assert_eq!(evil_host.asked.lock().unwrap().len(), 2);
+        assert_eq!(
+            evil_host.last_ask.lock().unwrap().as_ref().unwrap().program,
+            None
+        );
+
+        // Настройки до 0.10.2: клиент без программы. Первая программа
+        // привязывается без вопроса.
+        let mut old = enabled();
+        old.clients.push(AiClient {
+            name: "claude-code".into(),
+            access: AiAccess::Read,
+            added_ms: 1,
+            last_ms: 1,
+            program: None,
+        });
+        let legacy_dir = tmp("legacy");
+        let legacy = Fake::new(&legacy_dir, old);
+        let mut d = Conn::with_program(legacy.clone(), claude.clone());
+        assert!(matches!(
+            d.handle(hello()).await,
+            AiResponse::Hello {
+                access: AiAccess::Read,
+                ..
+            }
+        ));
+        assert!(legacy.asked.lock().unwrap().is_empty());
+        assert_eq!(legacy.ai_settings().clients[0].program, claude);
+        assert!(matches!(
+            d.handle(search("")).await,
+            AiResponse::Items { .. }
+        ));
+        // В журнале у строк — программа.
+        let log = legacy.store.history.lock().unwrap().ai_log_list(10);
+        assert!(log.iter().all(|e| e.program == claude), "{log:?}");
+        drop((a, b, c, d));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(legacy_dir);
+    }
+
+    /// Отказы пишутся не чаще раза в минуту на имя, одинаковые подряд
+    /// сворачиваются, строки с выданными данными поток отказов не вытесняет.
+    #[tokio::test]
+    async fn refusals_are_rate_limited_and_reads_kept() {
+        let dir = tmp("gate");
+        let host = Fake::new(&dir, enabled());
+        let id = host.add(Content::Text("заметка".into()), now_ms() - 1000);
+        let mut conn = Conn::new(host.clone());
+        conn.handle(hello()).await;
+        let r = conn
+            .handle(AiRequest::Get {
+                id: id.0.to_string(),
+                max_image_side: 0,
+            })
+            .await;
+        assert!(matches!(r, AiResponse::Item(_)), "{r:?}");
+        // Две пустые выдачи подряд — одна строка ×2.
+        conn.handle(search("нет такого")).await;
+        conn.handle(search("нет такого")).await;
+        host.ai.lock().unwrap().enabled = false;
+        for _ in 0..20 {
+            let mut c = Conn::new(host.clone());
+            assert_eq!(code(&c.handle(hello()).await), AiError::Disabled);
+        }
+        let log = host.store.history.lock().unwrap().ai_log_list(100);
+        let rows: Vec<_> = log.iter().map(|e| (e.tool.as_str(), e.count)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("connect", 1),
+                ("search_clipboard", 2),
+                ("get_clipboard_item", 1),
+                ("connect", 1),
+            ]
+        );
+        // Поток отказов под разными именами — строка с выдачей остаётся.
+        for i in 0..(history::AI_LOG_KEEP_OTHER + 50) {
+            let mut c = Conn::new(host.clone());
+            c.handle(AiRequest::Hello {
+                protocol: AI_PROTOCOL,
+                client: format!("spam {i}"),
+                client_version: String::new(),
+            })
+            .await;
+        }
+        let log = host.store.history.lock().unwrap().ai_log_list(usize::MAX);
+        assert!(log.iter().any(|e| e.tool == "get_clipboard_item"));
+        assert_eq!(log.len(), history::AI_LOG_KEEP_OTHER + 1);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn log_gate_once_a_minute_per_name() {
+        let g = LogGate::default();
+        assert!(g.allow("a", 1000));
+        assert!(!g.allow("a", 1000 + REFUSAL_LOG_EVERY_MS - 1));
+        assert!(g.allow("b", 1001));
+        assert!(g.allow("a", 1000 + REFUSAL_LOG_EVERY_MS));
+        // Часы ушли назад — не молчим до их возврата.
+        assert!(g.allow("b", 0));
+        // Много имён: память не растёт, новое имя пишется.
+        for i in 0..(LOG_GATE_NAMES * 2) {
+            assert!(g.allow(&format!("n{i}"), 5000));
+        }
+        assert!(g.0.lock().unwrap().len() <= LOG_GATE_NAMES);
     }
 
     #[test]

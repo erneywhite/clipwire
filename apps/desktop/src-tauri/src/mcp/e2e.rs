@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use super::channel;
-use super::handler::{AppStatus, Busy, Conn, Host, Store};
+use super::handler::{AppStatus, Busy, ClientAsk, Conn, Host, LogGate, Store};
 
 /// Как человек отвечает на «положить в буфер».
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,7 @@ struct Fake {
     notices: Mutex<Vec<String>>,
     /// Висящий вопрос «положить в буфер» бросили (соединение закрылось).
     hang_dropped: Arc<AtomicBool>,
+    gate: LogGate,
 }
 
 impl Fake {
@@ -66,6 +67,7 @@ impl Fake {
             copied: Mutex::default(),
             notices: Mutex::default(),
             hang_dropped: Arc::default(),
+            gate: LogGate::default(),
         })
     }
 
@@ -79,6 +81,11 @@ impl Fake {
 
     fn ai(&self) -> std::sync::MutexGuard<'_, AiSettings> {
         self.ai.lock().unwrap()
+    }
+
+    /// Ответ про клиента с этим именем из любой программы.
+    fn client(&self, name: &str) -> Option<AiClient> {
+        self.ai().clients.iter().find(|c| c.name == name).cloned()
     }
 }
 
@@ -104,13 +111,8 @@ impl Host for Fake {
     fn status(&self) -> AppStatus {
         AppStatus::default()
     }
-    async fn ask_client(
-        &self,
-        client: &str,
-        _version: &str,
-        _allow_write: bool,
-    ) -> Result<Option<AiAccess>, Busy> {
-        self.asked_clients.lock().unwrap().push(client.into());
+    async fn ask_client(&self, ask: ClientAsk) -> Result<Option<AiAccess>, Busy> {
+        self.asked_clients.lock().unwrap().push(ask.name);
         Ok(*self.client_answer.lock().unwrap())
     }
     async fn ask_clipboard(&self, _client: &str, text: &str) -> Result<bool, Busy> {
@@ -126,15 +128,16 @@ impl Host for Fake {
             }
         })
     }
-    fn remember_client(&self, name: &str, access: AiAccess) {
-        self.ai().clients.push(AiClient {
-            name: name.into(),
-            access,
-            added_ms: 1,
-            last_ms: 1,
-        });
+    fn remember_client(&self, name: &str, program: Option<&str>, access: AiAccess) {
+        self.ai().remember_client(name, program, access, 1);
     }
-    fn touch_client(&self, _: &str) {}
+    fn bind_program(&self, name: &str, program: &str) {
+        self.ai().bind_program(name, program);
+    }
+    fn touch_client(&self, _: &str, _: Option<&str>) {}
+    fn log_gate(&self) -> &LogGate {
+        &self.gate
+    }
     fn save(&self, content: Content, extra: Vec<Ext>) -> anyhow::Result<ItemId> {
         let mut e = history::local_entry(DeviceId([1; 32]), "Desk", content);
         e.ext = extra;
@@ -166,7 +169,7 @@ impl Host for Fake {
 async fn start_app(dir: &Path, host: Arc<Fake>) -> (String, JoinHandle<()>) {
     let bound = channel::bind(dir).await.unwrap().expect("канал свободен");
     let endpoint = bound.endpoint().to_string();
-    let task = tokio::spawn(bound.run(move || Conn::new(host.clone())));
+    let task = tokio::spawn(bound.run(move |pid| Conn::from_peer(host.clone(), pid)));
     (endpoint, task)
 }
 
@@ -360,9 +363,13 @@ async fn app_channel_and_bridge_end_to_end() {
         ["e2e-client"]
     );
     assert_eq!(
-        host.ai().client("e2e-client").map(|c| c.access),
+        host.client("e2e-client").map(|c| c.access),
         Some(AiAccess::Read)
     );
+    // Мост здесь в том же процессе, что и «приложение»: программой клиента
+    // считается родитель тестов (cargo), но она определилась.
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    assert!(host.client("e2e-client").unwrap().program.is_some());
     assert!(
         t.starts_with(&format!("Clipwire {}\n", env!("CARGO_PKG_VERSION"))),
         "{t}"
@@ -640,7 +647,7 @@ async fn app_channel_and_bridge_end_to_end() {
         t.contains("did not answer the Clipwire consent window in time"),
         "{t}"
     );
-    assert!(host.ai().client("e2e-client").is_none());
+    assert!(host.client("e2e-client").is_none());
     *host.client_answer.lock().unwrap() = Some(AiAccess::Read);
     ok(&client, "clipwire_status", json!({})).await;
     assert_eq!(host.asked_clients.lock().unwrap().len(), 4);

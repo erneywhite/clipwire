@@ -151,9 +151,101 @@ impl AiSettings {
             .then(|| now_ms.saturating_sub(i64::from(self.history_days) * 86_400_000))
     }
 
-    /// Сохранённый ответ про клиента с таким именем.
-    pub fn client(&self, name: &str) -> Option<&AiClient> {
-        self.clients.iter().find(|c| c.name == name)
+    /// Сохранённый ответ про клиента с таким именем и такой программой
+    /// ([`same_program`]; `None` — программа не определена).
+    pub fn client(&self, name: &str, program: Option<&str>) -> Option<&AiClient> {
+        self.clients
+            .iter()
+            .find(|c| c.name == name && same_program(c.program.as_deref(), program))
+    }
+
+    /// Кто это для настроек: известный клиент, разрешённый до привязки к
+    /// программе, клиент с тем же именем, но из другой программы, или новый.
+    pub fn match_client(&self, name: &str, program: Option<&str>) -> ClientMatch {
+        if self.client(name, program).is_some() {
+            return ClientMatch::Known;
+        }
+        let same_name = || self.clients.iter().filter(|c| c.name == name);
+        if same_name().next().is_none() {
+            return ClientMatch::New;
+        }
+        // Ответ без программы (настройки до 0.10.2): программа, пришедшая
+        // первой, к нему и привязывается.
+        if program.is_some() && same_name().any(|c| c.program.is_none()) {
+            return ClientMatch::Bind;
+        }
+        let before = same_name()
+            .max_by_key(|c| c.last_ms)
+            .and_then(|c| c.program.clone());
+        ClientMatch::Changed { before }
+    }
+
+    /// Привязать к программе `program` ответ про клиента `name`, данный без
+    /// программы ([`ClientMatch::Bind`]).
+    pub fn bind_program(&mut self, name: &str, program: &str) {
+        if self.client(name, Some(program)).is_some() {
+            return;
+        }
+        if let Some(c) = self
+            .clients
+            .iter_mut()
+            .find(|c| c.name == name && c.program.is_none())
+        {
+            c.program = Some(program.to_string());
+        }
+    }
+
+    /// Запомнить ответ про клиента `name` из программы `program`: у
+    /// известного поменять доступ, нового добавить.
+    pub fn remember_client(
+        &mut self,
+        name: &str,
+        program: Option<&str>,
+        access: clipwire_core::ai::AiAccess,
+        now_ms: i64,
+    ) {
+        match self
+            .clients
+            .iter_mut()
+            .find(|c| c.name == name && same_program(c.program.as_deref(), program))
+        {
+            Some(c) => {
+                c.access = access;
+                c.last_ms = now_ms;
+            }
+            None => self.clients.push(AiClient {
+                name: name.to_string(),
+                access,
+                added_ms: now_ms,
+                last_ms: now_ms,
+                program: program.map(str::to_string),
+            }),
+        }
+    }
+}
+
+/// Что настройки знают о подключившемся клиенте ([`AiSettings::match_client`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientMatch {
+    /// Ответ про это имя и эту программу есть.
+    Known,
+    /// Ответ про это имя дан без программы: привязать его к этой программе.
+    Bind,
+    /// Имя знакомо, программа другая (или не определилась): спросить заново.
+    /// `before` — программа последнего клиента с этим именем.
+    Changed { before: Option<String> },
+    /// Имя незнакомо.
+    New,
+}
+
+/// Одна и та же программа: пути совпадают, на Windows без учёта регистра.
+/// Не определилась — совпадает только с «не определилась».
+pub fn same_program(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) if cfg!(windows) => a.to_lowercase() == b.to_lowercase(),
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -207,7 +299,8 @@ impl AiKinds {
 
 /// ИИ-клиент, о котором человек уже ответил. Имя — то, каким клиент назвался
 /// в MCP (`clientInfo.name`); подделать его может любая программа того же
-/// пользователя ОС.
+/// пользователя ОС. Поэтому ответ привязан ещё и к программе, которая
+/// запустила мост: тот же клиент из другой программы спрашивается заново.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiClient {
@@ -217,6 +310,9 @@ pub struct AiClient {
     pub added_ms: i64,
     /// Когда последний раз обращался, мс Unix.
     pub last_ms: i64,
+    /// Путь к программе, которая запустила мост (ИИ-клиент). `None` —
+    /// ответ дан до 0.10.2 или программа не определилась.
+    pub program: Option<String>,
 }
 
 impl Default for AiClient {
@@ -226,6 +322,7 @@ impl Default for AiClient {
             access: clipwire_core::ai::AiAccess::Denied,
             added_ms: 0,
             last_ms: 0,
+            program: None,
         }
     }
 }
@@ -435,6 +532,74 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    use super::{AiSettings, ClientMatch};
+    use clipwire_core::ai::AiAccess;
+
+    #[test]
+    fn ai_client_is_bound_to_program() {
+        // Ответ из настроек до 0.10.2: без программы.
+        let old: AiSettings = serde_json::from_str(
+            r#"{"enabled":true,"clients":[{"name":"claude-code","access":"read","added_ms":1,"last_ms":2}]}"#,
+        )
+        .unwrap();
+        let mut ai = old.clone();
+        assert_eq!(ai.clients[0].program, None);
+        let claude = Some("/opt/claude/claude");
+        let other = Some("/home/u/.cache/evil");
+        // Без программы он находится как раньше; первая определившаяся
+        // программа к нему привязывается.
+        assert_eq!(ai.match_client("claude-code", None), ClientMatch::Known);
+        assert_eq!(ai.match_client("claude-code", claude), ClientMatch::Bind);
+        ai.bind_program("claude-code", "/opt/claude/claude");
+        assert_eq!(ai.clients[0].program.as_deref(), claude);
+        assert_eq!(ai.match_client("claude-code", claude), ClientMatch::Known);
+        assert_eq!(
+            ai.client("claude-code", claude).unwrap().access,
+            AiAccess::Read
+        );
+        // После привязки чужая программа и неопределённая — заново.
+        let changed = ClientMatch::Changed {
+            before: claude.map(Into::into),
+        };
+        assert_eq!(ai.match_client("claude-code", other), changed);
+        assert_eq!(ai.match_client("claude-code", None), changed);
+        assert!(ai.client("claude-code", other).is_none());
+        assert_eq!(ai.match_client("codex", claude), ClientMatch::New);
+        // Отказ чужой программе — своя строка, разрешение настоящей цело.
+        ai.remember_client("claude-code", other, AiAccess::Denied, 5);
+        assert_eq!(ai.clients.len(), 2);
+        assert_eq!(
+            ai.client("claude-code", claude).unwrap().access,
+            AiAccess::Read
+        );
+        assert_eq!(
+            ai.client("claude-code", other).unwrap().access,
+            AiAccess::Denied
+        );
+        ai.remember_client("claude-code", other, AiAccess::Read, 6);
+        assert_eq!(ai.clients.len(), 2);
+        // Повторная привязка ничего не трогает.
+        ai.bind_program("claude-code", "/x");
+        assert!(ai.client("claude-code", Some("/x")).is_none());
+        // Сохранённое читается обратно с программой.
+        let back: AiSettings = serde_json::from_str(&serde_json::to_string(&ai).unwrap()).unwrap();
+        assert_eq!(back.clients, ai.clients);
+    }
+
+    #[test]
+    fn same_program_compares_paths() {
+        use super::same_program;
+        assert!(same_program(None, None));
+        assert!(same_program(Some("/a/b"), Some("/a/b")));
+        assert!(!same_program(Some("/a/b"), None));
+        assert!(!same_program(None, Some("/a/b")));
+        assert!(!same_program(Some("/a/b"), Some("/a/c")));
+        assert_eq!(
+            same_program(Some(r"C:\Tools\Claude.exe"), Some(r"c:\tools\claude.EXE")),
+            cfg!(windows)
+        );
+    }
+
     #[test]
     fn pretty_hostname_from_machine_info() {
         use super::pretty_hostname;
@@ -514,7 +679,7 @@ mod tests {
         .unwrap();
         assert!(s.ai.enabled && s.ai.confirm_clipboard);
         assert!(s.ai.kinds.text && s.ai.kinds.images && !s.ai.kinds.files);
-        let c = s.ai.client("claude-code").unwrap();
+        let c = s.ai.client("claude-code", None).unwrap();
         assert_eq!(c.access, clipwire_core::ai::AiAccess::ReadWrite);
         assert_eq!((c.added_ms, c.last_ms), (0, 5));
     }
