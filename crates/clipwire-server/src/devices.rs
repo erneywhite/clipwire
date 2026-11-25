@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use clipwire_core::proto::io::write_msg;
 use clipwire_core::proto::{DeviceEntry, MAX_FRAME, ServerMsg, knows_server_groups};
 use clipwire_core::{BlobId, DeviceId, GroupId};
 use iroh::endpoint::SendStream;
@@ -37,7 +36,9 @@ pub fn rotation_msg(r: Rotation, alpn: &[u8]) -> ServerMsg {
 /// (подробнее у `session::refuse`).
 pub async fn close_with(send: &mut SendStream, msg: Option<&ServerMsg>) {
     if let Some(msg) = msg {
-        let _ = write_msg(send, msg).await;
+        // Запись с пределом простоя: клиент, который не читает, не задержит
+        // закрытие по смене ключа или токена.
+        let _ = crate::session::send_msg(send, msg).await;
     }
     let _ = send.finish();
     let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;

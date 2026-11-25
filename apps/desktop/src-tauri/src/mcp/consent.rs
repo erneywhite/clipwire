@@ -8,8 +8,18 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-/// Сколько символов текста для буфера показывает окно согласия.
-pub const SHOWN_CHARS: usize = 4000;
+/// Сколько символов из начала текста для буфера показывает окно согласия.
+pub const HEAD_CHARS: usize = 3000;
+/// И сколько из конца: хвост длинного текста тоже на виду, команду в конце
+/// за четырьмя тысячами пробелов не спрятать.
+pub const TAIL_CHARS: usize = 1000;
+/// Больше стольких вопросов в очереди не держим: клиент, засыпающий окно
+/// вопросами, получает «занято».
+pub const MAX_PENDING: usize = 8;
+
+/// Очередь вопросов полна ([`MAX_PENDING`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Busy;
 
 /// О чём спрашиваем.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -28,12 +38,41 @@ pub struct ConsentDto {
     pub kind: ConsentKind,
     pub client: String,
     pub client_version: String,
-    /// Текст для буфера, первые [`SHOWN_CHARS`] символов.
+    /// Текст для буфера: весь или первые [`HEAD_CHARS`] символов, невидимые
+    /// символы заменены метками ([`visible`]).
     pub text: Option<String>,
+    /// Последние [`TAIL_CHARS`] символов, если текст длиннее, чем
+    /// показывается целиком; между `text` и `tail` пропущено `skipped`.
+    pub tail: Option<String>,
+    /// Сколько символов середины не показано.
+    pub skipped: u32,
+    /// В тексте есть перевод строки: вставленный в терминал, он может сразу
+    /// выполниться как команда.
+    pub multiline: bool,
     /// Длина всего текста в символах.
     pub chars: u32,
     /// Показывать ли «Чтение и запись».
     pub allow_write: bool,
+}
+
+/// Текст для показа: управляющие символы (кроме перевода строки и
+/// табуляции) и невидимые (направление текста, нулевой ширины, мягкий
+/// перенос, BOM) — меткой `⟨U+202E⟩`. Иначе ими можно выдать в окне один
+/// текст за другой: «\u{202E}» разворачивает строку, `\r` прячет начало
+/// команды.
+pub fn visible(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let hide = (c.is_control() && c != '\n' && c != '\t')
+            || clipwire_agent::blobs::is_format_char(c)
+            || clipwire_core::admin::is_invisible_char(c);
+        if hide {
+            out.push_str(&format!("⟨U+{:04X}⟩", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl ConsentDto {
@@ -44,19 +83,38 @@ impl ConsentDto {
             client: client.into(),
             client_version: version.into(),
             text: None,
+            tail: None,
+            skipped: 0,
+            multiline: false,
             chars: 0,
             allow_write,
         }
     }
 
     pub fn clipboard(client: &str, text: &str) -> Self {
+        let n = text.chars().count();
+        let (head, tail, skipped) = if n <= HEAD_CHARS + TAIL_CHARS {
+            (visible(text), None, 0)
+        } else {
+            let head: String = text.chars().take(HEAD_CHARS).collect();
+            let tail: String = text.chars().skip(n - TAIL_CHARS).collect();
+            (
+                visible(&head),
+                Some(visible(&tail)),
+                n - HEAD_CHARS - TAIL_CHARS,
+            )
+        };
         Self {
             id: String::new(),
             kind: ConsentKind::Clipboard,
             client: client.into(),
             client_version: String::new(),
-            text: Some(text.chars().take(SHOWN_CHARS).collect()),
-            chars: u32::try_from(text.chars().count()).unwrap_or(u32::MAX),
+            text: Some(head),
+            tail,
+            skipped: u32::try_from(skipped).unwrap_or(u32::MAX),
+            // Одиночный `\r` терминал тоже примет за Enter.
+            multiline: text.contains(['\n', '\r']),
+            chars: u32::try_from(n).unwrap_or(u32::MAX),
             allow_write: false,
         }
     }
@@ -101,15 +159,18 @@ pub struct ConsentState {
 impl ConsentState {
     /// Спросить и ждать ответа не дольше `timeout`. `None` — не ответил.
     /// `changed(есть_вопросы)` зовётся, когда очередь меняется.
+    /// `Err(Busy)` — в очереди уже [`MAX_PENDING`] вопросов, новый не
+    /// ставится.
     pub async fn ask(
         &self,
         mut dto: ConsentDto,
         timeout: Duration,
         changed: impl Fn(bool),
-    ) -> Option<Choice> {
+    ) -> Result<Option<Choice>, Busy> {
         let (tx, rx) = oneshot::channel();
         {
             let mut q = self.q.lock().unwrap_or_else(|e| e.into_inner());
+            let full = q.items.len() >= MAX_PENDING;
             let same = q.items.iter_mut().find(|p| {
                 dto.kind == ConsentKind::Client
                     && p.dto.kind == ConsentKind::Client
@@ -117,6 +178,7 @@ impl ConsentState {
             });
             match same {
                 Some(p) => p.waiters.push(tx),
+                None if full => return Err(Busy),
                 None => {
                     q.next += 1;
                     dto.id = q.next.to_string();
@@ -136,7 +198,7 @@ impl ConsentState {
             armed: true,
         };
         let got = tokio::time::timeout(timeout, rx).await;
-        match got {
+        Ok(match got {
             Ok(Ok(choice)) => {
                 guard.armed = false;
                 Some(choice)
@@ -144,7 +206,7 @@ impl ConsentState {
             // Не дождались (или вопрос убрали без ответа): свой ждущий
             // закрыт, вопрос без ждущих уходит из очереди (в `Abandon`).
             _ => None,
-        }
+        })
     }
 
     /// Убрать вопросы, которых больше никто не ждёт. Возвращает, остались ли
@@ -258,6 +320,7 @@ mod tests {
                     changes.fetch_add(1, Ordering::Relaxed);
                 })
                 .await
+                .expect("очередь не полна")
             })
         };
         let a = ask(ConsentDto::client("codex", "1", true), 5_000);
@@ -285,7 +348,9 @@ mod tests {
         // Следующий — текст для буфера, обрезанный для показа.
         let next = st.pending().unwrap();
         assert_eq!(next.kind, ConsentKind::Clipboard);
-        assert_eq!(next.text.as_ref().unwrap().chars().count(), SHOWN_CHARS);
+        assert_eq!(next.text.as_ref().unwrap().chars().count(), HEAD_CHARS);
+        assert_eq!(next.tail.as_ref().unwrap().chars().count(), TAIL_CHARS);
+        assert_eq!(next.skipped, 1000);
         assert_eq!(next.chars, 5000);
         // Ответ не того вида не принимается.
         assert!(st.answer(&next.id, Choice::Read));
@@ -328,5 +393,86 @@ mod tests {
         let q = st.show().unwrap();
         assert!(!st.answer(&q.id, Choice::Dismiss));
         assert_eq!(g.await.unwrap(), None);
+    }
+
+    #[test]
+    fn clipboard_text_shows_head_tail_and_invisibles() {
+        // Короткий текст — целиком, без хвоста.
+        let d = ConsentDto::clipboard("codex", "echo hi");
+        assert_eq!(d.text.as_deref(), Some("echo hi"));
+        assert_eq!(
+            (d.tail.as_deref(), d.skipped, d.multiline),
+            (None, 0, false)
+        );
+        // Ровно на границе — тоже целиком.
+        let d = ConsentDto::clipboard("codex", &"a".repeat(HEAD_CHARS + TAIL_CHARS));
+        assert!(d.tail.is_none());
+        // Команда в конце длинного текста видна в хвосте.
+        let long = format!("{}\nrm -rf ~", " ".repeat(10_000));
+        let d = ConsentDto::clipboard("codex", &long);
+        assert!(d.tail.as_deref().unwrap().ends_with("\nrm -rf ~"));
+        assert_eq!(
+            d.skipped as usize,
+            long.chars().count() - HEAD_CHARS - TAIL_CHARS
+        );
+        assert!(d.multiline);
+        // Метки направления, нулевой ширины и `\r` видны меткой.
+        let d = ConsentDto::clipboard("codex", "ls\u{202E}txt.exe\u{200B}\rok\tx");
+        assert_eq!(
+            d.text.as_deref(),
+            Some("ls⟨U+202E⟩txt.exe⟨U+200B⟩⟨U+000D⟩ok\tx")
+        );
+        assert!(d.multiline);
+        assert_eq!(d.chars, 16);
+    }
+
+    #[tokio::test]
+    async fn queue_is_capped() {
+        let st = Arc::new(ConsentState::default());
+        let mut waiting = Vec::new();
+        for i in 0..MAX_PENDING {
+            let st = st.clone();
+            waiting.push(tokio::spawn(async move {
+                st.ask(
+                    ConsentDto::client(&format!("c{i}"), "", false),
+                    Duration::from_secs(60),
+                    |_| {},
+                )
+                .await
+            }));
+        }
+        while st.q.lock().unwrap().items.len() < MAX_PENDING {
+            tokio::task::yield_now().await;
+        }
+        // Девятый вопрос — «занято», сразу.
+        let extra = st
+            .ask(
+                ConsentDto::clipboard("c0", "x"),
+                Duration::from_secs(60),
+                |_| {},
+            )
+            .await;
+        assert_eq!(extra, Err(Busy));
+        // А тот же клиент ещё раз — не новый вопрос, ждёт вместе с первым.
+        let again = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.ask(
+                    ConsentDto::client("c0", "", false),
+                    Duration::from_secs(60),
+                    |_| {},
+                )
+                .await
+            })
+        };
+        while st.q.lock().unwrap().items[0].waiters.len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        let first = st.pending().unwrap();
+        st.answer(&first.id, Choice::Deny);
+        assert_eq!(again.await.unwrap(), Ok(Some(Choice::Deny)));
+        for w in waiting {
+            w.abort();
+        }
     }
 }

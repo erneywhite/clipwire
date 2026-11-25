@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use super::channel;
-use super::handler::{AppStatus, Conn, Host, Store};
+use super::handler::{AppStatus, Busy, Conn, Host, Store};
 
 /// Как человек отвечает на «положить в буфер».
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,14 +109,14 @@ impl Host for Fake {
         client: &str,
         _version: &str,
         _allow_write: bool,
-    ) -> Option<AiAccess> {
+    ) -> Result<Option<AiAccess>, Busy> {
         self.asked_clients.lock().unwrap().push(client.into());
-        *self.client_answer.lock().unwrap()
+        Ok(*self.client_answer.lock().unwrap())
     }
-    async fn ask_clipboard(&self, _client: &str, text: &str) -> bool {
+    async fn ask_clipboard(&self, _client: &str, text: &str) -> Result<bool, Busy> {
         self.asked_clip.lock().unwrap().push(text.into());
         let answer = *self.clip_answer.lock().unwrap();
-        match answer {
+        Ok(match answer {
             Clip::Accept => true,
             Clip::Decline => false,
             Clip::Hang => {
@@ -124,7 +124,7 @@ impl Host for Fake {
                 std::future::pending::<()>().await;
                 false
             }
-        }
+        })
     }
     fn remember_client(&self, name: &str, access: AiAccess) {
         self.ai().clients.push(AiClient {

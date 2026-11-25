@@ -297,7 +297,11 @@ pub fn summary(row: &Row) -> AiSummary {
 /// Срабатывает, если в тексте есть:
 /// - известный префикс токена (`sk-`, `ghp_`, `github_pat_`, `glpat-`,
 ///   `xoxb-`, `AKIA…`, `AIza…`, `ya29.`, `hf_`, `npm_`, `SG.` и др.) или JWT;
+/// - код Clipwire (`clipwire1-…`, `cwserver1-…`, `cwserver2-…`,
+///   `cwgroup1-…`) любой длины: в нём ключ группы или ключ админа сервера;
 /// - закрытый ключ PEM / OpenSSH / PGP или файл ключа PuTTY;
+/// - номер платёжной карты (13–19 цифр, можно через пробел или дефис,
+///   проходит проверку Луна);
 /// - `password=`, `secret:`, `token=`, `pwd=`, `пароль:` и т. п. со
 ///   значением (и в прозе: «password is …», «пароль от роутера: …»), строка
 ///   `.env` вида `KEY=значение`, где значение похоже на случайное или имя
@@ -313,13 +317,24 @@ pub fn summary(row: &Row) -> AiSummary {
 /// - или весь текст — короткое (8–64 символа) слово без пробелов с
 ///   прописными и строчными буквами и цифрой или знаком (так выглядят
 ///   пароли), если это не что-то из безобидного выше, не имя продукта с
-///   номером (`Windows11`, `Shift+Enter`) и не код.
+///   номером (`Windows11`, `Shift+Enter`) и не код;
+/// - или весь текст — 64 hex-символа (можно с `0x`): закрытый ключ ETH/BTC;
+/// - или весь текст — сид-фраза: 12/15/18/21/24 слова из строчных латинских
+///   букв по 3–8 в каждом;
+/// - или весь текст — одноразовый код из 6–8 цифр.
 pub fn looks_secret(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
         return false;
     }
-    if private_key(t) || short_password(t) {
+    if clipwire_code(t)
+        || private_key(t)
+        || short_password(t)
+        || raw_hex_key(t)
+        || seed_phrase(t)
+        || one_time_code(t)
+        || card_number(t)
+    {
         return true;
     }
     if t.lines()
@@ -335,6 +350,126 @@ pub fn looks_secret(text: &str) -> bool {
             || bare_userinfo(w)
             || generic_token(w)
     })
+}
+
+/// Начала кодов Clipwire: код приглашения и код группы несут ключ группы,
+/// коды сервера — ключ доступа к серверу или ключ админа.
+const CLIPWIRE_CODES: &[&str] = &["clipwire1-", "cwserver1-", "cwserver2-", "cwgroup1-"];
+
+/// Код Clipwire где угодно в тексте, без учёта регистра. Отдельное правило,
+/// а не `generic_token`: с длинным адресом сервера код выходит за 256
+/// символов, и общее правило его уже не видит. Хвост — base32 (`a-z`, `2-7`)
+/// от 16 символов, чтобы упоминание вида «код начинается с clipwire1-» не
+/// пряталось.
+fn clipwire_code(t: &str) -> bool {
+    let lower = t.to_ascii_lowercase();
+    CLIPWIRE_CODES.iter().any(|p| {
+        lower.match_indices(p).any(|(i, _)| {
+            lower[i + p.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || ('2'..='7').contains(c))
+                .count()
+                >= 16
+        })
+    })
+}
+
+/// Весь текст — 64 hex-символа, можно с `0x`: так выглядит закрытый ключ
+/// Ethereum или Bitcoin. Тот же вид у sha256 и у id коммита в репозитории
+/// на sha256: такие, вставленные отдельно, тоже прячутся — ошибка в другую
+/// сторону дороже. Хэш внутри текста или с меткой (`sha256:…`) не трогается.
+fn raw_hex_key(t: &str) -> bool {
+    let h = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Весь текст — сид-фраза кошелька (BIP39): 12, 15, 18, 21 или 24 слова из
+/// строчных латинских букв, по 3–8 в слове.
+fn seed_phrase(t: &str) -> bool {
+    let words: Vec<&str> = t.split_whitespace().collect();
+    matches!(words.len(), 12 | 15 | 18 | 21 | 24)
+        && words
+            .iter()
+            .all(|w| (3..=8).contains(&w.len()) && w.chars().all(|c| c.is_ascii_lowercase()))
+}
+
+/// Весь текст — одноразовый код: 6–8 цифр. Пятизначные номера заказов,
+/// годы и цены остаются видны; шестизначное число отдельно прячется.
+fn one_time_code(t: &str) -> bool {
+    (6..=8).contains(&t.len()) && t.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Номер карты в тексте: 13–19 цифр подряд, между цифрами можно по одному
+/// пробелу или дефису, первая цифра 2–6 (Visa, Mastercard, Amex, Discover,
+/// «Мир»), сумма Луна сходится. Первая цифра отсекает метки времени в мс
+/// (`1764…`), граница — числа внутри дробей, версий и слов: рядом с
+/// номером не буква и не цифра, а точка, запятая, `/` или `:` — только если
+/// за ними не цифра («карта 4111…1111, срок 12/29» — карта, `3.1411…` — нет).
+fn card_number(t: &str) -> bool {
+    let chars: Vec<char> = t.chars().collect();
+    // `n` — соседний символ, `beyond` — следующий за ним.
+    let edge = |n: Option<&char>, beyond: Option<&char>| {
+        n.is_none_or(|&n| {
+            !n.is_alphanumeric()
+                && n != '_'
+                && !(matches!(n, '.' | ',' | '/' | ':') && beyond.is_some_and(char::is_ascii_digit))
+        })
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        let before = i.checked_sub(1).and_then(|k| chars.get(k));
+        let beyond = i.checked_sub(2).and_then(|k| chars.get(k));
+        if !chars[i].is_ascii_digit() || !edge(before, beyond) {
+            i += 1;
+            continue;
+        }
+        // Число от `i`: цифры и одиночные разделители между ними.
+        let mut digits = Vec::new();
+        let mut j = i;
+        while j < chars.len() {
+            if chars[j].is_ascii_digit() {
+                digits.push(chars[j] as u8 - b'0');
+                j += 1;
+            } else if matches!(chars[j], ' ' | '-')
+                && chars.get(j + 1).is_some_and(char::is_ascii_digit)
+            {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if edge(chars.get(j), chars.get(j + 1))
+            && (13..=19).contains(&digits.len())
+            && (2..=6).contains(&digits[0])
+            && luhn(&digits)
+        {
+            return true;
+        }
+        i = j.max(i + 1);
+    }
+    false
+}
+
+/// Проверка Луна: каждая вторая цифра справа удваивается, сумма делится
+/// на 10.
+fn luhn(digits: &[u8]) -> bool {
+    let sum: u32 = digits
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(k, &d)| {
+            let d = u32::from(d);
+            match (k % 2, d * 2) {
+                (1, x) if x > 9 => x - 9,
+                (1, x) => x,
+                _ => d,
+            }
+        })
+        .sum();
+    sum.is_multiple_of(10)
 }
 
 /// Закрытый ключ: PEM (`-----BEGIN … PRIVATE KEY-----`, в том числе
@@ -1328,12 +1463,30 @@ mod tests {
         "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBF0123456\n-----END PGP PRIVATE KEY BLOCK-----",
         "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nPrivate-Lines: 1\nAAAAIAbc",
         "admin:S3cr3tPass@192.168.1.10",
+        // Закрытый ключ ETH/BTC целиком (и sha256 отдельно — так же).
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+        // Сид-фразы кошелька.
+        "abandon ability able about above absent absorb abstract absurd abuse access accident",
+        "legal winner thank year wave sausage worth useful legal winner thank yellow \
+         legal winner thank year wave sausage worth useful legal winner thank yellow",
+        // Номера карт: слитно, через пробел, через дефис, внутри текста.
+        "4111111111111111",
+        "4111 1111 1111 1111",
+        "5555-5555-5555-4444",
+        "378282246310005",
+        "карта 2200 0000 0000 0004, срок 12/29",
+        // Одноразовые коды.
+        "482913",
+        " 4829135 ",
+        "48291357",
     ];
 
     const HARMLESS: &[&str] = &[
         "550e8400-e29b-41d4-a716-446655440000",
         "da39a3ee5e6b4b0d3255bfef95601890afd80709",
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        // 64 hex внутри текста — хэш, а не ключ.
+        "образ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 собран",
         "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "d41d8cd98f00b204e9800998ecf8427e",
         "C:\\Users\\Erney\\Documents\\ClaudeCode\\Clipwire\\Cargo.toml",
@@ -1419,6 +1572,25 @@ mod tests {
         "git@github.com:erneywhite/clipwire.git",
         "mailto:ivan@example.com",
         "max_tokens: 4096",
+        // Числа, похожие на карты и коды, но не они.
+        "+1 (415) 555-2671",
+        "+37120000000",
+        "2026",
+        "1999.99",
+        "€ 1 299,00",
+        "Заказ 12345",
+        "123456789",
+        "1764000000000",
+        "4111 1111 1111 1112",
+        "Код 4821 из 6 цифр: 48",
+        "v1.4111111111111111",
+        // Слова, похожие на сид-фразу.
+        "abandon ability able about above absent absorb abstract absurd abuse access",
+        "Abandon ability able about above absent absorb abstract absurd abuse access accident",
+        "the quick brown fox jumps over the lazy dog and runs to the forest",
+        // Упоминание кода Clipwire без самого кода.
+        "Код приглашения не разобрался. Он начинается с clipwire1-.",
+        "cwserver2-…",
     ];
 
     #[test]
@@ -1444,6 +1616,37 @@ mod tests {
             "заметка ".repeat(80)
         );
         assert!(looks_secret(&text));
+    }
+
+    #[test]
+    fn clipwire_codes_hidden_at_any_length() {
+        // Хвост base32 длиннее 256 символов: общее правило длинных слов его
+        // не видит, видит только правило кодов Clipwire.
+        let tail = "abcdefghijklmnopqrstuvwxyz234567".repeat(10);
+        for p in ["clipwire1-", "cwserver1-", "cwserver2-", "cwgroup1-"] {
+            let code = format!("{p}{tail}");
+            assert!(code.chars().count() > 256);
+            assert!(!generic_token(&code), "{p}: проверка не по общему правилу");
+            assert!(looks_secret(&code), "{p}");
+            assert!(looks_secret(&code.to_uppercase()), "{p} прописными");
+            // Код внутри фразы.
+            let line = format!("Держи код: {code} — вставь в настройки.");
+            assert!(looks_secret(&line), "{p} в тексте");
+        }
+        assert!(looks_secret(
+            "вот приглашение clipwire1-mfrggzdfmztwq2lknnwg23tpobyxe43u, не теряй"
+        ));
+    }
+
+    #[test]
+    fn luhn_and_card_bounds() {
+        assert!(luhn(&[7, 9, 9, 2, 7, 3, 9, 8, 7, 1, 3]));
+        assert!(!luhn(&[7, 9, 9, 2, 7, 3, 9, 8, 7, 1, 4]));
+        // Слишком длинная цепочка цифр — не карта, даже если сумма сходится.
+        assert!(!card_number("41111111111111111111111"));
+        // Дробная часть и цифры в слове не считаются.
+        assert!(!card_number("3.141111111111111111"));
+        assert!(!card_number("id4111111111111111"));
     }
 
     fn file(name: &str, is_dir: bool) -> FileRef {

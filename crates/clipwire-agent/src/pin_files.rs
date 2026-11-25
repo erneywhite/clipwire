@@ -139,22 +139,31 @@ pub fn trusted_files(remote: &[FileRef], local: Option<&[FileRef]>) -> Option<Ve
     )
 }
 
-/// Можно ли починкой чужого закрепа залить свой файл без вопроса: он в
-/// пределах порога «сразу заливать» (`limit_mb`), или это устройство само его
-/// уже заливало (`blob` в своей записи без прямой передачи — такие `blob`
-/// выпускает только оно). Порог 0 — никогда. Файл больше порога заливается,
-/// только когда закрепляет сам владелец (окно вставки спрашивает).
-pub fn may_repair_own(local: &FileRef, limit_mb: u64) -> bool {
+/// Можно ли починкой чужого закрепа залить свой файл без вопроса. Да, если
+/// это устройство само его уже заливало (`blob` в своей записи без прямой
+/// передачи — такие `blob` выпускает только оно): файл и так был в группе.
+/// Иначе — только если запись сейчас можно отправить в группу (`share`: не
+/// пауза, виды включены в «Что отправлять», правила «Не отправлять» её не
+/// задевают), файл не под правилом «Не загружать сразу» и в пределах порога «сразу
+/// заливать» (`limit_mb`). Иначе закреп с тем же хэшем от любого участника
+/// вытащил бы файл, который настройки держат на этом устройстве. Порог 0 —
+/// никогда. Файл больше порога заливается, только когда закрепляет сам
+/// владелец (окно вставки спрашивает).
+pub fn may_repair_own(local: &FileRef, limit_mb: u64, share: bool) -> bool {
     if limit_mb == 0 {
         return false;
+    }
+    if local.blob.is_some() && !local.p2p {
+        return true;
     }
     let size = if local.is_dir && local.blob_size > 0 {
         local.blob_size
     } else {
         local.size
     };
-    crate::service::route(size, limit_mb) == crate::service::Route::Server
-        || (local.blob.is_some() && !local.p2p)
+    share
+        && !crate::exclusions::no_upload(local)
+        && crate::service::route(size, limit_mb) == crate::service::Route::Server
 }
 
 /// Файлы для содержимого починенного закрепа и что из них заливать (номер
@@ -164,12 +173,14 @@ pub type RepairPlan = (Vec<FileRef>, Vec<(usize, Bytes)>);
 /// Что залить при починке закрепа: файлы для содержимого
 /// ([`trusted_files`]) и какие из них заливать — не покрытые (`held`), с
 /// байтами здесь и, если запись своя, только с согласия владельца
-/// ([`may_repair_own`]). `None` — содержимое не сходится со своей записью.
+/// ([`may_repair_own`]; `share` — можно ли сейчас отправить свою запись в
+/// группу). `None` — содержимое не сходится со своей записью.
 pub fn repair_picks(
     remote: &[FileRef],
     local: Option<&[FileRef]>,
     held: impl Fn(BlobId) -> bool,
     limit_mb: u64,
+    share: bool,
     files_dir: &Path,
 ) -> Option<RepairPlan> {
     let files = trusted_files(remote, local)?;
@@ -178,7 +189,7 @@ pub fn repair_picks(
         .iter()
         .enumerate()
         .filter(|(_, f)| !covered(f, &held))
-        .filter(|(i, _)| local.is_none_or(|l| may_repair_own(&l[*i], limit_mb)))
+        .filter(|(i, _)| local.is_none_or(|l| may_repair_own(&l[*i], limit_mb, share)))
         .filter_map(|(i, f)| local_bytes(f, own, files_dir).map(|b| (i, b)))
         .collect();
     Some((files, picks))
@@ -446,7 +457,7 @@ mod tests {
         };
         for remote in [f, unc] {
             let (_, picks) =
-                repair_picks(&[remote], None, |_| false, 100, &dir.join("files")).unwrap();
+                repair_picks(&[remote], None, |_| false, 100, true, &dir.join("files")).unwrap();
             assert!(picks.is_empty(), "{picks:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -457,15 +468,59 @@ mod tests {
         let mb = 1024 * 1024;
         let mut f = file(None, false);
         f.size = 5 * mb;
-        assert!(!may_repair_own(&f, 0), "порог 0 — никогда");
-        assert!(may_repair_own(&f, 10), "в пределах порога");
-        assert!(!may_repair_own(&f, 1), "больше порога и не заливался");
+        assert!(!may_repair_own(&f, 0, true), "порог 0 — никогда");
+        assert!(may_repair_own(&f, 10, true), "в пределах порога");
+        assert!(!may_repair_own(&f, 1, true), "больше порога и не заливался");
         // Уже заливался этим устройством (свой blob без прямой передачи).
         f.blob = Some(BlobId([1; 16]));
-        assert!(may_repair_own(&f, 1));
+        assert!(may_repair_own(&f, 1, true));
+        assert!(may_repair_own(&f, 1, false), "и так был в группе");
         f.p2p = true;
-        assert!(!may_repair_own(&f, 1), "прямая передача — не заливался");
-        assert!(!may_repair_own(&f, 0));
+        assert!(
+            !may_repair_own(&f, 1, true),
+            "прямая передача — не заливался"
+        );
+        assert!(!may_repair_own(&f, 0, true));
+    }
+
+    /// Свой файл, который остался только здесь (пауза, «Что отправлять»,
+    /// «Не отправлять»), чужой закреп с тем же хэшем не заливает, даже в
+    /// пределах порога.
+    #[test]
+    fn own_local_only_file_not_repaired() {
+        let f = file(None, false);
+        assert!(!may_repair_own(&f, 100, false));
+        let dir = std::env::temp_dir().join(format!(
+            "clipwire-pin-local-only-{}",
+            getrandom::u64().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.txt");
+        std::fs::write(&path, b"secret").unwrap();
+        let (size, modified_ms) = crate::blobs::file_stamp(&path).unwrap();
+        let local = FileRef {
+            path: path.to_string_lossy().into_owned(),
+            size,
+            modified_ms,
+            blob_size: 0,
+            ..f
+        };
+        let files = std::slice::from_ref(&local);
+        let pick = |share| {
+            repair_picks(
+                files,
+                Some(files),
+                |_| false,
+                100,
+                share,
+                &dir.join("files"),
+            )
+            .unwrap()
+            .1
+        };
+        assert!(pick(false).is_empty(), "залили файл, который только здесь");
+        assert_eq!(pick(true), vec![(0, Bytes::Source(path))]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

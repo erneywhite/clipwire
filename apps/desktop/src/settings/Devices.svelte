@@ -5,7 +5,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, type DevicesIncoming, type GroupDevice, type RekeyResult, type Status, type StorageKind } from '../lib/api'
   import { ago, plural } from '../lib/format'
-  import { CHECKING, adminAction, adminConfirmText, canClaimAdmin, canManage, lastAdmin, checking as checkingText, confirmText, deviceTitle, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, pendingAdminTitle, pendingAdmins, recipients, rekeyChoice, rolesText, sameName, seenLabel, staying, type Roles } from '../lib/devices'
+  import { CHECKING, adminAction, adminConfirmText, adminKeyText, waitOnline, canClaimAdmin, canManage, lastAdmin, checking as checkingText, confirmText, deviceTitle, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, pendingAdminTitle, pendingAdmins, recipients, rekeyChoice, rolesText, sameName, seenLabel, staying, type Roles } from '../lib/devices'
 
   // `incoming` — итог смены ключа, пришедший событием (его забирает окно
   // настроек: раздел мог быть закрыт). Принятый сообщается `onIncomingTaken`.
@@ -41,6 +41,17 @@
   let shownAt = $state(0)
   let result = $state<RekeyResult | null>(null)
   let copied = $state(false)
+  /** Галочка «Сменить ключ администратора сервера» при удалении: смена ключа
+   *  группы ключ администратора у удалённого не отзывает. */
+  let rotateAdmin = $state(true)
+  /** Новый код сервера администратора после удаления; '' — не меняли. */
+  let adminCode = $state('')
+  let adminBusy = $state(false)
+  let adminError = $state('')
+  let adminCopied = $state(false)
+  /** Ключ администратора сменить после удаления, когда придёт ответ: он мог
+   *  потеряться и прийти событием (`incoming`). */
+  let rotatePending = false
   /** Ответ на смену ключа потерялся, ждём, что скажет сервер при повторном входе. */
   let checking = $state(false)
   /** Вид хранилища файлов группы: у внешнего доступы остаются у тех, кто окажется вне группы. */
@@ -81,6 +92,8 @@
   const keyTo = $derived(confirming === null ? [] : recipients(shown, confirming || null))
   const stay = $derived(confirming === null ? [] : staying(shown, confirming || null, unticked))
   const freshNote = $derived(confirming === null ? '' : freshWarning(shown, confirming || null, unticked, shownAt))
+  /** Кто-то окажется вне группы: удаляемое или получатели без галочки. */
+  const removing = $derived(confirming !== null && (confirming !== '' || unticked.length > 0))
 
   function toggle(id: string, on: boolean) {
     unticked = on ? unticked.filter((x) => x !== id) : [...unticked, id]
@@ -104,6 +117,9 @@
     shown = list
     unticked = []
     shownAt = Date.now()
+    rotateAdmin = true
+    adminCode = ''
+    adminError = ''
     confirming = id
     loadStorage()
   }
@@ -153,6 +169,7 @@
       // В команду уходит показанный список, а не свежий: устройство, которого
       // в диалоге не было, движок заметит и смену отменит.
       const pick = rekeyChoice(shown, id || null, unticked)
+      rotatePending = removing && serverAdmin && rotateAdmin
       done(id ? await api.deviceRemove(id, pick.confirmed, pick.remove) : await api.groupRekey(pick.confirmed, pick.remove))
     } catch (e) {
       const msg = String(e)
@@ -161,6 +178,8 @@
         checking = true
         confirming = null
       } else {
+        // Удаления не было: и ключ администратора менять не за что.
+        rotatePending = false
         error = msg
         // Состав группы изменился: закрыть вопрос и показать новый список.
         if (isNewDeviceError(msg)) {
@@ -179,6 +198,31 @@
     copied = false
     checking = false
     onRekeyed?.(r.invite)
+    if (rotatePending) {
+      rotatePending = false
+      rotateAdminKey()
+    }
+  }
+
+  /** Сменить ключ администратора сервера после удаления. Синхронизация
+   *  после смены ключа группы перезапускается, запрос ждёт связи. */
+  async function rotateAdminKey() {
+    adminBusy = true
+    adminError = ''
+    try {
+      if (!(await waitOnline(api.status))) throw new Error(t('Нет связи с сервером'))
+      adminCode = await api.serverRotateAdminKey()
+      adminCopied = false
+    } catch (e) {
+      adminError = t('Устройство удалено, но ключ администратора сервера не сменился: {e}. Смените его в разделе «Сервер».', { e: String(e) })
+    } finally {
+      adminBusy = false
+    }
+  }
+
+  async function copyAdminCode() {
+    await api.copyQuietly(adminCode)
+    adminCopied = true
   }
 
   async function copyInvite() {
@@ -202,6 +246,7 @@
     untrack(() => {
       if (inc.result) done(inc.result)
       if (inc.error) {
+        rotatePending = false
         checking = false
         error = inc.error
       }
@@ -349,6 +394,15 @@
         {/each}
         {#if freshNote}<p class="hint warn">{freshNote}</p>{/if}
       </div>
+      {#if removing && serverAdmin}
+        <label class="pick">
+          <input type="checkbox" bind:checked={rotateAdmin} disabled={busy} />
+          <span class="name">{t('Сменить ключ администратора сервера')}</span>
+        </label>
+        <p class="hint">{adminKeyText(true)}</p>
+      {:else if removing}
+        <p class="hint warn">{adminKeyText(false)}</p>
+      {/if}
       <div class="buttons">
         <button class="danger" disabled={busy} onclick={run}>
           {busy ? t('Меняю ключ…') : confirming ? t('Удалить устройство') : t('Сменить ключ')}
@@ -365,6 +419,19 @@
     </button>
   {/if}
   {#if checking}<p class="hint" role="status">{checkingText()}</p>{/if}
+  {#if adminBusy}<p class="hint" role="status">{t('Меняю ключ администратора сервера…')}</p>{/if}
+  {#if adminError}<p class="error" role="alert">{adminError}</p>{/if}
+  {#if adminCode}
+    <div class="done" role="status">
+      <p>{t('Ключ сменён. Новый код сервера администратора:')}</p>
+      <code class="code selectable">{adminCode}</code>
+      <div class="buttons">
+        <button onclick={copyAdminCode}>{adminCopied ? t('Скопировано') : t('Скопировать код сервера')}</button>
+        <button onclick={() => (adminCode = '')}>{t('Скрыть')}</button>
+      </div>
+      <p class="hint">{t('На этом устройстве новый ключ уже сохранён. На сервере новый код покажет команда clipwire-server info.')}</p>
+    </div>
+  {/if}
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if result}
     <div class="done" role="status">

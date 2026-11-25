@@ -118,6 +118,8 @@ pub struct Service {
 struct HistorySource {
     history: Arc<Mutex<History>>,
     limit_mb: Arc<AtomicU64>,
+    /// Синхронизация на паузе (`Service::paused`).
+    paused: Arc<AtomicBool>,
     /// Это устройство: источник своих записей (у записей, скопированных
     /// без группы, в истории нулевой id).
     device: DeviceId,
@@ -160,6 +162,10 @@ impl PinSource for HistorySource {
 
     fn upload_limit_mb(&self) -> u64 {
         self.limit_mb.load(Ordering::Relaxed)
+    }
+
+    fn may_send_own(&self, content: &Content) -> bool {
+        !self.paused.load(Ordering::Relaxed) && may_send(send_kinds(), content)
     }
 
     fn file_item(&self, hash: &[u8; 32]) -> Option<(Item, bool)> {
@@ -744,6 +750,7 @@ impl Service {
                 let source = HistorySource {
                     history: history.clone(),
                     limit_mb: upload_limit_mb.clone(),
+                    paused: paused.clone(),
                     device,
                 };
                 let engine = engine.with_pins(book.clone(), Arc::new(source));

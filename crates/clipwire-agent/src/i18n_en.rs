@@ -773,8 +773,8 @@ pub static EN: &[(&str, &str)] = &[
     ),
     // Администратор сервера и админ группы.
     (
-        "Его печатает сервер при запуске (лог контейнера) и команда clipwire-server info, строка начинается с cwserver2-.",
-        "The server prints it on startup (container log) and via clipwire-server info; it starts with cwserver2-.",
+        "Его печатает сервер при первом запуске (лог контейнера) и команда clipwire-server info, строка начинается с cwserver2-.",
+        "The server prints it on first start (container log) and via clipwire-server info; it starts with cwserver2-.",
     ),
     (
         "С кодом cwserver1- группу не создать: эта версия Clipwire создаёт группы только на сервере 0.5.0 или новее и только с его кодом администратора cwserver2-. Если сервер старее, обновите его образ, и он напечатает новый код.",

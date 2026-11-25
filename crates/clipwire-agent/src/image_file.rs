@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::i18n::trf;
 
@@ -147,12 +147,16 @@ pub fn local_now() -> Stamp {
 }
 
 /// Записать PNG в новую папку `<state>/pasted/<id>/` под именем «Снимок …».
-/// Возвращает описание файла для буфера (как его прочитает слежение).
+/// Возвращает описание файла для буфера (как его прочитает слежение). На
+/// unix папки с правами 0700, файл 0600: в снимке может быть что угодно с
+/// экрана, другим пользователям машины его читать незачем.
 pub fn write_png(state_dir: &Path, png: &[u8]) -> Result<clipwire_core::FileRef> {
-    let dir = pasted_dir(state_dir).join(uuid::Uuid::now_v7().simple().to_string());
-    std::fs::create_dir_all(&dir).with_context(|| format!("не создалась {}", dir.display()))?;
+    let root = pasted_dir(state_dir);
+    crate::state::ensure_private_dir(&root)?;
+    let dir = root.join(uuid::Uuid::now_v7().simple().to_string());
+    crate::state::ensure_private_dir(&dir)?;
     let path = dir.join(file_name(&local_now()));
-    std::fs::write(&path, png).with_context(|| format!("не записался {}", path.display()))?;
+    crate::state::write_atomic(&path, png)?;
     Ok(crate::clipboard::local_file_ref(&path))
 }
 
@@ -358,6 +362,15 @@ mod tests {
         assert!(Path::new(&a.path).starts_with(pasted_dir(&state)));
         assert!(a.name.ends_with(".png"));
         assert_eq!(a.size, 4);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            let file = Path::new(&a.path);
+            assert_eq!(mode(&pasted_dir(&state)), 0o700);
+            assert_eq!(mode(file.parent().unwrap()), 0o700);
+            assert_eq!(mode(file), 0o600);
+        }
         assert_eq!(std::fs::read(&b.path).unwrap(), b"\x89PNG2");
         let _ = std::fs::remove_dir_all(&state);
     }

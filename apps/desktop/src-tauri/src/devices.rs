@@ -9,9 +9,10 @@ use clipwire_agent::devices::{self, Controller, DeviceView, RekeyNotice};
 use clipwire_agent::i18n::{tr, trf};
 use clipwire_core::{DeviceId, GroupId, GroupKey};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
 use crate::AppState;
+use crate::admin::only_settings;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -208,11 +209,13 @@ pub struct RekeyDto {
 /// исключаются вместе с `device_id`.
 #[tauri::command]
 pub async fn device_remove(
+    window: WebviewWindow,
     app: AppHandle,
     device_id: String,
     confirmed: Vec<String>,
     also_remove: Vec<String>,
 ) -> CmdResult<RekeyDto> {
+    only_settings(&window)?;
     let mut remove = vec![parse_device(&device_id)?];
     remove.extend(parse_devices(&also_remove)?);
     rekey(&app, remove, parse_devices(&confirmed)?).await
@@ -222,10 +225,12 @@ pub async fn device_remove(
 /// получатели, с которых человек снял галочку (обычно пусто).
 #[tauri::command]
 pub async fn group_rekey(
+    window: WebviewWindow,
     app: AppHandle,
     confirmed: Vec<String>,
     remove: Vec<String>,
 ) -> CmdResult<RekeyDto> {
+    only_settings(&window)?;
     rekey(&app, parse_devices(&remove)?, parse_devices(&confirmed)?).await
 }
 
@@ -467,7 +472,8 @@ pub fn group_rekey_offer(app: AppHandle) -> Option<OfferDto> {
 
 /// «Перейти»: принять новый ключ и запустить синхронизацию с ним.
 #[tauri::command]
-pub async fn group_rekey_accept(app: AppHandle) -> CmdResult<()> {
+pub async fn group_rekey_accept(window: WebviewWindow, app: AppHandle) -> CmdResult<()> {
+    only_settings(&window)?;
     let offer = pending_offer(&app).ok_or_else(|| tr("Ключ группы уже сменён").to_string())?;
     // Сервис сейчас локальный: остановить до записи ключа, чтобы он не
     // держал файлы старой группы.

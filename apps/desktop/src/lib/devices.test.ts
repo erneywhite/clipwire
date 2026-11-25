@@ -3,7 +3,7 @@
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
 import type { GroupDevice } from './api'
 
-const { FRESH_MS, adminAction, adminConfirmText, canClaimAdmin, canManage, lastAdmin, confirmText, deviceTitle, exposedAccessText, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, leftOut, pendingAdmins, offerText, recipients, rekeyChoice, rekeyedBy, rolesText, sameName, seenLabel, staying } = (await import('./devices' + '.ts')) as typeof import('./devices')
+const { FRESH_MS, adminAction, adminKeyText, waitOnline, adminConfirmText, canClaimAdmin, canManage, lastAdmin, confirmText, deviceTitle, exposedAccessText, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, leftOut, pendingAdmins, offerText, recipients, rekeyChoice, rekeyedBy, rolesText, sameName, seenLabel, staying } = (await import('./devices' + '.ts')) as typeof import('./devices')
 const fmt = (await import('./format' + '.ts')) as typeof import('./format')
 
 function check(cond: boolean, msg: string) {
@@ -167,5 +167,29 @@ check(!canClaimAdmin(one('bbbb'), list, false), 'без ключа админи�
 check(!canClaimAdmin(one('aaaa'), list, true) && !canClaimAdmin(many('bbbb', 'aaaa'), list, true), 'уже админ — нет')
 check(!canClaimAdmin(one(), list, true), 'без админа роль приходит сама')
 check(!canClaimAdmin(old, list, true) && !canClaimAdmin(null, list, true), 'старый сервер или нет связи — нет')
+
+// Ключ администратора сервера при удалении: галочка у администратора,
+// предупреждение у остальных. Оба текста говорят «если был».
+check(adminKeyText(true).startsWith('Если у удалённого устройства был код'), 'у администратора — пояснение к галочке')
+check(adminKeyText(false).startsWith('Внимание: если у удалённого устройства был ключ'), 'без ключа — предупреждение')
+check(adminKeyText(false).includes('токен доступа'), 'и про токен доступа')
+
+// Ожидание связи после перезапуска синхронизации.
+{
+  const noSleep = async () => {}
+  const seq = (...kinds: string[]) => {
+    let i = 0
+    return async () => {
+      const k = kinds[Math.min(i++, kinds.length - 1)]
+      if (k === 'throw') throw new Error('нет ответа')
+      return { kind: k }
+    }
+  }
+  check(await waitOnline(seq('connecting', 'throw', 'online'), 30_000, 500, noSleep), 'дождались связи')
+  check(!(await waitOnline(seq('offline'), 1_000, 500, noSleep)), 'связи нет — сдаёмся')
+  let calls = 0
+  await waitOnline(async () => (calls++, { kind: 'connecting' }), 1_000, 500, noSleep)
+  check(calls === 3, 'опрос в пределах срока: 0, 500, 1000 мс')
+}
 
 console.log('devices: всё прошло')

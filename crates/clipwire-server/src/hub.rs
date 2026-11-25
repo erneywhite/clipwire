@@ -3,7 +3,7 @@
 //! кто на связи (`ListDevices`), и закрыть соединения при смене ключа.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clipwire_core::proto::ServerMsg;
@@ -15,10 +15,101 @@ use tokio::sync::{Notify, mpsc};
 /// придёт при переподключении.
 pub const QUEUE: usize = 64;
 
+/// Предел байтов в очереди одного соединения (по размеру содержимого
+/// сообщений). Сообщение сверх него отбрасывается, как при полной очереди.
+/// Без предела 64 элемента по 8–15 МиБ на каждое соединение, которое вошло
+/// и перестало читать, складывались бы в гигабайты. Пустая очередь берёт
+/// одно сообщение любого размера: элемент больше предела иначе не дошёл бы
+/// никогда.
+pub const QUEUE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Сколько байтов содержимого держит сообщение: элементы, настройки,
+/// записки, закрепы. Остальное считается маленьким.
+fn payload_len(msg: &ServerMsg) -> usize {
+    const SMALL: usize = 64;
+    SMALL
+        + match msg {
+            ServerMsg::Deliver(item) | ServerMsg::Backfill(item) => item.ciphertext.len(),
+            ServerMsg::GroupConfig(Some(c)) => c.len(),
+            ServerMsg::Deleted(note) => note.len(),
+            ServerMsg::Pinned(rec) => rec.state.len() + rec.content.as_ref().map_or(0, Vec::len),
+            _ => 0,
+        }
+}
+
+/// Отправляющая сторона очереди соединения. Сообщение лежит в `Arc`: при
+/// рассылке все очереди группы держат одну его копию, а не каждая свою.
+#[derive(Clone)]
+pub struct Outbox {
+    tx: mpsc::Sender<(Arc<ServerMsg>, usize)>,
+    bytes: Arc<AtomicUsize>,
+}
+
+/// Читающая сторона очереди: её разбирает соединение.
+pub struct Inbox {
+    rx: mpsc::Receiver<(Arc<ServerMsg>, usize)>,
+    bytes: Arc<AtomicUsize>,
+}
+
+/// Очередь одного соединения: не больше [`QUEUE`] сообщений и
+/// [`QUEUE_BYTES`] содержимого.
+pub fn queue() -> (Outbox, Inbox) {
+    let (tx, rx) = mpsc::channel(QUEUE);
+    let bytes = Arc::new(AtomicUsize::new(0));
+    (
+        Outbox {
+            tx,
+            bytes: bytes.clone(),
+        },
+        Inbox { rx, bytes },
+    )
+}
+
+impl Outbox {
+    /// Положить сообщение, не дожидаясь места. `Err` — очередь полна (по
+    /// числу или по байтам) или соединение закрыто.
+    fn try_send(&self, msg: Arc<ServerMsg>) -> Result<(), &'static str> {
+        let len = payload_len(&msg);
+        // Место по байтам занимаем до отправки: две рассылки разом не
+        // переберут предел вдвоём.
+        let reserved = self
+            .bytes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held == 0 || held + len <= QUEUE_BYTES).then_some(held + len)
+            });
+        if reserved.is_err() {
+            return Err("в очереди слишком много байтов");
+        }
+        self.tx.try_send((msg, len)).map_err(|e| {
+            self.bytes.fetch_sub(len, Ordering::AcqRel);
+            match e {
+                mpsc::error::TrySendError::Full(_) => "очередь полна",
+                mpsc::error::TrySendError::Closed(_) => "соединение закрыто",
+            }
+        })
+    }
+}
+
+impl Inbox {
+    /// Следующее сообщение. `None` — отправителей не осталось.
+    pub async fn recv(&mut self) -> Option<Arc<ServerMsg>> {
+        let (msg, len) = self.rx.recv().await?;
+        self.bytes.fetch_sub(len, Ordering::AcqRel);
+        Some(msg)
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Option<Arc<ServerMsg>> {
+        let (msg, len) = self.rx.try_recv().ok()?;
+        self.bytes.fetch_sub(len, Ordering::AcqRel);
+        Some(msg)
+    }
+}
+
 /// Одно соединение группы.
 struct Member {
     device: DeviceId,
-    tx: mpsc::Sender<ServerMsg>,
+    tx: Outbox,
     kick: Arc<Notify>,
     /// Соединение спрашивало `GetGroupConfig` и получает новые настройки.
     /// Клиенты 0.1.0 этого сообщения не знают, им `GroupConfig` слать нельзя.
@@ -98,12 +189,7 @@ impl Hub {
 
     /// Регистрирует соединение устройства `device`. Снимается с учёта, когда
     /// `Registration` дропается.
-    pub fn register(
-        &self,
-        group: GroupId,
-        device: DeviceId,
-        tx: mpsc::Sender<ServerMsg>,
-    ) -> Registration<'_> {
+    pub fn register(&self, group: GroupId, device: DeviceId, tx: Outbox) -> Registration<'_> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let kick = Arc::new(Notify::new());
         let config_sub = Arc::new(AtomicBool::new(false));
@@ -167,19 +253,19 @@ impl Hub {
 
     /// Рассылает сообщение всем соединениям группы, кроме `except`.
     /// Возвращает число получателей.
-    pub fn broadcast(&self, group: &GroupId, except: u64, msg: &ServerMsg) -> usize {
+    pub fn broadcast(&self, group: &GroupId, except: u64, msg: ServerMsg) -> usize {
         self.send_to(group, except, msg, |_| true)
     }
 
     /// То же, но только соединениям, подписанным на настройки группы
     /// ([`Registration::subscribe_config`]).
-    pub fn broadcast_config(&self, group: &GroupId, except: u64, msg: &ServerMsg) -> usize {
+    pub fn broadcast_config(&self, group: &GroupId, except: u64, msg: ServerMsg) -> usize {
         self.send_to(group, except, msg, |m| m.config_sub.load(Ordering::Relaxed))
     }
 
     /// То же, но только соединениям по `clipwire/5`
     /// ([`Registration::subscribe_deletes`]).
-    pub fn broadcast_deletes(&self, group: &GroupId, except: u64, msg: &ServerMsg) -> usize {
+    pub fn broadcast_deletes(&self, group: &GroupId, except: u64, msg: ServerMsg) -> usize {
         self.send_to(group, except, msg, |m| {
             m.deletes_sub.load(Ordering::Relaxed)
         })
@@ -188,7 +274,7 @@ impl Hub {
     /// То же, но только соединениям по `clipwire/8`
     /// ([`Registration::subscribe_pins`]). Полная очередь теряет сообщение:
     /// устройство догонит его по `PinsSince` при следующем входе.
-    pub fn broadcast_pins(&self, group: &GroupId, except: u64, msg: &ServerMsg) -> usize {
+    pub fn broadcast_pins(&self, group: &GroupId, except: u64, msg: ServerMsg) -> usize {
         self.send_to(group, except, msg, |m| m.pins_sub.load(Ordering::Relaxed))
     }
 
@@ -204,13 +290,16 @@ impl Hub {
         &self,
         group: &GroupId,
         except: u64,
-        msg: &ServerMsg,
+        msg: ServerMsg,
         pick: impl Fn(&Member) -> bool,
     ) -> usize {
         let groups = self.lock();
         let Some(members) = groups.get(group) else {
             return 0;
         };
+        // Одна копия на всех получателей: элемент до 15 МиБ не копируется
+        // в каждую очередь.
+        let msg = Arc::new(msg);
         let mut sent = 0;
         for (&id, m) in members {
             if id == except || !pick(m) {
@@ -233,7 +322,7 @@ fn send_devices_changed(members: &HashMap<u64, Member>, except: u64) -> usize {
         }
         // Полная очередь — не беда: значит, соединение и так отстаёт, а
         // список устройств оно перечитает при следующем `DevicesChanged`.
-        if m.tx.try_send(ServerMsg::DevicesChanged).is_ok() {
+        if m.tx.try_send(Arc::new(ServerMsg::DevicesChanged)).is_ok() {
             sent += 1;
         }
     }
@@ -248,18 +337,18 @@ mod tests {
     fn broadcast_skips_sender_and_other_groups() {
         let hub = Hub::default();
         let (g1, g2) = (GroupId([1; 32]), GroupId([2; 32]));
-        let (ta, mut ra) = mpsc::channel(4);
-        let (tb, mut rb) = mpsc::channel(4);
-        let (tc, mut rc) = mpsc::channel(4);
+        let (ta, mut ra) = queue();
+        let (tb, mut rb) = queue();
+        let (tc, mut rc) = queue();
         let (da, db) = (DeviceId([1; 32]), DeviceId([2; 32]));
         let a = hub.register(g1, da, ta);
         let _b = hub.register(g1, db, tb);
         let _c = hub.register(g2, da, tc);
         let msg = ServerMsg::Error("x".into());
-        assert_eq!(hub.broadcast(&g1, a.id, &msg), 1);
-        assert!(ra.try_recv().is_err());
-        assert_eq!(rb.try_recv().unwrap(), msg);
-        assert!(rc.try_recv().is_err());
+        assert_eq!(hub.broadcast(&g1, a.id, msg.clone()), 1);
+        assert!(ra.try_recv().is_none());
+        assert_eq!(*rb.try_recv().unwrap(), msg);
+        assert!(rc.try_recv().is_none());
         assert_eq!(hub.online_devices(&g1), HashSet::from([da, db]));
         assert_eq!(hub.online_devices(&GroupId([9; 32])), HashSet::new());
     }
@@ -268,9 +357,9 @@ mod tests {
     fn config_goes_only_to_subscribers() {
         let hub = Hub::default();
         let g = GroupId([1; 32]);
-        let (ta, mut ra) = mpsc::channel(4);
-        let (tb, mut rb) = mpsc::channel(4);
-        let (tc, mut rc) = mpsc::channel(4);
+        let (ta, mut ra) = queue();
+        let (tb, mut rb) = queue();
+        let (tc, mut rc) = queue();
         let a = hub.register(g, DeviceId([1; 32]), ta);
         let b = hub.register(g, DeviceId([2; 32]), tb);
         let _old = hub.register(g, DeviceId([3; 32]), tc);
@@ -278,19 +367,19 @@ mod tests {
         b.subscribe_config();
         let msg = ServerMsg::GroupConfig(Some(vec![1]));
         // Отправитель и неподписанный (клиент 0.1.0) не получают.
-        assert_eq!(hub.broadcast_config(&g, a.id, &msg), 1);
-        assert!(ra.try_recv().is_err());
-        assert_eq!(rb.try_recv().unwrap(), msg);
-        assert!(rc.try_recv().is_err());
+        assert_eq!(hub.broadcast_config(&g, a.id, msg.clone()), 1);
+        assert!(ra.try_recv().is_none());
+        assert_eq!(*rb.try_recv().unwrap(), msg);
+        assert!(rc.try_recv().is_none());
     }
 
     #[test]
     fn devices_changed_goes_to_v6_and_on_leave() {
         let hub = Hub::default();
         let g = GroupId([1; 32]);
-        let (ta, mut ra) = mpsc::channel(4);
-        let (tb, mut rb) = mpsc::channel(4);
-        let (tc, mut rc) = mpsc::channel(4);
+        let (ta, mut ra) = queue();
+        let (tb, mut rb) = queue();
+        let (tc, mut rc) = queue();
         let a = hub.register(g, DeviceId([1; 32]), ta);
         let b = hub.register(g, DeviceId([2; 32]), tb);
         let _old = hub.register(g, DeviceId([3; 32]), tc);
@@ -298,13 +387,13 @@ mod tests {
         b.subscribe_devices();
         // Новое устройство (b) не получает о себе, старый клиент — вообще.
         assert_eq!(hub.devices_changed(&g, b.id), 1);
-        assert_eq!(ra.try_recv().unwrap(), ServerMsg::DevicesChanged);
-        assert!(rb.try_recv().is_err());
-        assert!(rc.try_recv().is_err());
+        assert_eq!(*ra.try_recv().unwrap(), ServerMsg::DevicesChanged);
+        assert!(rb.try_recv().is_none());
+        assert!(rc.try_recv().is_none());
         // Отключение b: узнаёт a.
         drop(b);
-        assert_eq!(ra.try_recv().unwrap(), ServerMsg::DevicesChanged);
-        assert!(rc.try_recv().is_err());
+        assert_eq!(*ra.try_recv().unwrap(), ServerMsg::DevicesChanged);
+        assert!(rc.try_recv().is_none());
         assert_eq!(hub.devices_changed(&GroupId([9; 32]), 0), 0);
     }
 
@@ -312,9 +401,9 @@ mod tests {
     fn pins_go_only_to_v8() {
         let hub = Hub::default();
         let g = GroupId([1; 32]);
-        let (ta, mut ra) = mpsc::channel(4);
-        let (tb, mut rb) = mpsc::channel(4);
-        let (tc, mut rc) = mpsc::channel(4);
+        let (ta, mut ra) = queue();
+        let (tb, mut rb) = queue();
+        let (tc, mut rc) = queue();
         let a = hub.register(g, DeviceId([1; 32]), ta);
         let b = hub.register(g, DeviceId([2; 32]), tb);
         let old = hub.register(g, DeviceId([3; 32]), tc);
@@ -322,17 +411,17 @@ mod tests {
         b.subscribe_pins();
         old.subscribe_deletes();
         let msg = ServerMsg::PinStats(Default::default());
-        assert_eq!(hub.broadcast_pins(&g, a.id, &msg), 1);
-        assert!(ra.try_recv().is_err());
-        assert_eq!(rb.try_recv().unwrap(), msg);
-        assert!(rc.try_recv().is_err());
+        assert_eq!(hub.broadcast_pins(&g, a.id, msg.clone()), 1);
+        assert!(ra.try_recv().is_none());
+        assert_eq!(*rb.try_recv().unwrap(), msg);
+        assert!(rc.try_recv().is_none());
     }
 
     #[tokio::test]
     async fn kick_wakes_everyone_but_sender() {
         let hub = Hub::default();
         let g = GroupId([1; 32]);
-        let (t, _r) = mpsc::channel(4);
+        let (t, _r) = queue();
         let a = hub.register(g, DeviceId([1; 32]), t.clone());
         let b = hub.register(g, DeviceId([2; 32]), t.clone());
         let other = hub.register(GroupId([2; 32]), DeviceId([3; 32]), t);
@@ -353,23 +442,57 @@ mod tests {
         n.as_mut().poll(&mut cx).is_ready()
     }
 
+    fn item(len: usize) -> ServerMsg {
+        ServerMsg::Deliver(clipwire_core::SealedItem {
+            id: clipwire_core::ItemId::at_ms(1),
+            origin: DeviceId([1; 32]),
+            nonce: [0; 24],
+            ciphertext: vec![0; len],
+        })
+    }
+
+    /// Соединение, которое не читает, держит не больше [`QUEUE_BYTES`], а
+    /// все очереди группы делят одну копию элемента.
+    #[test]
+    fn stalled_queue_is_bounded_by_bytes_and_shares_items() {
+        let hub = Hub::default();
+        let g = GroupId([1; 32]);
+        let (ta, mut ra) = queue();
+        let (tb, mut rb) = queue();
+        let _a = hub.register(g, DeviceId([1; 32]), ta);
+        let _b = hub.register(g, DeviceId([2; 32]), tb);
+        let big = 8 * 1024 * 1024;
+        let fits = QUEUE_BYTES / (big + 64);
+        let mut delivered = 0;
+        for _ in 0..QUEUE {
+            delivered += hub.broadcast(&g, u64::MAX, item(big));
+        }
+        // По `fits` элементов в каждую из двух очередей, остальное отброшено.
+        assert_eq!(delivered, 2 * fits);
+        assert!(ra.bytes.load(Ordering::Relaxed) <= QUEUE_BYTES);
+        let (x, y) = (ra.try_recv().unwrap(), rb.try_recv().unwrap());
+        assert!(Arc::ptr_eq(&x, &y), "элемент скопирован в каждую очередь");
+        // Прочитанное освобождает место.
+        assert_eq!(hub.broadcast(&g, u64::MAX, item(big)), 2);
+        // Пустая очередь берёт и элемент больше предела, но только один.
+        while ra.try_recv().is_some() {}
+        while rb.try_recv().is_some() {}
+        assert_eq!(ra.bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(hub.broadcast(&g, u64::MAX, item(QUEUE_BYTES + 1)), 2);
+        assert_eq!(hub.broadcast(&g, u64::MAX, item(1)), 0);
+    }
+
     #[test]
     fn drop_unregisters() {
         let hub = Hub::default();
         let g = GroupId([1; 32]);
-        let (t, _r) = mpsc::channel(4);
+        let (t, _r) = queue();
         {
             let _reg = hub.register(g, DeviceId([1; 32]), t);
             assert!(hub.is_online(&g));
-            assert_eq!(
-                hub.broadcast(&g, u64::MAX, &ServerMsg::Error("x".into())),
-                1
-            );
+            assert_eq!(hub.broadcast(&g, u64::MAX, ServerMsg::Error("x".into())), 1);
         }
-        assert_eq!(
-            hub.broadcast(&g, u64::MAX, &ServerMsg::Error("x".into())),
-            0
-        );
+        assert_eq!(hub.broadcast(&g, u64::MAX, ServerMsg::Error("x".into())), 0);
         assert!(hub.lock().is_empty());
         assert!(!hub.is_online(&g));
     }

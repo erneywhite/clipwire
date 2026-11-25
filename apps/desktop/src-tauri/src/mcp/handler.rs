@@ -20,6 +20,8 @@ use clipwire_core::ai::{
 };
 use clipwire_core::{AiOrigin, Content, Ext, ExtList, ItemId};
 
+pub use super::consent::Busy;
+
 /// Сколько ждать ответа человека в окне согласия.
 pub const CONSENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// Самая большая сторона картинки, которую можно попросить в `Get`: больше
@@ -60,15 +62,20 @@ pub trait Host: Send + Sync + 'static {
     fn ignored_apps(&self) -> Vec<String>;
     fn store(&self) -> Store;
     fn status(&self) -> AppStatus;
-    /// Спросить человека про нового клиента. `None` — не ответил вовремя.
+    /// Спросить человека про нового клиента. `None` — не ответил вовремя,
+    /// `Busy` — вопросов в очереди и так слишком много.
     fn ask_client(
         &self,
         client: &str,
         version: &str,
         allow_write: bool,
-    ) -> impl Future<Output = Option<AiAccess>> + Send;
+    ) -> impl Future<Output = Result<Option<AiAccess>, Busy>> + Send;
     /// Спросить, можно ли клиенту положить `text` в буфер. Нет ответа — нет.
-    fn ask_clipboard(&self, client: &str, text: &str) -> impl Future<Output = bool> + Send;
+    fn ask_clipboard(
+        &self,
+        client: &str,
+        text: &str,
+    ) -> impl Future<Output = Result<bool, Busy>> + Send;
     /// Запомнить ответ про клиента (`settings.ai.clients`).
     fn remember_client(&self, name: &str, access: AiAccess);
     /// Клиент обратился: обновить `last_ms` (с отложенным сохранением).
@@ -176,7 +183,11 @@ impl<H: Host> Conn<H> {
             };
             // Hello пришёл при выключенном доступе: человека спрашиваем
             // сейчас, мосту не нужно переподключаться.
-            self.admit(&g.name, &g.version).await;
+            if self.admit(&g.name, &g.version).await.is_err() {
+                // Очередь вопросов полна: спросим на следующем запросе.
+                self.greeted = Some(g);
+                return (busy(), Vec::new());
+            }
         }
         let Some(client) = self.client.clone() else {
             unreachable!("admit ставит клиента");
@@ -274,7 +285,10 @@ impl<H: Host> Conn<H> {
                     return (error(AiError::Bad, "the text is empty"), Vec::new());
                 }
                 if ai.confirm_clipboard {
-                    if !self.host.ask_clipboard(&client.name, &text).await {
+                    let Ok(accepted) = self.host.ask_clipboard(&client.name, &text).await else {
+                        return (busy(), Vec::new());
+                    };
+                    if !accepted {
                         return (
                             error(
                                 AiError::Declined,
@@ -324,7 +338,12 @@ impl<H: Host> Conn<H> {
             self.greeted = Some(Greeting { name, version });
             return disabled();
         }
-        let access = self.admit(&name, &version).await;
+        let Ok(access) = self.admit(&name, &version).await else {
+            // Очередь вопросов полна: соединение живо, спросим на следующем
+            // запросе.
+            self.greeted = Some(Greeting { name, version });
+            return busy();
+        };
         if !self.host.ai_settings().enabled {
             return disabled();
         }
@@ -337,7 +356,8 @@ impl<H: Host> Conn<H> {
     /// Пустить клиента на это соединение: доступ из настроек, а нового
     /// клиента спросить у человека и запомнить ответ. Возвращает доступ по
     /// настройкам после ответа: их могли поменять, пока окно было открыто.
-    async fn admit(&mut self, name: &str, version: &str) -> AiAccess {
+    /// `Busy` — вопрос не задан, клиент на соединение не поставлен.
+    async fn admit(&mut self, name: &str, version: &str) -> Result<AiAccess, Busy> {
         let ai = self.host.ai_settings();
         // Не ответил вовремя — ничего не запоминаем: отказ только на это
         // соединение.
@@ -349,12 +369,15 @@ impl<H: Host> Conn<H> {
             let host = self.host.clone();
             let (n, v, w) = (name.to_string(), version.to_string(), ai.allow_write);
             let asking = tokio::spawn(async move {
-                if let Some(a) = host.ask_client(&n, &v, w).await {
+                if let Some(a) = host.ask_client(&n, &v, w).await? {
                     // Сохранение настроек — запись на диск.
                     let _ = tokio::task::spawn_blocking(move || host.remember_client(&n, a)).await;
                 }
+                Ok::<(), Busy>(())
             });
-            let _ = asking.await;
+            if let Ok(Err(busy)) = asking.await {
+                return Err(busy);
+            }
         }
         self.client = Some(Client { name: name.into() });
         let access = self
@@ -366,7 +389,7 @@ impl<H: Host> Conn<H> {
         if access.can_read() {
             self.host.touch_client(name);
         }
-        access
+        Ok(access)
     }
 
     async fn search(&self, policy: AiPolicy, args: SearchArgs) -> (AiResponse, Vec<String>) {
@@ -694,9 +717,16 @@ impl ExtList for TmpExt {
     }
 }
 
+/// Имя клиента для окна согласия, настроек и журнала. Управляющие символы —
+/// пробел; невидимые (направление текста, нулевой ширины, разделители строк)
+/// выбрасываются: ими имя можно развернуть или выдать за другое
+/// («Claude\u{200B}» рядом с «Claude» в списке клиентов).
 fn clean_client_name(name: &str) -> String {
     let n: String = name
         .chars()
+        .filter(|&c| {
+            !clipwire_agent::blobs::is_format_char(c) && !clipwire_core::admin::is_invisible_char(c)
+        })
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(CLIENT_NAME_CHARS)
         .collect();
@@ -719,6 +749,14 @@ fn disabled() -> AiResponse {
     error(
         AiError::Disabled,
         "AI access is turned off in Clipwire settings → AI tools",
+    )
+}
+
+/// Очередь окна согласия полна: человеку и так задано много вопросов.
+fn busy() -> AiResponse {
+    error(
+        AiError::Busy,
+        "too many questions are waiting for the user in Clipwire; try again later",
     )
 }
 
@@ -799,6 +837,8 @@ mod tests {
         revoke_write_on_ask: bool,
         /// Сколько человек думает над вопросом про нового клиента.
         client_delay: std::time::Duration,
+        /// Очередь окна согласия полна: на вопросы — `Busy`.
+        busy: AtomicBool,
         asked: Mutex<Vec<String>>,
         notices: Mutex<Vec<String>>,
         copied: Mutex<Vec<String>>,
@@ -818,6 +858,7 @@ mod tests {
                 clipboard_ok: true,
                 revoke_write_on_ask: false,
                 client_delay: std::time::Duration::ZERO,
+                busy: AtomicBool::new(false),
                 asked: Mutex::new(Vec::new()),
                 notices: Mutex::new(Vec::new()),
                 copied: Mutex::new(Vec::new()),
@@ -846,16 +887,27 @@ mod tests {
         fn status(&self) -> AppStatus {
             AppStatus::default()
         }
-        async fn ask_client(&self, client: &str, _: &str, _: bool) -> Option<AiAccess> {
+        async fn ask_client(
+            &self,
+            client: &str,
+            _: &str,
+            _: bool,
+        ) -> Result<Option<AiAccess>, Busy> {
+            if self.busy.load(Ordering::Relaxed) {
+                return Err(Busy);
+            }
             self.asked.lock().unwrap().push(client.into());
             tokio::time::sleep(self.client_delay).await;
-            self.answer
+            Ok(self.answer)
         }
-        async fn ask_clipboard(&self, _: &str, _: &str) -> bool {
+        async fn ask_clipboard(&self, _: &str, _: &str) -> Result<bool, Busy> {
+            if self.busy.load(Ordering::Relaxed) {
+                return Err(Busy);
+            }
             if self.revoke_write_on_ask {
                 self.ai.lock().unwrap().allow_write = false;
             }
-            self.clipboard_ok
+            Ok(self.clipboard_ok)
         }
         fn remember_client(&self, name: &str, access: AiAccess) {
             self.ai.lock().unwrap().clients.push(AiClient {
@@ -945,6 +997,49 @@ mod tests {
             AiResponse::Error { code, .. } => *code,
             other => panic!("ждали ошибку, пришло {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn full_consent_queue_answers_busy() {
+        let dir = tmp("busy");
+        let mut ai = enabled();
+        ai.allow_write = true;
+        ai.confirm_clipboard = true;
+        ai.clients.push(AiClient {
+            name: "codex".into(),
+            access: AiAccess::ReadWrite,
+            added_ms: 1,
+            last_ms: 1,
+        });
+        let host = Fake::new(&dir, ai);
+        host.busy.store(true, Ordering::Relaxed);
+        // Новый клиент при полной очереди — «занято», вопрос не задан.
+        let mut conn = Conn::new(host.clone());
+        assert_eq!(code(&conn.handle(hello()).await), AiError::Busy);
+        assert!(host.asked.lock().unwrap().is_empty());
+        // Очередь освободилась: следующий запрос того же соединения
+        // спрашивает человека без нового Hello.
+        host.busy.store(false, Ordering::Relaxed);
+        let r = conn.handle(search("")).await;
+        assert!(matches!(r, AiResponse::Items { .. }), "{r:?}");
+        assert_eq!(host.asked.lock().unwrap().as_slice(), ["claude-code"]);
+        // Текст в буфер при полной очереди — тоже «занято», в буфер ничего.
+        let mut conn = Conn::new(host.clone());
+        conn.handle(AiRequest::Hello {
+            protocol: AI_PROTOCOL,
+            client: "codex".into(),
+            client_version: "1".into(),
+        })
+        .await;
+        host.busy.store(true, Ordering::Relaxed);
+        let r = conn
+            .handle(AiRequest::Copy {
+                text: "echo hi".into(),
+            })
+            .await;
+        assert_eq!(code(&r), AiError::Busy);
+        assert!(host.copied.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1077,6 +1172,7 @@ mod tests {
             clipboard_ok: true,
             revoke_write_on_ask: false,
             client_delay: std::time::Duration::ZERO,
+            busy: AtomicBool::new(false),
             asked: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             copied: Mutex::new(Vec::new()),
@@ -1129,6 +1225,7 @@ mod tests {
             answer: None,
             ai: Mutex::new(host.ai_settings()),
             store: host.store.clone(),
+            busy: AtomicBool::new(false),
             asked: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             copied: Mutex::new(Vec::new()),
@@ -1218,6 +1315,7 @@ mod tests {
             ai: Mutex::new(ai),
             store: host.store.clone(),
             clipboard_ok: true,
+            busy: AtomicBool::new(false),
             asked: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             copied: Mutex::new(Vec::new()),
@@ -1247,6 +1345,7 @@ mod tests {
             clipboard_ok: true,
             revoke_write_on_ask: false,
             client_delay: std::time::Duration::from_millis(200),
+            busy: AtomicBool::new(false),
             asked: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             copied: Mutex::new(Vec::new()),
@@ -1326,6 +1425,11 @@ build",
         assert_eq!(clean_client_name("  "), "MCP client");
         assert_eq!(clean_client_name("a\nb"), "a b");
         assert_eq!(clean_client_name(&"x".repeat(200)).chars().count(), 64);
+        // Невидимые символы и метки направления выбрасываются.
+        assert_eq!(clean_client_name("Clau\u{200B}de"), "Claude");
+        assert_eq!(clean_client_name("\u{202E}edualC\u{202C}"), "edualC");
+        assert_eq!(clean_client_name("a\u{2028}b\u{FEFF}"), "ab");
+        assert_eq!(clean_client_name("\u{2066}\u{2069}"), "MCP client");
         let m = ai_mark("codex");
         assert_eq!(m.tag, clipwire_core::item::ext::AI_ORIGIN);
     }

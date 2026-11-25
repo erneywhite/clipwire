@@ -39,6 +39,8 @@ pub struct Running {
     /// Код сервера на момент запуска. После смены токена relay из клиента
     /// устаревает: текущий — [`Running::server_code`].
     pub info: ServerInfo,
+    /// Ключ администратора создан этим запуском (`admin.key` не было).
+    pub admin_key_created: bool,
     shared: Arc<Shared>,
     router: Router,
     relay: iroh_relay::server::Server,
@@ -92,6 +94,8 @@ pub struct Identity {
     pub secret_key: SecretKey,
     pub relay_token: String,
     pub admin_key: AdminKey,
+    /// `admin.key` не было, ключ создан сейчас.
+    pub admin_key_created: bool,
 }
 
 /// Новый случайный токен relay.
@@ -151,17 +155,20 @@ impl Identity {
         // Ключ администратора появился в 0.5.0: у сервера, обновлённого со
         // старой версии, файла ещё нет, и он создаётся при первом запуске.
         let admin_path = data_dir.join(ADMIN_KEY_FILE);
-        let admin_key = match std::fs::read(&admin_path) {
-            Ok(bytes) => AdminKey(
-                bytes
-                    .try_into()
-                    .ok()
-                    .with_context(|| format!("{} повреждён", admin_path.display()))?,
+        let (admin_key, admin_key_created) = match std::fs::read(&admin_path) {
+            Ok(bytes) => (
+                AdminKey(
+                    bytes
+                        .try_into()
+                        .ok()
+                        .with_context(|| format!("{} повреждён", admin_path.display()))?,
+                ),
+                false,
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let key = new_admin_key()?;
                 write_private(&admin_path, &key.0)?;
-                key
+                (key, true)
             }
             Err(e) => return Err(e).context("не читается ключ администратора"),
         };
@@ -169,11 +176,12 @@ impl Identity {
             secret_key,
             relay_token,
             admin_key,
+            admin_key_created,
         })
     }
 
     /// Код сервера администратора `cwserver2-…`: его печатают
-    /// `clipwire-server info` и лог при запуске.
+    /// `clipwire-server info` и лог первого запуска (`main.rs`).
     pub fn admin_info(&self, public_url: &str) -> AdminServerInfo {
         AdminServerInfo {
             server: self.server_info(public_url),
@@ -263,6 +271,13 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
         .context("не поднялся iroh-эндпоинт")?;
 
     let store = Store::open(&config.data_dir.join("clipwire.db"))?;
+    // Токен relay сменили мимо клиента: старые коды приглашения больше не
+    // должны пускать обычным `Join`, как и после смены из клиента.
+    if store.note_relay_token(&admin.token_fingerprint(), session::now_ms())? {
+        tracing::info!(
+            "токен relay сменён с прошлого запуска: старые коды приглашения не действуют"
+        );
+    }
     // Токен relay мог смениться мимо клиента (переменная окружения, правка
     // файла): коды создания группы со старым токеном отзываются. Входу они
     // и так не годятся (отпечаток токена не тот), отзыв — чтобы список не
@@ -284,6 +299,7 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
         streams: Default::default(),
         admin,
         devices: DeviceSlots::default(),
+        pre_join: tokio::sync::Semaphore::new(session::MAX_PRE_JOIN),
     });
     // Настройки, заданные из клиента, поверх переменных окружения.
     shared.reload_limits()?;
@@ -355,6 +371,7 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
 
     Ok(Running {
         info,
+        admin_key_created: identity.admin_key_created,
         shared,
         router,
         relay,
@@ -395,6 +412,17 @@ mod tests {
         assert!(Identity::load_or_create(&dir2, None).is_err());
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    #[test]
+    fn admin_key_created_only_once() {
+        let dir = tmp("admin");
+        let first = Identity::load_or_create(&dir, None).unwrap();
+        assert!(first.admin_key_created);
+        let again = Identity::load_or_create(&dir, None).unwrap();
+        assert!(!again.admin_key_created);
+        assert_eq!(again.admin_key, first.admin_key);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

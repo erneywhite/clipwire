@@ -81,7 +81,7 @@ pub fn set(
             if let Some(rec) = shared.store.pin(group, &pin_id)? {
                 let n = shared
                     .hub
-                    .broadcast_pins(group, conn_id, &ServerMsg::Pinned(rec));
+                    .broadcast_pins(group, conn_id, ServerMsg::Pinned(rec));
                 tracing::debug!(receivers = n, rev, "закреп сохранён");
             }
             Ok(Some(ServerMsg::PinAccepted { pin_id, rev }))

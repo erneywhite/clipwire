@@ -2,7 +2,9 @@
 //! формат кадров один, новые версии только добавляют сообщения (`proto.rs`).
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -17,13 +19,13 @@ use clipwire_core::storage::MAX_CONFIG_BYTES;
 use clipwire_core::{DeviceId, GroupId, ItemId, JoinSecret, SealedItem};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use tokio::sync::mpsc;
+use tokio::io::AsyncWrite;
 use tokio::task::JoinSet;
 
 use crate::admin::{AdminCtx, AdminReply, AdminSession, AdminState};
 use crate::blobs::Blobs;
 use crate::config::Guards;
-use crate::hub::{Hub, QUEUE};
+use crate::hub::Hub;
 use crate::store::{Create, JoinOutcome, Store};
 
 /// Сколько ждать первого сообщения `Join` после подключения.
@@ -35,6 +37,17 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Клиент, который ещё никуда не вошёл, не должен заставлять сервер выделять
 /// под кадр 16 МиБ.
 pub const MAX_JOIN_FRAME: usize = 512;
+/// Сколько соединений разом могут ещё не войти в группу. Подключиться по
+/// QUIC может кто угодно, без токена и секрета; сверх предела новые
+/// соединения сразу закрываются, чтобы ожидающие `Join` не копились.
+/// Каждое ждёт не дольше [`JOIN_TIMEOUT`] на шаг.
+pub const MAX_PRE_JOIN: usize = 512;
+/// Сколько запись клиенту может стоять без движения. Клиент, который вошёл
+/// и перестал читать, иначе держал бы соединение вечно: запись ждала бы
+/// места в окне QUIC, а цикл соединения не видел бы ни смены ключа, ни
+/// смены токена relay. Медленная, но живая связь предел не задевает:
+/// считается время без единого записанного байта.
+pub const WRITE_STALL: Duration = Duration::from_secs(30);
 /// Насколько время в id элемента может опережать часы сервера: запас на
 /// расхождение часов устройств. Запас большой, сутки: устройство со
 /// спешащими часами иначе молча теряло бы копирования. Курсор клиентов
@@ -108,6 +121,8 @@ pub struct Shared {
     pub admin: AdminState,
     /// Сколько соединений сейчас открыто с каждого устройства.
     pub devices: DeviceSlots,
+    /// Места соединений, ещё не вошедших в группу ([`MAX_PRE_JOIN`]).
+    pub pre_join: tokio::sync::Semaphore,
 }
 
 impl Shared {
@@ -200,9 +215,22 @@ impl std::fmt::Debug for ClipwireProtocol {
 impl ProtocolHandler for ClipwireProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let peer = conn.remote_id();
-        tracing::info!(peer = %peer.fmt_short(), "подключение");
-        if let Err(e) = serve(&self.0, &conn).await {
-            tracing::info!(peer = %peer.fmt_short(), "соединение закрыто: {e:#}");
+        // До входа в группу соединение ничем не подтверждено: подключиться
+        // может кто угодно, поэтому такие события — в debug, а не в лог
+        // по умолчанию.
+        tracing::debug!(peer = %peer.fmt_short(), "подключение");
+        let Ok(pre_join) = self.0.pre_join.try_acquire() else {
+            tracing::debug!(peer = %peer.fmt_short(), "слишком много соединений до входа, закрыто");
+            conn.close(1u32.into(), b"busy");
+            return Ok(());
+        };
+        let mut joined = false;
+        if let Err(e) = serve(&self.0, &conn, pre_join, &mut joined).await {
+            if joined {
+                tracing::info!(peer = %peer.fmt_short(), "соединение закрыто: {e:#}");
+            } else {
+                tracing::debug!(peer = %peer.fmt_short(), "соединение до входа закрыто: {e:#}");
+            }
         }
         Ok(())
     }
@@ -231,7 +259,14 @@ struct JoinRequest {
 /// кодом приглашения.
 const RELAY_ROTATED: &str = "токен сервера сменён: нужен новый код приглашения";
 
-async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
+/// `pre_join` — место среди соединений до входа: отдаётся, как только
+/// соединение вошло в группу или как администратор. `joined` ставится тогда же.
+async fn serve(
+    shared: &Arc<Shared>,
+    conn: &Connection,
+    pre_join: tokio::sync::SemaphorePermit<'_>,
+    joined: &mut bool,
+) -> Result<()> {
     let device = DeviceId(*conn.remote_id().as_bytes());
     // Подписка раньше входа: смена токена relay во время входа тоже закроет
     // соединение.
@@ -294,6 +329,8 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         // Соединение только для администрирования сервера, без группы.
         Ok(Some(ClientMsg::AdminAuth { key })) if knows_admin(conn.alpn()) => {
             let ctx = AdminCtx::new(device, conn.alpn());
+            drop(pre_join);
+            *joined = true;
             return serve_admin(shared, send, recv, key, closing, ctx).await;
         }
         Ok(Some(_)) => {
@@ -385,6 +422,8 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
         bail!("вход отклонён: {reason}");
     }
     tracing::info!(group = %short(&group), ?outcome, "вход в группу");
+    drop(pre_join);
+    *joined = true;
     // Группа без админа (до 0.5.0) получает админом первое устройство,
     // вошедшее с ключом администратора сервера.
     if create == Create::Admin && shared.store.claim_group_admin(&group, &device, now_ms())? {
@@ -393,7 +432,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
 
     // История по одному элементу и прямо из базы: картинки вместе не влезут
     // в один кадр, а держать всю историю в памяти на каждый вход незачем.
-    write_msg(&mut send, &ServerMsg::Joined).await?;
+    send_msg(&mut send, &ServerMsg::Joined).await?;
     let not_before = shared.not_before_ms();
     let mut last: Option<ItemId> = None;
     while let Some((item, backfill)) =
@@ -402,11 +441,11 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
             .history_after(&group, not_before, last.as_ref())?
     {
         last = Some(item.id);
-        write_msg(&mut send, &ServerMsg::History { item, backfill }).await?;
+        send_msg(&mut send, &ServerMsg::History { item, backfill }).await?;
     }
-    write_msg(&mut send, &ServerMsg::HistoryEnd).await?;
+    send_msg(&mut send, &ServerMsg::HistoryEnd).await?;
 
-    let (tx, mut rx) = mpsc::channel(QUEUE);
+    let (tx, mut rx) = crate::hub::queue();
     let reg = shared.hub.register(group, device, tx);
     // Записки об удалении — только клиентам по `clipwire/5`; старые оборвут
     // соединение на незнакомом `Deleted`. Регистрация раньше записок: удаление,
@@ -417,7 +456,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
     // Своя версия — чтобы клиент подсказал обновить образ сервера.
     if knows_server_info(conn.alpn()) {
         let version = env!("CARGO_PKG_VERSION").to_string();
-        write_msg(&mut send, &ServerMsg::ServerInfo { version }).await?;
+        send_msg(&mut send, &ServerMsg::ServerInfo { version }).await?;
     }
     // Устройство вышло на связь: окна устройств остальных обновятся.
     shared.hub.devices_changed(&group, reg.id);
@@ -430,7 +469,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
     if knows_deletes(conn.alpn()) {
         reg.subscribe_deletes();
         for note in shared.store.deletes(&group, not_before)? {
-            write_msg(&mut send, &ServerMsg::Deleted(note)).await?;
+            send_msg(&mut send, &ServerMsg::Deleted(note)).await?;
         }
     }
     // Ключ могли сменить между входом и регистрацией: тогда `Rekey` нас не
@@ -492,7 +531,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                             tracing::info!("неверный ключ администратора");
                             ServerMsg::AdminFailed(AdminFail::BadKey)
                         };
-                        write_msg(&mut send, &reply).await?;
+                        send_msg(&mut send, &reply).await?;
                     }
                     Some(ClientMsg::TransferGroupAdmin { device: to }) => {
                         need_admin_alpn(conn)?;
@@ -509,19 +548,19 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                             }
                             Err(f) => ServerMsg::AdminFailed(f),
                         };
-                        write_msg(&mut send, &reply).await?;
+                        send_msg(&mut send, &reply).await?;
                     }
                     Some(ClientMsg::GetGroupAdmin) => {
                         need_admin_alpn(conn)?;
                         // Старый вопрос про одного админа: само устройство,
                         // если оно админ, иначе самый ранний.
                         let admin = shared.store.group_admin_for(&group, &device)?;
-                        write_msg(&mut send, &ServerMsg::GroupAdmin { admin }).await?;
+                        send_msg(&mut send, &ServerMsg::GroupAdmin { admin }).await?;
                     }
                     Some(ClientMsg::GetGroupAdmins) => {
                         need_admins_alpn(conn)?;
                         let admins = shared.store.group_admins(&group)?;
-                        write_msg(&mut send, &ServerMsg::GroupAdmins { admins }).await?;
+                        send_msg(&mut send, &ServerMsg::GroupAdmins { admins }).await?;
                     }
                     Some(ClientMsg::GrantGroupAdmin { device: to }) => {
                         need_admins_alpn(conn)?;
@@ -535,7 +574,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                             }
                             Err(f) => ServerMsg::AdminFailed(f),
                         };
-                        write_msg(&mut send, &reply).await?;
+                        send_msg(&mut send, &reply).await?;
                     }
                     Some(ClientMsg::RevokeGroupAdmin { device: of }) => {
                         need_admins_alpn(conn)?;
@@ -549,7 +588,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                             }
                             Err(f) => ServerMsg::AdminFailed(f),
                         };
-                        write_msg(&mut send, &reply).await?;
+                        send_msg(&mut send, &reply).await?;
                     }
                     Some(ClientMsg::ClaimGroupAdmin) => {
                         need_admin_alpn(conn)?;
@@ -564,7 +603,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         } else {
                             ServerMsg::AdminFailed(AdminFail::NoSuchDevice)
                         };
-                        write_msg(&mut send, &reply).await?;
+                        send_msg(&mut send, &reply).await?;
                     }
                     Some(
                         msg @ (ClientMsg::GetServerSettings
@@ -582,9 +621,9 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                         need_admin_alpn(conn)?;
                         let ctx = AdminCtx::new(device, conn.alpn());
                         match crate::admin::handle(shared, &admin, &msg, &ctx)? {
-                            Some(AdminReply::Send(reply)) => write_msg(&mut send, &reply).await?,
+                            Some(AdminReply::Send(reply)) => send_msg(&mut send, &reply).await?,
                             Some(AdminReply::SendAndCloseAll(reply)) => {
-                                write_msg(&mut send, &reply).await?;
+                                send_msg(&mut send, &reply).await?;
                                 shared.close_all();
                                 streams.shutdown().await;
                                 crate::devices::close_with(&mut send, None).await;
@@ -595,7 +634,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     }
                     Some(ClientMsg::PublishCard(card)) => {
                         match crate::devices::publish_card(shared, &group, &device, &card)? {
-                            Some(reply) => write_msg(&mut send, &reply).await?,
+                            Some(reply) => send_msg(&mut send, &reply).await?,
                             // Имя или ОС устройства могли поменяться.
                             None => {
                                 shared.hub.devices_changed(&group, reg.id);
@@ -611,7 +650,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                             let n = shared.hub.broadcast_config(
                                 &group,
                                 reg.id,
-                                &ServerMsg::GroupConfig(Some(config)),
+                                ServerMsg::GroupConfig(Some(config)),
                             );
                             tracing::info!(group = %short(&group), receivers = n, "настройки группы сохранены");
                         }
@@ -619,7 +658,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                     Some(ClientMsg::GetGroupConfig) => {
                         reg.subscribe_config();
                         let config = shared.store.group_config(&group)?;
-                        write_msg(&mut send, &ServerMsg::GroupConfig(config)).await?;
+                        send_msg(&mut send, &ServerMsg::GroupConfig(config)).await?;
                     }
                     Some(ClientMsg::Delete(note)) => {
                         if note.len() > MAX_DELETE_BYTES {
@@ -627,7 +666,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                             bail!("записка об удалении {} байт", note.len());
                         }
                         if shared.store.add_delete(&group, &note, now_ms())? {
-                            let n = shared.hub.broadcast_deletes(&group, reg.id, &ServerMsg::Deleted(note));
+                            let n = shared.hub.broadcast_deletes(&group, reg.id, ServerMsg::Deleted(note));
                             tracing::info!(group = %short(&group), receivers = n, "удаление записей");
                         }
                     }
@@ -641,17 +680,17 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                             blobs: &blobs,
                         };
                         if let Some(reply) = crate::pins::set(shared, &group, reg.id, &w)? {
-                            write_msg(&mut send, &reply).await?;
+                            send_msg(&mut send, &reply).await?;
                         }
                     }
                     Some(ClientMsg::PinsSince { rev }) => {
                         let epoch = shared.store.pin_epoch(&group)?;
                         let (records, more) = shared.store.pins_since(&group, rev)?;
-                        write_msg(&mut send, &ServerMsg::Pins { epoch, records, more }).await?;
+                        send_msg(&mut send, &ServerMsg::Pins { epoch, records, more }).await?;
                     }
                     Some(ClientMsg::PinContent { pin_id }) => {
                         let content = shared.store.pin_content(&group, &pin_id)?;
-                        write_msg(&mut send, &ServerMsg::PinContentIs { pin_id, content }).await?;
+                        send_msg(&mut send, &ServerMsg::PinContentIs { pin_id, content }).await?;
                     }
                     Some(ClientMsg::GetPinStats) => {
                         let (pins, bytes) = shared.store.pin_stats(&group)?;
@@ -662,15 +701,15 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
                             max_pins: q.max_pins,
                             max_bytes: q.max_bytes,
                         };
-                        write_msg(&mut send, &ServerMsg::PinStats(stats)).await?;
+                        send_msg(&mut send, &ServerMsg::PinStats(stats)).await?;
                     }
                     Some(ClientMsg::GetStats) => {
                         let mut stats = shared.store.group_stats(&group, shared.not_before_ms())?;
                         stats.quota = shared.limits().blob_quota;
-                        write_msg(&mut send, &ServerMsg::Stats(stats)).await?;
+                        send_msg(&mut send, &ServerMsg::Stats(stats)).await?;
                     }
                     Some(ClientMsg::ListDevices) => {
-                        write_msg(&mut send, &crate::devices::list_devices(shared, &group)?).await?;
+                        send_msg(&mut send, &crate::devices::list_devices(shared, &group)?).await?;
                     }
                     Some(ClientMsg::Rekey { new_group, envelopes }) => {
                         match crate::devices::rekey(shared, &group, &device, reg.id, &new_group, &envelopes)? {
@@ -710,7 +749,7 @@ async fn serve(shared: &Arc<Shared>, conn: &Connection) -> Result<()> {
             out = rx.recv() => {
                 // Отправитель живёт в hub, пока жива регистрация, поэтому None не придёт.
                 let Some(out) = out else { return Ok(()) };
-                write_msg(&mut send, &out).await?;
+                send_msg(&mut send, &out).await?;
             }
         }
     }
@@ -763,12 +802,12 @@ async fn serve_admin(
     let mut admin = AdminSession::default();
     if !admin.auth(shared, &key) {
         // Без группы с неверным ключом соединению делать нечего.
-        let _ = write_msg(&mut send, &ServerMsg::AdminFailed(AdminFail::BadKey)).await;
+        let _ = send_msg(&mut send, &ServerMsg::AdminFailed(AdminFail::BadKey)).await;
         crate::devices::close_with(&mut send, None).await;
         bail!("неверный ключ администратора");
     }
     tracing::info!("вход администратора сервера");
-    write_msg(&mut send, &ServerMsg::AdminOk).await?;
+    send_msg(&mut send, &ServerMsg::AdminOk).await?;
     loop {
         tokio::select! {
             msg = read_msg::<_, ClientMsg>(&mut recv) => {
@@ -779,13 +818,13 @@ async fn serve_admin(
                     } else {
                         ServerMsg::AdminFailed(AdminFail::BadKey)
                     };
-                    write_msg(&mut send, &reply).await?;
+                    send_msg(&mut send, &reply).await?;
                     continue;
                 }
                 match crate::admin::handle(shared, &admin, &msg, &ctx)? {
-                    Some(AdminReply::Send(reply)) => write_msg(&mut send, &reply).await?,
+                    Some(AdminReply::Send(reply)) => send_msg(&mut send, &reply).await?,
                     Some(AdminReply::SendAndCloseAll(reply)) => {
-                        write_msg(&mut send, &reply).await?;
+                        send_msg(&mut send, &reply).await?;
                         shared.close_all();
                         crate::devices::close_with(&mut send, None).await;
                         return Ok(());
@@ -864,7 +903,7 @@ fn accept(
         } else {
             ServerMsg::Deliver(item)
         };
-        let n = shared.hub.broadcast(group, conn_id, &msg);
+        let n = shared.hub.broadcast(group, conn_id, msg);
         tracing::debug!(receivers = n, backfill, "элемент разослан");
     }
     Ok(())
@@ -875,9 +914,84 @@ fn accept(
 /// только «connection lost». Поэтому ждём, пока клиент дочитает поток до конца,
 /// но не дольше пары секунд.
 async fn refuse(send: &mut iroh::endpoint::SendStream, reason: &str) {
-    let _ = write_msg(send, &ServerMsg::Error(reason.into())).await;
+    let _ = send_msg(send, &ServerMsg::Error(reason.into())).await;
     let _ = send.finish();
     let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
+}
+
+/// Записать сообщение клиенту, но не ждать дольше [`WRITE_STALL`] без
+/// движения ([`StallGuard`]). Через неё идут все записи соединения группы и
+/// администратора, в том числе последнее сообщение перед закрытием.
+pub(crate) async fn send_msg<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    msg: &ServerMsg,
+) -> Result<(), IoError> {
+    write_msg(&mut StallGuard::new(w, WRITE_STALL), msg).await
+}
+
+/// Запись, которая сдаётся, если `limit` не удалось записать ни байта.
+/// Таймер ставится при первом «ещё нельзя» и сбрасывается при любом
+/// продвижении.
+struct StallGuard<'a, W> {
+    inner: &'a mut W,
+    limit: Duration,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<'a, W> StallGuard<'a, W> {
+    fn new(inner: &'a mut W, limit: Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            timer: None,
+        }
+    }
+
+    fn watch<T>(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        res: Poll<std::io::Result<T>>,
+    ) -> Poll<std::io::Result<T>> {
+        if res.is_ready() {
+            self.timer = None;
+            return res;
+        }
+        let limit = self.limit;
+        let timer = self
+            .timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        match timer.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "клиент не читает",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for StallGuard<'_, W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let res = Pin::new(&mut *this.inner).poll_write(cx, buf);
+        this.watch(cx, res)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let res = Pin::new(&mut *this.inner).poll_flush(cx);
+        this.watch(cx, res)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let res = Pin::new(&mut *this.inner).poll_shutdown(cx);
+        this.watch(cx, res)
+    }
 }
 
 pub(crate) fn short(g: &GroupId) -> String {
@@ -906,6 +1020,50 @@ mod tests {
         let v4 = Uuid::from_u128(0xffff_ffff_ffff_4fff_bfff_ffff_ffff_ffff);
         assert!(!id_is_sane(&ItemId(v4), now));
         assert!(!id_is_sane(&ItemId(Uuid::max()), now));
+    }
+
+    /// Клиент не читает: запись сдаётся через `limit` без движения.
+    #[tokio::test]
+    async fn stalled_write_gives_up() {
+        let (mut w, _r) = tokio::io::duplex(64);
+        let msg = ServerMsg::Error("x".repeat(4096));
+        let limit = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let res = write_msg(&mut StallGuard::new(&mut w, limit), &msg).await;
+        assert!(res.is_err(), "запись не сдалась");
+        assert!(started.elapsed() >= limit);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Медленный, но читающий клиент: каждая порция идёт дольше половины
+    /// предела, а всё сообщение — много дольше предела, и запись не рвётся.
+    #[tokio::test]
+    async fn slow_reader_is_not_dropped() {
+        use tokio::io::AsyncReadExt;
+        let (mut w, mut r) = tokio::io::duplex(64);
+        let msg = ServerMsg::Error("x".repeat(1024));
+        let limit = Duration::from_millis(300);
+        let reader = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let mut total = 0;
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                match r.read(&mut buf).await {
+                    Ok(0) | Err(_) => return total,
+                    Ok(n) => total += n,
+                }
+            }
+        });
+        let started = std::time::Instant::now();
+        write_msg(&mut StallGuard::new(&mut w, limit), &msg)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() > limit,
+            "тест не проверил медленного читателя"
+        );
+        drop(w);
+        assert!(reader.await.unwrap() > 1024);
     }
 
     #[test]

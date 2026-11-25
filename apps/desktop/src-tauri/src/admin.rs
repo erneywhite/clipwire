@@ -26,8 +26,9 @@ type CmdResult<T> = Result<T, String>;
 /// окно настроек. Окно вставки и редактор показывают чужое содержимое
 /// (HTML из буфера, превью ссылок), и, если в них когда-нибудь найдётся
 /// способ выполнить скрипт, он не должен дотянуться до ключа
-/// администратора.
-fn only_settings(window: &WebviewWindow) -> CmdResult<()> {
+/// администратора. Так же закрыты команды, которые отдают ключ группы или
+/// меняют её состав (`invite_code`, `device_remove`, `leave_group` и др.).
+pub(crate) fn only_settings(window: &WebviewWindow) -> CmdResult<()> {
     if window.label() == "settings" {
         Ok(())
     } else {
