@@ -65,6 +65,16 @@ export function settingText(key: string): { title: string; hint: string } {
       return { title: t('Закрепы: сколько записей'), hint: t('Сколько закреплённых записей группа может держать на сервере.') }
     case 'pin_bytes':
       return { title: t('Закрепы: сколько места'), hint: t('Место под закреплённые записи группы вместе с их файлами.') }
+    case 'pin_records':
+      return {
+        title: t('Записей закрепов в группе'),
+        hint: t('Сколько записей закрепов группа может держать вместе со снятыми. Новый закреп сверх предела сервер не примет.'),
+      }
+    case 'pin_total_bytes':
+      return {
+        title: t('Закрепы на сервере, всего'),
+        hint: t('Место под записи закрепов всех групп вместе, без файлов. Файлы считает ограничение «Всего на сервере».'),
+      }
     default:
       // Настройка новее приложения: показываем имя как есть.
       return { title: key, hint: '' }
@@ -76,7 +86,7 @@ export const SETTING_GROUPS: { title: () => string; keys: string[] }[] = [
   { title: () => t('История группы'), keys: ['history_len', 'ttl_hours', 'history_total_bytes'] },
   { title: () => t('Ограничения размера'), keys: ['max_item_bytes', 'max_file_bytes'] },
   { title: () => t('Место для файлов'), keys: ['blob_quota', 'blob_total_quota', 'max_reserves'] },
-  { title: () => t('Закрепы'), keys: ['pin_max', 'pin_bytes'] },
+  { title: () => t('Закрепы'), keys: ['pin_max', 'pin_bytes', 'pin_records', 'pin_total_bytes'] },
   { title: () => t('Группы и устройства'), keys: ['max_groups', 'max_devices', 'max_device_conns'] },
 ]
 
