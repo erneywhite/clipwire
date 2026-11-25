@@ -152,7 +152,11 @@ fn parse_range(h: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
         return Some(Ok((len - n.min(len), len - 1)));
     }
     let start: u64 = a.parse().ok()?;
-    let end: u64 = if b.is_empty() { u64::MAX } else { b.parse().ok()? };
+    let end: u64 = if b.is_empty() {
+        u64::MAX
+    } else {
+        b.parse().ok()?
+    };
     if end < start {
         return None;
     }
@@ -243,7 +247,14 @@ mod tests {
     fn serves_parts_and_whole() {
         let d = data(5000);
         let len = d.len() as u64;
-        let r = serve(&mut Cursor::new(&d), len, "video/mp4", Some("bytes=100-199"), false).unwrap();
+        let r = serve(
+            &mut Cursor::new(&d),
+            len,
+            "video/mp4",
+            Some("bytes=100-199"),
+            false,
+        )
+        .unwrap();
         assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(r.headers()[header::CONTENT_RANGE], "bytes 100-199/5000");
         assert_eq!(r.body(), &d[100..200]);
@@ -253,7 +264,14 @@ mod tests {
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(r.body(), &d);
 
-        let r = serve(&mut Cursor::new(&d), len, "video/mp4", Some("bytes=6000-"), false).unwrap();
+        let r = serve(
+            &mut Cursor::new(&d),
+            len,
+            "video/mp4",
+            Some("bytes=6000-"),
+            false,
+        )
+        .unwrap();
         assert_eq!(r.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(r.headers()[header::CONTENT_RANGE], "bytes */5000");
 
@@ -266,7 +284,14 @@ mod tests {
     fn big_parts_are_capped() {
         let d = data((CHUNK * 2) as usize);
         let len = d.len() as u64;
-        let r = serve(&mut Cursor::new(&d), len, "video/mp4", Some("bytes=10-"), false).unwrap();
+        let r = serve(
+            &mut Cursor::new(&d),
+            len,
+            "video/mp4",
+            Some("bytes=10-"),
+            false,
+        )
+        .unwrap();
         assert_eq!(r.body().len() as u64, CHUNK);
         assert_eq!(
             r.headers()[header::CONTENT_RANGE],
@@ -285,7 +310,10 @@ mod tests {
         assert_ne!(a, b);
         assert!(s.get(&a).is_none(), "прежний токен больше не работает");
         s.close(Some(&a));
-        assert!(s.get(&b).is_some(), "закрытие чужого токена не трогает текущий");
+        assert!(
+            s.get(&b).is_some(),
+            "закрытие чужого токена не трогает текущий"
+        );
         s.close(Some(&b));
         assert!(s.get(&b).is_none());
         assert!(s.get("").is_none());
