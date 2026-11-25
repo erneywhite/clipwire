@@ -367,7 +367,9 @@ The preview (Space) shows the beginning of text files (up to 64 KB), opens PDFs 
 viewer and plays video (mp4, webm, mov) and audio (mp3, m4a, wav, ogg, flac) with a built-in
 player. Video is read from disk in chunks, so size does not matter. PDFs and media open only if
 the start of the file matches the format, so a file with a wrong extension does not open as a
-page. The window can only reach files that are in the history. **Show in folder** opens
+page. The player has its own controls in the theme colours: seek bar, pause, time and volume
+(remembered between files). The window can read only the file that is open in the preview right
+now, and only while it is open (since 0.12.0). **Show in folder** opens
 Explorer on the file.
 
 **Sending to other devices.** Inside a group:
@@ -882,7 +884,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.11.1`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.12.0`.
 
 **Through a Docker control panel or plain `docker compose`:**
 
