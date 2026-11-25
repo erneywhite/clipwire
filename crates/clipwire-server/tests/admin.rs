@@ -30,6 +30,11 @@ struct Server {
 /// клиента), иначе — `test-token` из настроек.
 async fn start(relay_token: Option<&str>, guards: Guards) -> Result<Server> {
     let dir = std::env::temp_dir().join(format!("clipwire-admin-e2e-{}", uuid::Uuid::now_v7()));
+    start_in(dir, relay_token, guards).await
+}
+
+/// То же в заданном каталоге данных: перезапуск сервера на тех же данных.
+async fn start_in(dir: PathBuf, relay_token: Option<&str>, guards: Guards) -> Result<Server> {
     let config = Config {
         data_dir: dir.clone(),
         public_url: "http://unused".into(),
@@ -442,6 +447,37 @@ async fn rotate_relay_token_cuts_old_codes() -> Result<()> {
     let mut n = Client::connect(&s, &new.server.relay_token).await?;
     n.join_with(&with_token(&key, &new.server.relay_token))
         .await?;
+    s.running.shutdown().await
+}
+
+/// Токен сменили переменной окружения между запусками: старый код
+/// приглашения не пускает и обычным `Join`, как после смены из клиента.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_token_changed_by_env_cuts_old_codes() -> Result<()> {
+    let s = start(Some("old-token"), Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Client::connect(&s, "old-token").await?;
+    a.join_with(&as_admin(&key, &ADMIN)).await?;
+    let mut p = Client::connect(&s, "old-token").await?;
+    p.join_with(&plain(&key)).await?;
+    let dir = s.dir.clone();
+    drop((a, p));
+    s.running.shutdown().await?;
+
+    // Тот же токен после перезапуска — сменой не считается.
+    let s = start_in(dir.clone(), Some("old-token"), Guards::default()).await?;
+    let mut p = Client::connect(&s, "old-token").await?;
+    p.join_with(&plain(&key)).await?;
+    drop(p);
+    s.running.shutdown().await?;
+
+    let s = start_in(dir, Some("new-token"), Guards::default()).await?;
+    let mut p = Client::connect(&s, "new-token").await?;
+    let e = p.refused(&plain(&key)).await?;
+    assert!(e.contains("нужен новый код"), "{e}");
+    // С новым токеном входит.
+    let mut n = Client::connect(&s, "new-token").await?;
+    n.join_with(&with_token(&key, "new-token")).await?;
     s.running.shutdown().await
 }
 

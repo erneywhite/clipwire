@@ -50,7 +50,19 @@ async fn run() -> Result<()> {
         public = %config.public_url,
         "сервер запущен"
     );
-    tracing::info!("код сервера: {}", running.server_code());
+    // В коде сервера ключ администратора, а лог контейнера часто видят
+    // больше людей, чем нужно. Поэтому код печатается только при первом
+    // запуске, когда ключ только что создан, или по явной просьбе
+    // (`CLIPWIRE_PRINT_SERVER_CODE=1`: в панели без консоли контейнера это
+    // единственный способ его узнать).
+    if running.admin_key_created || print_code_requested() {
+        tracing::info!("код сервера: {}", running.server_code());
+    } else {
+        tracing::info!(
+            "код сервера (cwserver2-…) печатает `docker exec <контейнер> clipwire-server info`, \
+             либо он будет в логе после перезапуска с CLIPWIRE_PRINT_SERVER_CODE=1"
+        );
+    }
     stop_signal().await?;
     tracing::info!("остановка");
     // Не даём корректной остановке тянуться дольше, чем Docker ждёт до SIGKILL.
@@ -61,6 +73,12 @@ async fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Просят ли напечатать код сервера при запуске (`CLIPWIRE_PRINT_SERVER_CODE`).
+fn print_code_requested() -> bool {
+    std::env::var("CLIPWIRE_PRINT_SERVER_CODE")
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
 }
 
 /// Ctrl+C в консоли или SIGTERM от Docker. В контейнере сервер работает как

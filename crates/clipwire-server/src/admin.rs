@@ -490,10 +490,15 @@ pub fn handle(
             shared.store.mark_relay_rotated(now_ms())?;
             let revoked = shared.store.revoke_all_invites(now_ms())?;
             // Новый код в лог не пишется: его получает клиент в ответе, а
-            // лог контейнера часто видят больше людей, чем нужно. При
-            // запуске код печатается (`main.rs`): без SSH это единственный
-            // способ его узнать.
+            // лог контейнера часто видят больше людей, чем нужно. Узнать его
+            // и без клиента можно: `clipwire-server info` или запуск с
+            // `CLIPWIRE_PRINT_SERVER_CODE=1` (`main.rs`).
             let server_code = shared.admin.rotate_relay_token()?;
+            // Новый отпечаток — чтобы при следующем запуске смена из клиента
+            // не считалась ещё одной сменой мимо клиента.
+            shared
+                .store
+                .note_relay_token(&shared.admin.token_fingerprint(), now_ms())?;
             // Коды, выпущенные, пока токен записывался, — со старым
             // отпечатком. Войти по ним и так нельзя, отзыв — для списка.
             let revoked = revoked
