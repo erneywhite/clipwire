@@ -8,6 +8,8 @@ mod devices;
 mod editor;
 mod files;
 mod link;
+mod mcp;
+pub mod mcp_bridge;
 mod popup;
 mod settings_window;
 mod sound;
@@ -449,7 +451,7 @@ pub async fn stop_service(app: &AppHandle) {
 /// и оно всплывало пустым прямоугольником. Окну вставки защита выставляется
 /// в момент показа (`popup::show`).
 pub fn apply_capture_protection(app: &AppHandle, on: bool) {
-    for label in ["settings", "popup", "editor"] {
+    for label in ["settings", "popup", "editor", mcp::CONSENT_WINDOW] {
         if let Some(w) = app.get_webview_window(label)
             && (label == "settings" || w.is_visible().unwrap_or(false))
         {
@@ -654,6 +656,7 @@ pub fn run() {
         .manage(popup::PopupState::default())
         .manage(link::LinkCache::default())
         .manage(storage::LastWarning::default())
+        .manage(mcp::consent::ConsentState::default())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -742,6 +745,13 @@ pub fn run() {
             admin::server_invite_create,
             admin::server_invite_revoke,
             admin::sync_update_invite,
+            mcp::ai_bridge_command,
+            mcp::consent_pending,
+            mcp::consent_answer,
+            mcp::ai_log,
+            mcp::ai_log_clear,
+            mcp::ai_client_access,
+            mcp::ai_client_remove,
         ])
         .setup(|app| {
             #[cfg(target_os = "linux")]
@@ -771,6 +781,8 @@ pub fn run() {
             }
             spawn_pruner(app.handle().clone());
             updates::spawn(app.handle().clone());
+            // Канал для моста MCP: отвечает, только когда доступ ИИ включён.
+            mcp::spawn(app.handle().clone());
             if let Err(e) = popup::register_hotkey(app.handle()) {
                 tracing::warn!("{e}");
             }
@@ -817,6 +829,14 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.hide();
                 }
+                // Окно согласия ИИ закрыли: текущий вопрос — отказ; окно
+                // закроется само, когда вопросов не останется.
+                WindowEvent::CloseRequested { api, .. }
+                    if window.label() == mcp::CONSENT_WINDOW =>
+                {
+                    api.prevent_close();
+                    mcp::on_consent_close(window.app_handle());
+                }
                 // Несохранённая форма хранилища: окно спросит человека само.
                 // Иначе запомнить, как стояло окно, и вместе с настройками
                 // закрыть пример окна вставки.
@@ -853,6 +873,7 @@ pub fn run() {
                 return;
             }
             if let tauri::RunEvent::Exit = event {
+                mcp::shutdown(app);
                 // Дать движку дослать очередь перед выходом.
                 let state = app.state::<AppState>();
                 let service = state

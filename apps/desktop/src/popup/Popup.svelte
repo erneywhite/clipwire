@@ -12,6 +12,7 @@
   import EntryRow from '../lib/EntryRow.svelte'
   import { anchored, anchoredById, disjoint, HeightCache, keptInDom, offsets, reloadCount, rowAt, rowsLeft, scrollFor, visibleRange, type Range, type RowShape } from '../lib/vlist'
   import AppTag from '../lib/AppTag.svelte'
+  import AiTag from '../lib/AiTag.svelte'
   import { t } from '../lib/i18n'
   import { debounce } from '../lib/debounce'
   import { inFlight } from '../lib/inflight'
@@ -1167,7 +1168,7 @@
           {/if}
         </div>
         <div class="preview-meta">
-          {deviceOf(preview.entry)}{#if preview.entry.source_app}&nbsp;· <AppTag app={preview.entry.source_app} />{/if} · {ago(preview.entry.seen_ms)} · {preview.entry.width}×{preview.entry.height} · {bytesLabel(preview.entry.bytes)}
+          {deviceOf(preview.entry)}{#if preview.entry.by_ai}&nbsp;· <AiTag client={preview.entry.by_ai} />{/if}{#if preview.entry.source_app}&nbsp;· <AppTag app={preview.entry.source_app} />{/if} · {ago(preview.entry.seen_ms)} · {preview.entry.width}×{preview.entry.height} · {bytesLabel(preview.entry.bytes)}
         </div>
         <div class="actions">
           <button class="primary" onclick={() => paste(preview?.entry)}>{t('Вставить')}</button>
@@ -1274,7 +1275,7 @@
         {#if edited}
           {t('изменено · Ctrl+Enter вставить · Ctrl+S сохранить')}
         {:else}
-          {deviceOf(preview.entry)}{#if preview.entry.source_app}&nbsp;· <AppTag app={preview.entry.source_app} />{/if} · {ago(preview.entry.seen_ms)} · {sizeLabel(preview.entry.chars, preview.entry.lines)}{preview.entry.rich ? ` · ${preview.entry.rich}` : ''}
+          {deviceOf(preview.entry)}{#if preview.entry.by_ai}&nbsp;· <AiTag client={preview.entry.by_ai} />{/if}{#if preview.entry.source_app}&nbsp;· <AppTag app={preview.entry.source_app} />{/if} · {ago(preview.entry.seen_ms)} · {sizeLabel(preview.entry.chars, preview.entry.lines)}{preview.entry.rich ? ` · ${preview.entry.rich}` : ''}
         {/if}
       </div>
       <div class="actions">

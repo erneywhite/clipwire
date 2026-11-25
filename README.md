@@ -50,6 +50,7 @@ Found a bug or have an idea? Tell about it in [Issues](https://github.com/erneyw
 - [Privacy and security](#privacy-and-security)
 - [Updates](#updates)
 - [Settings](#settings)
+- [AI tools (MCP)](#ai-tools-mcp)
 - [Moving from Paste (macOS)](#moving-from-paste-macos)
 - [Self-hosted server](#self-hosted-server)
 - [Building from source and tests](#building-from-source-and-tests)
@@ -548,6 +549,8 @@ Full description: [docs/storage.md](docs/storage.md).
   goes to the history only and does not touch the clipboard.
 - Link cards do not execute the page and do not load single-use links (see
   [Link previews](#link-previews)).
+- AI tools get no access until you turn it on and approve each client; what they read leaves
+  the device unencrypted (see [AI tools (MCP)](#ai-tools-mcp)).
 - Leaving a group also deletes the cache of downloaded files.
 - Settings and keys live in `%APPDATA%\Clipwire` on Windows, in
   `~/Library/Application Support/Clipwire` on macOS and in `~/.config/clipwire` on Linux. On macOS
@@ -600,6 +603,9 @@ Settings open from the tray icon menu (the menu bar on macOS). Tabs:
   new code); leaving the group (it also removes the server administrator key from the device).
 - **Exclusions:** what to send, rules for files and folders, `.gitignore`, programs (see
   [Exclusions](#exclusions)).
+- **AI tools:** access for AI assistants over MCP, ready commands to connect them, what they
+  see and for how long, hiding passwords and keys, writing to the history and the clipboard,
+  connected clients and the access log (see [AI tools (MCP)](#ai-tools-mcp)).
 - **Server**, for the server administrator only: a summary (groups, devices, space used by
   history, files and pins, version), the server's groups with deletion, server limits and secret
   changes (see [Administrator code](#administrator-code)).
@@ -640,6 +646,140 @@ events and errors. Files are named `clipwire.<date>.log`, one per day, the last 
 
 With `CLIPWIRE_HOME` set, the `logs` folder is inside it. The `RUST_LOG` variable changes the
 log level (for example `RUST_LOG=debug`).
+
+## AI tools (MCP)
+
+AI assistants that speak [MCP](https://modelcontextprotocol.io) (Claude Code, Codex, Claude
+Desktop, Cursor, VS Code and others) can search the clipboard history, read entries and, if you
+allow it, add entries or put text on the clipboard. Ask the agent "find the SQL query I copied
+yesterday" or "put this command on my clipboard", and it goes to Clipwire instead of asking you
+to paste.
+
+It is off by default. Turn on **Access for AI tools** in Settings → **AI tools**, then connect
+the client.
+
+### Connecting a client
+
+The MCP server is the Clipwire executable itself, started with `--mcp`. It talks MCP over stdin
+and stdout and does not read the history on its own: every tool call goes over a local channel
+to the running app, and the app decides what the client may see. The tools work only while
+Clipwire is running.
+
+Settings → **AI tools** → **Connection** has ready commands and configs with the right path for
+this computer, each with a **Copy** button. Use those. The shape is:
+
+```sh
+# Claude Code
+claude mcp add clipwire -- "<path to Clipwire>" --mcp
+# Codex
+codex mcp add clipwire -- "<path to Clipwire>" --mcp
+```
+
+Claude Desktop and Cursor take JSON in their MCP config:
+
+```json
+{ "mcpServers": { "clipwire": { "command": "<path to Clipwire>", "args": ["--mcp"] } } }
+```
+
+VS Code uses `mcp.json` with a `servers` key:
+
+```json
+{ "servers": { "clipwire": { "type": "stdio", "command": "<path to Clipwire>", "args": ["--mcp"] } } }
+```
+
+Where the executable usually is:
+
+- Windows: `%LOCALAPPDATA%\Clipwire\clipwire-desktop.exe` (the installer installs for the
+  current user)
+- macOS: `/Applications/Clipwire.app/Contents/MacOS/clipwire-desktop`
+- Linux, `.deb`: `/usr/bin/clipwire`
+- Linux, AppImage: the `.AppImage` file itself (the app gives its path from `$APPIMAGE`, the
+  folder it unpacks into changes on every start)
+
+Bridge options:
+
+- `--home <dir>` (or `--home=<dir>`): the Clipwire data folder. Needed only if the app runs with
+  a non-default `CLIPWIRE_HOME`; the bridge also reads `CLIPWIRE_HOME` itself, and the command
+  in settings already has `--home` when it is needed.
+- `CLIPWIRE_MCP_LOG`: log level of the bridge, `warn` by default. Logs go to stderr, which the AI
+  client usually saves to its own log files. A bare level (`debug`) applies only to the bridge.
+  The MCP library logs every answer in full at debug level, clipboard text and images included,
+  so it stays at `info` unless you name it yourself (`rmcp=debug`); do that only for a short
+  debugging session and delete the client's logs afterwards.
+
+If the app is not running or AI access is off, the tools answer with an error saying so.
+
+### Tools
+
+| Tool | What it does |
+|---|---|
+| `search_clipboard` | Search the history by words, kind and age, newest first, with paging |
+| `get_clipboard_item` | One entry in full: text, image (PNG up to 1024 px) or the list of files |
+| `list_pins` | Pinned entries with their notes |
+| `clipwire_status` | Version, sync state and what AI tools may see and do |
+| `save_to_clipboard_history` | Add a text entry to the history (optionally pinned, with a note) |
+| `copy_to_clipboard` | Put text on the system clipboard; it also lands in the history |
+
+`save_to_clipboard_history` does not touch the clipboard on any device: other devices of the
+group put the entry into their history only. Devices on a Clipwire version without MCP support
+do not know this mark and put such an entry on their clipboard like any other.
+
+### What the AI sees
+
+Settings → **AI tools**:
+
+- **What AI can see**: text, formatted text and links by default; images, files and folders are
+  off. A copied image file counts as a file. With files the AI also gets their paths on this
+  computer, so an agent with disk access can read the files themselves. Entries mixing several
+  kinds are visible only if all of them are allowed.
+- **AI sees history for** 1 day, 7 days (default), 30 days or all history. Pinned entries are
+  always visible, however old they are.
+- **Hide entries that look like passwords and keys** (on): tokens, API keys, private keys and
+  password-like strings are left out of search and refused on a direct request. Turning it off
+  asks for confirmation first.
+- Entries from programs excluded from syncing and files under a **Don't send** rule are never
+  shown to the AI.
+- **Allow AI to add entries** (off) lets the client save text to the history and put it on the
+  clipboard. Such entries carry the **AI** label with the client's name (in the history, the
+  paste window and the preview) and sync to all devices of the group like any other entry. The
+  label stays with the entry when you paste it from the history again.
+- **Ask before putting text on the clipboard** (on): Clipwire shows the text and asks. When it is
+  off, you get a notification instead.
+
+### Clients and the access log
+
+The first call from a new AI client waits until you answer in the Clipwire window: **Read only**,
+**Read and write** (only when writing is allowed) or **Deny**. The button you press is remembered.
+Esc, closing the window or no answer within two minutes refuses just this call, and
+the client asks again next time. Some AI clients give up on a tool call sooner than that; the
+access question stays open anyway, so answer it and repeat the request. A clipboard request the
+client cancels is dropped together with its window.
+
+With **Ask before putting text on the clipboard** off, `copy_to_clipboard` shows a system
+notification with the start of the text. If the text looks like a password or token, the
+notification shows only its length.
+
+**Connected clients** lists every client with its access and when it was last used. Access can be
+switched between **No access**, **Read** and **Read and write**, and **Revoke** removes the client
+from the list, so it asks again next time.
+
+**Access log** shows the last 100 requests: time, client, tool and result (search queries and saved
+text cut to 80 characters). The log is stored encrypted on this device, keeps at most 1000 rows, and
+clearing the history does not touch it. **Clear log** empties it.
+
+### Limits
+
+- What the AI reads goes to the model, usually to the AI provider's cloud. The Clipwire end-to-end
+  encryption ends here: the entry leaves the device in the clear inside the AI client's request.
+  Allow only the kinds and the period you are fine sharing.
+- Clients are told apart by the name they report in MCP (`clientInfo.name`). Clipwire cannot check
+  it: any program running under your OS account can start the bridge and use the name of a client
+  you already allowed.
+- The **AI** label marks only what came through MCP. An agent that has a terminal can write to the
+  clipboard with ordinary system tools, and such an entry looks like your own copy.
+- The secrets filter is a heuristic: it knows common key formats and looks for random-looking
+  strings. It can miss a password that looks like a normal word and can hide a harmless string.
+  Exclude your password manager from syncing, and its entries stay hidden from AI as well.
 
 ## Moving from Paste (macOS)
 
@@ -686,7 +826,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.9.7`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.10.0`.
 
 **Through a Docker control panel or plain `docker compose`:**
 
@@ -952,7 +1092,7 @@ two clients can run on one machine.
 ## Project layout
 
 - `apps/desktop`: the app (Tauri 2 and Svelte 5): tray icon, paste window at the cursor,
-  settings window, auto-update.
+  settings window, auto-update, the channel for AI tools and the MCP bridge (`--mcp`).
 - `crates/clipwire-agent`: sync engine, OS clipboard access, local history and the debugging
   console client.
 - `crates/clipwire-server`: the server with the built-in iroh-relay, device groups, item delivery

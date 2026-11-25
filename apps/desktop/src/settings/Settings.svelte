@@ -21,13 +21,16 @@
   import ListEditor from './ListEditor.svelte'
   import Rules from './Rules.svelte'
   import Server from './Server.svelte'
+  import AiTools from './AiTools.svelte'
   import { creationKind, tokenRefused } from '../lib/server'
 
-  type Section = 'general' | 'sync' | 'exclusions' | 'server' | 'privacy' | 'keys' | 'about'
+  type Section = 'general' | 'sync' | 'exclusions' | 'ai' | 'server' | 'privacy' | 'keys' | 'about'
   const allSections: { id: Section; title: string; icon: string }[] = [
     { id: 'general', title: t('Основные'), icon: 'M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0' },
     { id: 'sync', title: t('Синхронизация'), icon: 'M4 12a8 8 0 0 1 14-5.3M20 12a8 8 0 0 1-14 5.3M18 3v4h-4M6 21v-4h4' },
     { id: 'exclusions', title: t('Исключения'), icon: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM5.6 5.6l12.8 12.8' },
+    // Искры: большая четырёхлучевая звезда и маленькая рядом.
+    { id: 'ai', title: t('ИИ-инструменты'), icon: 'M10 3c.6 3.8 2.2 5.4 6 6-3.8.6-5.4 2.2-6 6-.6-3.8-2.2-5.4-6-6 3.8-.6 5.4-2.2 6-6zM18 14c.3 1.8 1.2 2.7 3 3-1.8.3-2.7 1.2-3 3-.3-1.8-1.2-2.7-3-3 1.8-.3 2.7-1.2 3-3z' },
     { id: 'server', title: t('Сервер'), icon: 'M4 4h16v7H4zM4 13h16v7H4zM8 7.5h0M8 16.5h0M12 7.5h5M12 16.5h5' },
     { id: 'privacy', title: t('Приватность'), icon: 'M6 11V8a6 6 0 0 1 12 0v3M5 11h14v10H5z' },
     { id: 'keys', title: t('Клавиши'), icon: 'M3 7h18v10H3zM7 11h0M11 11h0M15 11h0M8 14h8' },
@@ -1036,6 +1039,9 @@
             label={t('Имя программы')}
           />
         </div>
+      {:else if section === 'ai'}
+        <h1>{t('ИИ-инструменты')}</h1>
+        <AiTools {s} {save} />
       {:else if section === 'server' && showServer}
         <h1>{t('Сервер')}</h1>
         <Server

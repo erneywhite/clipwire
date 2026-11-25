@@ -214,7 +214,7 @@ impl Paths {
 /// Создать каталог данных (и родителей), на unix с правами 0700: в нём лежат
 /// ключи, и читать их должен только владелец. Уже существующему каталогу
 /// права тоже приводятся к 0700.
-pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
+pub fn ensure_private_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -247,7 +247,7 @@ fn unique_tmp(path: &Path) -> PathBuf {
 /// Записать файл целиком или не записывать вовсе: временный файл рядом
 /// (на unix сразу с правами 0600, без окна с правами по umask), `fsync`,
 /// переименование. При ошибке временный файл удаляется.
-pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
     let tmp = unique_tmp(path);
     let result = (|| -> Result<()> {

@@ -3,6 +3,7 @@
 
 pub mod activity;
 pub mod admin;
+pub mod ai_access;
 pub mod blobs;
 pub mod cache;
 pub mod clipboard;
@@ -25,6 +26,7 @@ pub mod pin_files;
 pub mod pins;
 pub mod push_mark;
 pub mod read_budget;
+pub mod rich_text;
 pub mod secret;
 pub mod service;
 pub mod settings;

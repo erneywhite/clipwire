@@ -8,11 +8,19 @@
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import { isMac } from '../lib/platform'
 
-  let { title = 'Clipwire' }: { title?: string } = $props()
+  let {
+    title = 'Clipwire',
+    onclose,
+  }: {
+    title?: string
+    /** Маленькое окно (вопрос о доступе): только «закрыть», и закрывает его этот обработчик. */
+    onclose?: () => void
+  } = $props()
   const win = getCurrentWindow()
   let maximized = $state(false)
 
   $effect(() => {
+    if (onclose) return
     win.isMaximized().then((m) => (maximized = m))
     const un = win.onResized(async () => (maximized = await win.isMaximized()))
     return () => {
@@ -34,7 +42,13 @@
     </svg>
     {title}
   </span>
-  {#if !isMac}
+  {#if !isMac && onclose}
+  <div class="controls">
+    <button class="close" aria-label={t('Закрыть')} onclick={onclose}>
+      <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 1l8 8M9 1l-8 8" /></svg>
+    </button>
+  </div>
+  {:else if !isMac}
   <div class="controls">
     <button aria-label={t('Свернуть')} onclick={() => win.minimize()}>
       <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 5h8" /></svg>

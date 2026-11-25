@@ -7,7 +7,7 @@ use clipwire_agent::history::{CardKind, Entry, RichFormat, Row};
 use clipwire_agent::i18n::tr;
 use clipwire_agent::settings::Settings;
 use clipwire_agent::state::{AgentState, random_key};
-use clipwire_core::{Content, GroupKey, Invite, ItemId};
+use clipwire_core::{Content, ExtList, GroupKey, Invite, ItemId};
 use serde::Serialize;
 use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
@@ -149,6 +149,8 @@ pub struct EntryDto {
     pub files: Vec<FileDto>,
     /// Приложение, из которого скопировано; `None` — неизвестно.
     pub source_app: Option<SourceAppDto>,
+    /// Имя ИИ-инструмента, если запись добавил он (метка `ext::AI_ORIGIN`).
+    pub by_ai: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -298,6 +300,7 @@ fn row_dto(r: &Row, files_dir: &std::path::Path, uploaded: UploadedFn<'_>) -> En
             icon: (!a.icon_png.is_empty()).then(|| png_url(&a.icon_png)),
             name: a.name,
         }),
+        by_ai: c.ai_origin().map(|o| o.client),
     }
 }
 
@@ -393,7 +396,7 @@ pub fn history_get(state: State<'_, AppState>, id: String) -> CmdResult<EntryDto
 }
 
 /// Закрепы группы текущего сервиса; `None` в локальном режиме.
-fn group_pins(state: &AppState) -> Option<std::sync::Arc<clipwire_agent::pins::Pins>> {
+pub(crate) fn group_pins(state: &AppState) -> Option<std::sync::Arc<clipwire_agent::pins::Pins>> {
     state
         .service
         .lock()
@@ -646,15 +649,21 @@ pub fn get_settings(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
-pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> {
+pub async fn save_settings(app: AppHandle, mut settings: Settings) -> CmdResult<()> {
     let state = app.state::<AppState>();
-    let old = state
-        .settings
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    settings.save(&state.paths.dir).map_err(err)?;
-    *state.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings.clone();
+    // Чтение, запись на диск и замена в памяти — под одним замком: канал MCP
+    // пишет настройки так же (`mcp::update_settings`), и записи не теряются.
+    let old = {
+        let mut cur = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let old = cur.clone();
+        // Список ИИ-клиентов ведут канал MCP и свои команды вкладки
+        // «ИИ-инструменты» (`ai_client_access`, `ai_client_remove`): копия
+        // окна могла устареть и не должна их затирать.
+        settings.ai.clients = old.ai.clients.clone();
+        settings.save(&state.paths.dir).map_err(err)?;
+        *cur = settings.clone();
+        old
+    };
     *state.ignored_apps.lock().unwrap_or_else(|e| e.into_inner()) = settings.ignored_apps.clone();
     state.upload_limit_mb.store(
         settings.file_upload_limit_mb,
@@ -706,7 +715,12 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> 
     if old.device_name != settings.device_name {
         crate::restart_service(&app).await.map_err(err)?;
     }
-    let _ = app.emit("clipwire://settings-changed", &settings);
+    // Рассылается то, что сейчас в памяти: пока шли шаги выше, канал MCP мог
+    // записать свежее.
+    {
+        let cur = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = app.emit("clipwire://settings-changed", &*cur);
+    }
     Ok(())
 }
 

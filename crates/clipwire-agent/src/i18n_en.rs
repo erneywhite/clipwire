@@ -942,4 +942,26 @@ pub static EN: &[(&str, &str)] = &[
         "Картинка не записалась файлом: {e}",
         "Could not save the image as a file: {e}",
     ),
+    // Доступ ИИ через MCP: журнал обращений и уведомление (mcp/handler.rs).
+    (
+        "{client} положил в буфер: {text}",
+        "{client} put on the clipboard: {text}",
+    ),
+    (
+        "{client} положил в буфер текст, символов: {n}",
+        "{client} put text on the clipboard, {n} characters",
+    ),
+    ("отказано", "denied"),
+    ("разрешено: чтение", "allowed: read"),
+    ("разрешено: чтение и запись", "allowed: read and write"),
+    ("записей: {n}", "entries: {n}"),
+    ("выдано", "given"),
+    ("сохранено", "saved"),
+    ("доступ выключен", "access off"),
+    ("скрыто", "hidden"),
+    ("не найдено", "not found"),
+    ("запись выключена", "writing off"),
+    ("отклонено", "declined"),
+    ("занято", "busy"),
+    ("неверный запрос", "bad request"),
 ];

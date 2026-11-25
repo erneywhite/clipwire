@@ -11,7 +11,7 @@
 
   const now = Date.now()
   const min = 60_000
-  const base = { local: true, pinned: false, device_name: '', lines: 1, width: 0, height: 0, bytes: 0, thumb: null, image: null, rich: null, html: null, files: [], source_app: null, note: null }
+  const base = { local: true, pinned: false, device_name: '', lines: 1, width: 0, height: 0, bytes: 0, thumb: null, image: null, rich: null, html: null, files: [], source_app: null, by_ai: null, note: null }
   // Образец картинки: схематичный скриншот окна (16:9), чтобы превью показывало
   // настоящую высоту строки с картинкой.
   const sampleShot =
@@ -41,7 +41,7 @@
     { ...base, id: 'f', kind: 'files', text: '', chars: 0, seen_ms: now - 6 * min, local: false, device_name: 'MacBook', bytes: sampleFile.size, files: [sampleFile] },
     { ...base, id: '3', kind: 'text', text: 'docker compose pull && docker compose up -d', chars: 43, seen_ms: now - 9 * min, source_app: { name: t('Терминал'), icon: null } },
     { ...base, id: '4', kind: 'text', text: t('Созвон завтра в 10:00, ссылку пришлю утром'), chars: 42, seen_ms: now - 25 * min, local: false, device_name: 'MacBook', pinned: true },
-    { ...base, id: '5', kind: 'text', text: t('Ответ клиенту: заказ отправлен, номер для отслеживания пришлю отдельным письмом сегодня вечером'), chars: 96, lines: 1, seen_ms: now - 50 * min },
+    { ...base, id: '5', kind: 'text', text: t('Ответ клиенту: заказ отправлен, номер для отслеживания пришлю отдельным письмом сегодня вечером'), chars: 96, lines: 1, seen_ms: now - 50 * min, by_ai: 'Claude Code' },
     { ...base, id: '6', kind: 'text', text: 'SELECT id, name\nFROM devices\nWHERE last_seen > now() - interval 1 day;', chars: 70, lines: 3, seen_ms: now - 80 * min },
     { ...base, id: '7', kind: 'text', text: t('Адрес доставки: Рига, Бривибас 1'), chars: 32, seen_ms: now - 130 * min },
   ]

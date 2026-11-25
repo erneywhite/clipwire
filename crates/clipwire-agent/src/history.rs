@@ -66,6 +66,10 @@ const ICON_CACHE: usize = 128;
 /// базе перестанут совпадать.
 const HKEY_LABEL: &[u8] = b"clipwire/history/hkey/v1";
 const ICON_LABEL: &[u8] = b"clipwire/history/icon/v1";
+/// Метка ключа журнала обращений ИИ (таблица `ai_log`) и её AAD.
+const AI_LOG_LABEL: &[u8] = b"clipwire/history/ai-log/v1";
+/// Сколько последних обращений ИИ хранит журнал.
+pub const AI_LOG_KEEP: usize = 1000;
 /// Метка ключа истории для пометки нечитаемых строк (`cards.broken`).
 const KEYCHECK_LABEL: &[u8] = b"clipwire/history/keycheck/v1";
 
@@ -109,6 +113,11 @@ const CREATE_REST: &str = "
     CREATE TABLE IF NOT EXISTS icons (
         key   BLOB PRIMARY KEY,
         nonce BLOB NOT NULL,
+        data  BLOB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS ai_log (
+        id    INTEGER PRIMARY KEY,
+        at_ms INTEGER NOT NULL,
         data  BLOB NOT NULL
     );";
 
@@ -578,6 +587,25 @@ impl Row {
     }
 }
 
+/// Обращение ИИ-инструмента через MCP: строка журнала (`ai_log`). Лежит
+/// зашифрованной ключом, выведенным из ключа истории: в запросах и ответах
+/// бывает то же, что в истории.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiLogEntry {
+    /// Когда, мс Unix.
+    pub at_ms: i64,
+    /// Имя клиента MCP.
+    pub client: String,
+    /// Инструмент (`search_clipboard`, `get_clipboard_item`…).
+    pub tool: String,
+    /// Текст поиска или начало сохранённого текста, если были.
+    pub query: Option<String>,
+    /// id выданных или добавленных записей.
+    pub ids: Vec<String>,
+    /// Итог коротко: «5 записей», «скрыто», «отказано»…
+    pub result: String,
+}
+
 /// Значок PNG; `None` — в базе его нет.
 type Icon = Option<Arc<[u8]>>;
 
@@ -638,6 +666,8 @@ pub struct History {
     /// Ключ для `hkey` (дубли) и ключ для имён значков, оба выведены из ключа истории.
     hkey_key: [u8; 32],
     icon_key: [u8; 32],
+    /// Ключ журнала обращений ИИ (`ai_log`), выведен из ключа истории.
+    ai_log_key: [u8; 32],
     /// Метка ключа истории: ею помечаются нечитаемые строки (`cards.broken`).
     /// Строки, помеченные при другом ключе, перепроверяются при открытии.
     key_check: [u8; 8],
@@ -683,6 +713,7 @@ struct ReaderShared {
     cipher: XChaCha20Poly1305,
     hkey_key: [u8; 32],
     icon_key: [u8; 32],
+    ai_log_key: [u8; 32],
     key_check: [u8; 8],
     icons: Arc<Mutex<IconCache>>,
     pending: Arc<Mutex<Vec<Fix>>>,
@@ -761,6 +792,7 @@ impl HistoryReader {
                 cipher: s.cipher.clone(),
                 hkey_key: s.hkey_key,
                 icon_key: s.icon_key,
+                ai_log_key: s.ai_log_key,
                 key_check: s.key_check,
                 icons: s.icons.clone(),
                 pending: s.pending.clone(),
@@ -978,6 +1010,7 @@ impl History {
             cipher: XChaCha20Poly1305::new_from_slice(key).expect("ключ 32 байта"),
             hkey_key: mac(key, HKEY_LABEL),
             icon_key: mac(key, ICON_LABEL),
+            ai_log_key: mac(key, AI_LOG_LABEL),
             key_check,
             icons: Arc::new(Mutex::new(IconCache::default())),
             pending: Arc::new(Mutex::new(Vec::new())),
@@ -1025,6 +1058,7 @@ impl History {
             cipher: self.cipher.clone(),
             hkey_key: self.hkey_key,
             icon_key: self.icon_key,
+            ai_log_key: self.ai_log_key,
             key_check: self.key_check,
             icons: self.icons.clone(),
             pending: self.pending.clone(),
@@ -2531,6 +2565,150 @@ impl History {
                 .map(|(id, seen, pinned, card)| self.finish_row(id, seen, pinned, card))
                 .collect(),
         )
+    }
+
+    /// Обход для ИИ-инструментов: страница записей, которые подходят под
+    /// запрос (`matches_query`, как в окне вставки) и под `pred` (видимость
+    /// по `AiPolicy::check_row`: id для чтения тела, время, закреплена ли,
+    /// карточка), от новых к старым. Тело внутри `pred` читается через
+    /// [`History::get`] того же `History`.
+    /// `cutoff_ms` — записи старше не нужны: обход на первой такой
+    /// останавливается (строки идут по `seen_ms` вниз). `stop` — результат
+    /// уже не нужен (проверяется раз в 64 карточки); брошенный — `None`.
+    /// Второе в ответе — есть ли подходящие записи после страницы.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_visible(
+        &self,
+        query: &str,
+        pinned_only: bool,
+        offset: usize,
+        limit: usize,
+        cutoff_ms: Option<i64>,
+        stop: &dyn Fn() -> bool,
+        pred: &mut dyn FnMut(ItemId, i64, bool, &Card) -> bool,
+    ) -> Option<(Vec<Row>, bool)> {
+        const CHECK_EVERY: usize = 64;
+        let q = query.trim().to_lowercase();
+        let mut found: Vec<(ItemId, i64, bool, Card)> = Vec::new();
+        let (mut skip, mut seen, mut stopped, mut more) = (offset, 0usize, false, false);
+        let res = self.scan(pinned_only, 0, |id, seen_ms, pinned, card| {
+            seen += 1;
+            if seen.is_multiple_of(CHECK_EVERY) && stop() {
+                stopped = true;
+                return ControlFlow::Break(());
+            }
+            if cutoff_ms.is_some_and(|c| seen_ms < c) {
+                return ControlFlow::Break(());
+            }
+            if !card.matches_query(&q) || !pred(id, seen_ms, pinned, &card) {
+                return ControlFlow::Continue(());
+            }
+            if skip > 0 {
+                skip -= 1;
+                return ControlFlow::Continue(());
+            }
+            if found.len() >= limit {
+                more = true;
+                return ControlFlow::Break(());
+            }
+            found.push((id, seen_ms, pinned, card));
+            ControlFlow::Continue(())
+        });
+        if let Err(err) = res {
+            tracing::warn!("история не прочиталась: {err:#}");
+        }
+        if stopped || stop() {
+            return None;
+        }
+        let rows = found
+            .into_iter()
+            .map(|(id, seen, pinned, card)| self.finish_row(id, seen, pinned, card))
+            .collect();
+        Some((rows, more))
+    }
+
+    /// Шифр журнала обращений ИИ.
+    fn ai_log_cipher(&self) -> XChaCha20Poly1305 {
+        XChaCha20Poly1305::new_from_slice(&self.ai_log_key).expect("ключ 32 байта")
+    }
+
+    /// Добавить строку в журнал обращений ИИ. Хранятся последние
+    /// [`AI_LOG_KEEP`] строк. Очистка истории журнал не трогает.
+    pub fn ai_log_add(&mut self, entry: &AiLogEntry) -> Result<()> {
+        let plain = postcard::to_stdvec(entry)?;
+        let mut nonce = [0u8; 24];
+        getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("нет случайных байтов: {e}"))?;
+        let sealed = self
+            .ai_log_cipher()
+            .encrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: &plain,
+                    aad: AI_LOG_LABEL,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("не удалось зашифровать"))?;
+        // В `data` — nonce и шифротекст подряд.
+        let mut data = nonce.to_vec();
+        data.extend_from_slice(&sealed);
+        let tx = self.tx()?;
+        self.conn.execute(
+            "INSERT INTO ai_log (at_ms, data) VALUES (?1, ?2)",
+            rusqlite::params![entry.at_ms, data],
+        )?;
+        self.conn.execute(
+            "DELETE FROM ai_log WHERE id NOT IN
+                 (SELECT id FROM ai_log ORDER BY id DESC LIMIT ?1)",
+            [sql_limit(AI_LOG_KEEP)],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Последние `limit` строк журнала обращений ИИ, новые первыми.
+    /// Нечитаемые (другой ключ истории) пропускаются.
+    pub fn ai_log_list(&self, limit: usize) -> Vec<AiLogEntry> {
+        let cipher = self.ai_log_cipher();
+        let res = (|| -> Result<Vec<AiLogEntry>> {
+            let mut st = self
+                .conn
+                .prepare_cached("SELECT data FROM ai_log ORDER BY id DESC LIMIT ?1")?;
+            let mut rows = st.query([sql_limit(limit)])?;
+            let mut out = Vec::new();
+            while let Some(r) = rows.next()? {
+                let data = r.get_ref(0)?.as_blob()?;
+                if data.len() < 24 {
+                    continue;
+                }
+                let (nonce, ct) = data.split_at(24);
+                let nonce: [u8; 24] = nonce.try_into().expect("24 байта");
+                let Ok(plain) = cipher.decrypt(
+                    &XNonce::from(nonce),
+                    Payload {
+                        msg: ct,
+                        aad: AI_LOG_LABEL,
+                    },
+                ) else {
+                    continue;
+                };
+                if let Ok(e) = postcard::from_bytes::<AiLogEntry>(&plain) {
+                    out.push(e);
+                }
+            }
+            Ok(out)
+        })();
+        res.unwrap_or_else(|err| {
+            tracing::warn!("журнал обращений ИИ не прочитался: {err:#}");
+            Vec::new()
+        })
+    }
+
+    /// Очистить журнал обращений ИИ.
+    pub fn ai_log_clear(&mut self) -> Result<()> {
+        let tx = self.tx()?;
+        self.conn.execute("DELETE FROM ai_log", [])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Сколько записей в истории. Нечитаемые не считаются.
@@ -4315,6 +4493,106 @@ mod tests {
         assert_eq!(h.get(id).unwrap().content, content);
         let r = h.row(id).unwrap();
         assert_eq!((r.card.width, r.card.height), (800, 600));
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_visible_pages_filters_and_stops_at_cutoff() {
+        let mut h = History::in_memory();
+        for i in 1..=6 {
+            text(&mut h, &format!("запись {i}"), i * 10);
+        }
+        let p = text(&mut h, "закреп", 5);
+        h.set_pinned(p, true).unwrap();
+        let names = |rows: &[Row]| rows.iter().map(|r| r.card.head.clone()).collect::<Vec<_>>();
+        // Предикат прячет «запись 5»; первая страница из двух, дальше есть ещё.
+        let mut seen_calls = 0;
+        let mut pred = |_: ItemId, _: i64, _: bool, c: &Card| {
+            seen_calls += 1;
+            c.head != "запись 5"
+        };
+        let (rows, more) = h
+            .scan_visible("запись", false, 0, 2, None, &|| false, &mut pred)
+            .unwrap();
+        assert_eq!(names(&rows), ["запись 6", "запись 4"]);
+        assert!(more);
+        // Вторая страница со сдвигом; на последней `more` нет.
+        let (rows, more) = h
+            .scan_visible(
+                "запись",
+                false,
+                2,
+                10,
+                None,
+                &|| false,
+                &mut |_, _, _, _| true,
+            )
+            .unwrap();
+        assert_eq!(
+            names(&rows),
+            ["запись 4", "запись 3", "запись 2", "запись 1"]
+        );
+        assert!(!more);
+        // Граница времени: старше 30 не читается вовсе.
+        let mut calls = 0;
+        let (rows, _) = h
+            .scan_visible("", false, 0, 10, Some(30), &|| false, &mut |_, _, _, _| {
+                calls += 1;
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            names(&rows),
+            ["запись 6", "запись 5", "запись 4", "запись 3"]
+        );
+        assert_eq!(calls, 4, "после границы предикат не зовётся");
+        // Только закрепы — без окна.
+        let (rows, _) = h
+            .scan_visible("", true, 0, 10, None, &|| false, &mut |_, _, pinned, _| {
+                pinned
+            })
+            .unwrap();
+        assert_eq!(names(&rows), ["закреп"]);
+        // Брошенный обход — `None`.
+        assert!(
+            h.scan_visible("", false, 0, 10, None, &|| true, &mut |_, _, _, _| true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ai_log_keeps_last_rows_encrypted_and_survives_clear() {
+        let dir = tmp("ai-log");
+        let mut h = History::open(&dir).unwrap();
+        let row = |i: i64| AiLogEntry {
+            at_ms: i,
+            client: "claude-code".into(),
+            tool: "search_clipboard".into(),
+            query: Some(format!("секретный запрос {i}")),
+            ids: vec![format!("id{i}")],
+            result: "1 запись".into(),
+        };
+        for i in 0..(AI_LOG_KEEP as i64 + 5) {
+            h.ai_log_add(&row(i)).unwrap();
+        }
+        let all = h.ai_log_list(usize::MAX);
+        assert_eq!(all.len(), AI_LOG_KEEP);
+        assert_eq!(all[0], row(AI_LOG_KEEP as i64 + 4), "новые первыми");
+        assert_eq!(h.ai_log_list(3).len(), 3);
+        // Очистка истории журнал не трогает.
+        text(&mut h, "x", 1);
+        h.clear(false).unwrap();
+        assert_eq!(h.ai_log_list(1).len(), 1);
+        drop(h);
+        // В файле нет открытого текста запроса.
+        let raw = std::fs::read(dir.join("history.db")).unwrap();
+        let needle = "секретный запрос".as_bytes();
+        assert!(!raw.windows(needle.len()).any(|w| w == needle));
+        let mut h = History::open(&dir).unwrap();
+        assert_eq!(h.ai_log_list(1)[0].client, "claude-code");
+        h.ai_log_clear().unwrap();
+        assert!(h.ai_log_list(10).is_empty());
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
     }

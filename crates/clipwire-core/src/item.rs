@@ -363,6 +363,23 @@ pub mod ext {
     /// состоянием закрепа (`pin::PinState::note`), в элементах её нет, а
     /// пришедшая в элементе отбрасывается.
     pub const NOTE: u16 = 3;
+    /// Запись добавил ИИ-инструмент через MCP: [`super::AiOrigin`].
+    /// Синхронизируется с группой, как `SOURCE_APP`; версии, не знающие
+    /// метку, её просто хранят и пересылают.
+    pub const AI_ORIGIN: u16 = 4;
+    /// Элемент только для истории: ИИ-инструмент сохранил запись через MCP,
+    /// не трогая буфер. Получатель кладёт такой элемент в историю, а не в
+    /// системный буфер. Данных нет. Только в элементах группы: в локальную
+    /// историю метка не попадает. Версии, не знающие метку, кладут такой
+    /// элемент в буфер, как обычный.
+    pub const HISTORY_ONLY: u16 = 5;
+}
+
+/// Какой ИИ-инструмент добавил запись.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiOrigin {
+    /// Имя клиента MCP («claude-code», «Cursor»), как он себя назвал.
+    pub client: String,
 }
 
 /// Из какого приложения скопировано.
@@ -393,6 +410,24 @@ pub trait ExtList {
         let list = self.ext_list_mut();
         list.retain(|e| e.tag != tag);
         list.push(Ext { tag, data });
+    }
+
+    /// Метка «добавлено ИИ», если есть.
+    fn ai_origin(&self) -> Option<AiOrigin> {
+        self.ext_get(ext::AI_ORIGIN)
+    }
+
+    fn set_ai_origin(&mut self, origin: &AiOrigin) {
+        self.ext_set(ext::AI_ORIGIN, origin);
+    }
+
+    /// Элемент только для истории ([`ext::HISTORY_ONLY`]).
+    fn history_only(&self) -> bool {
+        self.ext_list().iter().any(|e| e.tag == ext::HISTORY_ONLY)
+    }
+
+    fn set_history_only(&mut self) {
+        self.ext_set(ext::HISTORY_ONLY, &());
     }
 }
 

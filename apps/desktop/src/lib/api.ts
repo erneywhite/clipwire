@@ -42,6 +42,47 @@ export interface Settings {
   exclusion_rules: ExclusionRule[]
   /** Учитывать .gitignore внутри скопированных папок. */
   use_gitignore: boolean
+  /** Доступ ИИ-инструментов к истории через MCP. */
+  ai: AiSettings
+}
+
+/** Доступ ИИ-клиента: отказано, только чтение, чтение и запись. */
+export type AiAccess = 'denied' | 'read' | 'read_write'
+
+/** ИИ-клиент, о котором человек уже ответил. */
+export interface AiClient {
+  /** Имя, которым клиент назвался в MCP. */
+  name: string
+  access: AiAccess
+  /** Когда разрешён или запрещён, мс Unix. */
+  added_ms: number
+  /** Когда последний раз обращался, мс Unix. */
+  last_ms: number
+}
+
+/** Какие виды записей видны ИИ. */
+export interface AiKinds {
+  text: boolean
+  rich: boolean
+  links: boolean
+  images: boolean
+  files: boolean
+  folders: boolean
+}
+
+/** Настройки вкладки «ИИ-инструменты». */
+export interface AiSettings {
+  enabled: boolean
+  /** За сколько последних дней ИИ видит историю; 0 — всю. */
+  history_days: number
+  kinds: AiKinds
+  /** Скрывать записи, похожие на пароли и ключи. */
+  hide_secrets: boolean
+  /** ИИ может добавлять записи. */
+  allow_write: boolean
+  /** Спрашивать, прежде чем ИИ положит текст в буфер. */
+  confirm_clipboard: boolean
+  clients: AiClient[]
 }
 
 export interface DeviceInfo {
@@ -183,6 +224,8 @@ export interface Entry {
   files: FileInfo[]
   /** Приложение, из которого скопировано; null — неизвестно. */
   source_app: SourceApp | null
+  /** Имя ИИ-инструмента, если запись добавил он; null — добавил человек. */
+  by_ai: string | null
 }
 
 export interface SourceApp {
@@ -493,6 +536,45 @@ export interface ExclusionRule {
   action: 'no_send' | 'no_upload'
 }
 
+/** Как запустить мост MCP: исполняемый файл и аргументы для конфигов ИИ-клиентов. */
+export interface AiBridgeCommand {
+  exe: string
+  args: string[]
+}
+
+/**
+ * Вопрос в окне согласия. `client` — ИИ-клиент впервые просит доступ;
+ * `clipboard` — клиент хочет положить текст в буфер обмена.
+ */
+export interface ConsentDto {
+  id: string
+  kind: 'client' | 'clipboard'
+  client: string
+  client_version: string
+  /** Текст для буфера, первые 4000 символов; null у вопроса о доступе. */
+  text: string | null
+  /** Сколько символов во всём тексте. */
+  chars: number
+  /** Запись для ИИ разрешена в настройках: можно предложить «Чтение и запись». */
+  allow_write: boolean
+}
+
+/** Ответ на вопрос: read/read_write/deny — о доступе, accept/decline — о буфере. */
+/** dismiss — Esc или закрытие окна: ответа нет, ничего не запоминается. */
+export type ConsentChoice = 'read' | 'read_write' | 'deny' | 'accept' | 'decline' | 'dismiss'
+
+/** Строка журнала обращений ИИ. */
+export interface AiLogEntry {
+  at_ms: number
+  client: string
+  /** Имя инструмента MCP: search_clipboard, get_clipboard_item… */
+  tool: string
+  query: string | null
+  ids: string[]
+  /** Короткий итог: сколько найдено, «скрыто», «отклонено»… */
+  result: string
+}
+
 export const api = {  settings: () => invoke<Settings>('get_settings'),
   exclusionDefaults: () => invoke<ExclusionRule[]>('exclusion_defaults'),
   saveSettings: (settings: Settings) => invoke<void>('save_settings', { settings }),
@@ -609,4 +691,19 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   /** Передать роль админа группы другому устройству. */
   deviceMakeAdmin: (deviceId: string) => invoke<void>('device_make_admin', { deviceId }),
   deviceGrantAdmin: (deviceId: string) => invoke<GroupAdmin>('device_grant_admin', { deviceId }),
-  deviceRevokeAdmin: (deviceId: string) => invoke<GroupAdmin>('device_revoke_admin', { deviceId }),}
+  deviceRevokeAdmin: (deviceId: string) => invoke<GroupAdmin>('device_revoke_admin', { deviceId }),
+  /** Команда запуска моста MCP для конфигов ИИ-клиентов. */
+  aiBridgeCommand: () => invoke<AiBridgeCommand>('ai_bridge_command'),
+  /** Вопрос, который сейчас ждёт ответа в окне согласия; null — вопросов нет. */
+  consentPending: () => invoke<ConsentDto | null>('consent_pending'),
+  consentAnswer: (id: string, choice: ConsentChoice) => invoke<void>('consent_answer', { id, choice }),
+  /** Последние `limit` обращений ИИ-инструментов (журнал). */
+  aiLog: (limit: number) => invoke<AiLogEntry[]>('ai_log', { limit }),
+  aiLogClear: () => invoke<void>('ai_log_clear'),
+  /**
+   * Доступ запомненного ИИ-клиента и «забыть клиента». Список клиентов
+   * save_settings не меняет: новое состояние приходит событием settings-changed.
+   */
+  aiClientAccess: (name: string, access: AiAccess) => invoke<void>('ai_client_access', { name, access }),
+  aiClientRemove: (name: string) => invoke<void>('ai_client_remove', { name }),
+}

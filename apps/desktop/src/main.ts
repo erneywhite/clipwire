@@ -7,6 +7,7 @@ import Settings from './settings/Settings.svelte'
 import Popup from './popup/Popup.svelte'
 import Preview from './settings/Preview.svelte'
 import Editor from './editor/Editor.svelte'
+import Consent from './consent/Consent.svelte'
 import './styles/base.css'
 
 // Это приложение, а не браузер: своё контекстное меню только в полях ввода,
@@ -53,7 +54,7 @@ listen<AppSettings>('clipwire://settings-changed', (e) => {
 // Одна сборка фронтенда на все окна: что рисовать, решает метка окна.
 const label = getCurrentWindow().label
 const target = document.getElementById('app')!
-const view = { popup: Popup, preview: Preview, editor: Editor }[label] ?? Settings
+const view = { popup: Popup, preview: Preview, editor: Editor, consent: Consent }[label] ?? Settings
 const app = mount(view, { target })
 
 export default app
