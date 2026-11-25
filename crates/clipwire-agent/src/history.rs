@@ -915,7 +915,7 @@ fn load_key(dir: &Path) -> Result<[u8; 32]> {
                 .map_err(|_| anyhow::anyhow!("history.key повреждён"))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(dir)?;
+            crate::state::ensure_private_dir(dir)?;
             let k = crate::state::random_key()?;
             // Права 0600, как у остальных секретов.
             crate::state::write_atomic(&path, &crate::secret::protect(&k)?)

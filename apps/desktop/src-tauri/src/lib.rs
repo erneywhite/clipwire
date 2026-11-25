@@ -318,6 +318,15 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let stdout = tracing_subscriber::fmt::layer().with_filter(filter());
     let file = Paths::resolve().ok().and_then(|p| {
         let dir = p.log_dir();
+        // Журнал — первое, что создаёт папку данных при запуске. Сразу 0700
+        // (на unix) и ей, и `logs/`: иначе обе получили бы права по umask,
+        // а файлы журнала создаёт `tracing_appender` без своих прав.
+        for d in [&p.dir, &dir] {
+            if let Err(e) = clipwire_agent::state::ensure_private_dir(d) {
+                eprintln!("журнал в файл не включён: {e:#}");
+                return None;
+            }
+        }
         tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix("clipwire")
