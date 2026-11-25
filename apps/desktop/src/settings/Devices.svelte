@@ -3,9 +3,9 @@
   import { onMount, untrack } from 'svelte'
   import { t } from '../lib/i18n'
   import { listen } from '@tauri-apps/api/event'
-  import { api, type DevicesIncoming, type GroupDevice, type RekeyResult, type Status, type StorageKind } from '../lib/api'
+  import { api, type DevicesIncoming, type GroupDevice, type RekeyResult, type RekeySent, type Status, type StorageKind } from '../lib/api'
   import { ago, plural } from '../lib/format'
-  import { CHECKING, adminAction, adminConfirmText, adminKeyText, waitOnline, canClaimAdmin, canManage, lastAdmin, checking as checkingText, confirmText, deviceTitle, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, pendingAdminTitle, pendingAdmins, recipients, rekeyChoice, rolesText, sameName, seenLabel, staying, type Roles } from '../lib/devices'
+  import { CHECKING, adminAction, adminConfirmText, adminKeyText, waitOnline, canClaimAdmin, canManage, lastAdmin, checking as checkingText, confirmText, deviceTitle, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, pendingAdminTitle, pendingAdmins, recipients, rekeyAgoLabel, rekeyChoice, rekeyProgress, rekeyRowLabel, rekeyStaleHint, rolesText, sameName, seenLabel, staying, type Roles } from '../lib/devices'
 
   // `incoming` — итог смены ключа, пришедший событием (его забирает окно
   // настроек: раздел мог быть закрыт). Принятый сообщается `onIncomingTaken`.
@@ -26,6 +26,12 @@
   const fmt = { ago, plural }
 
   let list = $state<GroupDevice[]>([])
+  /** Последняя смена ключа, сделанная здесь: кто из получателей уже перешёл. */
+  let sent = $state<RekeySent | null>(null)
+  /** Часы для «ключ сменён N мин назад» и выделения не перешедших. */
+  let now = $state(Date.now())
+  const progress = $derived(rekeyProgress(sent, list, now))
+  const staleHint = $derived(progress ? rekeyStaleHint(progress) : '')
   let loaded = $state(false)
   let error = $state('')
   let busy = $state(false)
@@ -138,6 +144,12 @@
     } catch {
       roles = null
     }
+    try {
+      sent = await api.rekeySent()
+    } catch {
+      sent = null
+    }
+    now = Date.now()
   }
 
   /** Назначить или снять админа (сервер с несколькими админами) либо
@@ -265,7 +277,14 @@
       listen('clipwire://devices-changed', loadSoon),
     ]
     load()
+    // Пока кто-то не перешёл на новый ключ, список перечитывается: вход в
+    // новую группу сервер сообщает не всегда.
+    const tick = setInterval(() => {
+      now = Date.now()
+      if (progress?.some((r) => !r.moved)) load()
+    }, 30_000)
     return () => {
+      clearInterval(tick)
       clearTimeout(reloadTimer)
       unlisten.forEach((p) => p.then((f) => f()))
     }
@@ -347,6 +366,24 @@
 </div>
 {#if rolesNote}
   <p class="hint outside">{rolesNote}</p>
+{/if}
+{#if progress && sent}
+  <h2>{t('Переход на новый ключ')}</h2>
+  <div class="card">
+    <p class="row hint">{rekeyAgoLabel(sent, fmt, now)}</p>
+    {#each progress as r (r.id)}
+      <div class="row device">
+        <span class="dot" class:on={r.moved}></span>
+        <div class="who">
+          <span class="name">{r.title}</span>
+          <span class="meta mono" class:warn={r.stale}>{r.os ?? '?'} · {r.fingerprint} · {rekeyRowLabel(r)}</span>
+        </div>
+      </div>
+    {/each}
+  </div>
+  {#if staleHint}
+    <p class="hint outside warn">{staleHint}</p>
+  {/if}
 {/if}
 {#if claimable}
   <div class="card pad">
@@ -529,6 +566,9 @@
   .meta {
     color: var(--c-muted);
     overflow-wrap: anywhere;
+  }
+  .meta.warn {
+    color: var(--c-danger);
   }
   .keyto {
     display: flex;

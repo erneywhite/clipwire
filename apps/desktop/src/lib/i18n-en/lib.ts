@@ -106,6 +106,14 @@ const en: Record<string, string> = {
   'Подпись: Enter — сохранить, Esc — отмена': 'Note: Enter to save, Esc to cancel',
   'Подпись закреплённой записи': 'Note of the pinned item',
 
+  'Переход на новый ключ': 'Moving to the new key',
+  'Ключ группы сменён только что': 'Group key rotated just now',
+  'Ключ группы сменён: {a}': 'Group key rotated {a}',
+  'Ключ группы сменён: {a} назад': 'Group key rotated {a} ago',
+  'перешло на новый ключ': 'moved to the new key',
+  'ещё не перешло': 'not moved yet',
+  'Выделенные устройства за 10 минут не перешли на новый ключ. Откройте на них Clipwire: если там вопрос о новом ключе, сверьте отпечаток и переходите. Если устройство в сети, а вопроса нет, сервер мог оставить его в старой группе. Тогда подключите его заново по новому коду приглашения.':
+    'The highlighted devices have not moved to the new key in 10 minutes. Open Clipwire on them: if it asks about a new key, check the fingerprint and accept. If a device is online and there is no question, the server may have kept it in the old group. Then connect it again with the new invite code.',
   'в группе давно': 'in the group for a long time',
   'появилось только что': 'first seen just now',
   'появилось: {a}': 'first seen {a}',

@@ -241,6 +241,7 @@ async fn rekey(
 ) -> CmdResult<RekeyDto> {
     let ctl = controller(app)?;
     let done = ctl.rekey(remove, confirmed).await?;
+    remember_rekey(app, done.key.group_id(), done.recipients.clone());
     // Движок старой группы уже не подключается: сохранить ключ и запустить
     // новый. Если сохранить не вышло, при следующем запуске устройство войдёт
     // в старую группу и получит свой пакет нового ключа.
@@ -386,6 +387,10 @@ pub fn on_rekeyed(app: &AppHandle, n: RekeyNotice) {
     if !n.by_me {
         return on_rekey_offered(app, n);
     }
+    // Получатели известны, только если смена шла в этом же запуске.
+    if !n.recipients.is_empty() {
+        remember_rekey(app, n.key.group_id(), n.recipients.clone());
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         match switch_to(&app, n.old, n.key).await {
@@ -399,6 +404,69 @@ pub fn on_rekeyed(app: &AppHandle, n: RekeyNotice) {
             Err(e) => tracing::error!("новый ключ группы не принят: {e}"),
         }
     });
+}
+
+/// Запомнить смену ключа, сделанную здесь (`devices::save_rekey_sent`): по
+/// ней раздел «Устройства группы» показывает, кто уже перешёл на новый ключ.
+fn remember_rekey(app: &AppHandle, group: GroupId, recipients: Vec<DeviceId>) {
+    let sent = devices::RekeySent {
+        group,
+        at_ms: clipwire_agent::history::now_ms(),
+        recipients,
+    };
+    if let Err(e) = devices::save_rekey_sent(&app.state::<AppState>().paths, &sent) {
+        tracing::warn!("смена ключа не запомнилась: {e:#}");
+    }
+}
+
+/// Получатель нового ключа после смены, сделанной здесь.
+#[derive(Debug, Clone, Serialize)]
+pub struct RekeyRecipientDto {
+    /// Полный id (64 hex): по нему интерфейс ищет устройство в списке новой
+    /// группы.
+    pub id: String,
+    pub fingerprint: String,
+    /// Имя и ОС из карточки, проверенной ещё в старой группе; `None` —
+    /// карточки здесь нет.
+    pub name: Option<String>,
+    pub os: Option<String>,
+}
+
+/// Последняя смена ключа, сделанная здесь, если она привела к нынешней
+/// группе.
+#[derive(Debug, Clone, Serialize)]
+pub struct RekeySentDto {
+    /// Когда сервер принял смену (мс Unix).
+    pub at_ms: i64,
+    pub recipients: Vec<RekeyRecipientDto>,
+}
+
+/// Кому ушёл новый ключ при последней смене здесь. Перешёл ли получатель,
+/// интерфейс решает по списку устройств новой группы (`devices_list`):
+/// карточка там открывается только новым ключом. `None` — смены здесь не
+/// было, ключ с тех пор меняли ещё раз или устройство не в группе.
+#[tauri::command]
+pub fn rekey_sent(app: AppHandle) -> Option<RekeySentDto> {
+    let paths = &app.state::<AppState>().paths;
+    let group = paths.load().ok().flatten()?.invite.group_key.group_id();
+    let sent = devices::load_rekey_sent(paths, group)?;
+    let cards = devices::load_known(paths, group);
+    Some(RekeySentDto {
+        at_ms: sent.at_ms,
+        recipients: sent
+            .recipients
+            .into_iter()
+            .map(|d| {
+                let card = cards.iter().find(|c| c.device == d);
+                RekeyRecipientDto {
+                    id: data_encoding::HEXLOWER.encode(&d.0),
+                    fingerprint: devices::fingerprint(d),
+                    name: card.map(|c| c.name.clone()),
+                    os: card.map(|c| c.os.clone()),
+                }
+            })
+            .collect(),
+    })
 }
 
 /// Смена ключа, которая ждёт ответа, для интерфейса.

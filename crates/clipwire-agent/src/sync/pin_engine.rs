@@ -463,7 +463,8 @@ impl Engine {
         let Some(pins) = self.pins.clone() else {
             return;
         };
-        let (desired, pending) = pins.read(|b| (b.desired(&hash), b.pending(&hash)));
+        let (desired, pending, at_ms) =
+            pins.read(|b| (b.desired(&hash), b.pending(&hash), b.pinned_at(&hash)));
         if pending {
             return;
         }
@@ -476,6 +477,7 @@ impl Engine {
                         pinned: false,
                         note: String::new(),
                         item: None,
+                        at_ms: 0,
                     }));
                 }
             }
@@ -498,6 +500,7 @@ impl Engine {
                     pinned: true,
                     note,
                     item,
+                    at_ms,
                 }));
             }
         }
@@ -830,7 +833,7 @@ impl Engine {
             ));
             return None;
         }
-        crate::history::strip_note(&mut item.ext);
+        crate::history::strip_private(&mut item.ext);
         item.content = item.content.fit(MAX_ITEM_BYTES);
         if item.content.len() > MAX_ITEM_BYTES {
             self.emit(Event::PinFailed(
@@ -1085,7 +1088,7 @@ impl Engine {
             if item.origin == self.device && crate::exclusions::blocks_send(&item.content) {
                 continue;
             }
-            crate::history::strip_note(&mut item.ext);
+            crate::history::strip_private(&mut item.ext);
             item.content = item.content.fit(MAX_ITEM_BYTES);
             let Ok(id) = PinId::random() else { continue };
             let state = PinState {
@@ -1235,12 +1238,13 @@ impl Engine {
                         // Здесь содержимого закрепа нет, только своя запись:
                         // у своей — её файлы и есть «содержимое».
                         let share = own && s.may_send_own(&item.content);
+                        let kept = own && s.kept_local(h);
                         pin_files::repair_picks(
                             files,
                             own.then_some(files.as_slice()),
                             |x| held.contains(&x) && !missing.contains(&x),
                             limit_mb,
-                            share,
+                            pin_files::Consent { share, kept },
                             &files_dir,
                         )
                         .is_some_and(|(_, picks)| !picks.is_empty())
@@ -1319,6 +1323,7 @@ impl Engine {
                 let share = own
                     .as_ref()
                     .is_some_and(|(i, _)| s.may_send_own(&i.content));
+                let kept = own.is_some() && s.kept_local(&hash);
                 let local = own.and_then(|(i, _)| match i.content {
                     Content::Files(f) => Some(f),
                     _ => None,
@@ -1328,7 +1333,7 @@ impl Engine {
                     local.as_deref(),
                     |x| held.contains(&x) && !missing.contains(&x),
                     limit_mb,
-                    share,
+                    pin_files::Consent { share, kept },
                     &files_dir,
                 );
                 plan.map(|p| (p, local))

@@ -168,6 +168,12 @@ impl PinSource for HistorySource {
         !self.paused.load(Ordering::Relaxed) && may_send(send_kinds(), content)
     }
 
+    fn kept_local(&self, hash: &[u8; 32]) -> bool {
+        self.lock()
+            .files_entry(hash)
+            .is_some_and(|e| e.local && crate::history::is_local_only(&e.ext))
+    }
+
     fn file_item(&self, hash: &[u8; 32]) -> Option<(Item, bool)> {
         let e = self.lock().files_entry(hash)?;
         let local = e.local;
@@ -183,7 +189,7 @@ impl PinSource for HistorySource {
 /// время — когда запись последний раз была в буфере.
 fn item_of(e: Entry) -> Item {
     let mut ext = e.ext;
-    crate::history::strip_note(&mut ext);
+    crate::history::strip_private(&mut ext);
     Item {
         id: e.id,
         origin: e.origin,
@@ -200,7 +206,7 @@ fn item_of(e: Entry) -> Item {
 /// её за свою.
 fn entry_of_pin(item: Item, me: DeviceId) -> Entry {
     let mut ext = item.ext;
-    crate::history::strip_note(&mut ext);
+    crate::history::strip_private(&mut ext);
     Entry {
         id: item.id,
         origin: if item.origin == me {
@@ -302,7 +308,18 @@ impl Copier {
                 "это не отправляется на другие устройства (настройки «Исключения»), только в историю"
             );
         }
-        let send = send && allowed && self.tx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let in_group = self.tx.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        // В группе, но не отправлено (пауза, «Что отправлять», «Не
+        // отправлять»): запись помечается «только здесь» и остаётся такой,
+        // пока человек сам её не отправит. Чужой закреп с тем же хэшем её
+        // файлы не зальёт и после того, как причина прошла
+        // (`pin_files::may_repair_own`). Без группы метки нет: при входе в
+        // группу локальная история отправляется по своим правилам.
+        let mut marks = marks;
+        if in_group && !(send && allowed) {
+            crate::history::mark_local_only(&mut marks.extra);
+        }
+        let send = send && allowed && in_group;
         let prepare = send && self.blobs.is_some();
         let limit = self.limit_mb.load(Ordering::Relaxed);
         if prepare && needs_scan(&content, limit) {
@@ -528,7 +545,7 @@ impl Copier {
             }
             match h.id_by_hash(&entry.content.hash()) {
                 Some(other) if other != id => {
-                    if let Err(e) = h.delete(id) {
+                    if let Err(e) = h.discard(id) {
                         tracing::warn!("черновая запись папки не удалилась: {e:#}");
                     }
                 }
@@ -829,6 +846,15 @@ impl Service {
                             }
                         }
                         Event::Incoming(item) => {
+                            // Повтор уже записанного элемента и удалённое
+                            // здесь не трогают ни буфер, ни историю.
+                            let take = {
+                                let h = history.lock().unwrap_or_else(|e| e.into_inner());
+                                take_incoming(&h, &item)
+                            };
+                            if !take {
+                                continue;
+                            }
                             // Чужие файлы в буфер сразу не кладём: пути там с
                             // другого устройства. Они скачиваются при вставке.
                             let files = matches!(item.content, Content::Files(_));
@@ -1264,7 +1290,33 @@ fn apply_pin_event(
     if pins.is_some_and(|b| b.pending(&p.hash)) {
         return Ok(false);
     }
+    // Содержимое, удалённое здесь после правки закрепа, закреп не
+    // возвращает; закреп, поставленный уже после удаления, — возвращает.
+    let entry = entry.filter(|_| {
+        let buried = h.buried_for_pin(&p.hash, p.at_ms);
+        if buried {
+            tracing::info!("запись закрепа удалена здесь после закрепления, не возвращаю");
+        }
+        !buried
+    });
     h.apply_pin(&p.hash, p.pinned, &p.note, entry)
+}
+
+/// Брать ли чужой элемент, разосланный сейчас (`sync::Event::Incoming`), в
+/// буфер и в историю. Нет, если запись с этим id уже есть: это повтор того
+/// же элемента (сервер может прислать его снова, а у элемента с id из
+/// будущего курсор не двигается), и буфер он уже переписывал; запись к тому
+/// же могли поправить. Нет и для удалённого здесь ([`History::buried`]).
+fn take_incoming(h: &History, item: &Item) -> bool {
+    if h.has_id(item.id) {
+        tracing::info!("элемент уже в истории, повтор не кладу в буфер");
+        return false;
+    }
+    if h.buried(item.id, &item.content.hash(), item.created_at_ms as i64) {
+        tracing::info!("элемент удалён здесь раньше, в буфер и историю не кладу");
+        return false;
+    }
+    true
 }
 
 /// Файлы закреплённой записи переехали (`sync::Event::PinFiles`): новые
@@ -1311,7 +1363,7 @@ fn apply_pin_files(
 /// одной доставке, а в записи истории осталась бы и при повторной отправке.
 fn without_note(ext: &[clipwire_core::Ext]) -> Vec<clipwire_core::Ext> {
     let mut v = ext.to_vec();
-    crate::history::strip_note(&mut v);
+    crate::history::strip_private(&mut v);
     v.retain(|e| e.tag != clipwire_core::item::ext::HISTORY_ONLY);
     v
 }
@@ -1321,7 +1373,11 @@ fn without_note(ext: &[clipwire_core::Ext]) -> Vec<clipwire_core::Ext> {
 fn local_backfill(h: &History) -> Vec<(Outgoing, u64)> {
     let mut out: Vec<(Outgoing, u64)> = h
         .ids_where(BACKFILL_MAX, |c| {
-            c.local && sendable_backfill(c.kind) && may_send_card(send_kinds(), c.kind)
+            // Помеченное «только здесь» в новую группу тоже не уходит.
+            c.local
+                && !crate::history::is_local_only(&c.ext)
+                && sendable_backfill(c.kind)
+                && may_send_card(send_kinds(), c.kind)
         })
         .into_iter()
         .filter_map(|id| h.get(id))
@@ -1703,6 +1759,7 @@ mod tests {
             pinned: false,
             note: String::new(),
             item: None,
+            at_ms: 0,
         };
         assert!(!apply_pin_event(&history, Some(&pins), unpin.clone(), DeviceId([1; 32])).unwrap());
         assert!(history.lock().unwrap().row(id).unwrap().pinned);
@@ -2364,6 +2421,170 @@ mod tests {
         let e = h.find(&Content::Text("раз".into())).unwrap();
         assert_eq!(e.source_app(), Some(app), "источник записан в историю");
         drop(h);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Разосланный элемент, который уже в истории (повтор с id из будущего)
+    /// или удалён здесь, не трогает ни буфер, ни историю. Новое копирование
+    /// того же содержимого на другом устройстве после удаления — проходит.
+    #[test]
+    fn incoming_repeat_or_deleted_skips_clipboard() {
+        let mut h = History::in_memory();
+        let item = Item::new(DeviceId([2; 32]), Content::Text("пароль".into()));
+        assert!(take_incoming(&h, &item));
+        h.add(Entry {
+            id: item.id,
+            origin: item.origin,
+            device_name: item.device_name.clone(),
+            local: false,
+            content: item.content.clone(),
+            seen_ms: now_ms(),
+            pinned: false,
+            ext: Vec::new(),
+        })
+        .unwrap();
+        assert!(!take_incoming(&h, &item), "повтор того же id");
+        h.delete(item.id).unwrap();
+        assert!(!take_incoming(&h, &item), "удалённое вернулось");
+        let mut again = Item::new(DeviceId([2; 32]), Content::Text("пароль".into()));
+        again.created_at_ms = now_ms() as u64 + 60_000;
+        assert!(
+            take_incoming(&h, &again),
+            "новое копирование после удаления"
+        );
+    }
+
+    /// Закреп, правленный до удаления записи здесь, её не возвращает;
+    /// поставленный после — возвращает.
+    #[test]
+    fn pin_does_not_restore_entry_deleted_after_it() {
+        let history = Mutex::new(History::in_memory());
+        let item = Item::new(DeviceId([2; 32]), Content::Text("закреп".into()));
+        let hash = item.content.hash();
+        {
+            let mut h = history.lock().unwrap();
+            h.merge(entry_of_pin(item.clone(), DeviceId([1; 32])))
+                .unwrap();
+            let id = h.id_by_hash(&hash).unwrap();
+            h.delete(id).unwrap();
+        }
+        let pin = |at_ms| crate::pins::PinApply {
+            hash,
+            pinned: true,
+            note: String::new(),
+            item: Some(item.clone()),
+            at_ms,
+        };
+        let me = DeviceId([1; 32]);
+        assert!(!apply_pin_event(&history, None, pin(now_ms() - 60_000), me).unwrap());
+        assert!(history.lock().unwrap().id_by_hash(&hash).is_none());
+        assert!(apply_pin_event(&history, None, pin(now_ms() + 60_000), me).unwrap());
+        assert!(history.lock().unwrap().id_by_hash(&hash).is_some());
+    }
+
+    /// Файл, скопированный на паузе в группе, помечается «только здесь» и
+    /// остаётся таким после снятия паузы: чужой закреп с тем же хэшем его не
+    /// зальёт. Метка в группу не уходит; отправив запись сам (копирование,
+    /// когда можно), человек её снимает.
+    #[tokio::test]
+    async fn copy_while_paused_stays_local_after_resume() {
+        let d = tmp("local-only");
+        let history = Arc::new(Mutex::new(History::open(&d).unwrap()));
+        let (tx, mut rx) = mpsc::channel(4);
+        let c = Copier {
+            tx: Arc::new(Mutex::new(Some(tx))),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            history: history.clone(),
+            device: DeviceId([1; 32]),
+            device_name: "тест".into(),
+            on_event: Arc::new(|_| {}),
+            blobs: None,
+            limit_mb: Arc::new(AtomicU64::new(100)),
+            rt: tokio::runtime::Handle::current(),
+            mark: None,
+            fingerprints: Default::default(),
+            pushed: Default::default(),
+        };
+        let paused = Arc::new(AtomicBool::new(true));
+        let src = HistorySource {
+            history: history.clone(),
+            limit_mb: Arc::new(AtomicU64::new(100)),
+            paused: paused.clone(),
+            device: DeviceId([1; 32]),
+        };
+        let path = d.join("отчёт.txt");
+        std::fs::write(&path, b"secret").unwrap();
+        let (size, modified_ms) = crate::blobs::file_stamp(&path).unwrap();
+        let file = FileRef {
+            name: "отчёт.txt".into(),
+            path: path.to_string_lossy().into_owned(),
+            size,
+            is_dir: false,
+            width: 0,
+            height: 0,
+            modified_ms,
+            blob: None,
+            blob_size: 0,
+            p2p: false,
+        };
+        let content = Content::Files(vec![file.clone()]);
+        let hash = content.hash();
+        // Как `Service::copy` на паузе.
+        c.dispatch(content.clone(), false, Marks::default());
+        assert!(rx.try_recv().is_err(), "на паузе ушло в группу");
+        // Паузу сняли: отправлять сейчас можно, но запись помечена.
+        paused.store(false, Ordering::Relaxed);
+        assert!(src.may_send_own(&content));
+        assert!(src.kept_local(&hash));
+        let files = vec![file];
+        let consent = crate::pin_files::Consent {
+            share: src.may_send_own(&content),
+            kept: src.kept_local(&hash),
+        };
+        let (_, picks) = crate::pin_files::repair_picks(
+            &files,
+            Some(&files),
+            |_| false,
+            100,
+            consent,
+            &d.join("files"),
+        )
+        .unwrap();
+        assert!(picks.is_empty(), "чужой закреп залил бы файл: {picks:?}");
+        // Без метки тот же файл залился бы: проверка не пустая.
+        let (_, would) = crate::pin_files::repair_picks(
+            &files,
+            Some(&files),
+            |_| false,
+            100,
+            crate::pin_files::Consent {
+                share: true,
+                kept: false,
+            },
+            &d.join("files"),
+        )
+        .unwrap();
+        assert_eq!(would.len(), 1);
+        // В содержимое закрепа метка не попадает.
+        let item = src.item(&hash).unwrap();
+        assert!(
+            !item
+                .ext
+                .iter()
+                .any(|x| x.tag == clipwire_core::item::ext::LOCAL_ONLY)
+        );
+        // Человек скопировал то же, когда можно, — ушло и метка снята.
+        c.dispatch(content.clone(), true, Marks::default());
+        let out = rx.try_recv().expect("ушло в группу");
+        assert!(
+            !out.ext
+                .iter()
+                .any(|x| x.tag == clipwire_core::item::ext::LOCAL_ONLY)
+        );
+        assert!(!src.kept_local(&hash));
+        drop(c);
+        drop(src);
+        drop(history);
         let _ = std::fs::remove_dir_all(d);
     }
 

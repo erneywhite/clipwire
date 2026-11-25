@@ -180,6 +180,14 @@ A deletion made offline waits for the connection and survives a Clipwire restart
 Entries pinned on another device are not deleted. The server does not know what was deleted: the
 deletion note is encrypted with the group key. This needs server 0.1.3 or newer.
 
+A deleted entry does not come back from the group, even if the server sends the same item
+again (when you reconnect, with the history of a device that joins, or on purpose). After
+**Clear history**, the group's older history does not refill it either. If you or another
+device copy the same thing again after the deletion, it shows up as usual. A pin set after the
+deletion brings the entry back, an older one does not. An item the server sends again with an
+id that is already in the history does not touch the clipboard, and neither does an item whose
+copy time is more than 5 minutes ahead of this computer's clock: it goes to the history only.
+
 ### Pins and notes
 
 Pinned entries are the same on every device of the group, including devices
@@ -222,7 +230,9 @@ has the file repairs it the same way. Clipwire 0.7 apps keep the old location af
 repair and report the file as missing until they are updated. One run of the app repairs at
 most 1 GiB and 50 files; if pins hold more, the rest is repaired after the next start. A file
 that never left your device (copied while sync was paused, its kind is off in "What to send",
-or it matches a "Don't send" rule) is not uploaded by someone else's pin.
+or it matches a "Don't send" rule) is not uploaded by someone else's pin, also after the pause
+is over or the kind is turned back on. Such an entry stays local until you send it yourself:
+copy it again while sending is allowed or pin it.
 
 Known rough edges. A file over the limit that was uploaded for a pin is deleted from the server
 right after the pin is removed, while the entry keeps its new location without direct transfer:
@@ -489,6 +499,14 @@ administrator should change the admin key and the access token.
 invitation code ended up in the wrong place. The group's history on the server is erased, local
 history is untouched and the invitation code changes. Devices without a card do not receive the
 new key, and Clipwire warns about it before you confirm.
+
+After the key changes on this device, **Group devices** shows a **Moving to the new key** block:
+each device that got the new key is marked **moved to the new key** once it has joined the new
+group (its card opens with the new key), or **not moved yet**. A device that has not moved
+within 10 minutes is highlighted with a hint. Usually it is just switched off or waits for
+**Switch to the new key**, but a server working with the removed device could also keep it in
+the old group. Then connect it again with the new invitation code. The block survives a restart
+and disappears a day after everyone has moved.
 
 **Group admins.** The device that created the group is its first admin. Every admin is marked
 **admin** in the device list. Only admins remove devices and change the group key: other devices

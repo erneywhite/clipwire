@@ -3,7 +3,7 @@
 // shortcut: тесты без фреймворка и вне npm run, переделать при появлении vitest.
 import type { GroupDevice } from './api'
 
-const { FRESH_MS, adminAction, adminKeyText, waitOnline, adminConfirmText, canClaimAdmin, canManage, lastAdmin, confirmText, deviceTitle, exposedAccessText, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, leftOut, pendingAdmins, offerText, recipients, rekeyChoice, rekeyedBy, rolesText, sameName, seenLabel, staying } = (await import('./devices' + '.ts')) as typeof import('./devices')
+const { FRESH_MS, REKEY_SHOW_MS, REKEY_STALE_MS, rekeyAgoLabel, rekeyProgress, rekeyRowLabel, rekeyStaleHint, adminAction, adminKeyText, waitOnline, adminConfirmText, canClaimAdmin, canManage, lastAdmin, confirmText, deviceTitle, exposedAccessText, firstSeenLabel, freshWarning, isAdmin, isFresh, isNewDeviceError, leftOut, pendingAdmins, offerText, recipients, rekeyChoice, rekeyedBy, rolesText, sameName, seenLabel, staying } = (await import('./devices' + '.ts')) as typeof import('./devices')
 const fmt = (await import('./format' + '.ts')) as typeof import('./format')
 
 function check(cond: boolean, msg: string) {
@@ -190,6 +190,47 @@ check(adminKeyText(false).includes('токен доступа'), 'и про то
   let calls = 0
   await waitOnline(async () => (calls++, { kind: 'connecting' }), 1_000, 500, noSleep)
   check(calls === 3, 'опрос в пределах срока: 0, 500, 1000 мс')
+}
+
+// Переход получателей на новый ключ после смены здесь.
+{
+  const at = now - 2 * 60_000
+  const sent = {
+    at_ms: at,
+    recipients: [
+      { id: 'bbbb', fingerprint: 'bbbb', name: 'Рабочий', os: 'Windows' },
+      { id: 'eeee', fingerprint: 'eeee', name: 'Планшет', os: 'Android' },
+    ],
+  }
+  // В новой группе уже «Рабочий» с открывшейся карточкой; «Планшета» нет.
+  const fresh = [me, work]
+  const rows = rekeyProgress(sent, fresh, now)
+  check(!!rows && rows.length === 2, 'все получатели в списке')
+  check(rows![0].moved && !rows![0].stale, 'перешедшее')
+  check(!rows![1].moved && !rows![1].stale, 'не перешло, но 10 минут ещё не прошло')
+  check(rows![1].title === 'Планшет' && rows![1].os === 'Android', 'имя из карточки старой группы')
+  check(rekeyRowLabel(rows![0]) === 'перешло на новый ключ' && rekeyRowLabel(rows![1]) === 'ещё не перешло', 'подписи')
+  check(rekeyStaleHint(rows!) === '', 'без подсказки до 10 минут')
+  check(rekeyAgoLabel(sent, fmt, now) === 'Ключ группы сменён: 2 мин', 'когда сменили')
+  check(rekeyAgoLabel({ ...sent, at_ms: now }, fmt, now) === 'Ключ группы сменён только что', 'только что')
+
+  const later = now + REKEY_STALE_MS
+  const stale = rekeyProgress(sent, fresh, later)!
+  check(stale[1].stale && !stale[0].stale, 'не перешедшее за 10 минут выделено')
+  check(rekeyStaleHint(stale).includes('старой группе'), 'подсказка, что делать')
+
+  // Устройство в списке новой группы, но карточка не открылась (подложил
+  // сервер или старая карточка) — не считается перешедшим.
+  const fake = rekeyProgress(sent, [me, d('eeee', { known: false, name: null })], later)!
+  check(!fake[1].moved, 'без открывшейся карточки — не перешло')
+
+  check(rekeyProgress(null, fresh, now) === null, 'смены не было')
+  check(rekeyProgress(sent, [], now) === null, 'список недоступен — не судим')
+  check(rekeyProgress({ ...sent, recipients: [] }, fresh, now) === null, 'получателей кроме себя нет')
+  const all = [me, work, d('eeee', { name: 'Планшет' })]
+  check(rekeyProgress(sent, all, now)!.every((r) => r.moved), 'все перешли')
+  check(rekeyProgress(sent, all, at + REKEY_SHOW_MS) === null, 'все перешли, сутки прошли — не показываем')
+  check(rekeyProgress(sent, fresh, at + REKEY_SHOW_MS) !== null, 'кто-то не перешёл — показываем и через сутки')
 }
 
 console.log('devices: всё прошло')

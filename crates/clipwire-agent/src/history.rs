@@ -72,6 +72,15 @@ const AI_LOG_LABEL: &[u8] = b"clipwire/history/ai-log/v1";
 pub const AI_LOG_KEEP: usize = 1000;
 /// Метка ключа истории для пометки нечитаемых строк (`cards.broken`).
 const KEYCHECK_LABEL: &[u8] = b"clipwire/history/keycheck/v1";
+/// Приставка, с которой id записи входит в ключевой id отметки об удалении
+/// (`tombstones.kid`, ключ тот же, что у `hkey`). Длина входа другая, чем у
+/// `hkey` (хэш, 32 байта), поэтому значения не пересекаются.
+const TOMB_PREFIX: &[u8] = b"tomb\0";
+/// Сколько отметок об удалении хранится. Лишние, самые старые, удаляются:
+/// элементы такой давности сервер уже не хранит (срок по умолчанию — сутки).
+pub const MAX_TOMBSTONES: usize = 20_000;
+/// Имя в таблице `marks`: когда историю последний раз очищали (мс Unix).
+const CLEARED_MARK: &str = "cleared_ms";
 
 /// Тела записей. Колонки и смысл те же, что у 0.2.x (она читает и пишет эту
 /// таблицу по именам колонок), порядок другой: тело последним, перед ним
@@ -119,6 +128,17 @@ const CREATE_REST: &str = "
         id    INTEGER PRIMARY KEY,
         at_ms INTEGER NOT NULL,
         data  BLOB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS tombstones (
+        kid   BLOB PRIMARY KEY,
+        hkey  BLOB NOT NULL,
+        at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS tombstones_hkey ON tombstones (hkey, at_ms);
+    CREATE INDEX IF NOT EXISTS tombstones_at ON tombstones (at_ms);
+    CREATE TABLE IF NOT EXISTS marks (
+        name  TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
     );";
 
 /// Живая строка: списки, счётчики и проверки видят только такие.
@@ -227,6 +247,28 @@ fn set_note_in(list: &mut Vec<Ext>, note: &str) {
 /// уходящего в группу: подпись живёт только в состоянии закрепа.
 pub fn strip_note(list: &mut Vec<Ext>) {
     list.retain(|e| e.tag != ext::NOTE);
+}
+
+/// Убрать всё, что живёт только в локальной истории: подпись
+/// ([`strip_note`]) и метку «только здесь» (`ext::LOCAL_ONLY`). Для
+/// сведений, уходящих в группу, и для пришедших оттуда.
+pub fn strip_private(list: &mut Vec<Ext>) {
+    list.retain(|e| e.tag != ext::NOTE && e.tag != ext::LOCAL_ONLY);
+}
+
+/// Пометить свою запись оставшейся только на этом устройстве.
+pub fn mark_local_only(list: &mut Vec<Ext>) {
+    if !is_local_only(list) {
+        list.push(Ext {
+            tag: ext::LOCAL_ONLY,
+            data: Vec::new(),
+        });
+    }
+}
+
+/// Помечена ли запись оставшейся только на этом устройстве.
+pub fn is_local_only(list: &[Ext]) -> bool {
+    list.iter().any(|e| e.tag == ext::LOCAL_ONLY)
 }
 
 /// То же, что `Entry`, но по ссылкам: тело пишется без копии содержимого.
@@ -1800,6 +1842,144 @@ impl History {
         Ok(n)
     }
 
+    // ---- отметки об удалении ----
+    //
+    // Удалённое здесь не должно вернуться из группы: сервер (злой или честный
+    // в пределах срока хранения) может прислать тот же запечатанный элемент
+    // ещё раз — историей при входе, `Backfill` или повтором `Deliver`. Дубли
+    // отсеиваются только по живым строкам, поэтому удаление запоминается
+    // отдельно: ключевой id записи, ключевой хэш содержимого и время. Оба
+    // ключевые (HMAC ключом `hkey`): по таблице не проверить догадку о
+    // содержимом и не узнать id, открыто лежит только время удаления.
+
+    /// Ключевой id записи для `tombstones.kid`.
+    fn tomb_id(&self, id: ItemId) -> [u8; 32] {
+        let mut data = TOMB_PREFIX.to_vec();
+        data.extend_from_slice(id.as_bytes());
+        mac(&self.hkey_key, &data)
+    }
+
+    /// Ключевой хэш строки: из колонки карточек, у строки без карточки —
+    /// из её тела.
+    fn hkey_of(&self, id: ItemId) -> Result<Option<[u8; 32]>> {
+        let col: Option<Option<Vec<u8>>> = self
+            .conn
+            .prepare_cached("SELECT hkey FROM cards WHERE id = ?1")?
+            .query_row([&id.as_bytes()[..]], |r| r.get(0))
+            .optional()?;
+        if let Some(h) = col.flatten().and_then(|h| <[u8; 32]>::try_from(h).ok()) {
+            return Ok(Some(h));
+        }
+        Ok(self.meta(id)?.map(|(_, _, c)| self.hkey(&c.hash)))
+    }
+
+    /// Запомнить удаление записей `ids` в момент `at_ms`. Таблица держится
+    /// в пределах [`MAX_TOMBSTONES`]: самые старые отметки уходят первыми.
+    fn bury(&self, ids: &[ItemId], at_ms: i64) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<([u8; 32], [u8; 32])> = ids
+            .iter()
+            .filter_map(|id| match self.hkey_of(*id) {
+                Ok(h) => h.map(|h| (self.tomb_id(*id), h)),
+                Err(e) => {
+                    tracing::warn!("отметка об удалении не записалась: {e:#}");
+                    None
+                }
+            })
+            .collect();
+        let mut st = self.conn.prepare_cached(
+            "INSERT INTO tombstones (kid, hkey, at_ms) VALUES (?1, ?2, ?3)
+             ON CONFLICT(kid) DO UPDATE SET hkey = excluded.hkey,
+                 at_ms = max(at_ms, excluded.at_ms)",
+        )?;
+        for (kid, hkey) in &rows {
+            st.execute(params![&kid[..], &hkey[..], at_ms])?;
+        }
+        self.conn
+            .prepare_cached(
+                "DELETE FROM tombstones WHERE kid IN (SELECT kid FROM tombstones
+                 ORDER BY at_ms DESC, kid DESC LIMIT -1 OFFSET ?1)",
+            )?
+            .execute([sql_limit(MAX_TOMBSTONES)])?;
+        Ok(())
+    }
+
+    /// Удалено ли здесь то, что пришло из группы: тот же элемент (`id`) или
+    /// то же содержимое (`hkey`), скопированное не позже удаления
+    /// (`created_ms` — время копирования из элемента, под шифрованием, сервер
+    /// его не подделает). `cleared` — учитывать и очистку истории: всё, что
+    /// скопировано не позже неё. Новое копирование того же содержимого после
+    /// удаления (здесь или на другом устройстве) проходит.
+    fn buried_by(
+        &self,
+        id: Option<ItemId>,
+        hkey: &[u8; 32],
+        created_ms: i64,
+        cleared: bool,
+    ) -> Result<bool> {
+        if let Some(id) = id
+            && self
+                .conn
+                .prepare_cached("SELECT 1 FROM tombstones WHERE kid = ?1")?
+                .exists([&self.tomb_id(id)[..]])?
+        {
+            return Ok(true);
+        }
+        if self
+            .conn
+            .prepare_cached("SELECT 1 FROM tombstones WHERE hkey = ?1 AND at_ms >= ?2")?
+            .exists(params![&hkey[..], created_ms])?
+        {
+            return Ok(true);
+        }
+        if !cleared {
+            return Ok(false);
+        }
+        Ok(self.cleared_ms()?.is_some_and(|at| created_ms <= at))
+    }
+
+    /// Когда историю последний раз очищали; `None` — не очищали.
+    fn cleared_ms(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT value FROM marks WHERE name = ?1")?
+            .query_row([CLEARED_MARK], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Чужой элемент (`id`, простой хэш содержимого `hash`, время копирования
+    /// `created_ms`) здесь удалили или очистили историю после его
+    /// копирования: в историю и в буфер он больше не идёт. Ошибка базы —
+    /// `false`: синхронизация не должна вставать из-за неё.
+    pub fn buried(&self, id: ItemId, hash: &[u8; 32], created_ms: i64) -> bool {
+        self.buried_by(Some(id), &self.hkey(hash), created_ms, true)
+            .unwrap_or_else(|e| {
+                tracing::warn!("отметки об удалении не прочитались: {e:#}");
+                false
+            })
+    }
+
+    /// Для закрепа группы, чьей записи здесь нет: содержимое с этим хэшем
+    /// удалили здесь не раньше правки закрепа (`pin_at_ms`). Тогда запись по
+    /// закрепу не возвращается; закреп, поставленный после удаления, —
+    /// возвращает. Очистка истории закрепы не задевает: закреплённое
+    /// остаётся при очистке, а снятие закрепов при очистке без них идёт
+    /// своим путём (`unpin_here`).
+    pub fn buried_for_pin(&self, hash: &[u8; 32], pin_at_ms: i64) -> bool {
+        self.buried_by(None, &self.hkey(hash), pin_at_ms, false)
+            .unwrap_or_else(|e| {
+                tracing::warn!("отметки об удалении не прочитались: {e:#}");
+                false
+            })
+    }
+
+    /// Есть ли читаемая запись с этим id.
+    pub fn has_id(&self, id: ItemId) -> bool {
+        self.live_exists(id).unwrap_or(false)
+    }
+
     fn count(&self, sql: &str) -> usize {
         self.conn
             .query_row(sql, [], |r| r.get::<_, i64>(0))
@@ -1934,6 +2114,11 @@ impl History {
             card.icon
         };
         let mut list = card.ext;
+        // Своё копирование само решает, осталась ли запись только здесь:
+        // ушедшее в группу снимает прежнюю метку, неушедшее ставит.
+        if entry.local {
+            list.retain(|e| e.tag != ext::LOCAL_ONLY);
+        }
         for x in entry.ext {
             list.retain(|e| e.tag != x.tag);
             list.push(x);
@@ -1998,6 +2183,12 @@ impl History {
         if self.id_by_hkey(&hkey)?.is_some() || self.live_exists(entry.id)? {
             return Ok(false);
         }
+        // Чужое, удалённое здесь (или скопированное до очистки истории), не
+        // возвращается. У элементов группы `seen_ms` — время копирования.
+        if !entry.local && self.buried_by(Some(entry.id), &hkey, entry.seen_ms, true)? {
+            tracing::info!("элемент удалён здесь раньше, в историю не возвращаю");
+            return Ok(false);
+        }
         self.write(&entry, None, Thumb::Set(thumb.as_deref()))?;
         Ok(true)
     }
@@ -2016,6 +2207,21 @@ impl History {
             if !pinned {
                 strip_note(&mut e.ext);
             }
+            self.write(&e, card.icon, Thumb::Keep)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Снять с записи метку «только здесь» (`ext::LOCAL_ONLY`): человек сам
+    /// отправил её в группу, закрепив. Метки нет — ничего не пишется.
+    pub fn clear_local_only(&mut self, id: ItemId) -> Result<()> {
+        let tx = self.tx()?;
+        if let Some((_, _, card)) = self.meta(id)?
+            && is_local_only(&card.ext)
+            && let Some(mut e) = self.body(id)?
+        {
+            e.ext.retain(|x| x.tag != ext::LOCAL_ONLY);
             self.write(&e, card.icon, Thumb::Keep)?;
         }
         tx.commit()?;
@@ -2288,21 +2494,46 @@ impl History {
                 }
             }
         }
+        // Удалённое запоминается, как своё удаление: время — записки, но не
+        // позже своих часов (записка с часами из будущего не должна
+        // отсекать будущие копирования того же содержимого).
+        let buried: Vec<ItemId> = ids.iter().filter_map(|r| item_id(r)).collect();
+        self.bury(&buried, until.min(now_ms()))?;
         let removed = self.delete_ids(&ids)?;
         tx.commit()?;
         Ok(removed)
     }
 
+    /// Удалить запись по просьбе человека. Удаление запоминается
+    /// (`tombstones`): тот же элемент из группы запись не вернёт.
     pub fn delete(&mut self, id: ItemId) -> Result<()> {
+        let tx = self.tx()?;
+        self.bury(&[id], now_ms())?;
+        self.delete_ids(&[id.as_bytes().to_vec()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Убрать служебную строку без отметки об удалении (черновая запись
+    /// папки, которую заменила прежняя с тем же содержимым).
+    pub fn discard(&mut self, id: ItemId) -> Result<()> {
         let tx = self.tx()?;
         self.delete_ids(&[id.as_bytes().to_vec()])?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Очистить историю. Закреплённое остаётся, если `keep_pinned`.
+    /// Очистить историю. Закреплённое остаётся, если `keep_pinned`. Время
+    /// очистки запоминается: скопированное до неё из группы не вернётся
+    /// (закрепы — своим путём, см. [`History::buried_for_pin`]).
     pub fn clear(&mut self, keep_pinned: bool) -> Result<()> {
         let tx = self.tx()?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO marks (name, value) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET value = max(value, excluded.value)",
+            )?
+            .execute(params![CLEARED_MARK, now_ms()])?;
         if keep_pinned {
             self.conn.execute_batch(
                 "DELETE FROM entries WHERE pinned = 0; DELETE FROM cards WHERE pinned = 0;",
@@ -2318,6 +2549,12 @@ impl History {
     /// Удалить старше срока хранения (кроме закреплённого). Возвращает число
     /// удалённых. Если что-то удалилось, заодно убираются значки программ, на
     /// которые больше не ссылается ни одна запись ([`History::prune_icons`]).
+    ///
+    /// Отметок об удалении очистка по сроку не пишет: удалённое ею старше
+    /// срока (не меньше суток), сервер такие элементы обычно уже не хранит, а
+    /// вернувшийся старый элемент встаёт на своё место по времени и уходит
+    /// следующей очисткой. Тысячи отметок от очистки вытеснили бы из
+    /// таблицы ([`MAX_TOMBSTONES`]) отметки удалений, сделанных человеком.
     pub fn prune(&mut self, retention: Retention, now: i64) -> Result<usize> {
         let Some(max) = retention.max_age_ms() else {
             return Ok(0);
@@ -4673,8 +4910,194 @@ mod tests {
             h.get(newer).is_some(),
             "скопированное после удаления остаётся"
         );
+        // Удалённое запиской тоже не возвращается повтором из группы.
+        let mut again = local_entry(DeviceId([2; 32]), "Mac", Content::Text("старое".into()));
+        again.local = false;
+        again.seen_ms = 1_000;
+        assert!(!h.merge(again).unwrap());
         drop(h);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Элемент группы, как его кладёт сервис: чужой, `seen_ms` — время
+    /// копирования из элемента.
+    fn foreign(s: &str, created_ms: i64) -> Entry {
+        let mut e = local_entry(DeviceId([2; 32]), "Mac", Content::Text(s.into()));
+        e.local = false;
+        e.seen_ms = created_ms;
+        e
+    }
+
+    /// Удалённое здесь не возвращается из группы: тот же элемент (история
+    /// при входе, `Backfill`, повтор) и то же содержимое, скопированное до
+    /// удаления, другим id. Новое копирование того же — проходит: своё
+    /// здесь и чужое, сделанное после удаления.
+    #[test]
+    fn deleted_item_is_not_reinserted_from_group() {
+        let dir = tmp("tomb");
+        let mut h = History::open(&dir).unwrap();
+        let now = now_ms();
+        let e = foreign("пароль с опечаткой", now - 60_000);
+        let id = e.id;
+        assert!(h.merge(e.clone()).unwrap());
+        h.delete(id).unwrap();
+        assert!(h.get(id).is_none());
+        // Тот же элемент снова: и пачкой (история, `Backfill`), и по одному.
+        assert!(!h.merge(e.clone()).unwrap(), "тот же элемент вернулся");
+        assert_eq!(h.merge_many([(e.clone(), None)]).unwrap(), 0);
+        // Тот же элемент со временем копирования из будущего — по id.
+        let mut late = e.clone();
+        late.seen_ms = now + 3_600_000;
+        assert!(!h.merge(late).unwrap(), "по id, а не по времени");
+        // Другой элемент с тем же содержимым, скопированный до удаления.
+        assert!(
+            !h.merge(foreign("пароль с опечаткой", now - 30_000))
+                .unwrap()
+        );
+        assert!(h.buried(ItemId::new(), &e.content.hash(), now - 30_000));
+        // Чужое копирование того же после удаления — новое.
+        assert!(!h.buried(ItemId::new(), &e.content.hash(), now + 60_000));
+        // Отметки переживают перезапуск.
+        drop(h);
+        let mut h = History::open(&dir).unwrap();
+        assert!(!h.merge(e.clone()).unwrap());
+        // Своё копирование того же содержимого здесь — как обычно.
+        let mine = local_entry(DeviceId([1; 32]), "ПК", e.content.clone());
+        assert!(h.add(mine).unwrap(), "своё копирование не блокируется");
+        assert_eq!(h.len(), 1);
+        drop(h);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Очищенная история не наполняется заново старой историей группы;
+    /// скопированное после очистки и закреплённое остаются как были.
+    #[test]
+    fn cleared_history_is_not_refilled_by_old_backfill() {
+        let mut h = History::in_memory();
+        let now = now_ms();
+        let old: Vec<Entry> = (0..3)
+            .map(|i| foreign(&format!("старое {i}"), now - 10_000 + i))
+            .collect();
+        assert_eq!(
+            h.merge_many(old.iter().cloned().map(|e| (e, None)))
+                .unwrap(),
+            3
+        );
+        let pinned = text(&mut h, "закреп", now - 5_000);
+        h.set_pinned(pinned, true).unwrap();
+        h.clear(true).unwrap();
+        assert_eq!(h.len(), 1, "закреплённое осталось");
+        assert_eq!(
+            h.merge_many(old.iter().cloned().map(|e| (e, None)))
+                .unwrap(),
+            0,
+            "старая история вернулась после очистки"
+        );
+        // Свежее из группы (скопировано после очистки) — приходит.
+        assert!(h.merge(foreign("новое", now + 60_000)).unwrap());
+        // Закреп группы очисткой не задет.
+        assert!(!h.buried_for_pin(&Content::Text("старое 0".into()).hash(), now - 10_000));
+    }
+
+    /// Закреп группы не возвращает запись, удалённую здесь после его
+    /// правки; закреп, поставленный после удаления, возвращает.
+    #[test]
+    fn pin_older_than_deletion_does_not_restore_entry() {
+        let mut h = History::in_memory();
+        let now = now_ms();
+        let e = foreign("закреплённое", now - 60_000);
+        let hash = e.content.hash();
+        assert!(h.merge(e.clone()).unwrap());
+        h.delete(e.id).unwrap();
+        assert!(h.buried_for_pin(&hash, now - 30_000));
+        assert!(!h.buried_for_pin(&hash, now + 60_000));
+        assert!(!h.buried_for_pin(&Content::Text("другое".into()).hash(), 0));
+    }
+
+    /// Отметки ключевые (ни id, ни хэша открыто) и держатся в пределе:
+    /// самые старые уходят первыми.
+    #[test]
+    fn tombstones_are_keyed_and_bounded() {
+        let mut h = History::in_memory();
+        let e = foreign("секрет", 1_000);
+        let id = e.id;
+        let hash = e.content.hash();
+        h.merge(e).unwrap();
+        h.delete(id).unwrap();
+        let (kid, hk): (Vec<u8>, Vec<u8>) = h
+            .conn
+            .query_row("SELECT kid, hkey FROM tombstones", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert!(!kid.windows(16).any(|w| w == id.as_bytes()), "id открыто");
+        assert_ne!(hk, hash.to_vec(), "голый хэш");
+        assert_eq!(hk, h.hkey(&hash).to_vec());
+        // Переполнение: старые отметки уходят, свежая остаётся.
+        {
+            let tx = h.conn.unchecked_transaction().unwrap();
+            let mut st = tx
+                .prepare("INSERT INTO tombstones (kid, hkey, at_ms) VALUES (?1, ?2, ?3)")
+                .unwrap();
+            for i in 0..MAX_TOMBSTONES as i64 {
+                let mut k = [0u8; 32];
+                k[..8].copy_from_slice(&i.to_le_bytes());
+                st.execute(params![&k[..], &[1u8; 32][..], i]).unwrap();
+            }
+            drop(st);
+            tx.commit().unwrap();
+        }
+        let fresh = foreign("свежее", now_ms());
+        let fresh_id = fresh.id;
+        h.merge(fresh.clone()).unwrap();
+        h.delete(fresh_id).unwrap();
+        let n: i64 = h
+            .conn
+            .query_row("SELECT count(*) FROM tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n as usize, MAX_TOMBSTONES);
+        assert!(!h.merge(fresh).unwrap(), "свежая отметка на месте");
+        let oldest: i64 = h
+            .conn
+            .query_row("SELECT min(at_ms) FROM tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert!(oldest > 1, "самые старые ушли");
+    }
+
+    /// Метка «только здесь» живёт только в локальной истории: своё
+    /// неотправленное копирование её ставит, отправленное — снимает, чужое
+    /// копирование того же содержимого её не трогает, в группу она не уходит.
+    #[test]
+    fn local_only_mark_follows_own_copies() {
+        let mut h = History::in_memory();
+        let mut e = local_entry(DeviceId([1; 32]), "ПК", Content::Text("заметка".into()));
+        mark_local_only(&mut e.ext);
+        let id = e.id;
+        h.add(e.clone()).unwrap();
+        assert!(is_local_only(&h.get(id).unwrap().ext));
+        // Чужое то же содержимое — метка остаётся.
+        let mut other = foreign("заметка", now_ms());
+        other.ext.push(Ext {
+            tag: ext::LOCAL_ONLY,
+            data: Vec::new(),
+        });
+        strip_private(&mut other.ext);
+        assert!(other.ext.is_empty(), "пришедшая метка отбрасывается");
+        h.add(other).unwrap();
+        assert!(is_local_only(&h.get(id).unwrap().ext));
+        // Своё отправленное копирование — снимает.
+        h.add(local_entry(
+            DeviceId([1; 32]),
+            "ПК",
+            Content::Text("заметка".into()),
+        ))
+        .unwrap();
+        assert!(!is_local_only(&h.get(id).unwrap().ext));
+        // И снова: закрепление человеком тоже снимает.
+        h.add(e).unwrap();
+        assert!(is_local_only(&h.get(id).unwrap().ext));
+        h.clear_local_only(id).unwrap();
+        assert!(!is_local_only(&h.get(id).unwrap().ext));
     }
 
     #[test]

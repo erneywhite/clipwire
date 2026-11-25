@@ -118,6 +118,23 @@ export interface GroupDevice {
   first_seen_ms: number
 }
 
+/** Получатель нового ключа после смены, сделанной здесь (`rekey_sent`). */
+export interface RekeyRecipient {
+  /** Полный id, 64 hex: по нему ищется в списке устройств новой группы. */
+  id: string
+  fingerprint: string
+  /** Имя и ОС из карточки, проверенной ещё в старой группе; null — нет. */
+  name: string | null
+  os: string | null
+}
+
+/** Последняя смена ключа, сделанная здесь, если она привела к нынешней группе. */
+export interface RekeySent {
+  /** Когда сервер принял смену, мс. */
+  at_ms: number
+  recipients: RekeyRecipient[]
+}
+
 /** Смена ключа другим устройством, которая ждёт ответа (`group_rekey_offer`). */
 export interface RekeyOffer {
   /** Имя, ОС и отпечаток устройства, сменившего ключ. */
@@ -634,6 +651,8 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   /** Забрать события группы, пришедшие с прошлого раза (в том числе пока настроек не было). */
   groupNoticesTake: () => invoke<GroupNotices>('group_notices_take'),
   devicesList: () => invoke<GroupDevice[]>('devices_list'),
+  /** Кому ушёл новый ключ при последней смене здесь; null — не было. */
+  rekeySent: () => invoke<RekeySent | null>('rekey_sent'),
   statsOverview: () => invoke<StatsOverview>('stats_overview'),
   /** `confirmed` — получатели нового ключа, которых человек видел в диалоге;
    *  `alsoRemove` — те, с кого он снял галочку. */
