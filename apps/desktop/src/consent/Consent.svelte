@@ -94,10 +94,12 @@
     }
   }
 
+  // Длинный текст Rust присылает началом и концом, середину пропускает:
+  // хвост тоже на виду, команду в конце за тысячами пробелов не спрятать.
+  // Невидимые символы (направление текста, нулевой ширины, `\r`) уже
+  // заменены метками ⟨U+202E⟩.
   const shown = $derived(req?.text ?? '')
-  // Rust считает символы Unicode, а length строки JS — UTF-16: эмодзи там два.
-  const shownChars = $derived([...shown].length)
-  const cut = $derived(!!req && req.chars > shownChars)
+  const tail = $derived(req?.tail ?? null)
 
   onMount(() => {
     api.settings().then((s) => applyTheme(s.theme, s.mode)).catch(() => {})
@@ -145,9 +147,18 @@
         </div>
       {:else}
         <h1>{t('«{client}» хочет положить в буфер обмена', { client: req.client })}</h1>
-        <pre class="text selectable" aria-label={t('Текст для буфера')}>{shown}</pre>
+        <pre class="text selectable" aria-label={t('Текст для буфера')}>{shown}{#if tail !== null}<span class="gap"
+              >{'\n'}{t('… не показано {count} …', {
+                count: tn(req.skipped, ['символ', 'символа', 'символов'], ['character', 'characters']),
+              })}{'\n'}</span
+            >{tail}{/if}</pre>
+        {#if req.multiline}
+          <p class="warn small" role="note">
+            {t('В тексте есть переводы строк: вставленный в терминал, он может сразу выполниться как команда.')}
+          </p>
+        {/if}
         <p class="mono muted small">
-          {tn(req.chars, ['символ', 'символа', 'символов'], ['character', 'characters'])}{#if cut}&nbsp;· {t('показаны первые {n}', { n: shownChars })}{/if}
+          {tn(req.chars, ['символ', 'символа', 'символов'], ['character', 'characters'])}{#if tail !== null}&nbsp;· {t('показаны начало и конец')}{/if}
         </p>
         {#if error}<p class="error" role="alert">{error}</p>{/if}
         <div class="buttons">
@@ -218,6 +229,15 @@
     font-size: var(--text-s);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+  /* Пропуск середины длинного текста: не часть текста, выделен цветом. */
+  .gap {
+    color: var(--c-muted);
+    font-style: italic;
+    user-select: none;
+  }
+  .warn {
+    color: var(--c-danger);
   }
   .buttons {
     margin-top: auto;

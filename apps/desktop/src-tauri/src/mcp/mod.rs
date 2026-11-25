@@ -22,7 +22,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::AppState;
-use consent::{Choice, ConsentDto, ConsentState};
+use consent::{Busy, Choice, ConsentDto, ConsentState};
 use handler::{AppStatus, CONSENT_TIMEOUT, Host, Store};
 
 /// Метка окна согласия.
@@ -76,7 +76,7 @@ impl AppHost {
         self.app.state::<AppState>()
     }
 
-    async fn ask(&self, dto: ConsentDto) -> Option<Choice> {
+    async fn ask(&self, dto: ConsentDto) -> Result<Option<Choice>, Busy> {
         let app = self.app.clone();
         self.app
             .state::<ConsentState>()
@@ -124,24 +124,32 @@ impl Host for AppHost {
         AppStatus { group, connected }
     }
 
-    async fn ask_client(&self, client: &str, version: &str, allow_write: bool) -> Option<AiAccess> {
-        let choice = self
+    async fn ask_client(
+        &self,
+        client: &str,
+        version: &str,
+        allow_write: bool,
+    ) -> Result<Option<AiAccess>, Busy> {
+        let Some(choice) = self
             .ask(ConsentDto::client(client, version, allow_write))
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
         // `ConsentState::answer` уже привёл ответ к вопросу: «чтение и
         // запись» приходит, только если их предлагали.
-        Some(match choice {
+        Ok(Some(match choice {
             Choice::Read => AiAccess::Read,
             Choice::ReadWrite if allow_write => AiAccess::ReadWrite,
             Choice::ReadWrite => AiAccess::Read,
             Choice::Deny | Choice::Accept | Choice::Decline => AiAccess::Denied,
             // До ждущих `Dismiss` не доходит (`ConsentState::answer`).
-            Choice::Dismiss => return None,
-        })
+            Choice::Dismiss => return Ok(None),
+        }))
     }
 
-    async fn ask_clipboard(&self, client: &str, text: &str) -> bool {
-        self.ask(ConsentDto::clipboard(client, text)).await == Some(Choice::Accept)
+    async fn ask_clipboard(&self, client: &str, text: &str) -> Result<bool, Busy> {
+        Ok(self.ask(ConsentDto::clipboard(client, text)).await? == Some(Choice::Accept))
     }
 
     fn remember_client(&self, name: &str, access: AiAccess) {

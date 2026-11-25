@@ -741,8 +741,11 @@ Settings → **AI tools**:
 - **AI sees history for** 1 day, 7 days (default), 30 days or all history. Pinned entries are
   always visible, however old they are.
 - **Hide entries that look like passwords and keys** (on): tokens, API keys, private keys, sign-in
-  and password-reset links and password-like strings are left out of search and refused on a
-  direct request. Turning it off
+  and password-reset links, Clipwire's own invite, group and server codes, payment card numbers,
+  wallet seed phrases and private keys (64 hex characters on their own), one-time codes (6–8
+  digits on their own) and password-like strings are left out of search and refused on a
+  direct request. A sha256 hash copied on its own is hidden too, since it looks exactly like a
+  wallet key. Turning it off
   asks for confirmation first.
 - Entries from programs excluded from syncing and files under a **Don't send** rule are never
   shown to the AI.
@@ -750,8 +753,11 @@ Settings → **AI tools**:
   clipboard. Such entries carry the **AI** label with the client's name (in the history, the
   paste window and the preview) and sync to all devices of the group like any other entry. The
   label stays with the entry when you paste it from the history again.
-- **Ask before putting text on the clipboard** (on): Clipwire shows the text and asks. When it is
-  off, you get a notification instead.
+- **Ask before putting text on the clipboard** (on): Clipwire shows the text and asks. A long text
+  is shown as its first 3000 and last 1000 characters with the number of skipped ones between them.
+  Invisible characters (text direction marks, zero-width characters, carriage return) are shown
+  as labels like `⟨U+202E⟩`, and a text with line breaks gets a warning: pasted into a terminal,
+  it may run as a command. When the setting is off, you get a notification instead.
 
 ### Clients and the access log
 
@@ -760,7 +766,8 @@ The first call from a new AI client waits until you answer in the Clipwire windo
 Esc, closing the window or no answer within two minutes refuses just this call, and
 the client asks again next time. Some AI clients give up on a tool call sooner than that; the
 access question stays open anyway, so answer it and repeat the request. A clipboard request the
-client cancels is dropped together with its window.
+client cancels is dropped together with its window. At most 8 questions wait in the queue; beyond
+that a client gets a "busy" error right away.
 
 With **Ask before putting text on the clipboard** off, `copy_to_clipboard` shows a system
 notification with the start of the text. If the text looks like a password or token, the
@@ -781,7 +788,9 @@ clearing the history does not touch it. **Clear log** empties it.
   Allow only the kinds and the period you are fine sharing.
 - Clients are told apart by the name they report in MCP (`clientInfo.name`). Clipwire cannot check
   it: any program running under your OS account can start the bridge and use the name of a client
-  you already allowed.
+  you already allowed. Invisible characters are removed from the name, so two clients cannot
+  look the same in the list. On macOS and Linux the bridge talks only to a socket owned by your
+  own user, as it does with the named pipe on Windows.
 - The **AI** label marks only what came through MCP. An agent that has a terminal can write to the
   clipboard with ordinary system tools, and such an entry looks like your own copy.
 - The secrets filter is a heuristic: it knows common key formats and looks for random-looking
