@@ -188,6 +188,10 @@ layer-shell пробовали (`zwlr_layer_shell_v1` через `libgtk-layer-s
   `TitleBar.svelte` с кнопками справа, как на Windows.
 - **Скрытие окон при демонстрации экрана** на Linux не работает, переключатель в
   «Приватности» скрыт.
+- **Пустые окна.** WebKitGTK, который рисует через DMA-BUF, на части видеокарт (VirtualBox,
+  VMware, NVIDIA) показывает окно без содержимого. Поэтому Clipwire при запуске сам выставляет
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1`, если переменная не задана (`lib.rs`, `run`). Чтобы
+  вернуть DMA-BUF, запустите с `WEBKIT_DISABLE_DMABUF_RENDERER=0`.
 
 ## Секреты
 

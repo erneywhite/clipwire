@@ -615,6 +615,15 @@ pub fn run() {
         // SAFETY: начало main, других потоков ещё нет.
         unsafe { std::env::set_var("GDK_BACKEND", "x11") };
     }
+    // WebKitGTK с отрисовкой через DMA-BUF на части видеокарт (VirtualBox,
+    // VMware, NVIDIA) показывает пустое окно: окно есть, содержимого нет.
+    // Без DMA-BUF рисует через общую память — чуть медленнее, для нашего
+    // интерфейса незаметно. Своё значение пользователя не трогаем.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        // SAFETY: начало main, других потоков ещё нет.
+        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
+    }
     // Linux: секреты под ключом из Secret Service (gnome-keyring, KWallet).
     // Подписи, как на маке, тут нет, поэтому и у `tauri dev` тоже.
     #[cfg(target_os = "linux")]

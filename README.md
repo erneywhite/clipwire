@@ -272,6 +272,10 @@ settings: on GNOME among the custom keyboard shortcuts, on KDE Plasma in the KDE
 portal (the desktop may ask to confirm once). On Sway, which has none of these, bind
 `clipwire --popup` to a key in its config.
 
+**Empty windows.** In some virtual machines (VirtualBox, VMware) and on some NVIDIA drivers
+WebKitGTK draws a window without content. Clipwire turns off its DMA-BUF renderer at start to
+avoid that; set `WEBKIT_DISABLE_DMABUF_RENDERER=0` to keep it on.
+
 ## Exclusions
 
 <p align="center">
