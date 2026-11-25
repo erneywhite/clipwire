@@ -1247,7 +1247,8 @@ mod tests {
         "SENTRY_DSN=https://0123456789abcdef0123456789abcdef@o123.ingest.sentry.io/123",
         concat!(
             "https://api.te",
-            "legram.org/bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/getMe"
+            "legram.org/bot123456789:AAHdqTcvCH1vG",
+            "WJxfSeofSAs0K5PALDsaw/getMe"
         ),
         "redis://:p4ssw0rd@redis.example.com:6379",
         "REDIS_URL=redis://:p4ssw0rd@redis.example.com:6379/0",
