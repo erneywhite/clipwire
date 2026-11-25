@@ -675,13 +675,22 @@ pub fn run() {
             show_settings(app);
         }
     }));
+    let preview_slot = file_proto::PreviewSlot::default();
+    #[cfg(target_os = "linux")]
+    let builder = match file_proto::loopback::start(preview_slot.clone()) {
+        Ok(lb) => builder.manage(lb),
+        Err(e) => {
+            tracing::warn!("сервер предпросмотра видео и аудио не запустился: {e}");
+            builder
+        }
+    };
     builder
         .manage(state)
         .manage(popup::PopupState::default())
         .manage(link::LinkCache::default())
         .manage(storage::LastWarning::default())
         .manage(mcp::consent::ConsentState::default())
-        .manage(file_proto::PreviewSlot::default())
+        .manage(preview_slot)
         .register_asynchronous_uri_scheme_protocol(file_proto::SCHEME, |ctx, req, responder| {
             let app = ctx.app_handle().clone();
             let window = ctx.webview_label().to_string();

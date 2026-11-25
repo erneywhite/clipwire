@@ -90,7 +90,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data:; media-src cwfile: http://cwfile.localhost; frame-src cwfile: http://cwfile.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'"
+      "csp": "default-src 'self'; img-src 'self' data:; media-src cwfile: http://cwfile.localhost http://127.0.0.1:*; frame-src cwfile: http://cwfile.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'"
     }
   },
   "bundle": {

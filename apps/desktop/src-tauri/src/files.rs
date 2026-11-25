@@ -36,6 +36,9 @@ pub struct FilePreview {
     pub truncated: bool,
     /// Адрес файла в протоколе `cwfile` для PDF, видео и аудио.
     pub token: Option<String>,
+    /// Полный адрес видео или аудио, если оно идёт не через `cwfile`
+    /// (на Linux — loopback, см. `file_proto::loopback`).
+    pub media_url: Option<String>,
 }
 
 const NONE: FilePreview = FilePreview {
@@ -43,6 +46,7 @@ const NONE: FilePreview = FilePreview {
     text: None,
     truncated: false,
     token: None,
+    media_url: None,
 };
 
 /// Предпросмотр закрыт: файл больше не отдаётся протоколу.
@@ -71,11 +75,18 @@ pub async fn file_preview(app: AppHandle, path: String) -> Result<FilePreview, S
             .state::<file_proto::PreviewSlot>()
             .open(p, file_proto::mime_of(&path, kind))
             .map_err(|e| trf("Файл не открылся для просмотра: {e}", &[("e", &e)]))?;
+        // Видео и аудио на Linux — через loopback: медиаплеер WebKitGTK не
+        // берёт собственные схемы приложения.
+        let media_url = (kind != "pdf")
+            .then(|| app.try_state::<file_proto::loopback::Loopback>())
+            .flatten()
+            .map(|lb| lb.url(&token));
         return Ok(FilePreview {
             kind,
             text: None,
             truncated: false,
             token: Some(token),
+            media_url,
         });
     }
     Ok(read_text(p).unwrap_or(NONE))
@@ -493,6 +504,7 @@ fn read_text(p: &Path) -> Option<FilePreview> {
         text: Some(text),
         truncated: size > TEXT_PREVIEW as u64,
         token: None,
+        media_url: None,
     })
 }
 

@@ -38,9 +38,10 @@ struct Open {
     mime: &'static str,
 }
 
-/// Файл, открытый в предпросмотре сейчас.
-#[derive(Default)]
-pub struct PreviewSlot(Mutex<Option<Open>>);
+/// Файл, открытый в предпросмотре сейчас. Клон — тот же слот (для потока
+/// loopback-сервера).
+#[derive(Default, Clone)]
+pub struct PreviewSlot(std::sync::Arc<Mutex<Option<Open>>>);
 
 impl PreviewSlot {
     /// Открыть файл для протокола вместо прежнего. Возвращает токен для адреса.
@@ -110,7 +111,17 @@ pub fn handle<R: Runtime>(
         return status(StatusCode::FORBIDDEN);
     }
     let token = req.uri().path().trim_start_matches('/');
-    let Some((path, mime)) = app.state::<PreviewSlot>().get(token) else {
+    let range = req
+        .headers()
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok());
+    let head = req.method() == tauri::http::Method::HEAD;
+    respond(&app.state::<PreviewSlot>(), token, range, head)
+}
+
+/// Ответ на запрос файла по токену: общий для протокола и loopback.
+fn respond(slot: &PreviewSlot, token: &str, range: Option<&str>, head: bool) -> Response<Vec<u8>> {
+    let Some((path, mime)) = slot.get(token) else {
         return status(StatusCode::NOT_FOUND);
     };
     let Ok(mut file) = std::fs::File::open(&path) else {
@@ -119,13 +130,147 @@ pub fn handle<R: Runtime>(
     let Ok(len) = file.metadata().map(|m| m.len()) else {
         return status(StatusCode::NOT_FOUND);
     };
-    let range = req
-        .headers()
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok());
-    let head = req.method() == tauri::http::Method::HEAD;
     serve(&mut file, len, mime, range, head)
         .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+/// Видео и аудио на Linux. Медиаплеер WebKitGTK (GStreamer) не принимает
+/// собственные схемы приложения: ни `cwfile://`, ни прежний `asset://`, он
+/// отказывает, не отправив запроса. Поэтому там медиа идёт по HTTP с
+/// `127.0.0.1` на случайном порту. Правила те же, что у протокола: только
+/// файл, открытый в предпросмотре сейчас, по его токену. Запрос с чужим
+/// `Host` (DNS rebinding) отклоняется. PDF на Linux идёт через `cwfile`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub mod loopback {
+    use super::{PreviewSlot, respond, status};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tauri::http::StatusCode;
+
+    /// Сколько соединений обслуживается одновременно. Плеер держит одно-два.
+    const MAX_CONNS: usize = 8;
+    /// Предел заголовков запроса.
+    const MAX_HEAD: usize = 8 * 1024;
+
+    /// Порт запущенного сервера (состояние приложения).
+    pub struct Loopback {
+        pub port: u16,
+    }
+
+    impl Loopback {
+        pub fn url(&self, token: &str) -> String {
+            format!("http://127.0.0.1:{}/{token}", self.port)
+        }
+    }
+
+    /// Запустить сервер, файлы — из `slot`.
+    pub fn start(slot: PreviewSlot) -> std::io::Result<Loopback> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let busy = Arc::new(AtomicUsize::new(0));
+        std::thread::Builder::new()
+            .name("cwfile-loopback".into())
+            .spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(conn) = conn else { continue };
+                    if busy.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+                        busy.fetch_sub(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    let (slot, busy) = (slot.clone(), busy.clone());
+                    let _ = std::thread::Builder::new()
+                        .name("cwfile-conn".into())
+                        .spawn(move || {
+                            let _ = serve_conn(conn, &slot, port);
+                            busy.fetch_sub(1, Ordering::SeqCst);
+                        });
+                }
+            })?;
+        Ok(Loopback { port })
+    }
+
+    /// Один запрос на соединение (`Connection: close`): плеер сам
+    /// переподключается с новым `Range`.
+    pub(super) fn serve_conn(
+        conn: TcpStream,
+        slot: &PreviewSlot,
+        port: u16,
+    ) -> std::io::Result<()> {
+        conn.set_read_timeout(Some(Duration::from_secs(10)))?;
+        conn.set_write_timeout(Some(Duration::from_secs(30)))?;
+        let mut reader = BufReader::new(conn.try_clone()?);
+        let mut lines = Vec::new();
+        let mut total = 0;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line)?;
+            total += n;
+            if n == 0 || total > MAX_HEAD {
+                return Ok(());
+            }
+            let line = line.trim_end_matches(['\r', '\n']).to_string();
+            if line.is_empty() {
+                break;
+            }
+            lines.push(line);
+        }
+        let resp = answer(&lines, slot, port);
+        write(conn, resp)
+    }
+
+    /// Ответ на разобранные строки запроса (первая — строка запроса).
+    pub(super) fn answer(
+        lines: &[String],
+        slot: &PreviewSlot,
+        port: u16,
+    ) -> tauri::http::Response<Vec<u8>> {
+        let mut first = lines.first().map(|l| l.split(' ')).into_iter().flatten();
+        let (Some(method), Some(target)) = (first.next(), first.next()) else {
+            return status(StatusCode::BAD_REQUEST);
+        };
+        let head = match method {
+            "GET" => false,
+            "HEAD" => true,
+            _ => return status(StatusCode::METHOD_NOT_ALLOWED),
+        };
+        let header = |name: &str| {
+            lines[1..].iter().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+            })
+        };
+        let host_ok = matches!(header("host"), Some(h) if h == format!("127.0.0.1:{port}"));
+        if !host_ok {
+            return status(StatusCode::FORBIDDEN);
+        }
+        let token = target.strip_prefix('/').unwrap_or(target);
+        respond(slot, token, header("range"), head)
+    }
+
+    fn write(mut conn: TcpStream, resp: tauri::http::Response<Vec<u8>>) -> std::io::Result<()> {
+        let s = resp.status();
+        let mut out = format!(
+            "HTTP/1.1 {} {}\r\nConnection: close\r\n",
+            s.as_u16(),
+            s.canonical_reason().unwrap_or("")
+        );
+        for (k, v) in resp.headers() {
+            out.push_str(&format!("{k}: {}\r\n", v.to_str().unwrap_or("")));
+        }
+        if !resp
+            .headers()
+            .contains_key(tauri::http::header::CONTENT_LENGTH)
+        {
+            out.push_str(&format!("Content-Length: {}\r\n", resp.body().len()));
+        }
+        out.push_str("\r\n");
+        conn.write_all(out.as_bytes())?;
+        conn.write_all(resp.body())?;
+        conn.flush()
+    }
 }
 
 fn status(code: StatusCode) -> Response<Vec<u8>> {
@@ -298,6 +443,81 @@ mod tests {
             format!("bytes 10-{}/{len}", 10 + CHUNK - 1).as_str()
         );
         assert_eq!(r.body(), &d[10..10 + CHUNK as usize]);
+    }
+
+    fn req(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn loopback_checks_host_method_and_token() {
+        let dir = std::env::temp_dir().join(format!("cwfile-lb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.mp4");
+        std::fs::write(&f, data(3000)).unwrap();
+        let slot = PreviewSlot::default();
+        let tok = slot.open(&f, "video/mp4").unwrap();
+        let get = format!("GET /{tok} HTTP/1.1");
+        let ok = loopback::answer(
+            &req(&[&get, "Host: 127.0.0.1:5000", "Range: bytes=0-9"]),
+            &slot,
+            5000,
+        );
+        assert_eq!(ok.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(ok.body().len(), 10);
+        // Чужой Host (DNS rebinding), другой порт, нет Host.
+        for host in ["Host: evil.example:5000", "Host: 127.0.0.1:5001", "X: y"] {
+            let r = loopback::answer(&req(&[&get, host]), &slot, 5000);
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{host}");
+        }
+        let post = format!("POST /{tok} HTTP/1.1");
+        let r = loopback::answer(&req(&[&post, "Host: 127.0.0.1:5000"]), &slot, 5000);
+        assert_eq!(r.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let r = loopback::answer(
+            &req(&["GET /wrong HTTP/1.1", "Host: 127.0.0.1:5000"]),
+            &slot,
+            5000,
+        );
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        slot.close(None);
+        let r = loopback::answer(&req(&[&get, "Host: 127.0.0.1:5000"]), &slot, 5000);
+        assert_eq!(
+            r.status(),
+            StatusCode::NOT_FOUND,
+            "закрытый файл больше не отдаётся"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn loopback_serves_over_tcp() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("cwfile-tcp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.mp3");
+        let d = data(5000);
+        std::fs::write(&f, &d).unwrap();
+        let slot = PreviewSlot::default();
+        let lb = loopback::start(slot.clone()).unwrap();
+        let tok = slot.open(&f, "audio/mpeg").unwrap();
+        let url = lb.url(&tok);
+        assert!(url.starts_with("http://127.0.0.1:"));
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", lb.port)).unwrap();
+        write!(
+            c,
+            "GET /{tok} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nRange: bytes=100-199\r\n\r\n",
+            lb.port
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).unwrap();
+        let split = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&out[..split]).to_lowercase();
+        assert!(head.starts_with("http/1.1 206"), "{head}");
+        assert!(head.contains("content-range: bytes 100-199/5000"), "{head}");
+        assert!(head.contains("content-type: audio/mpeg"), "{head}");
+        assert_eq!(&out[split + 4..], &d[100..200]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -36,7 +36,7 @@
   let info = $state<FilePreview | null>(null)
   let failed = $state('')
   let mediaError = $state(false)
-  const src = $derived(info?.token ? convertFileSrc(info.token, 'cwfile') : '')
+  const src = $derived(info?.media_url ?? (info?.token ? convertFileSrc(info.token, 'cwfile') : ''))
 
   $effect(() => {
     const want = path

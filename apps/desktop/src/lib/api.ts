@@ -301,6 +301,8 @@ export interface FilePreview {
   truncated: boolean
   /** Адрес файла в протоколе `cwfile` для PDF, видео и аудио. */
   token: string | null
+  /** Полный адрес видео или аудио не через `cwfile` (на Linux — loopback). */
+  media_url: string | null
 }
 
 export interface LinkCard {
