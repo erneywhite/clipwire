@@ -169,113 +169,114 @@ impl Store {
     /// вызывающий: кто на связи, знает не база. `rotated_keep_ms` — сколько
     /// после смены ключа хранятся пакеты (`Limits::rotated_keep`).
     pub fn list_groups(&self, now_ms: i64, rotated_keep_ms: i64) -> Result<Vec<GroupEntry>> {
-        let conn = self.conn();
-        let u = |v: i64| v.max(0) as u64;
-        let devices = per_group(
-            &conn,
-            "SELECT group_id, COUNT(*), MAX(last_seen_ms) FROM devices GROUP BY group_id",
-            [],
-        )?;
-        let items = per_group(
-            &conn,
-            "SELECT group_id, COUNT(*), SUM(length(ciphertext)) FROM items GROUP BY group_id",
-            [],
-        )?;
-        // Та же формула sealed_size, что у квоты файлов и сводки сервера.
-        // Файлы живых закрепов считаются в месте закрепов, как в квотах.
-        let blobs = per_group(
-            &conn,
-            &format!(
-                "SELECT group_id, COUNT(*), SUM(size + MAX(1, (size + ?1 - 1) / ?1) * ?2)
-                 FROM blobs WHERE NOT {} AND pin_only = 0 GROUP BY group_id",
-                super::pins::KEPT_BY_PIN
-            ),
-            params![CHUNK as i64, OVERHEAD as i64],
-        )?;
-        // Записи со строками базы, как в квоте закрепов (`pins_used`).
-        let pins = per_group(
-            &conn,
-            "SELECT group_id, SUM(n), SUM(b) FROM (
-                 SELECT group_id, pinned AS n, length(state) + content_len + ?3 AS b FROM pins
-                 UNION ALL
-                 SELECT group_id, 0, ?4 FROM pin_blobs
-                 UNION ALL
-                 SELECT group_id, 0, size + MAX(1, (size + ?1 - 1) / ?1) * ?2 FROM blobs
-                 WHERE EXISTS (SELECT 1 FROM pin_blobs AS pb
-                               WHERE pb.group_id = blobs.group_id AND pb.blob_id = blobs.blob_id))
-             GROUP BY group_id",
-            params![
-                CHUNK as i64,
-                OVERHEAD as i64,
-                super::pins::RECORD_OVERHEAD as i64,
-                super::pins::BLOB_REF_OVERHEAD as i64
-            ],
-        )?;
-        let mut stmt = conn.prepare(
-            "SELECT group_id, created_ms,
-                    EXISTS (SELECT 1 FROM group_admins AS a WHERE a.group_id = groups.group_id),
-                    pending_by IS NOT NULL,
-                    rotated_ms, tombstone_ms IS NOT NULL, idle_ms IS NOT NULL,
-                    COALESCE(name, '')
-             FROM groups WHERE deleted_ms IS NULL",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, Vec<u8>>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, bool>(2)?,
-                r.get::<_, bool>(3)?,
-                r.get::<_, Option<i64>>(4)?,
-                r.get::<_, bool>(5)?,
-                r.get::<_, bool>(6)?,
-                r.get::<_, String>(7)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, created_ms, has_admin, pending, rotated_ms, tombstone, idle, name) = row?;
-            let get = |m: &HashMap<Vec<u8>, (i64, i64)>| m.get(&id).copied().unwrap_or((0, 0));
-            let (n_dev, last_seen) = get(&devices);
-            let (n_items, item_bytes) = get(&items);
-            let (n_files, file_bytes) = get(&blobs);
-            let (n_pins, pin_bytes) = get(&pins);
-            let info = GroupInfo {
-                group: GroupId(
-                    id.as_slice()
-                        .try_into()
-                        .ok()
-                        .context("битый group_id в базе")?,
+        self.read(|conn| {
+            let u = |v: i64| v.max(0) as u64;
+            let devices = per_group(
+                conn,
+                "SELECT group_id, COUNT(*), MAX(last_seen_ms) FROM devices GROUP BY group_id",
+                [],
+            )?;
+            let items = per_group(
+                conn,
+                "SELECT group_id, COUNT(*), SUM(length(ciphertext)) FROM items GROUP BY group_id",
+                [],
+            )?;
+            // Та же формула sealed_size, что у квоты файлов и сводки сервера.
+            // Файлы живых закрепов считаются в месте закрепов, как в квотах.
+            let blobs = per_group(
+                conn,
+                &format!(
+                    "SELECT group_id, COUNT(*), SUM(size + MAX(1, (size + ?1 - 1) / ?1) * ?2)
+                     FROM blobs WHERE NOT {} AND pin_only = 0 GROUP BY group_id",
+                    super::pins::KEPT_BY_PIN
                 ),
-                created_ms,
-                last_seen_ms: last_seen,
-                devices: u(n_dev),
-                online: 0,
-                items: u(n_items),
-                item_bytes: u(item_bytes),
-                files: u(n_files),
-                file_bytes: u(file_bytes),
-                pins: u(n_pins),
-                pin_bytes: u(pin_bytes),
-                has_admin,
-                state: state_of(
-                    pending,
-                    rotated_ms,
-                    tombstone,
-                    idle,
-                    now_ms,
-                    rotated_keep_ms,
-                ),
-            };
-            out.push(GroupEntry { info, name });
-        }
-        out.sort_by(|a, b| {
-            b.info
-                .last_seen_ms
-                .cmp(&a.info.last_seen_ms)
-                .then(b.info.created_ms.cmp(&a.info.created_ms))
-        });
-        out.truncate(MAX_LISTED_GROUPS);
-        Ok(out)
+                params![CHUNK as i64, OVERHEAD as i64],
+            )?;
+            // Записи со строками базы, как в квоте закрепов (`pins_used`).
+            let pins = per_group(
+                conn,
+                "SELECT group_id, SUM(n), SUM(b) FROM (
+                     SELECT group_id, pinned AS n, length(state) + content_len + ?3 AS b FROM pins
+                     UNION ALL
+                     SELECT group_id, 0, ?4 FROM pin_blobs
+                     UNION ALL
+                     SELECT group_id, 0, size + MAX(1, (size + ?1 - 1) / ?1) * ?2 FROM blobs
+                     WHERE EXISTS (SELECT 1 FROM pin_blobs AS pb
+                                   WHERE pb.group_id = blobs.group_id AND pb.blob_id = blobs.blob_id))
+                 GROUP BY group_id",
+                params![
+                    CHUNK as i64,
+                    OVERHEAD as i64,
+                    super::pins::RECORD_OVERHEAD as i64,
+                    super::pins::BLOB_REF_OVERHEAD as i64
+                ],
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT group_id, created_ms,
+                        EXISTS (SELECT 1 FROM group_admins AS a WHERE a.group_id = groups.group_id),
+                        pending_by IS NOT NULL,
+                        rotated_ms, tombstone_ms IS NOT NULL, idle_ms IS NOT NULL,
+                        COALESCE(name, '')
+                 FROM groups WHERE deleted_ms IS NULL",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, bool>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, bool>(5)?,
+                    r.get::<_, bool>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, created_ms, has_admin, pending, rotated_ms, tombstone, idle, name) = row?;
+                let get = |m: &HashMap<Vec<u8>, (i64, i64)>| m.get(&id).copied().unwrap_or((0, 0));
+                let (n_dev, last_seen) = get(&devices);
+                let (n_items, item_bytes) = get(&items);
+                let (n_files, file_bytes) = get(&blobs);
+                let (n_pins, pin_bytes) = get(&pins);
+                let info = GroupInfo {
+                    group: GroupId(
+                        id.as_slice()
+                            .try_into()
+                            .ok()
+                            .context("битый group_id в базе")?,
+                    ),
+                    created_ms,
+                    last_seen_ms: last_seen,
+                    devices: u(n_dev),
+                    online: 0,
+                    items: u(n_items),
+                    item_bytes: u(item_bytes),
+                    files: u(n_files),
+                    file_bytes: u(file_bytes),
+                    pins: u(n_pins),
+                    pin_bytes: u(pin_bytes),
+                    has_admin,
+                    state: state_of(
+                        pending,
+                        rotated_ms,
+                        tombstone,
+                        idle,
+                        now_ms,
+                        rotated_keep_ms,
+                    ),
+                };
+                out.push(GroupEntry { info, name });
+            }
+            out.sort_by(|a, b| {
+                b.info
+                    .last_seen_ms
+                    .cmp(&a.info.last_seen_ms)
+                    .then(b.info.created_ms.cmp(&a.info.created_ms))
+            });
+            out.truncate(MAX_LISTED_GROUPS);
+            Ok(out)
+        })
     }
 
     /// Удалить группу по запросу администратора сервера с устройства `by`.
@@ -291,46 +292,47 @@ impl Store {
         by: &DeviceId,
         now_ms: i64,
     ) -> Result<DeleteOutcome> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let row: Option<(bool, bool)> = tx
-            .query_row(
-                "SELECT deleted_ms IS NOT NULL, rotated_ms IS NULL AND idle_ms IS NULL
-                 FROM groups WHERE group_id = ?1",
-                params![&group.0[..]],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let live = match row {
-            None | Some((true, _)) => return Ok(DeleteOutcome::NoSuchGroup),
-            Some((false, live)) => live,
-        };
-        if live && super::devices::is_member(&tx, group, by)? {
-            return Ok(DeleteOutcome::OwnGroup);
-        }
-        let mut blobs = Vec::new();
-        {
-            let mut stmt = tx.prepare("SELECT blob_id FROM blobs WHERE group_id = ?1")?;
-            for b in stmt.query_map(params![&group.0[..]], |r| r.get::<_, Vec<u8>>(0))? {
-                blobs.push(BlobId(b?.try_into().ok().context("битый blob_id в базе")?));
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            let row: Option<(bool, bool)> = tx
+                .query_row(
+                    "SELECT deleted_ms IS NOT NULL, rotated_ms IS NULL AND idle_ms IS NULL
+                     FROM groups WHERE group_id = ?1",
+                    params![&group.0[..]],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let live = match row {
+                None | Some((true, _)) => return Ok(DeleteOutcome::NoSuchGroup),
+                Some((false, live)) => live,
+            };
+            if live && super::devices::is_member(&tx, group, by)? {
+                return Ok(DeleteOutcome::OwnGroup);
             }
-        }
-        for table in super::GROUP_TABLES {
+            let mut blobs = Vec::new();
+            {
+                let mut stmt = tx.prepare("SELECT blob_id FROM blobs WHERE group_id = ?1")?;
+                for b in stmt.query_map(params![&group.0[..]], |r| r.get::<_, Vec<u8>>(0))? {
+                    blobs.push(BlobId(b?.try_into().ok().context("битый blob_id в базе")?));
+                }
+            }
+            for table in super::GROUP_TABLES {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE group_id = ?1"),
+                    params![&group.0[..]],
+                )?;
+            }
             tx.execute(
-                &format!("DELETE FROM {table} WHERE group_id = ?1"),
-                params![&group.0[..]],
+                "UPDATE groups SET deleted_ms = ?2,
+                     rotated_ms = COALESCE(rotated_ms, ?2), tombstone_ms = COALESCE(tombstone_ms, ?2),
+                     idle_ms = NULL, pending_by = NULL, pending_ms = NULL, admin_device = NULL,
+                     name = NULL
+                 WHERE group_id = ?1",
+                params![&group.0[..], now_ms],
             )?;
-        }
-        tx.execute(
-            "UPDATE groups SET deleted_ms = ?2,
-                 rotated_ms = COALESCE(rotated_ms, ?2), tombstone_ms = COALESCE(tombstone_ms, ?2),
-                 idle_ms = NULL, pending_by = NULL, pending_ms = NULL, admin_device = NULL,
-                 name = NULL
-             WHERE group_id = ?1",
-            params![&group.0[..], now_ms],
-        )?;
-        tx.commit()?;
-        Ok(DeleteOutcome::Deleted { blobs })
+            tx.commit()?;
+            Ok(DeleteOutcome::Deleted { blobs })
+        })
     }
 
     /// Имя группы (`SetGroupName`), уже проверенное
@@ -338,10 +340,12 @@ impl Store {
     /// нет или её удалили.
     pub fn set_group_name(&self, group: &GroupId, name: &str) -> Result<bool> {
         let name = (!name.is_empty()).then_some(name);
-        Ok(self.conn().execute(
-            "UPDATE groups SET name = ?2 WHERE group_id = ?1 AND deleted_ms IS NULL",
-            params![&group.0[..], name],
-        )? > 0)
+        self.write(|conn| {
+            Ok(conn.execute(
+                "UPDATE groups SET name = ?2 WHERE group_id = ?1 AND deleted_ms IS NULL",
+                params![&group.0[..], name],
+            )? > 0)
+        })
     }
 }
 

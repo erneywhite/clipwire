@@ -32,11 +32,41 @@ pub use pins::{
 };
 use pins::{expired_sql, live_sql, unpinned_live_sql};
 
-// shortcut: синхронный rusqlite под std::Mutex прямо из async-кода. Запросы
-// короткие, а нагрузка — единицы устройств. Переделать на пул и spawn_blocking,
-// если сервером начнут пользоваться десятки групп.
+/// Сколько соединений только для чтения держит сервер. В WAL читатели не ждут
+/// писателя и друг друга, так что долгий подсчёт одной группы не задерживает
+/// чтение истории другой.
+const READERS: usize = 4;
+
+/// Сколько соединение ждёт занятую базу (контрольная точка WAL), прежде чем
+/// вернуть `SQLITE_BUSY`.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// База сервера. Запись идёт через одно соединение (в SQLite писатель всегда
+/// один), чтение — через пул из [`READERS`] соединений. Запрос вместе с
+/// ожиданием соединения выполняется в [`blocking`]: поток tokio на это время
+/// отдаёт свою очередь задач другому, и занятая база не останавливает relay,
+/// передачу файлов и сессии других групп.
 pub struct Store {
-    conn: Mutex<Connection>,
+    writer: Mutex<Connection>,
+    /// Если пусто, чтение идёт через писателя.
+    readers: Vec<Mutex<Connection>>,
+    next_reader: std::sync::atomic::AtomicUsize,
+}
+
+/// Выполнить синхронный код с базой из async-кода. В многопоточном рантайме —
+/// через `block_in_place`, в однопоточном (тесты) и вне рантайма — как есть.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+fn lock(m: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> {
+    // Паника внутри запроса не портит SQLite, поэтому отравленный мьютекс
+    // просто подбираем.
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Чем закончилась попытка начать загрузку файла.
@@ -143,15 +173,56 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("не открылась база {}", path.display()))?;
-        Self::init(conn)
+        let mut store = Self::init(conn)?;
+        // Читатели открываются после миграций: схема к этому времени готова.
+        store.open_readers(path.as_os_str(), READERS, rusqlite::OpenFlags::empty())?;
+        Ok(store)
     }
 
+    /// База в памяти для тестов. Общий кэш, чтобы у читателей была та же база:
+    /// так тесты ловят запись через [`Store::read`] (читатели только на чтение).
     #[cfg(test)]
     pub fn in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        use rusqlite::OpenFlags as F;
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let uri = format!(
+            "file:clipwire-{}-{n}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let conn = Connection::open_with_flags(
+            &uri,
+            F::SQLITE_OPEN_READ_WRITE | F::SQLITE_OPEN_CREATE | F::SQLITE_OPEN_URI,
+        )?;
+        let mut store = Self::init(conn)?;
+        store.open_readers(uri.as_ref(), 2, F::SQLITE_OPEN_URI)?;
+        Ok(store)
+    }
+
+    fn open_readers(
+        &mut self,
+        path: &std::ffi::OsStr,
+        n: usize,
+        extra: rusqlite::OpenFlags,
+    ) -> Result<()> {
+        use rusqlite::OpenFlags as F;
+        for _ in 0..n {
+            let r = Connection::open_with_flags(
+                path,
+                F::SQLITE_OPEN_READ_ONLY | F::SQLITE_OPEN_NO_MUTEX | extra,
+            )
+            .with_context(|| format!("не открылась база {} для чтения", path.display()))?;
+            r.busy_timeout(BUSY_TIMEOUT)?;
+            // READ_ONLY не действует на базу в памяти с общим кэшем, а
+            // query_only запрещает запись на уровне соединения везде.
+            r.pragma_update(None, "query_only", true)?;
+            self.readers.push(Mutex::new(r));
+        }
+        Ok(())
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
@@ -223,14 +294,40 @@ impl Store {
         groups::migrate(&conn)?;
         invites::migrate(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            writer: Mutex::new(conn),
+            readers: Vec::new(),
+            next_reader: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
+    /// Запрос, который что-то меняет (или читает и меняет в одной транзакции).
+    fn write<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        blocking(|| f(&mut lock(&self.writer)))
+    }
+
+    /// Запрос только на чтение: свободное соединение из пула, а если все
+    /// заняты — очередное по кругу.
+    fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        blocking(|| {
+            if self.readers.is_empty() {
+                return f(&lock(&self.writer));
+            }
+            for r in &self.readers {
+                if let Ok(c) = r.try_lock() {
+                    return f(&c);
+                }
+            }
+            let n = self
+                .next_reader
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            f(&lock(&self.readers[n % self.readers.len()]))
+        })
+    }
+
+    /// Соединение писателя напрямую, для проверок в тестах.
+    #[cfg(test)]
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        // Паника внутри запроса не портит SQLite, поэтому отравленный мьютекс
-        // просто подбираем.
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.writer)
     }
 
     /// Вход устройства в группу. Новая группа создаётся, только если это
@@ -256,111 +353,112 @@ impl Store {
             max_devices,
         } = limits;
         let digest = secret.digest();
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let existing: Option<(Vec<u8>, bool)> = tx
-            .query_row(
-                "SELECT join_digest, idle_ms IS NOT NULL FROM groups WHERE group_id = ?1",
-                params![&group.0[..]],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        // С кодом в существующую группу — только повтор после потерянного
-        // ответа на создание. Проверка раньше секрета группы: она смотрит
-        // только на код, о группе отказ ничего не говорит.
-        if let (Some(_), Create::Invite(check)) = (&existing, &create) {
-            let rotated = admin::relay_rotated_ms(&tx)?;
-            if let Err(f) = invites::check_retry(&tx, check, group, rotated)? {
-                return Ok(JoinOutcome::InviteRefused(f));
-            }
-        }
-        let outcome = match existing {
-            None if create == Create::No => return Ok(JoinOutcome::NoGroup),
-            None if create == Create::ForRekey && !admin::may_rekey_any(&tx, device)? => {
-                return Ok(JoinOutcome::NoGroup);
-            }
-            None => {
-                if create == Create::ForRekey {
-                    // Одна незавершённая новая группа на устройство: прошлая
-                    // (смена ключа не дошла до `Rekey`) больше не нужна и
-                    // удаляется целиком.
-                    admin::drop_pending_of(&tx, device)?;
-                    if admin::pending_count(&tx, device)? > 0 {
-                        return Ok(JoinOutcome::TooManyGroups);
-                    }
-                }
-                // Код гасится в этой же транзакции: любой отказ ниже (предел
-                // групп) откатывает и его, а второй вход с тем же кодом ждёт
-                // замка базы и видит код уже использованным.
-                if let Create::Invite(check) = &create
-                    && let Err(f) = invites::consume(&tx, check, group, now_ms)?
-                {
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            let existing: Option<(Vec<u8>, bool)> = tx
+                .query_row(
+                    "SELECT join_digest, idle_ms IS NOT NULL FROM groups WHERE group_id = ?1",
+                    params![&group.0[..]],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            // С кодом в существующую группу — только повтор после потерянного
+            // ответа на создание. Проверка раньше секрета группы: она смотрит
+            // только на код, о группе отказ ничего не говорит.
+            if let (Some(_), Create::Invite(check)) = (&existing, &create) {
+                let rotated = admin::relay_rotated_ms(&tx)?;
+                if let Err(f) = invites::check_retry(&tx, check, group, rotated)? {
                     return Ok(JoinOutcome::InviteRefused(f));
                 }
-                // Надгробия и группы со сменённым ключом (`store/devices.rs`),
-                // заброшенные группы места не занимают.
-                if admin::counted_groups(&tx)? >= max_groups as u64 {
-                    return Ok(JoinOutcome::TooManyGroups);
-                }
-                tx.execute(
-                    "INSERT INTO groups (group_id, join_digest, created_ms) VALUES (?1, ?2, ?3)",
-                    params![&group.0[..], &digest[..], now_ms],
-                )?;
-                admin::mark_created(&tx, group, device, create, now_ms)?;
-                // Группа по коду приглашения получает имя из подписи кода:
-                // администратор сервера видит, для кого её создали.
-                if let Create::Invite(check) = &create {
-                    let label = invites::label_of(&tx, &check.hash)?;
-                    groups::set_name_in(&tx, group, &groups::name_from_invite(&label))?;
-                }
-                JoinOutcome::Created
             }
-            // Заброшенная группа (`bury_idle_group`): верный секрет создаёт её
-            // заново, как до 0.5.0 создавал первый вход с токеном. Ключ
-            // администратора не нужен: группу когда-то создали законно, а
-            // секрет знают только её устройства. Админа у неё нет, как у
-            // группы до 0.5.0.
-            Some((d, true)) if constant_time_eq(&d, &digest) => {
-                if admin::counted_groups(&tx)? >= max_groups as u64 {
-                    return Ok(JoinOutcome::TooManyGroups);
+            let outcome = match existing {
+                None if create == Create::No => return Ok(JoinOutcome::NoGroup),
+                None if create == Create::ForRekey && !admin::may_rekey_any(&tx, device)? => {
+                    return Ok(JoinOutcome::NoGroup);
                 }
-                tx.execute(
-                    "UPDATE groups SET idle_ms = NULL, admin_device = NULL, created_ms = ?2
-                     WHERE group_id = ?1",
-                    params![&group.0[..], now_ms],
-                )?;
-                tx.execute(
-                    "DELETE FROM group_admins WHERE group_id = ?1",
-                    params![&group.0[..]],
-                )?;
-                JoinOutcome::Created
-            }
-            Some((d, _)) if constant_time_eq(&d, &digest) => {
-                // Секрет проверен — теперь можно сказать, что ключ сменён.
-                if let Some(r) = devices::rotation_in(&tx, group, device)? {
-                    return Ok(JoinOutcome::Rotated(r));
-                }
-                if !devices::is_member(&tx, group, device)? {
-                    let members: i64 = tx.query_row(
-                        "SELECT COUNT(*) FROM devices WHERE group_id = ?1",
-                        params![&group.0[..]],
-                        |r| r.get(0),
-                    )?;
-                    if members as u64 >= max_devices as u64 {
-                        return Ok(JoinOutcome::TooManyDevices);
+                None => {
+                    if create == Create::ForRekey {
+                        // Одна незавершённая новая группа на устройство: прошлая
+                        // (смена ключа не дошла до `Rekey`) больше не нужна и
+                        // удаляется целиком.
+                        admin::drop_pending_of(&tx, device)?;
+                        if admin::pending_count(&tx, device)? > 0 {
+                            return Ok(JoinOutcome::TooManyGroups);
+                        }
                     }
+                    // Код гасится в этой же транзакции: любой отказ ниже (предел
+                    // групп) откатывает и его, а второй вход с тем же кодом ждёт
+                    // замка базы и видит код уже использованным.
+                    if let Create::Invite(check) = &create
+                        && let Err(f) = invites::consume(&tx, check, group, now_ms)?
+                    {
+                        return Ok(JoinOutcome::InviteRefused(f));
+                    }
+                    // Надгробия и группы со сменённым ключом (`store/devices.rs`),
+                    // заброшенные группы места не занимают.
+                    if admin::counted_groups(&tx)? >= max_groups as u64 {
+                        return Ok(JoinOutcome::TooManyGroups);
+                    }
+                    tx.execute(
+                        "INSERT INTO groups (group_id, join_digest, created_ms) VALUES (?1, ?2, ?3)",
+                        params![&group.0[..], &digest[..], now_ms],
+                    )?;
+                    admin::mark_created(&tx, group, device, create, now_ms)?;
+                    // Группа по коду приглашения получает имя из подписи кода:
+                    // администратор сервера видит, для кого её создали.
+                    if let Create::Invite(check) = &create {
+                        let label = invites::label_of(&tx, &check.hash)?;
+                        groups::set_name_in(&tx, group, &groups::name_from_invite(&label))?;
+                    }
+                    JoinOutcome::Created
                 }
-                JoinOutcome::Joined
-            }
-            Some(_) => return Ok(JoinOutcome::Denied),
-        };
-        tx.execute(
-            "INSERT INTO devices (device_id, group_id, last_seen_ms) VALUES (?1, ?2, ?3)
-             ON CONFLICT (device_id, group_id) DO UPDATE SET last_seen_ms = excluded.last_seen_ms",
-            params![&device.0[..], &group.0[..], now_ms],
-        )?;
-        tx.commit()?;
-        Ok(outcome)
+                // Заброшенная группа (`bury_idle_group`): верный секрет создаёт её
+                // заново, как до 0.5.0 создавал первый вход с токеном. Ключ
+                // администратора не нужен: группу когда-то создали законно, а
+                // секрет знают только её устройства. Админа у неё нет, как у
+                // группы до 0.5.0.
+                Some((d, true)) if constant_time_eq(&d, &digest) => {
+                    if admin::counted_groups(&tx)? >= max_groups as u64 {
+                        return Ok(JoinOutcome::TooManyGroups);
+                    }
+                    tx.execute(
+                        "UPDATE groups SET idle_ms = NULL, admin_device = NULL, created_ms = ?2
+                         WHERE group_id = ?1",
+                        params![&group.0[..], now_ms],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM group_admins WHERE group_id = ?1",
+                        params![&group.0[..]],
+                    )?;
+                    JoinOutcome::Created
+                }
+                Some((d, _)) if constant_time_eq(&d, &digest) => {
+                    // Секрет проверен — теперь можно сказать, что ключ сменён.
+                    if let Some(r) = devices::rotation_in(&tx, group, device)? {
+                        return Ok(JoinOutcome::Rotated(r));
+                    }
+                    if !devices::is_member(&tx, group, device)? {
+                        let members: i64 = tx.query_row(
+                            "SELECT COUNT(*) FROM devices WHERE group_id = ?1",
+                            params![&group.0[..]],
+                            |r| r.get(0),
+                        )?;
+                        if members as u64 >= max_devices as u64 {
+                            return Ok(JoinOutcome::TooManyDevices);
+                        }
+                    }
+                    JoinOutcome::Joined
+                }
+                Some(_) => return Ok(JoinOutcome::Denied),
+            };
+            tx.execute(
+                "INSERT INTO devices (device_id, group_id, last_seen_ms) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (device_id, group_id) DO UPDATE SET last_seen_ms = excluded.last_seen_ms",
+                params![&device.0[..], &group.0[..], now_ms],
+            )?;
+            tx.commit()?;
+            Ok(outcome)
+        })
     }
 
     /// [`Store::join_limited`] без предела устройств: для тестов хранилища.
@@ -419,38 +517,39 @@ impl Store {
         backfill: bool,
         total_bytes: u64,
     ) -> Result<bool> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        if is_rotated(&tx, group)? {
-            // Ключ сменён, пока соединение ещё живо: элемент не нужен никому.
-            return Ok(false);
-        }
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO items (group_id, item_id, origin, nonce, ciphertext, received_ms, backfill)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                &group.0[..],
-                &item.id.as_bytes()[..],
-                &item.origin.0[..],
-                &item.nonce[..],
-                &item.ciphertext,
-                now_ms,
-                backfill
-            ],
-        )?;
-        // UUID v7 в виде BLOB сортируется по времени, поэтому старые элементы
-        // отсекаются по item_id.
-        tx.execute(
-            "DELETE FROM items WHERE group_id = ?1 AND item_id NOT IN (
-                 SELECT item_id FROM items WHERE group_id = ?1
-                 ORDER BY item_id DESC LIMIT ?2)",
-            params![&group.0[..], keep as i64],
-        )?;
-        if inserted == 1 {
-            evict_over_total(&tx, group, item, total_bytes)?;
-        }
-        tx.commit()?;
-        Ok(inserted == 1)
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            if is_rotated(&tx, group)? {
+                // Ключ сменён, пока соединение ещё живо: элемент не нужен никому.
+                return Ok(false);
+            }
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO items (group_id, item_id, origin, nonce, ciphertext, received_ms, backfill)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    &group.0[..],
+                    &item.id.as_bytes()[..],
+                    &item.origin.0[..],
+                    &item.nonce[..],
+                    &item.ciphertext,
+                    now_ms,
+                    backfill
+                ],
+            )?;
+            // UUID v7 в виде BLOB сортируется по времени, поэтому старые элементы
+            // отсекаются по item_id.
+            tx.execute(
+                "DELETE FROM items WHERE group_id = ?1 AND item_id NOT IN (
+                     SELECT item_id FROM items WHERE group_id = ?1
+                     ORDER BY item_id DESC LIMIT ?2)",
+                params![&group.0[..], keep as i64],
+            )?;
+            if inserted == 1 {
+                evict_over_total(&tx, group, item, total_bytes)?;
+            }
+            tx.commit()?;
+            Ok(inserted == 1)
+        })
     }
 
     /// Следующий элемент истории группы после `after` (или первый, если
@@ -469,24 +568,25 @@ impl Store {
     ) -> Result<Option<(SealedItem, bool)>> {
         // Пустой BLOB меньше любого id, так что `None` — с самого начала.
         let after: &[u8] = after.map_or(&[], |a| &a.as_bytes()[..]);
-        let row = self
-            .conn()
-            .query_row(
-                "SELECT item_id, origin, nonce, ciphertext, backfill FROM items
+        let row = self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT item_id, origin, nonce, ciphertext, backfill FROM items
                  WHERE group_id = ?1 AND item_id > ?2 AND received_ms >= ?3
                  ORDER BY item_id ASC LIMIT 1",
-                params![&group.0[..], after, not_before_ms],
-                |r| {
-                    Ok((
-                        r.get::<_, Vec<u8>>(0)?,
-                        r.get::<_, Vec<u8>>(1)?,
-                        r.get::<_, Vec<u8>>(2)?,
-                        r.get::<_, Vec<u8>>(3)?,
-                        r.get::<_, bool>(4)?,
-                    ))
-                },
-            )
-            .optional()?;
+                    params![&group.0[..], after, not_before_ms],
+                    |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, Vec<u8>>(1)?,
+                            r.get::<_, Vec<u8>>(2)?,
+                            r.get::<_, Vec<u8>>(3)?,
+                            r.get::<_, bool>(4)?,
+                        ))
+                    },
+                )
+                .optional()?)
+        })?;
         let Some((id, origin, nonce, ciphertext, backfill)) = row else {
             return Ok(None);
         };
@@ -520,56 +620,59 @@ impl Store {
     /// квотах. Квоту (`quota`) знает не база, а настройки сервера: её
     /// заполняет вызывающий.
     pub fn group_stats(&self, group: &GroupId, not_before_ms: i64) -> Result<GroupStats> {
-        let conn = self.conn();
-        let (items, item_bytes): (i64, i64) = conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(length(ciphertext)), 0) FROM items
-             WHERE group_id = ?1 AND received_ms >= ?2",
-            params![&group.0[..], not_before_ms],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let mut files = 0u64;
-        let mut file_bytes = 0u64;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT size, have FROM blobs WHERE group_id = ?1 AND {}",
-            unpinned_live_sql("?2")
-        ))?;
-        let rows = stmt.query_map(params![&group.0[..], not_before_ms], |r| {
-            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
-        })?;
-        for row in rows {
-            let (size, have) = row?;
-            if have >= clipwire_core::blob::chunk_count(size) {
-                files += 1;
-                file_bytes += size;
-            }
-        }
-        drop(stmt);
-        // Та же формула sealed_size, что при проверке квоты в `blob_begin`.
-        let quota_used: i64 = conn.query_row(
-            &format!(
-                "SELECT COALESCE(SUM(size + MAX(1, (size + ?3 - 1) / ?3) * ?4), 0)
-                 FROM blobs WHERE group_id = ?1 AND {}",
+        self.read(|conn| {
+            let (items, item_bytes): (i64, i64) = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(ciphertext)), 0) FROM items
+                 WHERE group_id = ?1 AND received_ms >= ?2",
+                params![&group.0[..], not_before_ms],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let mut files = 0u64;
+            let mut file_bytes = 0u64;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT size, have FROM blobs WHERE group_id = ?1 AND {}",
                 unpinned_live_sql("?2")
-            ),
-            params![&group.0[..], not_before_ms, CHUNK as i64, OVERHEAD as i64],
-            |r| r.get(0),
-        )?;
-        Ok(GroupStats {
-            items: items as u64,
-            item_bytes: item_bytes as u64,
-            files,
-            file_bytes,
-            quota_used: quota_used as u64,
-            quota: 0,
+            ))?;
+            let rows = stmt.query_map(params![&group.0[..], not_before_ms], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+            })?;
+            for row in rows {
+                let (size, have) = row?;
+                if have >= clipwire_core::blob::chunk_count(size) {
+                    files += 1;
+                    file_bytes += size;
+                }
+            }
+            drop(stmt);
+            // Та же формула sealed_size, что при проверке квоты в `blob_begin`.
+            let quota_used: i64 = conn.query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(size + MAX(1, (size + ?3 - 1) / ?3) * ?4), 0)
+                     FROM blobs WHERE group_id = ?1 AND {}",
+                    unpinned_live_sql("?2")
+                ),
+                params![&group.0[..], not_before_ms, CHUNK as i64, OVERHEAD as i64],
+                |r| r.get(0),
+            )?;
+            Ok(GroupStats {
+                items: items as u64,
+                item_bytes: item_bytes as u64,
+                files,
+                file_bytes,
+                quota_used: quota_used as u64,
+                quota: 0,
+            })
         })
     }
 
     /// Удаляет просроченные элементы во всех группах. Возвращает число удалённых.
     pub fn purge_expired(&self, not_before_ms: i64) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM items WHERE received_ms < ?1",
-            params![not_before_ms],
-        )?)
+        self.write(|conn| {
+            Ok(conn.execute(
+                "DELETE FROM items WHERE received_ms < ?1",
+                params![not_before_ms],
+            )?)
+        })
     }
 
     /// Начать загрузку файла или продолжить начатую (то же для `Reserve`).
@@ -632,124 +735,128 @@ impl Store {
         pin_bytes: u64,
         max_reserves: usize,
     ) -> Result<BlobBegin> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        if is_rotated(&tx, group)? {
-            return Ok(BlobBegin::Rotated);
-        }
-        if admin::is_pending(&tx, group)? {
-            return Ok(BlobBegin::Pending);
-        }
-        // Третье — истёк ли файл: файлы живых закрепов не истекают.
-        let existing: Option<(i64, i64, bool)> = tx
-            .query_row(
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            if is_rotated(&tx, group)? {
+                return Ok(BlobBegin::Rotated);
+            }
+            if admin::is_pending(&tx, group)? {
+                return Ok(BlobBegin::Pending);
+            }
+            // Третье — истёк ли файл: файлы живых закрепов не истекают.
+            let existing: Option<(i64, i64, bool)> = tx
+                .query_row(
+                    &format!(
+                        "SELECT size, have, {}
+                         FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
+                        expired_sql("?3")
+                    ),
+                    params![&group.0[..], &blob.0[..], not_before_ms],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            match existing {
+                Some((_, _, true)) => {
+                    tx.execute(
+                        "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
+                        params![&group.0[..], &blob.0[..]],
+                    )?;
+                }
+                Some((s, _, _)) if s as u64 != size => return Ok(BlobBegin::SizeMismatch),
+                Some((_, have, _)) => {
+                    tx.execute(
+                        "UPDATE blobs SET last_touch_ms = MAX(last_touch_ms, ?3)
+                         WHERE group_id = ?1 AND blob_id = ?2",
+                        params![&group.0[..], &blob.0[..], now_ms],
+                    )?;
+                    tx.commit()?;
+                    return Ok(BlobBegin::Existing { have: have as u64 });
+                }
+                None => {}
+            }
+            let need = clipwire_core::blob::sealed_size(size);
+            // sealed_size(size) = size + max(1, ceil(size / CHUNK)) * OVERHEAD,
+            // посчитано прямо в SQLite: так не надо тянуть все строки в память.
+            // Квота группы — только обычные файлы, предел сервера — все живые
+            // (это предел диска), включая закреплённые.
+            let (group_used, total_used): (i64, i64) = tx.query_row(
                 &format!(
-                    "SELECT size, have, {}
-                     FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
-                    expired_sql("?3")
+                    "SELECT COALESCE(SUM(CASE WHEN group_id = ?1 AND plain THEN s END), 0),
+                            COALESCE(SUM(s), 0)
+                     FROM (SELECT group_id, {} AS plain,
+                                  size + MAX(1, (size + ?3 - 1) / ?3) * ?4 AS s
+                           FROM blobs WHERE {})",
+                    unpinned_live_sql("?2"),
+                    live_sql("?2")
                 ),
-                params![&group.0[..], &blob.0[..], not_before_ms],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        match existing {
-            Some((_, _, true)) => {
-                tx.execute(
-                    "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
-                    params![&group.0[..], &blob.0[..]],
-                )?;
-            }
-            Some((s, _, _)) if s as u64 != size => return Ok(BlobBegin::SizeMismatch),
-            Some((_, have, _)) => {
-                tx.execute(
-                    "UPDATE blobs SET last_touch_ms = MAX(last_touch_ms, ?3)
-                     WHERE group_id = ?1 AND blob_id = ?2",
-                    params![&group.0[..], &blob.0[..], now_ms],
-                )?;
-                tx.commit()?;
-                return Ok(BlobBegin::Existing { have: have as u64 });
-            }
-            None => {}
-        }
-        let need = clipwire_core::blob::sealed_size(size);
-        // sealed_size(size) = size + max(1, ceil(size / CHUNK)) * OVERHEAD,
-        // посчитано прямо в SQLite: так не надо тянуть все строки в память.
-        // Квота группы — только обычные файлы, предел сервера — все живые
-        // (это предел диска), включая закреплённые.
-        let (group_used, total_used): (i64, i64) = tx.query_row(
-            &format!(
-                "SELECT COALESCE(SUM(CASE WHEN group_id = ?1 AND plain THEN s END), 0),
-                        COALESCE(SUM(s), 0)
-                 FROM (SELECT group_id, {} AS plain,
-                              size + MAX(1, (size + ?3 - 1) / ?3) * ?4 AS s
-                       FROM blobs WHERE {})",
-                unpinned_live_sql("?2"),
-                live_sql("?2")
-            ),
-            params![&group.0[..], not_before_ms, CHUNK as i64, OVERHEAD as i64],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let pinned = pins::is_pin_blob(&tx, group, blob)?;
-        if pinned {
-            // Файл закрепа: место закрепов, квота файлов группы ни при чём.
-            let used = pins::pins_used(&tx, group)?;
-            if used.saturating_add(need) > pin_bytes {
+                params![&group.0[..], not_before_ms, CHUNK as i64, OVERHEAD as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let pinned = pins::is_pin_blob(&tx, group, blob)?;
+            if pinned {
+                // Файл закрепа: место закрепов, квота файлов группы ни при чём.
+                let used = pins::pins_used(&tx, group)?;
+                if used.saturating_add(need) > pin_bytes {
+                    return Ok(BlobBegin::QuotaExceeded);
+                }
+            } else if (group_used as u64).saturating_add(need) > quota {
                 return Ok(BlobBegin::QuotaExceeded);
             }
-        } else if (group_used as u64).saturating_add(need) > quota {
-            return Ok(BlobBegin::QuotaExceeded);
-        }
-        if (total_used as u64).saturating_add(need) > total_quota {
-            return Ok(BlobBegin::ServerFull);
-        }
-        // Файлы без единой части: резервы и только что начатые Put. Каждый
-        // держит квоту, поэтому их число ограничено. Считаем на устройство, а
-        // не на группу: одно устройство с большой пачкой файлов не мешает
-        // остальным устройствам группы.
-        let empty: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM blobs WHERE origin = ?1 AND have = 0 AND created_ms >= ?2",
-            params![&origin.0[..], not_before_ms],
-            |r| r.get(0),
-        )?;
-        if empty as u64 >= max_reserves as u64 {
-            return Ok(BlobBegin::TooManyReserves);
-        }
-        tx.execute(
-            "INSERT INTO blobs (group_id, blob_id, size, have, created_ms, last_touch_ms, origin, pin_only)
-             VALUES (?1, ?2, ?3, 0, ?4, ?4, ?5, ?6)",
-            params![
-                &group.0[..],
-                &blob.0[..],
-                size as i64,
-                now_ms,
-                &origin.0[..],
-                pinned
-            ],
-        )?;
-        tx.commit()?;
-        Ok(BlobBegin::Created)
+            if (total_used as u64).saturating_add(need) > total_quota {
+                return Ok(BlobBegin::ServerFull);
+            }
+            // Файлы без единой части: резервы и только что начатые Put. Каждый
+            // держит квоту, поэтому их число ограничено. Считаем на устройство, а
+            // не на группу: одно устройство с большой пачкой файлов не мешает
+            // остальным устройствам группы.
+            let empty: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM blobs WHERE origin = ?1 AND have = 0 AND created_ms >= ?2",
+                params![&origin.0[..], not_before_ms],
+                |r| r.get(0),
+            )?;
+            if empty as u64 >= max_reserves as u64 {
+                return Ok(BlobBegin::TooManyReserves);
+            }
+            tx.execute(
+                "INSERT INTO blobs (group_id, blob_id, size, have, created_ms, last_touch_ms, origin, pin_only)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?4, ?5, ?6)",
+                params![
+                    &group.0[..],
+                    &blob.0[..],
+                    size as i64,
+                    now_ms,
+                    &origin.0[..],
+                    pinned
+                ],
+            )?;
+            tx.commit()?;
+            Ok(BlobBegin::Created)
+        })
     }
 
     /// Удалить строку файла (отмена отправки). `true`, если она была.
     pub fn blob_delete(&self, group: &GroupId, blob: &BlobId) -> Result<bool> {
-        Ok(self.conn().execute(
-            "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
-            params![&group.0[..], &blob.0[..]],
-        )? > 0)
+        self.write(|conn| {
+            Ok(conn.execute(
+                "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
+                params![&group.0[..], &blob.0[..]],
+            )? > 0)
+        })
     }
 
     /// Есть ли строка файла, даже истёкшая: чистка по сроку проверяет, не
     /// завёл ли кто-то файл с тем же id заново, прежде чем удалять его с диска.
     pub fn blob_exists(&self, group: &GroupId, blob: &BlobId) -> Result<bool> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT 1 FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
-                params![&group.0[..], &blob.0[..]],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM blobs WHERE group_id = ?1 AND blob_id = ?2",
+                    params![&group.0[..], &blob.0[..]],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
     }
 
     /// Размер файла и сколько частей принято. `None`, если файла нет или он истёк.
@@ -759,42 +866,74 @@ impl Store {
         blob: &BlobId,
         not_before_ms: i64,
     ) -> Result<Option<(u64, u64)>> {
-        Ok(self
-            .conn()
-            .query_row(
-                &format!(
-                    "SELECT size, have FROM blobs
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    &format!(
+                        "SELECT size, have FROM blobs
                      WHERE group_id = ?1 AND blob_id = ?2 AND {}",
-                    live_sql("?3")
-                ),
-                params![&group.0[..], &blob.0[..], not_before_ms],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-            )
-            .optional()?)
+                        live_sql("?3")
+                    ),
+                    params![&group.0[..], &blob.0[..], not_before_ms],
+                    |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+                )
+                .optional()?)
+        })
     }
 
     /// Записать, сколько частей файла уже лежит на диске.
     pub fn blob_set_have(&self, group: &GroupId, blob: &BlobId, have: u64) -> Result<()> {
-        self.conn().execute(
-            "UPDATE blobs SET have = ?3 WHERE group_id = ?1 AND blob_id = ?2",
-            params![&group.0[..], &blob.0[..], have as i64],
-        )?;
-        Ok(())
+        self.write(|conn| {
+            conn.execute(
+                "UPDATE blobs SET have = ?3 WHERE group_id = ?1 AND blob_id = ?2",
+                params![&group.0[..], &blob.0[..], have as i64],
+            )?;
+            Ok(())
+        })
     }
 
     /// Удаляет строки истёкших файлов и возвращает, чьи файлы убрать с диска.
     pub fn purge_expired_blobs(&self, not_before_ms: i64) -> Result<Vec<(GroupId, BlobId)>> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let mut out = Vec::new();
-        {
-            let mut stmt = tx.prepare(&format!(
-                "SELECT group_id, blob_id FROM blobs WHERE {}",
-                expired_sql("?1")
-            ))?;
-            let rows = stmt.query_map(params![not_before_ms], |r| {
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            let mut out = Vec::new();
+            {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT group_id, blob_id FROM blobs WHERE {}",
+                    expired_sql("?1")
+                ))?;
+                let rows = stmt.query_map(params![not_before_ms], |r| {
+                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })?;
+                for row in rows {
+                    let (g, b) = row?;
+                    out.push((
+                        GroupId(g.try_into().ok().context("битый group_id в базе")?),
+                        BlobId(b.try_into().ok().context("битый blob_id в базе")?),
+                    ));
+                }
+            }
+            tx.execute(
+                &format!("DELETE FROM blobs WHERE {}", expired_sql("?1")),
+                params![not_before_ms],
+            )?;
+            tx.commit()?;
+            Ok(out)
+        })
+    }
+
+    /// Резервы без единой части, которые последний раз трогали (`Reserve`,
+    /// `Put`) раньше `older_than_ms`: кандидаты на удаление. Удаляет их
+    /// [`Store::delete_stale_reserve`] под замком записи файла.
+    pub fn stale_reserves(&self, older_than_ms: i64) -> Result<Vec<(GroupId, BlobId)>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT group_id, blob_id FROM blobs WHERE have = 0 AND last_touch_ms < ?1",
+            )?;
+            let rows = stmt.query_map(params![older_than_ms], |r| {
                 Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
             })?;
+            let mut out = Vec::new();
             for row in rows {
                 let (g, b) = row?;
                 out.push((
@@ -802,34 +941,8 @@ impl Store {
                     BlobId(b.try_into().ok().context("битый blob_id в базе")?),
                 ));
             }
-        }
-        tx.execute(
-            &format!("DELETE FROM blobs WHERE {}", expired_sql("?1")),
-            params![not_before_ms],
-        )?;
-        tx.commit()?;
-        Ok(out)
-    }
-
-    /// Резервы без единой части, которые последний раз трогали (`Reserve`,
-    /// `Put`) раньше `older_than_ms`: кандидаты на удаление. Удаляет их
-    /// [`Store::delete_stale_reserve`] под замком записи файла.
-    pub fn stale_reserves(&self, older_than_ms: i64) -> Result<Vec<(GroupId, BlobId)>> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare("SELECT group_id, blob_id FROM blobs WHERE have = 0 AND last_touch_ms < ?1")?;
-        let rows = stmt.query_map(params![older_than_ms], |r| {
-            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (g, b) = row?;
-            out.push((
-                GroupId(g.try_into().ok().context("битый group_id в базе")?),
-                BlobId(b.try_into().ok().context("битый blob_id в базе")?),
-            ));
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     /// Удалить резерв, если он всё ещё без частей и его не трогали с
@@ -841,29 +954,32 @@ impl Store {
         blob: &BlobId,
         older_than_ms: i64,
     ) -> Result<bool> {
-        Ok(self.conn().execute(
-            "DELETE FROM blobs
+        self.write(|conn| {
+            Ok(conn.execute(
+                "DELETE FROM blobs
              WHERE group_id = ?1 AND blob_id = ?2 AND have = 0 AND last_touch_ms < ?3",
-            params![&group.0[..], &blob.0[..], older_than_ms],
-        )? > 0)
+                params![&group.0[..], &blob.0[..], older_than_ms],
+            )? > 0)
+        })
     }
 
     /// Заброшенные группы: ни одно устройство не входило с `seen_before_ms`,
     /// и нет ни элементов, ни файлов. Кандидаты на чистку
     /// ([`Store::bury_idle_group`]).
     pub fn idle_groups(&self, seen_before_ms: i64) -> Result<Vec<GroupId>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT group_id FROM groups AS g WHERE {IDLE_GROUP}"
-        ))?;
-        let rows = stmt.query_map(params![seen_before_ms], |r| r.get::<_, Vec<u8>>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(GroupId(
-                row?.try_into().ok().context("битый group_id в базе")?,
-            ));
-        }
-        Ok(out)
+        self.read(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT group_id FROM groups AS g WHERE {IDLE_GROUP}"
+            ))?;
+            let rows = stmt.query_map(params![seen_before_ms], |r| r.get::<_, Vec<u8>>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(GroupId(
+                    row?.try_into().ok().context("битый group_id в базе")?,
+                ));
+            }
+            Ok(out)
+        })
     }
 
     /// Очистить заброшенную группу, если она всё ещё заброшена: между
@@ -878,31 +994,32 @@ impl Store {
         seen_before_ms: i64,
         now_ms: i64,
     ) -> Result<bool> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let idle = tx
-            .query_row(
-                &format!("SELECT 1 FROM groups AS g WHERE g.group_id = ?2 AND {IDLE_GROUP}"),
-                params![seen_before_ms, &group.0[..]],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !idle {
-            return Ok(false);
-        }
-        for table in GROUP_TABLES {
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            let idle = tx
+                .query_row(
+                    &format!("SELECT 1 FROM groups AS g WHERE g.group_id = ?2 AND {IDLE_GROUP}"),
+                    params![seen_before_ms, &group.0[..]],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !idle {
+                return Ok(false);
+            }
+            for table in GROUP_TABLES {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE group_id = ?1"),
+                    params![&group.0[..]],
+                )?;
+            }
             tx.execute(
-                &format!("DELETE FROM {table} WHERE group_id = ?1"),
-                params![&group.0[..]],
+                "UPDATE groups SET idle_ms = ?2, admin_device = NULL WHERE group_id = ?1",
+                params![&group.0[..], now_ms],
             )?;
-        }
-        tx.execute(
-            "UPDATE groups SET idle_ms = ?2, admin_device = NULL WHERE group_id = ?1",
-            params![&group.0[..], now_ms],
-        )?;
-        tx.commit()?;
-        Ok(true)
+            tx.commit()?;
+            Ok(true)
+        })
     }
 
     /// Пускать ли устройство в relay без места гостя (`relay.rs`): оно
@@ -911,20 +1028,21 @@ impl Store {
     /// забрало ключ). Исключённое сменой ключа устройство участником не
     /// считается.
     pub fn is_relay_member(&self, device: &DeviceId) -> Result<bool> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT 1 FROM devices AS d JOIN groups AS g ON g.group_id = d.group_id
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM devices AS d JOIN groups AS g ON g.group_id = d.group_id
                  WHERE d.device_id = ?1 AND g.deleted_ms IS NULL AND g.idle_ms IS NULL
                    AND (g.rotated_ms IS NULL
                         OR EXISTS (SELECT 1 FROM rekeys AS r
                                    WHERE r.group_id = d.group_id AND r.device_id = d.device_id))
                  LIMIT 1",
-                params![&device.0[..]],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
+                    params![&device.0[..]],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
     }
 }
 
@@ -995,6 +1113,96 @@ mod tests {
 
     /// Устройство-источник файлов в тестах.
     const DEV: DeviceId = DeviceId([5; 32]);
+
+    /// База в файле, как у сервера: WAL и пул читателей.
+    fn on_disk(name: &str) -> (Store, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("clipwire-store-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (Store::open(&dir.join("t.db")).unwrap(), dir)
+    }
+
+    #[test]
+    fn readers_cannot_write() {
+        let s = Store::in_memory().unwrap();
+        let r = s.read(|c| Ok(c.execute("DELETE FROM groups", [])?));
+        assert!(r.is_err(), "читатель должен быть только на чтение");
+        let (s, dir) = on_disk("ro");
+        assert!(
+            s.read(|c| Ok(c.execute("DELETE FROM groups", [])?))
+                .is_err()
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reads_do_not_wait_for_busy_writer() {
+        let (s, dir) = on_disk("busy");
+        let s = std::sync::Arc::new(s);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let w = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                s.write(|_| {
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap()
+            })
+        };
+        held_rx.recv().unwrap();
+        // Писатель занят, а чтение идёт через свой пул и сразу отвечает.
+        let t = std::time::Instant::now();
+        assert!(!s.is_relay_member(&DeviceId([9; 32])).unwrap());
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        go_tx.send(()).unwrap();
+        w.join().unwrap();
+        drop(s);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn busy_db_does_not_stall_runtime() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let s = std::sync::Arc::new(Store::in_memory().unwrap());
+        let inside = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        rt.block_on(async {
+            // Единственный рабочий поток занят «долгим запросом» на 300 мс.
+            let busy = {
+                let (s, inside) = (s.clone(), inside.clone());
+                tokio::spawn(async move {
+                    s.write(|_| {
+                        inside.store(true, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        Ok(())
+                    })
+                    .unwrap()
+                })
+            };
+            while !inside.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            // Без block_in_place этот таймер ждал бы конца запроса.
+            let t = std::time::Instant::now();
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_millis(10)).await })
+                .await
+                .unwrap();
+            assert!(
+                t.elapsed() < std::time::Duration::from_millis(200),
+                "{:?}",
+                t.elapsed()
+            );
+            busy.await.unwrap();
+        });
+    }
 
     fn sealed(key: &GroupKey, text: &str) -> SealedItem {
         key.seal(&Item::new(DeviceId([1; 32]), Content::Text(text.into())))

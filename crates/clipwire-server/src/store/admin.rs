@@ -457,48 +457,51 @@ pub(super) fn inherit_admins(
 impl Store {
     /// Настройки, заданные администратором (без служебных ключей).
     pub fn settings(&self) -> Result<Vec<(String, u64)>> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT key, value FROM settings WHERE key NOT LIKE '\\_%' ESCAPE '\\'")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (k, v) = row?;
-            out.push((k, v.max(0) as u64));
-        }
-        Ok(out)
+        self.read(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT key, value FROM settings WHERE key NOT LIKE '\\_%' ESCAPE '\\'")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (k, v) = row?;
+                out.push((k, v.max(0) as u64));
+            }
+            Ok(out)
+        })
     }
 
     /// Записать настройки одной транзакцией: `Some` — значение, `None` —
     /// сброс. Значения проверяет вызывающий.
     pub fn set_settings(&self, values: &[(String, Option<u64>)]) -> Result<()> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        for (key, value) in values {
-            match value {
-                Some(v) => tx.execute(
-                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
-                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                    params![key, i64::try_from(*v).unwrap_or(i64::MAX)],
-                )?,
-                None => tx.execute("DELETE FROM settings WHERE key = ?1", params![key])?,
-            };
-        }
-        tx.commit()?;
-        Ok(())
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            for (key, value) in values {
+                match value {
+                    Some(v) => tx.execute(
+                        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                        params![key, i64::try_from(*v).unwrap_or(i64::MAX)],
+                    )?,
+                    None => tx.execute("DELETE FROM settings WHERE key = ?1", params![key])?,
+                };
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Меняли ли токен relay из клиента.
     pub fn relay_rotated(&self) -> Result<bool> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT 1 FROM settings WHERE key = ?1",
-                params![RELAY_ROTATED],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM settings WHERE key = ?1",
+                    params![RELAY_ROTATED],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
     }
 
     /// Запомнить отпечаток текущего токена relay. Если запомнен был другой,
@@ -509,46 +512,49 @@ impl Store {
     /// считается: сравнивать не с чем.
     pub fn note_relay_token(&self, fingerprint: &[u8; 32], now_ms: i64) -> Result<bool> {
         let fp = i64::from_be_bytes(fingerprint[..8].try_into().expect("8 байт"));
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let stored: Option<i64> = tx
-            .query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                params![RELAY_TOKEN_FP],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let changed = stored.is_some_and(|s| s != fp);
-        if stored != Some(fp) {
-            tx.execute(
-                "INSERT INTO settings (key, value) VALUES (?1, ?2)
-                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                params![RELAY_TOKEN_FP, fp],
-            )?;
-        }
-        if changed {
-            tx.execute(
-                "INSERT INTO settings (key, value) VALUES (?1, ?2)
-                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                params![RELAY_ROTATED, now_ms],
-            )?;
-        }
-        tx.commit()?;
-        Ok(changed)
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            let stored: Option<i64> = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key = ?1",
+                    params![RELAY_TOKEN_FP],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let changed = stored.is_some_and(|s| s != fp);
+            if stored != Some(fp) {
+                tx.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    params![RELAY_TOKEN_FP, fp],
+                )?;
+            }
+            if changed {
+                tx.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    params![RELAY_ROTATED, now_ms],
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        })
     }
 
     pub fn mark_relay_rotated(&self, now_ms: i64) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+        self.write(|conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            params![RELAY_ROTATED, now_ms],
-        )?;
-        Ok(())
+                params![RELAY_ROTATED, now_ms],
+            )?;
+            Ok(())
+        })
     }
 
     /// Админы группы, самый ранний первым.
     pub fn group_admins(&self, group: &GroupId) -> Result<Vec<DeviceId>> {
-        admins_of(&self.conn(), group)
+        self.read(|conn| admins_of(conn, group))
     }
 
     /// Один админ группы для старых клиентов (`GetGroupAdmin`, до
@@ -556,7 +562,7 @@ impl Store {
     /// старый клиент на устройстве-админе видит себя админом и может удалять
     /// устройства.
     pub fn group_admin_for(&self, group: &GroupId, asker: &DeviceId) -> Result<Option<DeviceId>> {
-        let admins = admins_of(&self.conn(), group)?;
+        let admins = self.read(|conn| admins_of(conn, group))?;
         Ok(if admins.contains(asker) {
             Some(*asker)
         } else {
@@ -567,7 +573,7 @@ impl Store {
     /// Самый ранний админ группы.
     #[cfg(test)]
     pub fn group_admin(&self, group: &GroupId) -> Result<Option<DeviceId>> {
-        Ok(admins_of(&self.conn(), group)?.first().copied())
+        Ok(self.read(|conn| admins_of(conn, group))?.first().copied())
     }
 
     /// Сделать `device` админом группы, если среди её устройств админа нет
@@ -579,20 +585,21 @@ impl Store {
         device: &DeviceId,
         now_ms: i64,
     ) -> Result<bool> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        if !is_live(&tx, group)?
-            || !super::devices::is_member(&tx, group, device)?
-            || active_admins_except(&tx, group, device)? > 0
-        {
-            return Ok(false);
-        }
-        // Уже админ (единственный действующий) — ничего не поменялось:
-        // без `true`, иначе каждый вход администратора сервера рассылал бы
-        // группе `DevicesChanged`.
-        let added = add_admin(&tx, group, device, now_ms)?;
-        tx.commit()?;
-        Ok(added)
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            if !is_live(&tx, group)?
+                || !super::devices::is_member(&tx, group, device)?
+                || active_admins_except(&tx, group, device)? > 0
+            {
+                return Ok(false);
+            }
+            // Уже админ (единственный действующий) — ничего не поменялось:
+            // без `true`, иначе каждый вход администратора сервера рассылал бы
+            // группе `DevicesChanged`.
+            let added = add_admin(&tx, group, device, now_ms)?;
+            tx.commit()?;
+            Ok(added)
+        })
     }
 
     /// Добавить `device` в админы группы и при живых админах (`ClaimGroupAdmin`
@@ -606,14 +613,15 @@ impl Store {
         device: &DeviceId,
         now_ms: i64,
     ) -> Result<bool> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        if !is_live(&tx, group)? || !super::devices::is_member(&tx, group, device)? {
-            return Ok(false);
-        }
-        add_admin(&tx, group, device, now_ms)?;
-        tx.commit()?;
-        Ok(true)
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            if !is_live(&tx, group)? || !super::devices::is_member(&tx, group, device)? {
+                return Ok(false);
+            }
+            add_admin(&tx, group, device, now_ms)?;
+            tx.commit()?;
+            Ok(true)
+        })
     }
 
     /// Сделать `device` админом группы по запросу админа `by`. Уже админ —
@@ -625,17 +633,18 @@ impl Store {
         device: &DeviceId,
         now_ms: i64,
     ) -> Result<Result<bool, AdminFail>> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        if !is_live(&tx, group)? || !is_active_admin(&tx, group, by)? {
-            return Ok(Err(AdminFail::NotGroupAdmin));
-        }
-        if !super::devices::is_member(&tx, group, device)? {
-            return Ok(Err(AdminFail::NoSuchDevice));
-        }
-        let added = add_admin(&tx, group, device, now_ms)?;
-        tx.commit()?;
-        Ok(Ok(added))
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            if !is_live(&tx, group)? || !is_active_admin(&tx, group, by)? {
+                return Ok(Err(AdminFail::NotGroupAdmin));
+            }
+            if !super::devices::is_member(&tx, group, device)? {
+                return Ok(Err(AdminFail::NoSuchDevice));
+            }
+            let added = add_admin(&tx, group, device, now_ms)?;
+            tx.commit()?;
+            Ok(Ok(added))
+        })
     }
 
     /// Снять роль админа с `device` по запросу админа `by` (в том числе с
@@ -649,20 +658,21 @@ impl Store {
         by: &DeviceId,
         device: &DeviceId,
     ) -> Result<Result<bool, AdminFail>> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        if !is_live(&tx, group)? || !is_active_admin(&tx, group, by)? {
-            return Ok(Err(AdminFail::NotGroupAdmin));
-        }
-        if !is_admin(&tx, group, device)? && !super::devices::is_member(&tx, group, device)? {
-            return Ok(Err(AdminFail::NoSuchDevice));
-        }
-        let removed = match revoke_in(&tx, group, device)? {
-            Ok(removed) => removed,
-            Err(f) => return Ok(Err(f)),
-        };
-        tx.commit()?;
-        Ok(Ok(removed))
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            if !is_live(&tx, group)? || !is_active_admin(&tx, group, by)? {
+                return Ok(Err(AdminFail::NotGroupAdmin));
+            }
+            if !is_admin(&tx, group, device)? && !super::devices::is_member(&tx, group, device)? {
+                return Ok(Err(AdminFail::NoSuchDevice));
+            }
+            let removed = match revoke_in(&tx, group, device)? {
+                Ok(removed) => removed,
+                Err(f) => return Ok(Err(f)),
+            };
+            tx.commit()?;
+            Ok(Ok(removed))
+        })
     }
 
     /// Передать роль админа от `from` к `to` (`TransferGroupAdmin` старых
@@ -676,69 +686,71 @@ impl Store {
         to: &DeviceId,
         now_ms: i64,
     ) -> Result<Result<bool, AdminFail>> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        if !is_live(&tx, group)? || !is_active_admin(&tx, group, from)? {
-            return Ok(Err(AdminFail::NotGroupAdmin));
-        }
-        if !super::devices::is_member(&tx, group, to)? {
-            return Ok(Err(AdminFail::NoSuchDevice));
-        }
-        let mut changed = add_admin(&tx, group, to, now_ms)?;
-        // `to` уже админ и состоит в группе, так что `from` последним не
-        // окажется.
-        if from != to {
-            match revoke_in(&tx, group, from)? {
-                Ok(removed) => changed |= removed,
-                Err(f) => return Ok(Err(f)),
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            if !is_live(&tx, group)? || !is_active_admin(&tx, group, from)? {
+                return Ok(Err(AdminFail::NotGroupAdmin));
             }
-        }
-        tx.commit()?;
-        Ok(Ok(changed))
+            if !super::devices::is_member(&tx, group, to)? {
+                return Ok(Err(AdminFail::NoSuchDevice));
+            }
+            let mut changed = add_admin(&tx, group, to, now_ms)?;
+            // `to` уже админ и состоит в группе, так что `from` последним не
+            // окажется.
+            if from != to {
+                match revoke_in(&tx, group, from)? {
+                    Ok(removed) => changed |= removed,
+                    Err(f) => return Ok(Err(f)),
+                }
+            }
+            tx.commit()?;
+            Ok(Ok(changed))
+        })
     }
 
     /// Незавершённая ли это группа смены ключа (`Rekey` ещё не пришёл).
     pub fn is_pending(&self, group: &GroupId) -> Result<bool> {
-        is_pending(&self.conn(), group)
+        self.read(|conn| is_pending(conn, group))
     }
 
     /// Сводка сервера без версии (её знает не база).
     pub fn summary(&self) -> Result<ServerSummary> {
-        let conn = self.conn();
-        let one = |sql: &str| -> Result<u64> {
-            let v: i64 = conn.query_row(sql, [], |r| r.get(0))?;
-            Ok(v.max(0) as u64)
-        };
-        let groups = counted_groups(&conn)?;
-        let devices = one("SELECT COUNT(DISTINCT d.device_id) FROM devices AS d
-             JOIN groups AS g ON g.group_id = d.group_id
-             WHERE g.rotated_ms IS NULL AND g.tombstone_ms IS NULL AND g.idle_ms IS NULL")?;
-        let bytes_items = one("SELECT COALESCE(SUM(length(ciphertext)), 0) FROM items")?;
-        // Та же формула sealed_size, что у квоты файлов (`blob_begin`).
-        // Файлы живых закрепов — в месте закрепов, не в файлах.
-        let sealed = |kept: &str| -> Result<u64> {
-            let v: i64 = conn.query_row(
-                &format!(
-                    "SELECT COALESCE(SUM(size + MAX(1, (size + ?1 - 1) / ?1) * ?2), 0) FROM blobs
-                     WHERE {kept}{}",
-                    super::pins::KEPT_BY_PIN
-                ),
-                params![CHUNK as i64, OVERHEAD as i64],
-                |r| r.get(0),
-            )?;
-            Ok(v.max(0) as u64)
-        };
-        // Записи со строками базы, как в квоте закрепов.
-        let bytes_pins = super::pins::all_records_bytes(&conn)?.saturating_add(sealed("")?);
-        // Снятые файлы закрепов (`pin_only`) уже истекли: чистка их уберёт.
-        let bytes_files = sealed("pin_only = 0 AND NOT ")?;
-        Ok(ServerSummary {
-            groups,
-            devices,
-            bytes_items,
-            bytes_files,
-            bytes_pins,
-            version: String::new(),
+        self.read(|conn| {
+            let one = |sql: &str| -> Result<u64> {
+                let v: i64 = conn.query_row(sql, [], |r| r.get(0))?;
+                Ok(v.max(0) as u64)
+            };
+            let groups = counted_groups(conn)?;
+            let devices = one("SELECT COUNT(DISTINCT d.device_id) FROM devices AS d
+                 JOIN groups AS g ON g.group_id = d.group_id
+                 WHERE g.rotated_ms IS NULL AND g.tombstone_ms IS NULL AND g.idle_ms IS NULL")?;
+            let bytes_items = one("SELECT COALESCE(SUM(length(ciphertext)), 0) FROM items")?;
+            // Та же формула sealed_size, что у квоты файлов (`blob_begin`).
+            // Файлы живых закрепов — в месте закрепов, не в файлах.
+            let sealed = |kept: &str| -> Result<u64> {
+                let v: i64 = conn.query_row(
+                    &format!(
+                        "SELECT COALESCE(SUM(size + MAX(1, (size + ?1 - 1) / ?1) * ?2), 0) FROM blobs
+                         WHERE {kept}{}",
+                        super::pins::KEPT_BY_PIN
+                    ),
+                    params![CHUNK as i64, OVERHEAD as i64],
+                    |r| r.get(0),
+                )?;
+                Ok(v.max(0) as u64)
+            };
+            // Записи со строками базы, как в квоте закрепов.
+            let bytes_pins = super::pins::all_records_bytes(conn)?.saturating_add(sealed("")?);
+            // Снятые файлы закрепов (`pin_only`) уже истекли: чистка их уберёт.
+            let bytes_files = sealed("pin_only = 0 AND NOT ")?;
+            Ok(ServerSummary {
+                groups,
+                devices,
+                bytes_items,
+                bytes_files,
+                bytes_pins,
+                version: String::new(),
+            })
         })
     }
 
@@ -746,10 +758,12 @@ impl Store {
     /// не получившие `Rekey`, со всем содержимым. Файлов в них не бывает:
     /// загрузка туда не принимается. Возвращает число удалённых.
     pub fn purge_pending(&self, before_ms: i64) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM groups WHERE pending_by IS NOT NULL AND pending_ms < ?1",
-            params![before_ms],
-        )?)
+        self.write(|conn| {
+            Ok(conn.execute(
+                "DELETE FROM groups WHERE pending_by IS NOT NULL AND pending_ms < ?1",
+                params![before_ms],
+            )?)
+        })
     }
 }
 

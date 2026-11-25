@@ -330,167 +330,168 @@ impl Store {
         freed: &mut Vec<BlobId>,
     ) -> Result<PinOutcome> {
         let g = &group.0[..];
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let rotated: Option<Option<i64>> = tx
-            .query_row(
-                "SELECT rotated_ms FROM groups WHERE group_id = ?1",
-                params![g],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if !matches!(rotated, Some(None)) {
-            return Ok(PinOutcome::Rotated);
-        }
-        let current: Option<(u64, bool, i64, i64)> = tx
-            .query_row(
-                "SELECT rev, pinned, length(state), content_len FROM pins
-                 WHERE group_id = ?1 AND pin_id = ?2",
-                params![g, &w.pin_id.0[..]],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        let current_rev = current.map_or(0, |c| c.0);
-        if w.base_rev != current_rev {
-            return Ok(PinOutcome::Stale(record_in(&tx, group, &w.pin_id)?));
-        }
-        let (was_pinned, old_bytes, old_content) =
-            current.map_or((false, 0, 0), |(_, p, s, c)| (p, s + c, c));
-        // Сколько будет содержимого после правки.
-        let content_len = match (w.pinned, w.content) {
-            (false, _) => 0,
-            (true, Some(c)) => c.len() as i64,
-            (true, None) if old_content > 0 => old_content,
-            (true, None) => return Ok(PinOutcome::NoContent),
-        };
-        if w.pinned && !was_pinned {
-            let live: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM pins WHERE group_id = ?1 AND pinned = 1",
-                params![g],
-                |r| r.get(0),
-            )?;
-            if live as u64 >= quota.max_pins {
-                return Ok(PinOutcome::TooMany);
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            let rotated: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT rotated_ms FROM groups WHERE group_id = ?1",
+                    params![g],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if !matches!(rotated, Some(None)) {
+                return Ok(PinOutcome::Rotated);
             }
-        }
-        if current.is_none() {
-            // Новая строка: предел записей считает и снятые.
-            let all: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM pins WHERE group_id = ?1",
-                params![g],
-                |r| r.get(0),
-            )?;
-            if all as u64 >= quota.max_records {
-                return Ok(PinOutcome::TooManyRecords);
+            let current: Option<(u64, bool, i64, i64)> = tx
+                .query_row(
+                    "SELECT rev, pinned, length(state), content_len FROM pins
+                     WHERE group_id = ?1 AND pin_id = ?2",
+                    params![g, &w.pin_id.0[..]],
+                    |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            let current_rev = current.map_or(0, |c| c.0);
+            if w.base_rev != current_rev {
+                return Ok(PinOutcome::Stale(record_in(&tx, group, &w.pin_id)?));
             }
-        }
-        // Место закрепов: записи со строками базы и файлы, которые уже лежат
-        // на сервере. Сколько файлов держит этот закреп до правки и будет
-        // держать после.
-        let old_files = pin_blob_list(&tx, group, &w.pin_id)?;
-        let new_files: &[BlobId] = match (w.pinned, w.content) {
-            (false, _) => &[],
-            (true, Some(_)) => w.blobs,
-            (true, None) => &old_files,
-        };
-        let refs = |b: &[BlobId]| -> u64 {
-            let unique: std::collections::HashSet<_> = b.iter().collect();
-            unique.len() as u64 * BLOB_REF_OVERHEAD
-        };
-        let record_before = if current.is_some() {
-            old_bytes.max(0) as u64 + RECORD_OVERHEAD + refs(&old_files)
-        } else {
-            0
-        };
-        let record_after =
-            w.state.len() as u64 + content_len.max(0) as u64 + RECORD_OVERHEAD + refs(new_files);
-        let before = record_before
-            + if was_pinned {
-                own_files_bytes(&tx, group, &w.pin_id, &old_files)?
+            let (was_pinned, old_bytes, old_content) =
+                current.map_or((false, 0, 0), |(_, p, s, c)| (p, s + c, c));
+            // Сколько будет содержимого после правки.
+            let content_len = match (w.pinned, w.content) {
+                (false, _) => 0,
+                (true, Some(c)) => c.len() as i64,
+                (true, None) if old_content > 0 => old_content,
+                (true, None) => return Ok(PinOutcome::NoContent),
+            };
+            if w.pinned && !was_pinned {
+                let live: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM pins WHERE group_id = ?1 AND pinned = 1",
+                    params![g],
+                    |r| r.get(0),
+                )?;
+                if live as u64 >= quota.max_pins {
+                    return Ok(PinOutcome::TooMany);
+                }
+            }
+            if current.is_none() {
+                // Новая строка: предел записей считает и снятые.
+                let all: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM pins WHERE group_id = ?1",
+                    params![g],
+                    |r| r.get(0),
+                )?;
+                if all as u64 >= quota.max_records {
+                    return Ok(PinOutcome::TooManyRecords);
+                }
+            }
+            // Место закрепов: записи со строками базы и файлы, которые уже лежат
+            // на сервере. Сколько файлов держит этот закреп до правки и будет
+            // держать после.
+            let old_files = pin_blob_list(&tx, group, &w.pin_id)?;
+            let new_files: &[BlobId] = match (w.pinned, w.content) {
+                (false, _) => &[],
+                (true, Some(_)) => w.blobs,
+                (true, None) => &old_files,
+            };
+            let refs = |b: &[BlobId]| -> u64 {
+                let unique: std::collections::HashSet<_> = b.iter().collect();
+                unique.len() as u64 * BLOB_REF_OVERHEAD
+            };
+            let record_before = if current.is_some() {
+                old_bytes.max(0) as u64 + RECORD_OVERHEAD + refs(&old_files)
             } else {
                 0
             };
-        let after = record_after + own_files_bytes(&tx, group, &w.pin_id, new_files)?;
-        if after > before {
-            let used = pins_used(&tx, group)?;
-            if used.saturating_sub(before).saturating_add(after) > quota.max_bytes {
-                return Ok(PinOutcome::NoSpace);
+            let record_after =
+                w.state.len() as u64 + content_len.max(0) as u64 + RECORD_OVERHEAD + refs(new_files);
+            let before = record_before
+                + if was_pinned {
+                    own_files_bytes(&tx, group, &w.pin_id, &old_files)?
+                } else {
+                    0
+                };
+            let after = record_after + own_files_bytes(&tx, group, &w.pin_id, new_files)?;
+            if after > before {
+                let used = pins_used(&tx, group)?;
+                if used.saturating_sub(before).saturating_add(after) > quota.max_bytes {
+                    return Ok(PinOutcome::NoSpace);
+                }
             }
-        }
-        if record_after > record_before {
-            let total = all_records_bytes(&tx)?;
-            if total
-                .saturating_sub(record_before)
-                .saturating_add(record_after)
-                > quota.max_total_bytes
-            {
-                return Ok(PinOutcome::ServerFull);
+            if record_after > record_before {
+                let total = all_records_bytes(&tx)?;
+                if total
+                    .saturating_sub(record_before)
+                    .saturating_add(record_after)
+                    > quota.max_total_bytes
+                {
+                    return Ok(PinOutcome::ServerFull);
+                }
             }
-        }
 
-        tx.execute(
-            "UPDATE groups SET pin_rev = pin_rev + 1 WHERE group_id = ?1",
-            params![g],
-        )?;
-        let rev: i64 = tx.query_row(
-            "SELECT pin_rev FROM groups WHERE group_id = ?1",
-            params![g],
-            |r| r.get(0),
-        )?;
-        let pid = &w.pin_id.0[..];
-        match (w.pinned, w.content) {
-            // Подпись поменяли, содержимое и файлы прежние.
-            (true, None) => {
-                tx.execute(
-                    "UPDATE pins SET rev = ?3, pinned = 1, state = ?4, updated_ms = ?5
-                     WHERE group_id = ?1 AND pin_id = ?2",
-                    params![g, pid, rev, w.state, now_ms],
-                )?;
-            }
-            (pinned, content) => {
-                tx.execute(
-                    "INSERT INTO pins (group_id, pin_id, rev, pinned, state, content, content_len, updated_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                     ON CONFLICT (group_id, pin_id) DO UPDATE SET
-                         rev = excluded.rev, pinned = excluded.pinned, state = excluded.state,
-                         content = excluded.content, content_len = excluded.content_len,
-                         updated_ms = excluded.updated_ms",
-                    params![g, pid, rev, pinned, w.state, content, content_len, now_ms],
-                )?;
-                tx.execute(
-                    "DELETE FROM pin_blobs WHERE group_id = ?1 AND pin_id = ?2",
-                    params![g, pid],
-                )?;
-                if pinned {
-                    for b in w.blobs {
-                        tx.execute(
-                            "INSERT OR IGNORE INTO pin_blobs (group_id, pin_id, blob_id) VALUES (?1, ?2, ?3)",
-                            params![g, pid, &b.0[..]],
-                        )?;
-                    }
-                }
-                // Файлы закрепа, которые больше никто не держит, — сразу.
-                for b in &old_files {
-                    let n = tx.execute(
-                        "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2 AND pin_only = 1
-                           AND NOT EXISTS (SELECT 1 FROM pin_blobs AS pb
-                                           WHERE pb.group_id = ?1 AND pb.blob_id = ?2)",
-                        params![g, &b.0[..]],
+            tx.execute(
+                "UPDATE groups SET pin_rev = pin_rev + 1 WHERE group_id = ?1",
+                params![g],
+            )?;
+            let rev: i64 = tx.query_row(
+                "SELECT pin_rev FROM groups WHERE group_id = ?1",
+                params![g],
+                |r| r.get(0),
+            )?;
+            let pid = &w.pin_id.0[..];
+            match (w.pinned, w.content) {
+                // Подпись поменяли, содержимое и файлы прежние.
+                (true, None) => {
+                    tx.execute(
+                        "UPDATE pins SET rev = ?3, pinned = 1, state = ?4, updated_ms = ?5
+                         WHERE group_id = ?1 AND pin_id = ?2",
+                        params![g, pid, rev, w.state, now_ms],
                     )?;
-                    if n > 0 {
-                        freed.push(*b);
+                }
+                (pinned, content) => {
+                    tx.execute(
+                        "INSERT INTO pins (group_id, pin_id, rev, pinned, state, content, content_len, updated_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                         ON CONFLICT (group_id, pin_id) DO UPDATE SET
+                             rev = excluded.rev, pinned = excluded.pinned, state = excluded.state,
+                             content = excluded.content, content_len = excluded.content_len,
+                             updated_ms = excluded.updated_ms",
+                        params![g, pid, rev, pinned, w.state, content, content_len, now_ms],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM pin_blobs WHERE group_id = ?1 AND pin_id = ?2",
+                        params![g, pid],
+                    )?;
+                    if pinned {
+                        for b in w.blobs {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO pin_blobs (group_id, pin_id, blob_id) VALUES (?1, ?2, ?3)",
+                                params![g, pid, &b.0[..]],
+                            )?;
+                        }
+                    }
+                    // Файлы закрепа, которые больше никто не держит, — сразу.
+                    for b in &old_files {
+                        let n = tx.execute(
+                            "DELETE FROM blobs WHERE group_id = ?1 AND blob_id = ?2 AND pin_only = 1
+                               AND NOT EXISTS (SELECT 1 FROM pin_blobs AS pb
+                                               WHERE pb.group_id = ?1 AND pb.blob_id = ?2)",
+                            params![g, &b.0[..]],
+                        )?;
+                        if n > 0 {
+                            freed.push(*b);
+                        }
                     }
                 }
             }
-        }
-        tx.commit()?;
-        Ok(PinOutcome::Accepted { rev: rev as u64 })
+            tx.commit()?;
+            Ok(PinOutcome::Accepted { rev: rev as u64 })
+        })
     }
 
     /// Запись закрепа; содержимое — только до [`INLINE_BYTES`], как в
     /// рассылке `Pinned`.
     pub fn pin(&self, group: &GroupId, pin: &PinId) -> Result<Option<PinRecord>> {
-        record_in(&self.conn(), group, pin)
+        self.read(|conn| record_in(conn, group, pin))
     }
 
     /// Страница закрепов с `rev > after_rev`, по возрастанию: не больше
@@ -498,60 +499,63 @@ impl Store {
     /// длиннее [`INLINE_BYTES`] не кладётся (`content: None`). Второе в паре —
     /// есть ли записи дальше.
     pub fn pins_since(&self, group: &GroupId, after_rev: u64) -> Result<(Vec<PinRecord>, bool)> {
-        let conn = self.conn();
-        // На одну больше страницы: так видно, есть ли продолжение.
-        let mut stmt = conn.prepare(
-            "SELECT pin_id, rev, pinned, state, content_len,
-                    CASE WHEN content_len <= ?3 THEN content END
-             FROM pins WHERE group_id = ?1 AND rev > ?2 ORDER BY rev LIMIT ?4",
-        )?;
-        let mut rows = stmt.query(params![
-            &group.0[..],
-            after_rev as i64,
-            INLINE_BYTES as i64,
-            PAGE_RECORDS as i64 + 1
-        ])?;
-        let mut out = Vec::new();
-        let mut bytes = 0u64;
-        while let Some(r) = rows.next()? {
-            let rec = row_record(&conn, group, r)?;
-            let len = rec.content.as_ref().map_or(0, |c| c.len() as u64)
-                + (rec.blobs.len() * std::mem::size_of::<BlobId>()) as u64;
-            if out.len() == PAGE_RECORDS || (!out.is_empty() && bytes + len > PAGE_BYTES) {
-                // Не влезло: эта запись придёт следующей страницей.
-                return Ok((out, true));
+        self.read(|conn| {
+            // На одну больше страницы: так видно, есть ли продолжение.
+            let mut stmt = conn.prepare(
+                "SELECT pin_id, rev, pinned, state, content_len,
+                        CASE WHEN content_len <= ?3 THEN content END
+                 FROM pins WHERE group_id = ?1 AND rev > ?2 ORDER BY rev LIMIT ?4",
+            )?;
+            let mut rows = stmt.query(params![
+                &group.0[..],
+                after_rev as i64,
+                INLINE_BYTES as i64,
+                PAGE_RECORDS as i64 + 1
+            ])?;
+            let mut out = Vec::new();
+            let mut bytes = 0u64;
+            while let Some(r) = rows.next()? {
+                let rec = row_record(conn, group, r)?;
+                let len = rec.content.as_ref().map_or(0, |c| c.len() as u64)
+                    + (rec.blobs.len() * std::mem::size_of::<BlobId>()) as u64;
+                if out.len() == PAGE_RECORDS || (!out.is_empty() && bytes + len > PAGE_BYTES) {
+                    // Не влезло: эта запись придёт следующей страницей.
+                    return Ok((out, true));
+                }
+                bytes += len;
+                out.push(rec);
             }
-            bytes += len;
-            out.push(rec);
-        }
-        Ok((out, false))
+            Ok((out, false))
+        })
     }
 
     /// Содержимое закрепа целиком (`PinContent`). `None` — закрепа нет или
     /// он снят.
     pub fn pin_content(&self, group: &GroupId, pin: &PinId) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT content FROM pins WHERE group_id = ?1 AND pin_id = ?2",
-                params![&group.0[..], &pin.0[..]],
-                |r| r.get::<_, Option<Vec<u8>>>(0),
-            )
-            .optional()?
-            .flatten())
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT content FROM pins WHERE group_id = ?1 AND pin_id = ?2",
+                    params![&group.0[..], &pin.0[..]],
+                    |r| r.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()?
+                .flatten())
+        })
     }
 
     /// Сколько у группы закреплённых записей и сколько места закрепов
     /// занято: все записи, включая снятые, и файлы живых закрепов (то, что
     /// считается в `CLIPWIRE_PIN_BYTES`).
     pub fn pin_stats(&self, group: &GroupId) -> Result<(u64, u64)> {
-        let conn = self.conn();
-        let pins: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(pinned), 0) FROM pins WHERE group_id = ?1",
-            params![&group.0[..]],
-            |r| r.get(0),
-        )?;
-        Ok((pins.max(0) as u64, pins_used(&conn, group)?))
+        self.read(|conn| {
+            let pins: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(pinned), 0) FROM pins WHERE group_id = ?1",
+                params![&group.0[..]],
+                |r| r.get(0),
+            )?;
+            Ok((pins.max(0) as u64, pins_used(conn, group)?))
+        })
     }
 
     /// Метка закрепов группы в этой базе (`ServerMsg::Pins::epoch`):
@@ -559,33 +563,34 @@ impl Store {
     /// — новая метка, и устройства понимают, что `rev` пошли заново.
     pub fn pin_epoch(&self, group: &GroupId) -> Result<[u8; 16]> {
         let g = &group.0[..];
-        let conn = self.conn();
-        let old: Option<Option<Vec<u8>>> = conn
-            .query_row(
-                "SELECT pin_epoch FROM groups WHERE group_id = ?1",
-                params![g],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(e) = old.flatten().and_then(|e| <[u8; 16]>::try_from(e).ok()) {
-            return Ok(e);
-        }
-        let mut e = [0u8; 16];
-        getrandom::fill(&mut e).map_err(|e| anyhow::anyhow!("нет случайных байтов: {e}"))?;
-        // Две сессии одновременно: остаётся метка первой.
-        conn.execute(
-            "UPDATE groups SET pin_epoch = ?2 WHERE group_id = ?1 AND pin_epoch IS NULL",
-            params![g, &e[..]],
-        )?;
-        let now: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT pin_epoch FROM groups WHERE group_id = ?1",
-                params![g],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        Ok(now.and_then(|v| v.try_into().ok()).unwrap_or(e))
+        self.write(|conn| {
+            let old: Option<Option<Vec<u8>>> = conn
+                .query_row(
+                    "SELECT pin_epoch FROM groups WHERE group_id = ?1",
+                    params![g],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(e) = old.flatten().and_then(|e| <[u8; 16]>::try_from(e).ok()) {
+                return Ok(e);
+            }
+            let mut e = [0u8; 16];
+            getrandom::fill(&mut e).map_err(|e| anyhow::anyhow!("нет случайных байтов: {e}"))?;
+            // Две сессии одновременно: остаётся метка первой.
+            conn.execute(
+                "UPDATE groups SET pin_epoch = ?2 WHERE group_id = ?1 AND pin_epoch IS NULL",
+                params![g, &e[..]],
+            )?;
+            let now: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT pin_epoch FROM groups WHERE group_id = ?1",
+                    params![g],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            Ok(now.and_then(|v| v.try_into().ok()).unwrap_or(e))
+        })
     }
 
     /// Удалить снятые закрепы, которые не менялись с `before_ms` (сейчас
@@ -593,10 +598,12 @@ impl Store {
     /// устройства, видевшие снятие, о записи больше не спрашивают, а новым
     /// она и не нужна. Файлов у снятых записей нет. Возвращает число удалённых.
     pub fn purge_unpinned_pins(&self, before_ms: i64) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM pins WHERE pinned = 0 AND updated_ms < ?1",
-            params![before_ms],
-        )?)
+        self.write(|conn| {
+            Ok(conn.execute(
+                "DELETE FROM pins WHERE pinned = 0 AND updated_ms < ?1",
+                params![before_ms],
+            )?)
+        })
     }
 }
 
