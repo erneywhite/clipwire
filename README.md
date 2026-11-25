@@ -191,7 +191,8 @@ a server with pins a device uploads its earlier pins once. If two devices pinned
 while offline, one pin is kept with the note of the newer change. A pin can be removed on this
 device only: the other devices keep it, and it does not come back here unless you pin it here
 again. The server keeps pins with no expiry, encrypted with the group key, and refuses new ones
-over its limits (`CLIPWIRE_PIN_MAX`, `CLIPWIRE_PIN_BYTES`): such an entry stays pinned on this
+over its limits (`CLIPWIRE_PIN_MAX`, `CLIPWIRE_PIN_RECORDS`, `CLIPWIRE_PIN_BYTES`,
+`CLIPWIRE_PIN_TOTAL_BYTES`): such an entry stays pinned on this
 device only, and the app says so. The order of changes is decided by the server, not by device
 clocks: an unpin or a note made offline reaches every device even if this device's clock is
 behind. Simply deleting a pinned entry removes the pin on this device only; the other devices keep it
@@ -1009,7 +1010,11 @@ app without restarting the container.
 | `CLIPWIRE_HISTORY_TOTAL_BYTES`\* | `1073741824` | total limit of item history per server (1 GiB); the excess is evicted from the largest group |
 | `CLIPWIRE_MAX_DEVICE_CONNS`\* | `4` | simultaneous connections from one device |
 | `CLIPWIRE_PIN_MAX`\* | `5000` | how many pinned entries one group can keep on the server; a new pin over the limit is refused |
-| `CLIPWIRE_PIN_BYTES`\* | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries, the records of removed pins and the files of pinned entries. Those files don't count toward `CLIPWIRE_BLOB_QUOTA`. A file uploaded for a pin is deleted right after the pin is removed; a file that was ordinary before pinning counts toward `CLIPWIRE_BLOB_QUOTA` again |
+| `CLIPWIRE_PIN_BYTES`\* | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries, the records of removed pins and the files of pinned entries. Every record (removed ones too) also costs 192 bytes and every file in a pin's list 224 bytes, the size of the database rows, even if the file is not on the server yet. Those files don't count toward `CLIPWIRE_BLOB_QUOTA`. A file uploaded for a pin is deleted right after the pin is removed; a file that was ordinary before pinning counts toward `CLIPWIRE_BLOB_QUOTA` again |
+| `CLIPWIRE_PIN_RECORDS`\* | `20000` | how many pin records one group can keep, removed pins included; a new pin over the limit is refused |
+| `CLIPWIRE_PIN_TOTAL_BYTES`\* | `4294967296` | space for the pin records of all groups together (4 GiB), without files: those count toward `CLIPWIRE_BLOB_TOTAL_QUOTA` |
+| `CLIPWIRE_RELAY_RATE` | `16777216` | how fast the relay reads from one client, bytes per second (16 MiB/s); `0` means no limit. It also applies to the server's own relay connection, so everything the server sends through the relay is capped at this rate; direct UDP connections are not affected |
+| `CLIPWIRE_RELAY_GUESTS` | `32` | how many relay connections devices the server does not know as group members may hold at once: new devices before they join and devices removed by a key change. Members always get through |
 
 ### What the server stores
 
@@ -1032,11 +1037,22 @@ app without restarting the container.
 - Limits set from the app (table `settings`) and the admin of every group (a device ID).
 - Encrypted pins of the group (`clipwire/8`) with their notes and the pinned entries
   themselves, with no expiry: a pin lives until it is removed, and a removed pin stays as a
-  record of a few hundred bytes without content. Files of pinned entries are not deleted after
+  record of a few hundred bytes without content for 90 days, so that devices that were off learn
+  about the removal. A device that stays off longer misses it and keeps the entry pinned. Files of pinned entries are not deleted after
   `CLIPWIRE_TTL_HOURS` while the pin exists. A group with live pins is not deleted as idle.
   Pins are erased on a key change and together with the group.
 
-The server sees ciphertext only. When a device is removed, the server immediately erases the
+The server cannot read the contents: items, files, pins with notes, device cards and storage
+settings are encrypted with the group key. Metadata is stored in plain form, and whoever runs the
+server can see it: group ids and device IDs (who is in which group, when each device last
+connected and who is online), the source device, exact ciphertext size and timestamps of every
+item (the UUID v7 id carries the copy time), exact file sizes, which files belong to which pin,
+whether an entry is pinned, the admins of each group, who changed a group key and which devices
+were excluded, group names and invitation code labels (these are administrator notes and are not
+encrypted), and device IP addresses. The full list is in
+[docs/architecture.md](docs/architecture.md#что-видит-администратор-сервера).
+
+When a device is removed, the server immediately erases the
 history and files of the old group, hands the remaining devices the new key (packed separately
 for each one) and tells the removed device that it was excluded. See
 [docs/devices.md](docs/devices.md) and [docs/architecture.md](docs/architecture.md).
