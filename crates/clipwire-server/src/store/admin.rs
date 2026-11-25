@@ -60,6 +60,12 @@ pub(super) const COUNTED_GROUP: &str =
 /// токеном отклонён.
 const RELAY_ROTATED: &str = "_relay_token_rotated_ms";
 
+/// Служебный ключ: отпечаток токена relay, с которым сервер работал прошлый
+/// раз (первые 8 байт [`clipwire_core::admin::relay_token_fingerprint`]).
+/// Нужен, чтобы заметить смену токена мимо клиента: переменной окружения
+/// `CLIPWIRE_RELAY_TOKEN` или правкой файла `relay.token`.
+const RELAY_TOKEN_FP: &str = "_relay_token_fp";
+
 /// Можно ли этому входу создать группу, если её нет.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Create {
@@ -493,6 +499,42 @@ impl Store {
             )
             .optional()?
             .is_some())
+    }
+
+    /// Запомнить отпечаток текущего токена relay. Если запомнен был другой,
+    /// токен сменили, и это отмечается как смена из клиента
+    /// ([`Store::mark_relay_rotated`]): старые коды приглашения перестают
+    /// пускать обычным `Join`. Возвращает, сменился ли токен. Первый запуск
+    /// (и первый запуск версии, которая отпечаток ещё не хранила) сменой не
+    /// считается: сравнивать не с чем.
+    pub fn note_relay_token(&self, fingerprint: &[u8; 32], now_ms: i64) -> Result<bool> {
+        let fp = i64::from_be_bytes(fingerprint[..8].try_into().expect("8 байт"));
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let stored: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![RELAY_TOKEN_FP],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let changed = stored.is_some_and(|s| s != fp);
+        if stored != Some(fp) {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![RELAY_TOKEN_FP, fp],
+            )?;
+        }
+        if changed {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![RELAY_ROTATED, now_ms],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn mark_relay_rotated(&self, now_ms: i64) -> Result<()> {
@@ -1273,6 +1315,27 @@ mod tests {
         s.set_settings(&[("max_devices".into(), None)]).unwrap();
         assert_eq!(s.settings().unwrap(), vec![("pin_max".into(), 7)]);
         assert!(s.relay_rotated().unwrap());
+    }
+
+    #[test]
+    fn relay_token_change_outside_client_is_noticed() {
+        let s = Store::in_memory().unwrap();
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        // Первый запуск: сравнивать не с чем.
+        assert!(!s.note_relay_token(&a, 10).unwrap());
+        assert!(!s.relay_rotated().unwrap());
+        // Тот же токен после перезапуска.
+        assert!(!s.note_relay_token(&a, 20).unwrap());
+        assert!(!s.relay_rotated().unwrap());
+        // Токен сменили переменной окружения или правкой файла.
+        assert!(s.note_relay_token(&b, 30).unwrap());
+        assert!(s.relay_rotated().unwrap());
+        assert_eq!(relay_rotated_ms(&s.conn()).unwrap(), Some(30));
+        // Следующий запуск с новым токеном — уже не смена, отметка прежняя.
+        assert!(!s.note_relay_token(&b, 40).unwrap());
+        assert_eq!(relay_rotated_ms(&s.conn()).unwrap(), Some(30));
+        // Служебный ключ в настройки не попадает.
+        assert!(s.settings().unwrap().is_empty());
     }
 
     #[test]

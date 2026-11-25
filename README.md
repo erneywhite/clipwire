@@ -844,11 +844,15 @@ version number: `ghcr.io/erneywhite/clipwire-server:0.10.1`.
 4. Optionally hide the iroh-relay status page at the domain root: add a `location = /` with a
    redirect to the proxy config. An example is at the end of
    [deploy/nginx-clipwire.conf](deploy/nginx-clipwire.conf).
-5. Find the server code line in the container log (Clipwire's own log line is in Russian:
-   `код сервера: cwserver2-…`). Your first device connects with it. `clipwire-server info`
-   prints the same. **This line contains the server administrator key**: whoever can read the
-   container log can create groups and change limits. Do not show the log to others and do not
-   paste it whole into chats or issues.
+5. Find the server code line in the container log of the first start (Clipwire's own log line
+   is in Russian: `код сервера: cwserver2-…`). Your first device connects with it. Later starts
+   do not print it; see [Administrator code](#administrator-code) for how to get it again.
+   **This line contains the server administrator key**: whoever can read the container log can
+   create groups and change limits. Do not show the log to others and do not paste it whole into
+   chats or issues.
+
+Both compose files cap the container at 1 GB of memory (`mem_limit`) and keep at most three log
+files of 10 MB. With large groups and many images the memory limit can be raised.
 
 **Updating:** pull the new image and recreate the container. When the app needs a newer
 server protocol, About shows it next to the server version and you get a notification once.
@@ -871,14 +875,18 @@ invitation code. The administrator key (32 random bytes, `admin.key` in the data
 created on the first start of server 0.5.0 and is only in the server code `cwserver2-…`, never in
 an invitation code. Where to find the code:
 
-- the container log in the Docker panel, line `код сервера: cwserver2-…` (printed at every
-  start). When the administrator changes a secret from the app, the new code is not written to the
-  log: the app shows it, and the log prints it at the next container start;
-- `clipwire-server info` in the container console, if your panel has one.
+- the container log in the Docker panel, line `код сервера: cwserver2-…`. It is printed only on
+  the first start, when the administrator key is created. Later starts print a hint instead;
+- `docker exec <container> clipwire-server info` prints the current code at any time. The image has
+  no shell, so a panel console that opens `sh` will not work, only `docker exec` with the command;
+- without a console: set `CLIPWIRE_PRINT_SERVER_CODE=1` in the container settings and restart it.
+  The code then appears in the log at every start; remove the variable once you have it.
 
-The container log contains the administrator code, so access to it is server administrator
-access. Printing it on start is deliberate: the server is deployed through panels, and without SSH
-the log is the only way to get the code.
+When the administrator changes a secret from the app, the new code is not written to the log: the
+app shows it, and `clipwire-server info` prints it.
+
+The container log of the first start contains the administrator code, so access to it is server
+administrator access.
 
 With the administrator code a device can create groups and sees the **Server** section in
 settings: limits (the same as the variables below), a server summary, changing the relay token
@@ -941,7 +949,9 @@ The key is stored encrypted on the device, like the group key; it can be forgott
 **Server** section, and leaving the group removes it too.
 
 Changing the relay token disconnects every device, and old invitation codes stop working: hand
-out a new one. The device that changed the token saves the new server code and reconnects on its
+out a new one. This also holds for a token changed in `CLIPWIRE_RELAY_TOKEN` or in `relay.token`
+with a restart: the server remembers the fingerprint of the previous token and notices the change
+at start. The device that changed the token saves the new server code and reconnects on its
 own, and the app shows the new server code and the new invitation code for its group. Other
 devices enter the new invitation code under **Sync → New invite code**: the group, history and
 keys stay, only the token changes. An administrator device in
@@ -968,6 +978,7 @@ app without restarting the container.
 | `CLIPWIRE_RELAY_BIND` | `0.0.0.0:3340` | HTTP of the built-in relay |
 | `CLIPWIRE_QUIC_BIND` | `0.0.0.0:7843` | UDP for direct connections |
 | `CLIPWIRE_RELAY_TOKEN` | generated | relay access token, if you want your own (up to 256 characters) |
+| `CLIPWIRE_PRINT_SERVER_CODE` | not set | `1`: print the server code with the administrator key at every start, not only the first one |
 | `CLIPWIRE_MAX_ITEM_BYTES`\* | `8388608` | limit for one encrypted item (8 MiB, enough for images) |
 | `CLIPWIRE_HISTORY_LEN`\* | `50` | how many latest items to keep per group |
 | `CLIPWIRE_TTL_HOURS`\* | `24` | how long to keep an item |

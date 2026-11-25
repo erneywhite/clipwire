@@ -14,6 +14,15 @@ services:
     # SQLite может писать временные файлы в /tmp: он в памяти.
     tmpfs:
       - /tmp
+    # Предел памяти: если что-то пойдёт не так, контейнер упрётся в него, а не
+    # займёт всю память машины. Для больших групп и картинок можно поднять.
+    mem_limit: 1g
+    # Лог не растёт без конца: три файла по 10 МБ.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       CLIPWIRE_PUBLIC_URL: https://clip.example.com
       # Необязательные, значения по умолчанию:
@@ -33,6 +42,9 @@ services:
       # CLIPWIRE_PIN_MAX: 5000
       # CLIPWIRE_PIN_BYTES: 2147483648
       # RUST_LOG: info
+      # Печатать код сервера (с ключом администратора) при каждом запуске,
+      # а не только при первом:
+      # CLIPWIRE_PRINT_SERVER_CODE: 1
     ports:
       # relay по HTTP, наружу его выставляет nginx с TLS
       - "127.0.0.1:3340:3340"
