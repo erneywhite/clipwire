@@ -239,14 +239,60 @@ pub enum ClientMatch {
 }
 
 /// Одна и та же программа: пути совпадают, на Windows без учёта регистра.
+/// Папки, похожие на версию или хэш сборки, не сравниваются: клиенты ставят
+/// каждое обновление в свою папку (`claude-code\2.1.331\8ceec14ae60c\
+/// claude.exe`, `nvm\v20.11.1\node.exe`, `Cellar/node/22.1.0/bin/node`,
+/// `app-1.0.9\Discord.exe`), и после обновления Clipwire спрашивал бы доступ
+/// заново. Остальной путь и имя файла сравниваются целиком, так что
+/// программа из другой папки по-прежнему считается другой.
 /// Не определилась — совпадает только с «не определилась».
 pub fn same_program(a: Option<&str>, b: Option<&str>) -> bool {
     match (a, b) {
         (None, None) => true,
-        (Some(a), Some(b)) if cfg!(windows) => a.to_lowercase() == b.to_lowercase(),
-        (Some(a), Some(b)) => a == b,
+        (Some(a), Some(b)) => program_key(a) == program_key(b),
         _ => false,
     }
+}
+
+/// Путь программы для сравнения: на Windows в нижнем регистре, разделители
+/// единые, папки-версии и папки-хэши заменены на `*`.
+fn program_key(path: &str) -> String {
+    let path = if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    };
+    let parts: Vec<&str> = path.split(['/', '\\']).collect();
+    let last = parts.len().saturating_sub(1);
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| if i != last && build_folder(p) { "*" } else { p })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Папка конкретной сборки: версия (`2.1.331`, `v20.11.1`, `1.2.3-beta.1`,
+/// `app-1.0.9`), хэш (`8ceec14ae60c`) или точка монтирования AppImage
+/// (`.mount_AbC123`).
+fn build_folder(p: &str) -> bool {
+    let version = |s: &str| {
+        let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
+        let core = s.split(['-', '+']).next().unwrap_or("");
+        let nums: Vec<&str> = core.split('.').collect();
+        nums.len() >= 2
+            && nums
+                .iter()
+                .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let hash = p.len() >= 7
+        && p.bytes().all(|b| b.is_ascii_hexdigit())
+        && p.bytes().any(|b| b.is_ascii_digit())
+        && p.bytes().any(|b| b.is_ascii_alphabetic());
+    let named_version = p.split_once('-').is_some_and(|(name, v)| {
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphabetic()) && version(v)
+    });
+    version(p) || hash || named_version || p.starts_with(".mount_")
 }
 
 /// Какие виды записей видны ИИ (см. [`clipwire_core::ai::AiKind`]).
@@ -597,6 +643,49 @@ mod tests {
         assert_eq!(
             same_program(Some(r"C:\Tools\Claude.exe"), Some(r"c:\tools\claude.EXE")),
             cfg!(windows)
+        );
+    }
+
+    #[test]
+    fn same_program_survives_client_updates() {
+        use super::same_program;
+        let same = |a: &str, b: &str| same_program(Some(a), Some(b));
+        // Обновление клиента — новая папка версии и хэша.
+        assert!(same(
+            "/u/Claude-Data/claude-code/2.1.331/8ceec14ae60c/claude.exe",
+            "/u/Claude-Data/claude-code/2.1.402/0f1e2d3c4b5a/claude.exe"
+        ));
+        assert!(same(
+            "/home/u/.nvm/versions/node/v20.11.1/bin/node",
+            "/home/u/.nvm/versions/node/v22.3.0/bin/node"
+        ));
+        assert!(same(
+            "/opt/homebrew/Cellar/node/22.1.0/bin/node",
+            "/opt/homebrew/Cellar/node/23.0.0-rc.1/bin/node"
+        ));
+        assert!(same(
+            "/u/Discord/app-1.0.9/Discord.exe",
+            "/u/Discord/app-1.0.11/Discord.exe"
+        ));
+        assert!(same(
+            "/tmp/.mount_AbC123/usr/bin/cursor",
+            "/tmp/.mount_ZyX987/usr/bin/cursor"
+        ));
+        // Другая программа или другая папка — по-прежнему другая.
+        assert!(!same(
+            "/u/claude-code/2.1.331/claude.exe",
+            "/u/claude-code/2.1.331/evil.exe"
+        ));
+        assert!(!same(
+            "/u/claude-code/2.1.331/claude.exe",
+            "/u/Downloads/2.1.331/claude.exe"
+        ));
+        assert!(!same("/u/bin/claude", "/u/bin2/claude"));
+        // Обычные папки с цифрами не считаются версиями.
+        assert!(!same("/u/projects2024/claude", "/u/projects2025/claude"));
+        assert!(
+            !same("/u/deadbeef/claude", "/u/cafebabe/claude"),
+            "без цифр — не хэш"
         );
     }
 
