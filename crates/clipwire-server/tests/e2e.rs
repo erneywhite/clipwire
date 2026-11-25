@@ -236,6 +236,37 @@ async fn relay_rejects_wrong_token() -> Result<()> {
     server.shutdown().await
 }
 
+/// Неизвестных устройств в relay одновременно не больше
+/// `CLIPWIRE_RELAY_GUESTS`. Гость, который вошёл в группу, места больше не
+/// держит; участник проходит всегда.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_limits_unknown_devices() -> Result<()> {
+    let guards = Guards {
+        relay_guests: 1,
+        ..Guards::default()
+    };
+    let (server, relay) = start_server_guarded(|_| {}, guards).await?;
+    let key = GroupKey::generate()?;
+    // Первое устройство — гость, входит в группу и становится участником.
+    let mut a = Client::connect(&server.info, &relay, "test-token").await?;
+    a.join(&key).await?;
+    // Место гостя освобождается для следующего неизвестного.
+    let _b = Client::connect(&server.info, &relay, "test-token").await?;
+    // Третьему неизвестному места нет.
+    let res = tokio::time::timeout(
+        Duration::from_secs(8),
+        Client::connect(&server.info, &relay, "test-token"),
+    )
+    .await;
+    assert!(
+        !matches!(res, Ok(Ok(_))),
+        "сверх предела гостей подключиться не должно"
+    );
+    // Участник по-прежнему на связи.
+    a.push_text(&key, "ещё здесь").await?;
+    server.shutdown().await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn oversized_item_is_dropped() -> Result<()> {
     let (server, relay) = start_server().await?;
@@ -1718,7 +1749,7 @@ async fn pin_quotas_refuse_without_disconnect() -> Result<()> {
     for i in 0..2 {
         let pin = PinId::random()?;
         let (s, c) = sealed_pin(&key, &pin, a.device, &format!("{i}"), "", true)?;
-        used += (s.len() + c.len()) as u64;
+        used += (s.len() + c.len()) as u64 + clipwire_server::PIN_RECORD_OVERHEAD;
         match a.pin_set(pin, 0, true, s, Some(c), vec![]).await? {
             ServerMsg::PinAccepted { .. } => pins.push(pin),
             other => anyhow::bail!("ждали PinAccepted, пришло {other:?}"),

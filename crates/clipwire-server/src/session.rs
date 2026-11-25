@@ -99,6 +99,8 @@ impl Limits {
             pin_quota: crate::store::PinQuota {
                 max_pins: guards.pin_max,
                 max_bytes: guards.pin_bytes,
+                max_records: guards.pin_records,
+                max_total_bytes: guards.pin_total_bytes,
             },
         }
     }

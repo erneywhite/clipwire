@@ -170,6 +170,8 @@ pub fn value_of(l: &Limits, key: &str) -> Option<u64> {
         "max_reserves" => l.max_reserves as u64,
         "pin_max" => l.pin_quota.max_pins,
         "pin_bytes" => l.pin_quota.max_bytes,
+        "pin_records" => l.pin_quota.max_records,
+        "pin_total_bytes" => l.pin_quota.max_total_bytes,
         _ => return None,
     })
 }
@@ -192,6 +194,8 @@ fn set_value(l: &mut Limits, key: &str, v: u64) {
         "max_reserves" => l.max_reserves = us(v),
         "pin_max" => l.pin_quota.max_pins = v,
         "pin_bytes" => l.pin_quota.max_bytes = v,
+        "pin_records" => l.pin_quota.max_records = v,
+        "pin_total_bytes" => l.pin_quota.max_total_bytes = v,
         _ => tracing::warn!(key, "незнакомая настройка в базе, пропускаю"),
     }
 }
