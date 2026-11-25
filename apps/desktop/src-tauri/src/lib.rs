@@ -716,6 +716,7 @@ pub fn run() {
             devices::group_rekey,
             devices::group_retry,
             devices::group_rekey_offer,
+            devices::rekey_sent,
             devices::group_rekey_accept,
             devices::group_rekey_decline,
             commands::copy_quietly,

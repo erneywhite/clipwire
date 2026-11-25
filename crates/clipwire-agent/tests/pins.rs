@@ -76,6 +76,8 @@ struct Mem {
     limit_mb: std::sync::atomic::AtomicU64,
     /// Свои записи можно отправлять (нет паузы, исключений, выключенных видов).
     share: std::sync::atomic::AtomicBool,
+    /// Свои записи помечены «только здесь» (`ext::LOCAL_ONLY`).
+    kept: std::sync::atomic::AtomicBool,
 }
 
 impl Mem {
@@ -85,6 +87,7 @@ impl Mem {
             rows: Mutex::default(),
             limit_mb: 100.into(),
             share: true.into(),
+            kept: false.into(),
         })
     }
 
@@ -217,6 +220,10 @@ impl PinSource for Mem {
     }
     fn may_send_own(&self, _: &Content) -> bool {
         self.share.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn kept_local(&self, hash: &[u8; 32]) -> bool {
+        self.kept.load(std::sync::atomic::Ordering::Relaxed)
+            && self.rows.lock().unwrap().get(hash).is_some_and(|r| r.local)
     }
     fn file_item(&self, hash: &[u8; 32]) -> Option<(Item, bool)> {
         let rows = self.rows.lock().unwrap();
@@ -1418,6 +1425,44 @@ async fn foreign_pin_skips_local_only_file() -> Result<()> {
         .mem
         .add_content(Content::Files(vec![file.clone()]), false, "");
     // B угадал путь и размер и закрепляет запись с тем же хэшем.
+    let item = a.mem.item(&h).context("нет записи")?;
+    b.mem.add_foreign(item, true);
+    b.pins.pin(h, "");
+    a.until("закреп пришёл", |m, _| {
+        m.state(&h).is_some_and(|(p, _)| p)
+    })
+    .await?;
+    never_uploaded(&mut b, &mut a, &h).await?;
+    assert!(
+        a.mem.files(&h).iter().all(|f| f.blob.is_none()),
+        "своя запись получила blob: {:?}",
+        a.mem.files(&h)
+    );
+    a.stop().await?;
+    b.stop().await?;
+    server.shutdown().await
+}
+
+/// Свой файл, скопированный на паузе, остаётся только здесь и после того,
+/// как паузу сняли: отправлять сейчас можно (`share`), но запись помечена
+/// «только здесь», и чужой закреп с тем же хэшем её файл не заливает.
+#[tokio::test(flavor = "multi_thread")]
+async fn foreign_pin_skips_file_kept_local_after_resume() -> Result<()> {
+    let (server, info) = start_server(Guards::default()).await?;
+    let key = GroupKey::generate()?;
+    let mut a = Dev::new("A", &info, &key)?;
+    let mut b = Dev::new("B", &info, &key)?;
+    a.files = true;
+    // Пауза уже снята, метка осталась.
+    a.mem.kept.store(true, std::sync::atomic::Ordering::Relaxed);
+    a.start();
+    a.online().await?;
+    b.start();
+    b.online().await?;
+    let file = disk_file(&a.dir.join("src"), "secret.bin", 300_000)?;
+    let h = a
+        .mem
+        .add_content(Content::Files(vec![file.clone()]), false, "");
     let item = a.mem.item(&h).context("нет записи")?;
     b.mem.add_foreign(item, true);
     b.pins.pin(h, "");

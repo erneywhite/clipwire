@@ -139,18 +139,33 @@ pub fn trusted_files(remote: &[FileRef], local: Option<&[FileRef]>) -> Option<Ve
     )
 }
 
-/// Можно ли починкой чужого закрепа залить свой файл без вопроса. Да, если
-/// это устройство само его уже заливало (`blob` в своей записи без прямой
-/// передачи — такие `blob` выпускает только оно): файл и так был в группе.
-/// Иначе — только если запись сейчас можно отправить в группу (`share`: не
-/// пауза, виды включены в «Что отправлять», правила «Не отправлять» её не
-/// задевают), файл не под правилом «Не загружать сразу» и в пределах порога «сразу
-/// заливать» (`limit_mb`). Иначе закреп с тем же хэшем от любого участника
-/// вытащил бы файл, который настройки держат на этом устройстве. Порог 0 —
-/// никогда. Файл больше порога заливается, только когда закрепляет сам
-/// владелец (окно вставки спрашивает).
-pub fn may_repair_own(local: &FileRef, limit_mb: u64, share: bool) -> bool {
-    if limit_mb == 0 {
+/// Согласие владельца своей записи на заливку её файлов починкой чужого
+/// закрепа ([`may_repair_own`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Consent {
+    /// Запись сейчас можно отправить в группу: не пауза, виды включены в «Что
+    /// отправлять», правила «Не отправлять» её не задевают.
+    pub share: bool,
+    /// Запись помечена «только здесь» (`ext::LOCAL_ONLY`): когда её
+    /// скопировали, она в группу не ушла, и с тех пор человек её сам не
+    /// отправлял.
+    pub kept: bool,
+}
+
+/// Можно ли починкой чужого закрепа залить свой файл без вопроса. Нет, если
+/// запись помечена «только здесь» (`consent.kept`): решение не отправлять её
+/// принималось при копировании, и то, что причина прошла (пауза снята, вид
+/// включили), его не отменяет. Да, если это устройство само его уже
+/// заливало (`blob` в своей записи без прямой передачи — такие `blob`
+/// выпускает только оно): файл и так был в группе. Иначе — только если
+/// запись сейчас можно отправить в группу (`consent.share`), файл не под
+/// правилом «Не загружать сразу» и в пределах порога «сразу заливать»
+/// (`limit_mb`). Иначе закреп с тем же хэшем от любого участника вытащил бы
+/// файл, который настройки держат на этом устройстве. Порог 0 — никогда.
+/// Файл больше порога заливается, только когда закрепляет сам владелец
+/// (окно вставки спрашивает).
+pub fn may_repair_own(local: &FileRef, limit_mb: u64, consent: Consent) -> bool {
+    if limit_mb == 0 || consent.kept {
         return false;
     }
     if local.blob.is_some() && !local.p2p {
@@ -161,7 +176,7 @@ pub fn may_repair_own(local: &FileRef, limit_mb: u64, share: bool) -> bool {
     } else {
         local.size
     };
-    share
+    consent.share
         && !crate::exclusions::no_upload(local)
         && crate::service::route(size, limit_mb) == crate::service::Route::Server
 }
@@ -173,14 +188,14 @@ pub type RepairPlan = (Vec<FileRef>, Vec<(usize, Bytes)>);
 /// Что залить при починке закрепа: файлы для содержимого
 /// ([`trusted_files`]) и какие из них заливать — не покрытые (`held`), с
 /// байтами здесь и, если запись своя, только с согласия владельца
-/// ([`may_repair_own`]; `share` — можно ли сейчас отправить свою запись в
-/// группу). `None` — содержимое не сходится со своей записью.
+/// ([`may_repair_own`], [`Consent`]). `None` — содержимое не сходится со
+/// своей записью.
 pub fn repair_picks(
     remote: &[FileRef],
     local: Option<&[FileRef]>,
     held: impl Fn(BlobId) -> bool,
     limit_mb: u64,
-    share: bool,
+    consent: Consent,
     files_dir: &Path,
 ) -> Option<RepairPlan> {
     let files = trusted_files(remote, local)?;
@@ -189,7 +204,7 @@ pub fn repair_picks(
         .iter()
         .enumerate()
         .filter(|(_, f)| !covered(f, &held))
-        .filter(|(i, _)| local.is_none_or(|l| may_repair_own(&l[*i], limit_mb, share)))
+        .filter(|(i, _)| local.is_none_or(|l| may_repair_own(&l[*i], limit_mb, consent)))
         .filter_map(|(i, f)| local_bytes(f, own, files_dir).map(|b| (i, b)))
         .collect();
     Some((files, picks))
@@ -457,30 +472,58 @@ mod tests {
         };
         for remote in [f, unc] {
             let (_, picks) =
-                repair_picks(&[remote], None, |_| false, 100, true, &dir.join("files")).unwrap();
+                repair_picks(&[remote], None, |_| false, 100, ok(), &dir.join("files")).unwrap();
             assert!(picks.is_empty(), "{picks:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Согласие: отправлять можно, метки «только здесь» нет.
+    fn ok() -> Consent {
+        Consent {
+            share: true,
+            kept: false,
+        }
+    }
+
+    const NO_SHARE: Consent = Consent {
+        share: false,
+        kept: false,
+    };
 
     #[test]
     fn own_repair_needs_owner_consent() {
         let mb = 1024 * 1024;
         let mut f = file(None, false);
         f.size = 5 * mb;
-        assert!(!may_repair_own(&f, 0, true), "порог 0 — никогда");
-        assert!(may_repair_own(&f, 10, true), "в пределах порога");
-        assert!(!may_repair_own(&f, 1, true), "больше порога и не заливался");
+        assert!(!may_repair_own(&f, 0, ok()), "порог 0 — никогда");
+        assert!(may_repair_own(&f, 10, ok()), "в пределах порога");
+        assert!(!may_repair_own(&f, 1, ok()), "больше порога и не заливался");
         // Уже заливался этим устройством (свой blob без прямой передачи).
         f.blob = Some(BlobId([1; 16]));
-        assert!(may_repair_own(&f, 1, true));
-        assert!(may_repair_own(&f, 1, false), "и так был в группе");
+        assert!(may_repair_own(&f, 1, ok()));
+        assert!(may_repair_own(&f, 1, NO_SHARE), "и так был в группе");
         f.p2p = true;
         assert!(
-            !may_repair_own(&f, 1, true),
+            !may_repair_own(&f, 1, ok()),
             "прямая передача — не заливался"
         );
-        assert!(!may_repair_own(&f, 0, true));
+        assert!(!may_repair_own(&f, 0, ok()));
+    }
+
+    /// Запись, оставшаяся только здесь, не заливается и после того, как
+    /// причина прошла (`share` снова да), и даже с `blob`.
+    #[test]
+    fn kept_local_is_never_repaired() {
+        let kept = Consent {
+            share: true,
+            kept: true,
+        };
+        let mut f = file(None, false);
+        assert!(may_repair_own(&f, 100, ok()));
+        assert!(!may_repair_own(&f, 100, kept));
+        f.blob = Some(BlobId([1; 16]));
+        assert!(!may_repair_own(&f, 100, kept));
     }
 
     /// Свой файл, который остался только здесь (пауза, «Что отправлять»,
@@ -489,7 +532,7 @@ mod tests {
     #[test]
     fn own_local_only_file_not_repaired() {
         let f = file(None, false);
-        assert!(!may_repair_own(&f, 100, false));
+        assert!(!may_repair_own(&f, 100, NO_SHARE));
         let dir = std::env::temp_dir().join(format!(
             "clipwire-pin-local-only-{}",
             getrandom::u64().unwrap()
@@ -506,20 +549,24 @@ mod tests {
             ..f
         };
         let files = std::slice::from_ref(&local);
-        let pick = |share| {
+        let pick = |share, kept| {
             repair_picks(
                 files,
                 Some(files),
                 |_| false,
                 100,
-                share,
+                Consent { share, kept },
                 &dir.join("files"),
             )
             .unwrap()
             .1
         };
-        assert!(pick(false).is_empty(), "залили файл, который только здесь");
-        assert_eq!(pick(true), vec![(0, Bytes::Source(path))]);
+        assert!(
+            pick(false, false).is_empty(),
+            "залили файл, который только здесь"
+        );
+        assert!(pick(true, true).is_empty(), "метка «только здесь»");
+        assert_eq!(pick(true, false), vec![(0, Bytes::Source(path))]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
