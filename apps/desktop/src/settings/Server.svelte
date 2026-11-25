@@ -606,7 +606,7 @@
         <button onclick={() => copy(adminCode, 'admin-server')}>{copied === 'admin-server' ? t('Скопировано') : t('Скопировать код сервера')}</button>
         <button onclick={() => (adminCode = '')}>{t('Скрыть')}</button>
       </div>
-      <p class="hint">{t('На этом устройстве новый ключ уже сохранён. Сервер тоже печатает новый код в лог контейнера.')}</p>
+      <p class="hint">{t('На этом устройстве новый ключ уже сохранён. На сервере новый код покажет команда clipwire-server info.')}</p>
     </div>
   {/if}
 </div>
