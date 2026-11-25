@@ -796,6 +796,8 @@ The question window shows which program started the bridge, for example
 `C:\Users\…\claude.exe` or `/usr/local/bin/node`. The answer is remembered for the pair of name
 and program. If another program connects under the same name, Clipwire asks again and shows both,
 the earlier one and the current one. Denying it does not take access away from the real client.
+Folders that look like a version or a build hash (`2.1.331`, `v20.11.1`, `8ceec14ae60c`) are not
+compared, so a client that installs each update into a new folder keeps its access.
 When the program cannot be determined, the window says **program unknown**. Clients allowed
 before 0.11.0 had no program; the first program that connects after the update is bound to them.
 
@@ -880,7 +882,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.11.0`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.11.1`.
 
 **Through a Docker control panel or plain `docker compose`:**
 

@@ -3,9 +3,9 @@
   // положить текст в буфер. Вопросы стоят в очереди у Rust, окно показывает
   // один, первый. Событие clipwire://consent — повод перечитать очередь; само
   // окно показывает и прячет Rust.
-  import { onMount } from 'svelte'
+  import { onMount, tick } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
-  import { getCurrentWindow } from '@tauri-apps/api/window'
+  import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window'
   import { api, type ConsentChoice, type ConsentDto, type Settings } from '../lib/api'
   import { applyTheme } from '../lib/theme'
   import { t, tn } from '../lib/i18n'
@@ -30,6 +30,41 @@
    * запомнился бы. У вопроса про буфер — на «Отклонить», он не запоминается.
    */
   let safeFocus = $state<HTMLElement | null>(null)
+  let root = $state<HTMLElement | null>(null)
+
+  /** Самый высокий блок с текстом для буфера, пока окно подгоняется по высоте. */
+  const TEXT_MAX = 360
+
+  /**
+   * Высота окна — по содержимому вопроса: путь программы, предупреждение о
+   * смене программы и длинное имя клиента не должны прятаться под прокрутку.
+   * Окно не выше экрана; блок с текстом для буфера растёт до TEXT_MAX, дальше
+   * прокручивается внутри. После смены высоты окно встаёт по центру заново.
+   */
+  async function fit() {
+    await tick()
+    if (!root) return
+    root.classList.add('measure')
+    const want = Math.ceil(root.scrollHeight)
+    root.classList.remove('measure')
+    const max = Math.max(320, window.screen.availHeight - 80)
+    const height = Math.min(want, max)
+    if (Math.abs(height - window.innerHeight) < 2) return
+    const w = getCurrentWindow()
+    try {
+      await w.setSize(new LogicalSize(window.innerWidth, height))
+      await w.center()
+    } catch {
+      // Не вышло подогнать — останется прокрутка, вопрос всё равно виден.
+    }
+  }
+
+  $effect(() => {
+    // Перечитать высоту при новом вопросе и при появлении ошибки.
+    void req?.id
+    void error
+    fit()
+  })
 
   async function refresh() {
     try {
@@ -125,7 +160,7 @@
 
 <svelte:window {onkeydown} />
 
-<div class="window">
+<div class="window" bind:this={root}>
   <TitleBar title={t('Clipwire — запрос ИИ')} onclose={dismiss} />
   {#if req}
     <main>
@@ -188,6 +223,17 @@
     flex-direction: column;
     height: 100vh;
     background: var(--c-bg);
+  }
+  /* Замер для fit(): высота по содержимому, текст для буфера не выше TEXT_MAX. */
+  .window:global(.measure) {
+    height: auto;
+  }
+  .window:global(.measure) .text {
+    flex: none;
+    max-height: 360px;
+  }
+  .window:global(.measure) .buttons {
+    margin-top: 0;
   }
   main {
     flex: 1;
