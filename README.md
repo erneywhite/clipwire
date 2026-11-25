@@ -478,7 +478,11 @@ all. The removed device keeps the relay token from the invitation code:
 it can no longer create groups (that needs the administrator code since server 0.5.0), but it
 can still reach the relay. If the computer may have fallen into the wrong hands, the server
 administrator changes the relay token (the app calls it the **access token**, in the **Server**
-section), and every device enters a new invitation code.
+section), and every device enters a new invitation code. Removing a device does not revoke the
+server administrator key either: if the removed device had it, it can still manage the server.
+When this device has the key, the removal dialog offers **Change the server admin key** (on by
+default) and shows the new server code afterwards; otherwise it warns that the server
+administrator should change the admin key and the access token.
 
 **Changing the group key** does the same without removing anyone, which is useful if the
 invitation code ended up in the wrong place. The group's history on the server is erased, local

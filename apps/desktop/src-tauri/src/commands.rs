@@ -10,7 +10,7 @@ use clipwire_agent::state::{AgentState, random_key};
 use clipwire_core::{Content, ExtList, GroupKey, Invite, ItemId};
 use serde::Serialize;
 use tauri::Emitter;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::{AppState, StatusDto, current_status, publish_status, start_service};
 
@@ -40,7 +40,8 @@ pub fn set_paused(app: AppHandle, state: State<'_, AppState>, paused: bool) {
 
 /// Код приглашения для нового устройства (в нём ключ группы).
 #[tauri::command]
-pub fn invite_code(state: State<'_, AppState>) -> CmdResult<String> {
+pub fn invite_code(window: WebviewWindow, state: State<'_, AppState>) -> CmdResult<String> {
+    crate::admin::only_settings(&window)?;
     let agent = state
         .paths
         .load()
@@ -726,7 +727,8 @@ pub async fn save_settings(app: AppHandle, mut settings: Settings) -> CmdResult<
 
 /// Отключить устройство от группы: ключи удаляются, локальная история остаётся.
 #[tauri::command]
-pub async fn leave_group(app: AppHandle) -> CmdResult<()> {
+pub async fn leave_group(window: WebviewWindow, app: AppHandle) -> CmdResult<()> {
+    crate::admin::only_settings(&window)?;
     crate::stop_service(&app).await;
     let reset = app.state::<AppState>().paths.reset();
     app.state::<AppState>()
