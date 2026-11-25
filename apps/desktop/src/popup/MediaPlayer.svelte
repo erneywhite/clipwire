@@ -23,7 +23,6 @@
   const VOLUME_KEY = 'clipwire.volume'
 
   let media: HTMLMediaElement | undefined = $state()
-  let box: HTMLElement | undefined = $state()
   let paused = $state(true)
   let waiting = $state(false)
   let current = $state(0)
@@ -31,11 +30,6 @@
   let volume = $state(savedVolume())
   let muted = $state(false)
   let stopped = false
-
-  const canFullscreen = $derived(
-    kind === 'video' &&
-      (document.fullscreenEnabled || !!(document as { webkitFullscreenEnabled?: boolean }).webkitFullscreenEnabled),
-  )
 
   function savedVolume(): number {
     try {
@@ -98,14 +92,6 @@
     }
   }
 
-  function fullscreen() {
-    const el = box as (HTMLElement & { webkitRequestFullscreen?: () => void }) | undefined
-    if (!el) return
-    if (document.fullscreenElement) document.exitFullscreen().catch(() => {})
-    else if (el.requestFullscreen) el.requestFullscreen().catch(() => {})
-    else el.webkitRequestFullscreen?.()
-  }
-
   /** Отпустили ползунок — фокус уходит, чтобы стрелки снова листали список. */
   function release(e: Event) {
     ;(e.currentTarget as HTMLElement).blur()
@@ -127,7 +113,7 @@
 <!-- Окно вставки прячется, когда теряет фокус: звук не должен играть в спрятанном окне. -->
 <svelte:window onblur={() => media?.pause()} />
 
-<div class="player {kind}" bind:this={box}>
+<div class="player {kind}">
   {#if kind === 'video'}
     <!-- svelte-ignore a11y_media_has_caption, a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
     <video
@@ -230,18 +216,6 @@
         onpointerup={release}
       />
 
-      {#if canFullscreen}
-        <button
-          class="btn"
-          tabindex="-1"
-          aria-label={t('Во весь экран')}
-          title={t('Во весь экран')}
-          onmousedown={(e) => e.preventDefault()}
-          onclick={fullscreen}
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" /></svg>
-        </button>
-      {/if}
     </div>
   </div>
 </div>
@@ -266,9 +240,6 @@
     background: #000;
     object-fit: contain;
     cursor: pointer;
-  }
-  .player:fullscreen video {
-    cursor: default;
   }
   /* Две строки: перемотка на всю ширину, под ней кнопки и время. Так
      меняющаяся ширина времени (9:59 → 10:00) не двигает полосу под мышью. */

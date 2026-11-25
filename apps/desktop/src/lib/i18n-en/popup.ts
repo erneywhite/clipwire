@@ -10,7 +10,6 @@ const en: Record<string, string> = {
   'Включить звук': 'Unmute',
   'Выключить звук': 'Mute',
   'Громкость': 'Volume',
-  'Во весь экран': 'Full screen',
 
   // LinkCard
   'Загружаю карточку…': 'Loading card…',
