@@ -29,41 +29,45 @@ impl Store {
     /// Сохранить записку. Группа со сменённым ключом записок не принимает.
     /// `true`, если сохранена.
     pub fn add_delete(&self, group: &GroupId, note: &[u8], now_ms: i64) -> Result<bool> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let added = tx.execute(
-            "INSERT INTO deletes (group_id, received_ms, note)
-             SELECT ?1, ?2, ?3 WHERE EXISTS (
-                 SELECT 1 FROM groups WHERE group_id = ?1 AND rotated_ms IS NULL)",
-            params![&group.0[..], now_ms, note],
-        )? > 0;
-        tx.execute(
-            "DELETE FROM deletes WHERE group_id = ?1 AND rowid NOT IN (
-                 SELECT rowid FROM deletes WHERE group_id = ?1
-                 ORDER BY received_ms DESC, rowid DESC LIMIT ?2)",
-            params![&group.0[..], MAX_PER_GROUP],
-        )?;
-        tx.commit()?;
-        Ok(added)
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            let added = tx.execute(
+                "INSERT INTO deletes (group_id, received_ms, note)
+                 SELECT ?1, ?2, ?3 WHERE EXISTS (
+                     SELECT 1 FROM groups WHERE group_id = ?1 AND rotated_ms IS NULL)",
+                params![&group.0[..], now_ms, note],
+            )? > 0;
+            tx.execute(
+                "DELETE FROM deletes WHERE group_id = ?1 AND rowid NOT IN (
+                     SELECT rowid FROM deletes WHERE group_id = ?1
+                     ORDER BY received_ms DESC, rowid DESC LIMIT ?2)",
+                params![&group.0[..], MAX_PER_GROUP],
+            )?;
+            tx.commit()?;
+            Ok(added)
+        })
     }
 
     /// Записки группы не старше `not_before_ms`, от старых к новым.
     pub fn deletes(&self, group: &GroupId, not_before_ms: i64) -> Result<Vec<Vec<u8>>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT note FROM deletes WHERE group_id = ?1 AND received_ms >= ?2
-             ORDER BY received_ms, rowid",
-        )?;
-        let rows = stmt.query_map(params![&group.0[..], not_before_ms], |r| r.get(0))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT note FROM deletes WHERE group_id = ?1 AND received_ms >= ?2
+                 ORDER BY received_ms, rowid",
+            )?;
+            let rows = stmt.query_map(params![&group.0[..], not_before_ms], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
     }
 
     /// Удалить просроченные записки всех групп.
     pub fn purge_expired_deletes(&self, not_before_ms: i64) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM deletes WHERE received_ms < ?1",
-            params![not_before_ms],
-        )?)
+        self.write(|conn| {
+            Ok(conn.execute(
+                "DELETE FROM deletes WHERE received_ms < ?1",
+                params![not_before_ms],
+            )?)
+        })
     }
 }
 

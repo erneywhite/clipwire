@@ -91,14 +91,16 @@ impl Store {
         card: &[u8],
         now_ms: i64,
     ) -> Result<bool> {
-        Ok(self.conn().execute(
-            "INSERT INTO cards (group_id, device_id, card, updated_ms)
+        self.write(|conn| {
+            Ok(conn.execute(
+                "INSERT INTO cards (group_id, device_id, card, updated_ms)
              SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (
                  SELECT 1 FROM groups WHERE group_id = ?1 AND rotated_ms IS NULL)
              ON CONFLICT (group_id, device_id)
              DO UPDATE SET card = excluded.card, updated_ms = excluded.updated_ms",
-            params![&group.0[..], &device.0[..], card, now_ms],
-        )? > 0)
+                params![&group.0[..], &device.0[..], card, now_ms],
+            )? > 0)
+        })
     }
 
     /// Все устройства группы с карточками (пустая, если устройство её не
@@ -108,37 +110,38 @@ impl Store {
         group: &GroupId,
         online: &HashSet<DeviceId>,
     ) -> Result<Vec<DeviceEntry>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT d.device_id, d.last_seen_ms, c.card FROM devices AS d
-             LEFT JOIN cards AS c ON c.group_id = d.group_id AND c.device_id = d.device_id
-             WHERE d.group_id = ?1 ORDER BY d.device_id",
-        )?;
-        let rows = stmt.query_map(params![&group.0[..]], |r| {
-            Ok((
-                r.get::<_, Vec<u8>>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, Option<Vec<u8>>>(2)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, last_seen_ms, card) = row?;
-            let device = DeviceId(id.try_into().ok().context("битый device_id в базе")?);
-            out.push(DeviceEntry {
-                device,
-                card: card.unwrap_or_default(),
-                last_seen_ms,
-                online: online.contains(&device),
-            });
-        }
-        Ok(out)
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT d.device_id, d.last_seen_ms, c.card FROM devices AS d
+                 LEFT JOIN cards AS c ON c.group_id = d.group_id AND c.device_id = d.device_id
+                 WHERE d.group_id = ?1 ORDER BY d.device_id",
+            )?;
+            let rows = stmt.query_map(params![&group.0[..]], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, last_seen_ms, card) = row?;
+                let device = DeviceId(id.try_into().ok().context("битый device_id в базе")?);
+                out.push(DeviceEntry {
+                    device,
+                    card: card.unwrap_or_default(),
+                    last_seen_ms,
+                    online: online.contains(&device),
+                });
+            }
+            Ok(out)
+        })
     }
 
     /// Сменён ли ключ группы, и что тогда отдать устройству `device`.
     /// `None` — группа в обычном режиме (или её нет).
     pub fn rotation(&self, group: &GroupId, device: &DeviceId) -> Result<Option<Rotation>> {
-        rotation_in(&self.conn(), group, device)
+        self.read(|conn| rotation_in(conn, group, device))
     }
 
     /// Сменить ключ группы `group` по запросу устройства `sender`. Все проверки
@@ -166,120 +169,121 @@ impl Store {
             return Ok(Refused("два пакета для одного устройства"));
         }
 
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let old: Option<Option<i64>> = tx
-            .query_row(
-                "SELECT rotated_ms FROM groups WHERE group_id = ?1",
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            let old: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT rotated_ms FROM groups WHERE group_id = ?1",
+                    params![&group.0[..]],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match old {
+                None => return Ok(Refused("группы нет")),
+                Some(Some(_)) => return Ok(Refused("ключ этой группы уже сменён")),
+                Some(None) => {}
+            }
+            // Ключ меняют и устройства удаляют только админы группы. У группы без
+            // админов (создана до 0.5.0) — любой участник, как раньше.
+            if super::admin::has_admins(&tx, group)? && !super::admin::is_admin(&tx, group, sender)? {
+                return Ok(Refused(
+                    "сменить ключ группы и удалить устройство может только админ группы",
+                ));
+            }
+            if super::admin::is_pending(&tx, group)? {
+                return Ok(Refused("смена ключа этой группы ещё не завершена"));
+            }
+            let day_ago = now_ms - 24 * 60 * 60 * 1000;
+            if super::admin::rekeys_since(&tx, sender, day_ago)? >= super::admin::MAX_REKEYS_PER_DAY {
+                return Ok(Refused(
+                    "слишком много смен ключа с этого устройства за сутки, попробуйте позже",
+                ));
+            }
+            let new: Option<(Option<i64>, Option<Vec<u8>>)> = tx
+                .query_row(
+                    "SELECT rotated_ms, pending_by FROM groups WHERE group_id = ?1",
+                    params![&new_group.0[..]],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let pending_by = match new {
+                None => return Ok(Refused("новой группы нет на сервере")),
+                Some((Some(_), _)) => return Ok(Refused("ключ новой группы тоже сменён")),
+                Some((None, p)) => p,
+            };
+            // Новой группой годится только та, что отправитель сам только что
+            // создал под смену ключа (`Create::ForRekey`) и где он один. Иначе
+            // участник одной группы перевёл бы её устройства в другую
+            // существующую группу и унаследовал бы там админов (`inherit_admins`).
+            if pending_by.as_deref() != Some(&sender.0[..]) {
+                return Ok(Refused(
+                    "новая группа должна быть создана этим устройством для смены ключа",
+                ));
+            }
+            if !is_member(&tx, new_group, sender)? {
+                return Ok(Refused("отправитель не вошёл в новую группу"));
+            }
+            let new_members: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM devices WHERE group_id = ?1",
+                params![&new_group.0[..]],
+                |r| r.get(0),
+            )?;
+            if new_members != 1 {
+                return Ok(Refused("в новой группе уже есть другие устройства"));
+            }
+            let members: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM devices WHERE group_id = ?1",
                 params![&group.0[..]],
                 |r| r.get(0),
-            )
-            .optional()?;
-        match old {
-            None => return Ok(Refused("группы нет")),
-            Some(Some(_)) => return Ok(Refused("ключ этой группы уже сменён")),
-            Some(None) => {}
-        }
-        // Ключ меняют и устройства удаляют только админы группы. У группы без
-        // админов (создана до 0.5.0) — любой участник, как раньше.
-        if super::admin::has_admins(&tx, group)? && !super::admin::is_admin(&tx, group, sender)? {
-            return Ok(Refused(
-                "сменить ключ группы и удалить устройство может только админ группы",
-            ));
-        }
-        if super::admin::is_pending(&tx, group)? {
-            return Ok(Refused("смена ключа этой группы ещё не завершена"));
-        }
-        let day_ago = now_ms - 24 * 60 * 60 * 1000;
-        if super::admin::rekeys_since(&tx, sender, day_ago)? >= super::admin::MAX_REKEYS_PER_DAY {
-            return Ok(Refused(
-                "слишком много смен ключа с этого устройства за сутки, попробуйте позже",
-            ));
-        }
-        let new: Option<(Option<i64>, Option<Vec<u8>>)> = tx
-            .query_row(
-                "SELECT rotated_ms, pending_by FROM groups WHERE group_id = ?1",
-                params![&new_group.0[..]],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let pending_by = match new {
-            None => return Ok(Refused("новой группы нет на сервере")),
-            Some((Some(_), _)) => return Ok(Refused("ключ новой группы тоже сменён")),
-            Some((None, p)) => p,
-        };
-        // Новой группой годится только та, что отправитель сам только что
-        // создал под смену ключа (`Create::ForRekey`) и где он один. Иначе
-        // участник одной группы перевёл бы её устройства в другую
-        // существующую группу и унаследовал бы там админов (`inherit_admins`).
-        if pending_by.as_deref() != Some(&sender.0[..]) {
-            return Ok(Refused(
-                "новая группа должна быть создана этим устройством для смены ключа",
-            ));
-        }
-        if !is_member(&tx, new_group, sender)? {
-            return Ok(Refused("отправитель не вошёл в новую группу"));
-        }
-        let new_members: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM devices WHERE group_id = ?1",
-            params![&new_group.0[..]],
-            |r| r.get(0),
-        )?;
-        if new_members != 1 {
-            return Ok(Refused("в новой группе уже есть другие устройства"));
-        }
-        let members: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM devices WHERE group_id = ?1",
-            params![&group.0[..]],
-            |r| r.get(0),
-        )?;
-        if envelopes.len() as u64 > members as u64 {
-            return Ok(Refused("пакетов больше, чем устройств в группе"));
-        }
-        for (device, _) in envelopes {
-            if !is_member(&tx, group, device)? {
-                return Ok(Refused("пакет для устройства не из этой группы"));
+            )?;
+            if envelopes.len() as u64 > members as u64 {
+                return Ok(Refused("пакетов больше, чем устройств в группе"));
             }
-        }
+            for (device, _) in envelopes {
+                if !is_member(&tx, group, device)? {
+                    return Ok(Refused("пакет для устройства не из этой группы"));
+                }
+            }
 
-        tx.execute(
-            "UPDATE groups SET rotated_to = ?2, rotated_ms = ?3, rotated_by = ?4 WHERE group_id = ?1",
-            params![&group.0[..], &new_group.0[..], now_ms, &sender.0[..]],
-        )?;
-        // Админы старой группы, получившие новый ключ, остаются админами;
-        // исключённые этой сменой ключа — нет.
-        let kept: HashSet<DeviceId> = envelopes.iter().map(|(d, _)| *d).collect();
-        super::admin::inherit_admins(&tx, group, new_group, sender, &kept, now_ms)?;
-        super::groups::inherit_name(&tx, group, new_group)?;
-        for (device, envelope) in envelopes {
             tx.execute(
-                "INSERT INTO rekeys (group_id, device_id, envelope) VALUES (?1, ?2, ?3)",
-                params![&group.0[..], &device.0[..], envelope],
+                "UPDATE groups SET rotated_to = ?2, rotated_ms = ?3, rotated_by = ?4 WHERE group_id = ?1",
+                params![&group.0[..], &new_group.0[..], now_ms, &sender.0[..]],
             )?;
-        }
-        let mut blobs = Vec::new();
-        {
-            let mut stmt = tx.prepare("SELECT blob_id FROM blobs WHERE group_id = ?1")?;
-            for b in stmt.query_map(params![&group.0[..]], |r| r.get::<_, Vec<u8>>(0))? {
-                blobs.push(BlobId(b?.try_into().ok().context("битый blob_id в базе")?));
+            // Админы старой группы, получившие новый ключ, остаются админами;
+            // исключённые этой сменой ключа — нет.
+            let kept: HashSet<DeviceId> = envelopes.iter().map(|(d, _)| *d).collect();
+            super::admin::inherit_admins(&tx, group, new_group, sender, &kept, now_ms)?;
+            super::groups::inherit_name(&tx, group, new_group)?;
+            for (device, envelope) in envelopes {
+                tx.execute(
+                    "INSERT INTO rekeys (group_id, device_id, envelope) VALUES (?1, ?2, ?3)",
+                    params![&group.0[..], &device.0[..], envelope],
+                )?;
             }
-        }
-        for table in [
-            "items",
-            "blobs",
-            "cards",
-            "group_config",
-            "deletes",
-            "pins",
-            "pin_blobs",
-        ] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE group_id = ?1"),
-                params![&group.0[..]],
-            )?;
-        }
-        tx.commit()?;
-        Ok(RekeyOutcome::Done { blobs })
+            let mut blobs = Vec::new();
+            {
+                let mut stmt = tx.prepare("SELECT blob_id FROM blobs WHERE group_id = ?1")?;
+                for b in stmt.query_map(params![&group.0[..]], |r| r.get::<_, Vec<u8>>(0))? {
+                    blobs.push(BlobId(b?.try_into().ok().context("битый blob_id в базе")?));
+                }
+            }
+            for table in [
+                "items",
+                "blobs",
+                "cards",
+                "group_config",
+                "deletes",
+                "pins",
+                "pin_blobs",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE group_id = ?1"),
+                    params![&group.0[..]],
+                )?;
+            }
+            tx.commit()?;
+            Ok(RekeyOutcome::Done { blobs })
+        })
     }
 
     /// Группы, ключ которых сменён раньше `before_ms`, превратить в надгробия:
@@ -290,30 +294,31 @@ impl Store {
     /// групп не считаются ни надгробия, ни группы со сменённым ключом до них
     /// (`admin::COUNTED_GROUP`). Возвращает, сколько групп стало надгробиями.
     pub fn purge_rotated(&self, before_ms: i64, now_ms: i64) -> Result<usize> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let groups: Vec<Vec<u8>> = {
-            let mut stmt = tx.prepare(
-                "SELECT group_id FROM groups
-                 WHERE rotated_ms IS NOT NULL AND rotated_ms < ?1 AND tombstone_ms IS NULL",
-            )?;
-            stmt.query_map(params![before_ms], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        for g in &groups {
-            for table in super::GROUP_TABLES {
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            let groups: Vec<Vec<u8>> = {
+                let mut stmt = tx.prepare(
+                    "SELECT group_id FROM groups
+                     WHERE rotated_ms IS NOT NULL AND rotated_ms < ?1 AND tombstone_ms IS NULL",
+                )?;
+                stmt.query_map(params![before_ms], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for g in &groups {
+                for table in super::GROUP_TABLES {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE group_id = ?1"),
+                        params![g],
+                    )?;
+                }
                 tx.execute(
-                    &format!("DELETE FROM {table} WHERE group_id = ?1"),
-                    params![g],
+                    "UPDATE groups SET tombstone_ms = ?2 WHERE group_id = ?1",
+                    params![g, now_ms],
                 )?;
             }
-            tx.execute(
-                "UPDATE groups SET tombstone_ms = ?2 WHERE group_id = ?1",
-                params![g, now_ms],
-            )?;
-        }
-        tx.commit()?;
-        Ok(groups.len())
+            tx.commit()?;
+            Ok(groups.len())
+        })
     }
 }
 

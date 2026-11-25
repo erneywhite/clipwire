@@ -24,26 +24,29 @@ impl Store {
     /// Сохранить настройки группы (заменяют прежние). Если ключ группы уже
     /// сменён или группы нет, ничего не сохраняется. `true`, если сохранены.
     pub fn set_group_config(&self, group: &GroupId, config: &[u8], now_ms: i64) -> Result<bool> {
-        Ok(self.conn().execute(
-            "INSERT INTO group_config (group_id, config, updated_ms)
+        self.write(|conn| {
+            Ok(conn.execute(
+                "INSERT INTO group_config (group_id, config, updated_ms)
              SELECT ?1, ?2, ?3 WHERE EXISTS (
                  SELECT 1 FROM groups WHERE group_id = ?1 AND rotated_ms IS NULL)
              ON CONFLICT (group_id)
              DO UPDATE SET config = excluded.config, updated_ms = excluded.updated_ms",
-            params![&group.0[..], config, now_ms],
-        )? > 0)
+                params![&group.0[..], config, now_ms],
+            )? > 0)
+        })
     }
 
     /// Последние настройки группы, `None` — не задавались.
     pub fn group_config(&self, group: &GroupId) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT config FROM group_config WHERE group_id = ?1",
-                params![&group.0[..]],
-                |r| r.get(0),
-            )
-            .optional()?)
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT config FROM group_config WHERE group_id = ?1",
+                    params![&group.0[..]],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
     }
 }
 

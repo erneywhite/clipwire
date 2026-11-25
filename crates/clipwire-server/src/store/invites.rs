@@ -207,87 +207,93 @@ impl Store {
         expires_ms: i64,
         max_active: u64,
     ) -> Result<Result<u64, AdminFail>> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let active: i64 = tx.query_row(
-            &format!("SELECT COUNT(*) FROM group_invites WHERE {ACTIVE}"),
-            params![now_ms],
-            |r| r.get(0),
-        )?;
-        if active.max(0) as u64 >= max_active {
-            return Ok(Err(AdminFail::TooManyInvites { max: max_active }));
-        }
-        tx.execute(
-            "INSERT INTO group_invites (secret_hash, label, created_ms, expires_ms, token_fp)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![&hash[..], label, now_ms, expires_ms, &token_fp[..]],
-        )?;
-        let id = tx.last_insert_rowid();
-        trim_rows(&tx, now_ms, MAX_INVITE_ROWS)?;
-        tx.commit()?;
-        Ok(Ok(id.max(0) as u64))
+        self.write(|conn| {
+            let tx = conn.transaction()?;
+            let active: i64 = tx.query_row(
+                &format!("SELECT COUNT(*) FROM group_invites WHERE {ACTIVE}"),
+                params![now_ms],
+                |r| r.get(0),
+            )?;
+            if active.max(0) as u64 >= max_active {
+                return Ok(Err(AdminFail::TooManyInvites { max: max_active }));
+            }
+            tx.execute(
+                "INSERT INTO group_invites (secret_hash, label, created_ms, expires_ms, token_fp)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![&hash[..], label, now_ms, expires_ms, &token_fp[..]],
+            )?;
+            let id = tx.last_insert_rowid();
+            trim_rows(&tx, now_ms, MAX_INVITE_ROWS)?;
+            tx.commit()?;
+            Ok(Ok(id.max(0) as u64))
+        })
     }
 
     /// Коды, новые первыми, не больше [`MAX_INVITE_ROWS`].
     pub fn list_invites(&self) -> Result<Vec<GroupInviteInfo>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, label, created_ms, expires_ms, used_ms, used_group, revoked_ms
-             FROM group_invites ORDER BY created_ms DESC, id DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![MAX_INVITE_ROWS as i64], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, Option<i64>>(4)?,
-                r.get::<_, Option<Vec<u8>>>(5)?,
-                r.get::<_, Option<i64>>(6)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, label, created_ms, expires_ms, used_ms, group, revoked_ms) = row?;
-            let used_group = group
-                .map(|g| {
-                    Ok::<_, anyhow::Error>(GroupId(
-                        g.try_into().ok().context("битый used_group в базе")?,
-                    ))
-                })
-                .transpose()?;
-            out.push(GroupInviteInfo {
-                id: id.max(0) as u64,
-                label,
-                created_ms,
-                expires_ms,
-                used_ms,
-                used_group,
-                revoked_ms,
-            });
-        }
-        Ok(out)
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, label, created_ms, expires_ms, used_ms, used_group, revoked_ms
+                 FROM group_invites ORDER BY created_ms DESC, id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![MAX_INVITE_ROWS as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<Vec<u8>>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, label, created_ms, expires_ms, used_ms, group, revoked_ms) = row?;
+                let used_group = group
+                    .map(|g| {
+                        Ok::<_, anyhow::Error>(GroupId(
+                            g.try_into().ok().context("битый used_group в базе")?,
+                        ))
+                    })
+                    .transpose()?;
+                out.push(GroupInviteInfo {
+                    id: id.max(0) as u64,
+                    label,
+                    created_ms,
+                    expires_ms,
+                    used_ms,
+                    used_group,
+                    revoked_ms,
+                });
+            }
+            Ok(out)
+        })
     }
 
     /// Отозвать неиспользованный код. `false` — такого нет, он использован
     /// или уже отозван.
     pub fn revoke_invite(&self, id: u64, now_ms: i64) -> Result<bool> {
         let id = i64::try_from(id).unwrap_or(i64::MAX);
-        Ok(self.conn().execute(
-            "UPDATE group_invites SET revoked_ms = ?2
+        self.write(|conn| {
+            Ok(conn.execute(
+                "UPDATE group_invites SET revoked_ms = ?2
              WHERE id = ?1 AND used_ms IS NULL AND revoked_ms IS NULL",
-            params![id, now_ms],
-        )? > 0)
+                params![id, now_ms],
+            )? > 0)
+        })
     }
 
     /// Отозвать все действующие коды (меняют токен relay или ключ
     /// администратора). Истёкшие остаются истёкшими. Возвращает число
     /// отозванных.
     pub fn revoke_all_invites(&self, now_ms: i64) -> Result<usize> {
-        Ok(self.conn().execute(
-            &format!("UPDATE group_invites SET revoked_ms = ?1 WHERE {ACTIVE}"),
-            params![now_ms],
-        )?)
+        self.write(|conn| {
+            Ok(conn.execute(
+                &format!("UPDATE group_invites SET revoked_ms = ?1 WHERE {ACTIVE}"),
+                params![now_ms],
+            )?)
+        })
     }
 
     /// Отозвать действующие коды, выпущенные не при этом токене relay: при
@@ -295,23 +301,27 @@ impl Store {
     /// из клиента (коды, выпущенные, пока новый токен записывался). Входу они
     /// и так не годятся (`consume`), отзыв нужен, чтобы список не врал.
     pub fn revoke_stale_invites(&self, token_fp: &[u8; 32], now_ms: i64) -> Result<usize> {
-        Ok(self.conn().execute(
-            &format!(
-                "UPDATE group_invites SET revoked_ms = ?1
+        self.write(|conn| {
+            Ok(conn.execute(
+                &format!(
+                    "UPDATE group_invites SET revoked_ms = ?1
                  WHERE {ACTIVE} AND (token_fp IS NULL OR token_fp <> ?2)"
-            ),
-            params![now_ms, &token_fp[..]],
-        )?)
+                ),
+                params![now_ms, &token_fp[..]],
+            )?)
+        })
     }
 
     /// Удалить коды, которые закончились (использованы, отозваны или
     /// истекли) раньше `before_ms`. Действующие не трогаются: у них срок
     /// впереди.
     pub fn purge_invites(&self, before_ms: i64) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM group_invites WHERE COALESCE(used_ms, revoked_ms, expires_ms) < ?1",
-            params![before_ms],
-        )?)
+        self.write(|conn| {
+            Ok(conn.execute(
+                "DELETE FROM group_invites WHERE COALESCE(used_ms, revoked_ms, expires_ms) < ?1",
+                params![before_ms],
+            )?)
+        })
     }
 }
 
