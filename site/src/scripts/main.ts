@@ -698,7 +698,8 @@ function aiScene(still: boolean) {
   const list = $('[data-ai-list]', root);
   const c1 = $('[data-consent="1"]', root);
   const c2 = $('[data-consent="2"]', root);
-  const logRows = $$('[data-ai-log] > li', root);
+  const logRows = $$('[data-log-row]', root);
+  const logEmpty = $('[data-log-empty]', root);
   const tpl = $<HTMLTemplateElement>('[data-ai-new]', root);
   const query = 'select';
   const press = (c: HTMLElement) => $('[data-press]', c);
@@ -713,6 +714,11 @@ function aiScene(still: boolean) {
       b.title = b.dataset.show!;
       (b.closest('li')!.querySelector('.log-items') as HTMLElement).hidden = true;
     });
+  const showLog = (i: number) => {
+    logEmpty.hidden = true;
+    logRows[i].hidden = false;
+    gsap.fromTo(logRows[i], { autoAlpha: 0, y: -6 }, { autoAlpha: 1, y: 0, duration: 0.35, ease: 'power2.out' });
+  };
   const reset = () => {
     collapse();
     list.querySelector('.ai-new')?.remove();
@@ -725,7 +731,9 @@ function aiScene(still: boolean) {
     // Вторая просьба скрыта через autoAlpha: класс .on её не перебьёт, GSAP ставит visibility сам.
     gsap.set(say1, { autoAlpha: 1, y: 0 });
     gsap.set(say2, { autoAlpha: 0, y: 0 });
-    gsap.set(logRows, { autoAlpha: 0, y: 6 });
+    // Строки журнала, которых ещё не было, убраны из раскладки: новые встают сверху.
+    logRows.forEach((r) => (r.hidden = true));
+    logEmpty.hidden = false;
   };
 
   if (still) {
@@ -733,7 +741,9 @@ function aiScene(still: boolean) {
     reset();
     list.classList.add('searching');
     q.textContent = query;
-    gsap.set([ans, logRows], { autoAlpha: 1, y: 0 });
+    gsap.set(ans, { autoAlpha: 1 });
+    logRows.forEach((r) => (r.hidden = false));
+    logEmpty.hidden = true;
     addRow();
     return;
   }
@@ -745,14 +755,15 @@ function aiScene(still: boolean) {
     .fromTo(c1, { autoAlpha: 0, scale: 0.96 }, { autoAlpha: 1, scale: 1, duration: 0.35 }, '+=0.5')
     .call(() => press(c1).classList.add('pressed'), undefined, '+=1.6')
     .to(c1, { autoAlpha: 0, scale: 0.98, duration: 0.3 }, '+=0.25')
+    .call(() => showLog(0), undefined, '<0.1')
     // Поиск: печатает запрос, находит нужное, ключ и картинка скрыты.
     .set(caret, { autoAlpha: 1 })
     .addLabel('type')
     .set(caret, { autoAlpha: 0 }, `type+=${(query.length * 0.1 + 0.15).toFixed(2)}`)
     .call(() => list.classList.add('searching'))
-    .to(logRows[0], { autoAlpha: 1, y: 0, duration: 0.35 }, '+=0.2')
+    .call(() => showLog(1), undefined, '+=0.2')
     .to(ans, { autoAlpha: 1, duration: 0.4 }, '+=0.5')
-    .to(logRows[1], { autoAlpha: 1, y: 0, duration: 0.35 }, '<')
+    .call(() => showLog(2), undefined, '<')
     // Вторая просьба: положить текст в буфер, снова с согласия.
     .to(say1, { autoAlpha: 0, y: -6, duration: 0.3 }, '+=2')
     .to(ans, { autoAlpha: 0, duration: 0.3 }, '<')
@@ -770,7 +781,7 @@ function aiScene(still: boolean) {
       addRow();
       gsap.fromTo(list.querySelector('.ai-new'), { autoAlpha: 0, y: -10 }, { autoAlpha: 1, y: 0, duration: 0.5, ease: 'power3.out' });
     })
-    .to(logRows[2], { autoAlpha: 1, y: 0, duration: 0.35 }, '<0.1')
+    .call(() => showLog(3), undefined, '<0.1')
     .to({}, { duration: 3 });
   // Результат в журнале раскрывает, какие записи получил ИИ, как в программе.
   // Пока что-то раскрыто, сцена стоит: иначе следующий круг спрячет журнал.

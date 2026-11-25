@@ -508,8 +508,8 @@ const sceneData = JSON.stringify({
               <b class="consent-h">{t.ai.consent1Title}</b>
               <p>{t.ai.consent1Body}</p>
               <div class="consent-btns">
-                <span class="cbtn primary" data-press>{t.ai.readOnly}</span>
-                <span class="cbtn">{t.ai.readWrite}</span>
+                <span class="cbtn primary">{t.ai.readOnly}</span>
+                <span class="cbtn" data-press>{t.ai.readWrite}</span>
                 <span class="cbtn danger">{t.ai.deny}</span>
               </div>
             </div>
@@ -524,15 +524,16 @@ const sceneData = JSON.stringify({
           </div>
 
           <div class="ai-log">
-            <span class="dev-label">{t.ai.logTitle}</span>
+            <span class="ai-log-h">{t.ai.logTitle}</span>
             <ul data-ai-log>
+              <li class="log-empty" data-log-empty>{t.ai.logEmpty}</li>
               {t.ai.log.map((e) => (
-                <li>
+                <li data-log-row>
                   <div class="log-row">
                     <span class="log-at">{e.at}</span>
                     <span class="log-main">
                       <span class="log-what">
-                        <span class="log-client">{t.ai.client}</span> {e.tool}
+                        <span class="log-client">{t.ai.client}</span> <span class="log-tool">{e.tool}</span>
                       </span>
                       {e.query && <span class="log-query">{e.query}</span>}
                     </span>

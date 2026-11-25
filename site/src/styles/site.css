@@ -1403,7 +1403,15 @@ kbd.down {
 /* сцена */
 .ai-scene {
   display: grid;
+  /* minmax(0, …): длинные строки (SQL в журнале) не распирают колонку. */
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-4);
+  min-width: 0;
+}
+.ai-log,
+.ai-log > ul,
+.ai-log > ul > li {
+  min-width: 0;
 }
 .ai-ask {
   background: var(--c-bg);
@@ -1572,6 +1580,7 @@ kbd.down {
 /* журнал */
 .ai-log {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-2);
 }
 .ai-log > ul {
@@ -1579,26 +1588,49 @@ kbd.down {
   gap: 4px;
   min-height: 84px;
 }
-/* Как журнал в программе (settings/AiTools.svelte): время, клиент с инструментом
- * и запрос под ними, справа результат; у поиска результат раскрывает записи. */
-.ai-log > ul > li {
-  font: var(--text-xs) var(--font-mono);
+/* Как журнал в программе (settings/AiTools.svelte): одна карточка, строки через
+ * разделитель, новые сверху; время, клиент с инструментом и запрос под ними,
+ * справа итог. Итог со списком записей — ссылка, раскрывает их под строкой. */
+.ai-log-h {
+  font-size: var(--text-s);
   color: var(--c-muted);
-  border-radius: var(--radius-s);
-  background: var(--c-bg);
-  border: 1px solid var(--c-border-soft);
-  padding: 6px var(--space-3);
+}
+.ai-log > ul {
+  display: flex;
+  flex-direction: column-reverse;
+  justify-content: flex-end;
+  min-height: 0;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-l);
+  padding: 2px var(--space-4);
+}
+.ai-log > ul > li {
+  padding: 10px 0;
+}
+/* Порядок обратный (новые сверху), поэтому линия — снизу у каждой видимой строки,
+ * кроме самой старой. Заглушка и ещё не случившиеся строки не в счёт. */
+.ai-log > ul > li:not([hidden]) ~ li:not([hidden]) {
+  border-bottom: 1px solid var(--c-border);
+}
+.log-empty {
+  font-size: var(--text-s);
+  color: var(--c-muted);
 }
 .log-row {
   display: grid;
-  grid-template-columns: 6ch minmax(0, 1fr) auto;
+  grid-template-columns: 9ch minmax(0, 1fr) minmax(0, auto);
   gap: var(--space-3);
   align-items: baseline;
+}
+.log-at {
+  font: var(--text-xs) var(--font-mono);
+  color: var(--c-muted);
 }
 .log-main {
   min-width: 0;
   display: grid;
-  gap: 1px;
+  gap: 2px;
 }
 .log-what,
 .log-query,
@@ -1609,29 +1641,34 @@ kbd.down {
   white-space: nowrap;
 }
 .log-what {
-  color: var(--c-text-2);
+  font-size: var(--text-s);
+  font-weight: 600;
+  color: var(--c-text);
 }
-.log-client {
-  color: color-mix(in oklch, var(--c-claude) 62%, var(--c-text));
+.log-tool {
+  font-family: var(--font-mono);
+}
+.log-query {
+  font: var(--text-xs) var(--font-mono);
+  color: var(--c-muted);
 }
 .log-res {
-  color: var(--c-ok);
+  font: var(--text-xs) var(--font-mono);
+  color: var(--c-muted);
   text-align: right;
   justify-self: end;
   max-width: 100%;
 }
 button.log-res {
-  font: inherit;
   background: none;
   border: 0;
   padding: 0;
   cursor: pointer;
-  text-decoration: underline;
-  text-decoration-style: dotted;
-  text-underline-offset: 3px;
+  color: var(--c-wire);
 }
 button.log-res:hover {
-  text-decoration-style: solid;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .log-arrow {
   display: inline-block;
@@ -1641,10 +1678,11 @@ button.log-res[aria-expanded='true'] .log-arrow {
   transform: rotate(180deg);
 }
 .log-items {
-  margin: 6px 0 2px calc(6ch + var(--space-3));
+  margin: 8px 0 0 calc(9ch + var(--space-3));
   padding: 2px var(--space-3);
   border-left: 2px solid var(--c-border);
-  color: var(--c-text-2);
+  font-size: var(--text-s);
+  color: var(--c-text);
   overflow: hidden;
 }
 .log-items li {
@@ -2370,6 +2408,18 @@ button.log-res[aria-expanded='true'] .log-arrow {
   }
   .demo-rich {
     grid-template-columns: minmax(0, 1fr);
+  }
+  .log-row {
+    grid-template-columns: 6ch minmax(0, 1fr);
+  }
+  /* На телефоне итог встаёт под клиентом с инструментом, иначе не помещается. */
+  .log-res {
+    grid-column: 2;
+    justify-self: start;
+    text-align: left;
+  }
+  .log-items {
+    margin-left: calc(6ch + var(--space-3));
   }
   .log-client {
     display: none;
