@@ -6,6 +6,7 @@ mod cache;
 mod commands;
 mod devices;
 mod editor;
+mod file_proto;
 mod files;
 mod link;
 mod mcp;
@@ -674,12 +675,29 @@ pub fn run() {
             show_settings(app);
         }
     }));
+    let preview_slot = file_proto::PreviewSlot::default();
+    #[cfg(target_os = "linux")]
+    let builder = match file_proto::loopback::start(preview_slot.clone()) {
+        Ok(lb) => builder.manage(lb),
+        Err(e) => {
+            tracing::warn!("сервер предпросмотра видео и аудио не запустился: {e}");
+            builder
+        }
+    };
     builder
         .manage(state)
         .manage(popup::PopupState::default())
         .manage(link::LinkCache::default())
         .manage(storage::LastWarning::default())
         .manage(mcp::consent::ConsentState::default())
+        .manage(preview_slot)
+        .register_asynchronous_uri_scheme_protocol(file_proto::SCHEME, |ctx, req, responder| {
+            let app = ctx.app_handle().clone();
+            let window = ctx.webview_label().to_string();
+            tauri::async_runtime::spawn_blocking(move || {
+                responder.respond(file_proto::handle(&app, &window, &req));
+            });
+        })
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -737,6 +755,7 @@ pub fn run() {
             editor::editor_pending,
             link::link_preview,
             files::file_preview,
+            files::file_preview_close,
             files::files_download,
             files::folder_open,
             files::transfers,

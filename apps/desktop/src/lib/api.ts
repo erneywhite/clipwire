@@ -299,6 +299,10 @@ export interface FilePreview {
   kind: 'text' | 'pdf' | 'video' | 'audio' | 'none'
   text: string | null
   truncated: boolean
+  /** Адрес файла в протоколе `cwfile` для PDF, видео и аудио. */
+  token: string | null
+  /** Полный адрес видео или аудио не через `cwfile` (на Linux — loopback). */
+  media_url: string | null
 }
 
 export interface LinkCard {
@@ -688,6 +692,8 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   editorPending: () => invoke<string | null>('editor_pending'),
   linkPreview: (url: string) => invoke<LinkCard>('link_preview', { url }),
   filePreview: (path: string) => invoke<FilePreview>('file_preview', { path }),
+  /** Предпросмотр закрыт: файл больше не отдаётся протоколу. */
+  filePreviewClose: (token: string) => invoke<void>('file_preview_close', { token }),
   /** Скачать файлы записи с другого устройства без вставки. Прогресс идёт событиями. */
   filesDownload: (id: string) => invoke<void>('files_download', { id }),
   /** Открыть папку из истории (свою или скачанную) в файловом менеджере. */

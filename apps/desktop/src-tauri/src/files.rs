@@ -5,8 +5,8 @@
 //! архивом и распаковывается в кэш, дальше это обычный путь папки.
 //!
 //! Предпросмотр: текст читаем сами (начало файла), PDF, видео и аудио
-//! показывает WebView через asset-протокол. Доступ к файлу через протокол
-//! открывается только для файлов из истории: своих по исходному пути (или по
+//! показывает WebView через свой протокол `cwfile` (`file_proto.rs`). Файл
+//! открывается протоколу только из истории: своих по исходному пути (или по
 //! копии в кэше, если исходный пропал), чужих — по пути в кэше скачанного.
 //! Тип для протокола определяется по содержимому, поэтому как PDF или медиа
 //! файл открывается только с подходящей сигнатурой в начале.
@@ -22,7 +22,7 @@ use clipwire_core::{Content, FileRef};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::AppState;
+use crate::{AppState, file_proto};
 
 /// Сколько текста показывать в предпросмотре.
 const TEXT_PREVIEW: usize = 64 * 1024;
@@ -34,13 +34,26 @@ pub struct FilePreview {
     pub text: Option<String>,
     /// Показано только начало файла.
     pub truncated: bool,
+    /// Адрес файла в протоколе `cwfile` для PDF, видео и аудио.
+    pub token: Option<String>,
+    /// Полный адрес видео или аудио, если оно идёт не через `cwfile`
+    /// (на Linux — loopback, см. `file_proto::loopback`).
+    pub media_url: Option<String>,
 }
 
 const NONE: FilePreview = FilePreview {
     kind: "none",
     text: None,
     truncated: false,
+    token: None,
+    media_url: None,
 };
+
+/// Предпросмотр закрыт: файл больше не отдаётся протоколу.
+#[tauri::command]
+pub fn file_preview_close(app: AppHandle, token: String) {
+    app.state::<file_proto::PreviewSlot>().close(Some(&token));
+}
 
 #[tauri::command]
 pub async fn file_preview(app: AppHandle, path: String) -> Result<FilePreview, String> {
@@ -52,22 +65,28 @@ pub async fn file_preview(app: AppHandle, path: String) -> Result<FilePreview, S
         return Ok(NONE);
     }
     let kind = media_kind(&path);
-    // Сверяем начало файла с типом: asset-протокол сам смотрит в содержимое, и
-    // HTML с расширением .pdf открылся бы в iframe как страница со скриптами.
+    // Сверяем начало файла с типом: HTML с расширением .pdf не должен попасть
+    // в iframe даже с типом application/pdf, на случай если WebView его угадает.
     // Не совпало — показываем как обычный файл (текстом, если это текст).
     if kind != "none" && head(p).is_some_and(|h| signature_matches(kind, &h)) {
-        // WebView читает файл сам, кусками: видео любого размера не грузится целиком.
-        // shortcut: разрешение в scope не отзывается (в tauri 2 нет удаления из
-        // allowed, а forbid_file запрещает навсегда), файл доступен протоколу до
-        // перезапуска. Переделать на свой протокол с проверкой текущего файла,
-        // если в окнах появится сторонний контент.
-        app.asset_protocol_scope()
-            .allow_file(p)
+        // WebView читает файл сам, кусками, через протокол `cwfile`: он
+        // отдаёт только этот файл и только пока он открыт в предпросмотре.
+        let token = app
+            .state::<file_proto::PreviewSlot>()
+            .open(p, file_proto::mime_of(&path, kind))
             .map_err(|e| trf("Файл не открылся для просмотра: {e}", &[("e", &e)]))?;
+        // Видео и аудио на Linux — через loopback: медиаплеер WebKitGTK не
+        // берёт собственные схемы приложения.
+        let media_url = (kind != "pdf")
+            .then(|| app.try_state::<file_proto::loopback::Loopback>())
+            .flatten()
+            .map(|lb| lb.url(&token));
         return Ok(FilePreview {
             kind,
             text: None,
             truncated: false,
+            token: Some(token),
+            media_url,
         });
     }
     Ok(read_text(p).unwrap_or(NONE))
@@ -484,6 +503,8 @@ fn read_text(p: &Path) -> Option<FilePreview> {
         kind: "text",
         text: Some(text),
         truncated: size > TEXT_PREVIEW as u64,
+        token: None,
+        media_url: None,
     })
 }
 

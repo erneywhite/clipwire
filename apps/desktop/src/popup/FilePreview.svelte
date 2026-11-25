@@ -1,7 +1,8 @@
 <script lang="ts">
   // Предпросмотр одного файла: начало текста, PDF во встроенном просмотрщике
-  // WebView, видео и аудио с плеером. Файл читается через asset-протокол, доступ
-  // к нему Rust открывает только для файлов из истории и с подходящей сигнатурой.
+  // WebView, видео и аудио с плеером. Файл читается через протокол `cwfile`: Rust
+  // открывает его только для файлов из истории с подходящей сигнатурой и только
+  // пока файл открыт здесь, адрес — одноразовый токен.
   // Файл с другого устройства показывается так же, когда скачан (по пути в
   // кэше); пока не скачан — карточка с кнопкой «Скачать». Так же и свой файл,
   // который пропал с места, но есть на сервере. Файл больше порога и папка
@@ -9,6 +10,7 @@
   // распаковывается в кэш; скачанная папка показывается карточкой с путём.
   import { convertFileSrc } from '@tauri-apps/api/core'
   import { api, type FileInfo, type FilePreview } from '../lib/api'
+  import MediaPlayer from './MediaPlayer.svelte'
   import { bytesLabel } from '../lib/format'
   import { t } from '../lib/i18n'
   import { canDownload, entryProgress, isDirect, isHere, progressLabel, type TransferMap } from '../lib/transfer'
@@ -34,30 +36,7 @@
   let info = $state<FilePreview | null>(null)
   let failed = $state('')
   let mediaError = $state(false)
-  let media: HTMLMediaElement | undefined = $state()
-  const src = $derived(convertFileSrc(path))
-
-  // Открыли — сразу играет. Закрыли — сразу тишина: Chromium не глушит
-  // плеер, убранный со страницы, он доигрывает, пока его не соберёт GC.
-  $effect(() => {
-    const m = media
-    if (!m) return
-    m.play().catch(() => {})
-    return () => stop(m)
-  })
-
-  function stop(m: HTMLMediaElement | undefined) {
-    if (!m) return
-    // Сброс источника вызывает error — это не «формат не поддерживается».
-    m.dataset.stopped = '1'
-    m.pause()
-    m.removeAttribute('src')
-    m.load()
-  }
-
-  function onMediaError(e: Event) {
-    if (!(e.currentTarget as HTMLElement).dataset.stopped) mediaError = true
-  }
+  const src = $derived(info?.media_url ?? (info?.token ? convertFileSrc(info.token, 'cwfile') : ''))
 
   $effect(() => {
     const want = path
@@ -67,17 +46,26 @@
     mediaError = false
     // Не скачанный файл читать нечем: показывается карточка, а не ошибка.
     if (!ready) return
+    let token: string | null = null
+    let gone = false
     api
       .filePreview(want)
       .then((p) => {
-        if (want === path) info = p
+        token = p.token
+        // Ушли с файла раньше ответа — сразу закрываем открытое.
+        if (gone || want !== path) {
+          if (token) api.filePreviewClose(token).catch(() => {})
+          return
+        }
+        info = p
       })
       .catch((e) => (failed = String(e)))
+    return () => {
+      gone = true
+      if (token) api.filePreviewClose(token).catch(() => {})
+    }
   })
 </script>
-
-<!-- Окно вставки прячется, когда теряет фокус: звук не должен играть в спрятанном окне. -->
-<svelte:window onblur={() => media?.pause()} />
 
 <!-- Свой плеер на каждый файл: при переключении старый останавливается. -->
 {#key path}
@@ -124,12 +112,13 @@
 {:else if info.kind === 'pdf'}
   <iframe class="box pdf" src={src} title={file.name}></iframe>
 {:else if info.kind === 'video' && !mediaError}
-  <!-- svelte-ignore a11y_media_has_caption -->
-  <video bind:this={media} class="box video" {src} controls preload="metadata" onerror={onMediaError}></video>
+  <MediaPlayer {src} kind="video" onerror={() => (mediaError = true)} />
 {:else if info.kind === 'audio' && !mediaError}
-  <div class="box audio">
-    <span class="name">{file.name}</span>
-    <audio bind:this={media} {src} controls preload="metadata" onerror={onMediaError}></audio>
+  <div class="audio-wrap">
+    <div class="audio-card">
+      <span class="name">{file.name}</span>
+      <MediaPlayer {src} kind="audio" onerror={() => (mediaError = true)} />
+    </div>
   </div>
 {:else}
   <div class="box muted">
@@ -185,20 +174,23 @@
     width: 100%;
     background: #fff;
   }
-  .video {
-    width: 100%;
-    background: #000;
-    object-fit: contain;
+  /* Аудио — компактная карточка по высоте содержимого посреди области. */
+  .audio-wrap {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    place-items: center;
   }
-  .audio {
+  .audio-card {
+    width: 100%;
     display: flex;
     flex-direction: column;
-    justify-content: center;
-    gap: var(--space-3);
-    padding: var(--space-4);
+    gap: var(--space-2);
   }
-  .audio audio {
-    width: 100%;
+  .audio-card .name {
+    font-size: var(--text-s);
+    color: var(--c-text);
+    padding: 0 var(--space-1);
   }
   .name {
     overflow-wrap: anywhere;
