@@ -797,7 +797,7 @@ The question window shows which program started the bridge, for example
 and program. If another program connects under the same name, Clipwire asks again and shows both,
 the earlier one and the current one. Denying it does not take access away from the real client.
 When the program cannot be determined, the window says **program unknown**. Clients allowed
-before 0.10.2 had no program; the first program that connects after the update is bound to them.
+before 0.11.0 had no program; the first program that connects after the update is bound to them.
 
 With **Ask before putting text on the clipboard** off, `copy_to_clipboard` shows a system
 notification with the start of the text. If the text looks like a password or token, the
@@ -880,7 +880,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.10.2`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.11.0`.
 
 **Through a Docker control panel or plain `docker compose`:**
 
