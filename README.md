@@ -180,6 +180,14 @@ A deletion made offline waits for the connection and survives a Clipwire restart
 Entries pinned on another device are not deleted. The server does not know what was deleted: the
 deletion note is encrypted with the group key. This needs server 0.1.3 or newer.
 
+A deleted entry does not come back from the group, even if the server sends the same item
+again (when you reconnect, with the history of a device that joins, or on purpose). After
+**Clear history**, the group's older history does not refill it either. If you or another
+device copy the same thing again after the deletion, it shows up as usual. A pin set after the
+deletion brings the entry back, an older one does not. An item the server sends again with an
+id that is already in the history does not touch the clipboard, and neither does an item whose
+copy time is more than 5 minutes ahead of this computer's clock: it goes to the history only.
+
 ### Pins and notes
 
 Pinned entries are the same on every device of the group, including devices
@@ -191,7 +199,8 @@ a server with pins a device uploads its earlier pins once. If two devices pinned
 while offline, one pin is kept with the note of the newer change. A pin can be removed on this
 device only: the other devices keep it, and it does not come back here unless you pin it here
 again. The server keeps pins with no expiry, encrypted with the group key, and refuses new ones
-over its limits (`CLIPWIRE_PIN_MAX`, `CLIPWIRE_PIN_BYTES`): such an entry stays pinned on this
+over its limits (`CLIPWIRE_PIN_MAX`, `CLIPWIRE_PIN_RECORDS`, `CLIPWIRE_PIN_BYTES`,
+`CLIPWIRE_PIN_TOTAL_BYTES`): such an entry stays pinned on this
 device only, and the app says so. The order of changes is decided by the server, not by device
 clocks: an unpin or a note made offline reaches every device even if this device's clock is
 behind. Simply deleting a pinned entry removes the pin on this device only; the other devices keep it
@@ -221,7 +230,9 @@ has the file repairs it the same way. Clipwire 0.7 apps keep the old location af
 repair and report the file as missing until they are updated. One run of the app repairs at
 most 1 GiB and 50 files; if pins hold more, the rest is repaired after the next start. A file
 that never left your device (copied while sync was paused, its kind is off in "What to send",
-or it matches a "Don't send" rule) is not uploaded by someone else's pin.
+or it matches a "Don't send" rule) is not uploaded by someone else's pin, also after the pause
+is over or the kind is turned back on. Such an entry stays local until you send it yourself:
+copy it again while sending is allowed or pin it.
 
 Known rough edges. A file over the limit that was uploaded for a pin is deleted from the server
 right after the pin is removed, while the entry keeps its new location without direct transfer:
@@ -488,6 +499,14 @@ administrator should change the admin key and the access token.
 invitation code ended up in the wrong place. The group's history on the server is erased, local
 history is untouched and the invitation code changes. Devices without a card do not receive the
 new key, and Clipwire warns about it before you confirm.
+
+After the key changes on this device, **Group devices** shows a **Moving to the new key** block:
+each device that got the new key is marked **moved to the new key** once it has joined the new
+group (its card opens with the new key), or **not moved yet**. A device that has not moved
+within 10 minutes is highlighted with a hint. Usually it is just switched off or waits for
+**Switch to the new key**, but a server working with the removed device could also keep it in
+the old group. Then connect it again with the new invitation code. The block survives a restart
+and disappears a day after everyone has moved.
 
 **Group admins.** The device that created the group is its first admin. Every admin is marked
 **admin** in the device list. Only admins remove devices and change the group key: other devices
@@ -773,28 +792,43 @@ access question stays open anyway, so answer it and repeat the request. A clipbo
 client cancels is dropped together with its window. At most 8 questions wait in the queue; beyond
 that a client gets a "busy" error right away.
 
+The question window shows which program started the bridge, for example
+`C:\Users\…\claude.exe` or `/usr/local/bin/node`. The answer is remembered for the pair of name
+and program. If another program connects under the same name, Clipwire asks again and shows both,
+the earlier one and the current one. Denying it does not take access away from the real client.
+When the program cannot be determined, the window says **program unknown**. Clients allowed
+before 0.11.0 had no program; the first program that connects after the update is bound to them.
+
 With **Ask before putting text on the clipboard** off, `copy_to_clipboard` shows a system
 notification with the start of the text. If the text looks like a password or token, the
 notification shows only its length.
 
-**Connected clients** lists every client with its access and when it was last used. Access can be
+**Connected clients** lists every client with its program, access and when it was last used. Access can be
 switched between **No access**, **Read** and **Read and write**, and **Revoke** removes the client
 from the list, so it asks again next time.
 
 **Access log** shows the last 100 requests: time, client, tool and result (search queries and saved
-text cut to 80 characters). The log is stored encrypted on this device, keeps at most 1000 rows, and
-clearing the history does not touch it. **Clear log** empties it.
+text cut to 80 characters); the client's program is in the tooltip. Identical requests in a row are
+folded into one row marked "×N". Refusals (access turned off, client denied) are logged at most once
+a minute per client name. The log is stored encrypted on this device, and clearing the history does
+not touch it. It keeps at most 1000 rows about requests that returned entries (a search with
+results, an entry, the pins) and at most 500 other rows, so a stream of refusals cannot push out
+what the AI actually read. **Clear log** empties it.
 
 ### Limits
 
 - What the AI reads goes to the model, usually to the AI provider's cloud. The Clipwire end-to-end
   encryption ends here: the entry leaves the device in the clear inside the AI client's request.
   Allow only the kinds and the period you are fine sharing.
-- Clients are told apart by the name they report in MCP (`clientInfo.name`). Clipwire cannot check
-  it: any program running under your OS account can start the bridge and use the name of a client
-  you already allowed. Invisible characters are removed from the name, so two clients cannot
-  look the same in the list. On macOS and Linux the bridge talks only to a socket owned by your
-  own user, as it does with the named pipe on Windows.
+- Clients are told apart by the name they report in MCP (`clientInfo.name`) and by the program
+  that started the bridge. The name cannot be checked, the program backs it up: another program
+  using the name of a known client gets a new question instead of that client's access. This
+  makes impersonation harder but does not stop malware running under your OS account: it can
+  start the AI client itself or replace its file. The program is found as the parent of the bridge
+  process (shells like `cmd` and `sh` are skipped), and this does not always work. Invisible
+  characters are removed from the name, so two clients cannot look the same in the list. On macOS
+  and Linux the bridge talks only to a socket owned by your own user, as it does with the named
+  pipe on Windows.
 - The **AI** label marks only what came through MCP. An agent that has a terminal can write to the
   clipboard with ordinary system tools, and such an entry looks like your own copy.
 - The secrets filter is a heuristic: it knows common key formats and looks for random-looking
@@ -846,7 +880,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.10.2`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.11.0`.
 
 **Through a Docker control panel or plain `docker compose`:**
 
@@ -1009,7 +1043,11 @@ app without restarting the container.
 | `CLIPWIRE_HISTORY_TOTAL_BYTES`\* | `1073741824` | total limit of item history per server (1 GiB); the excess is evicted from the largest group |
 | `CLIPWIRE_MAX_DEVICE_CONNS`\* | `4` | simultaneous connections from one device |
 | `CLIPWIRE_PIN_MAX`\* | `5000` | how many pinned entries one group can keep on the server; a new pin over the limit is refused |
-| `CLIPWIRE_PIN_BYTES`\* | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries, the records of removed pins and the files of pinned entries. Those files don't count toward `CLIPWIRE_BLOB_QUOTA`. A file uploaded for a pin is deleted right after the pin is removed; a file that was ordinary before pinning counts toward `CLIPWIRE_BLOB_QUOTA` again |
+| `CLIPWIRE_PIN_BYTES`\* | `2147483648` | space for a group's pins (2 GiB): encrypted pinned entries, the records of removed pins and the files of pinned entries. Every record (removed ones too) also costs 192 bytes and every file in a pin's list 224 bytes, the size of the database rows, even if the file is not on the server yet. Those files don't count toward `CLIPWIRE_BLOB_QUOTA`. A file uploaded for a pin is deleted right after the pin is removed; a file that was ordinary before pinning counts toward `CLIPWIRE_BLOB_QUOTA` again |
+| `CLIPWIRE_PIN_RECORDS`\* | `20000` | how many pin records one group can keep, removed pins included; a new pin over the limit is refused |
+| `CLIPWIRE_PIN_TOTAL_BYTES`\* | `4294967296` | space for the pin records of all groups together (4 GiB), without files: those count toward `CLIPWIRE_BLOB_TOTAL_QUOTA` |
+| `CLIPWIRE_RELAY_RATE` | `16777216` | how fast the relay reads from one client, bytes per second (16 MiB/s); `0` means no limit. It also applies to the server's own relay connection, so everything the server sends through the relay is capped at this rate; direct UDP connections are not affected |
+| `CLIPWIRE_RELAY_GUESTS` | `32` | how many relay connections devices the server does not know as group members may hold at once: new devices before they join and devices removed by a key change. Members always get through |
 
 ### What the server stores
 
@@ -1032,11 +1070,22 @@ app without restarting the container.
 - Limits set from the app (table `settings`) and the admin of every group (a device ID).
 - Encrypted pins of the group (`clipwire/8`) with their notes and the pinned entries
   themselves, with no expiry: a pin lives until it is removed, and a removed pin stays as a
-  record of a few hundred bytes without content. Files of pinned entries are not deleted after
+  record of a few hundred bytes without content for 90 days, so that devices that were off learn
+  about the removal. A device that stays off longer misses it and keeps the entry pinned. Files of pinned entries are not deleted after
   `CLIPWIRE_TTL_HOURS` while the pin exists. A group with live pins is not deleted as idle.
   Pins are erased on a key change and together with the group.
 
-The server sees ciphertext only. When a device is removed, the server immediately erases the
+The server cannot read the contents: items, files, pins with notes, device cards and storage
+settings are encrypted with the group key. Metadata is stored in plain form, and whoever runs the
+server can see it: group ids and device IDs (who is in which group, when each device last
+connected and who is online), the source device, exact ciphertext size and timestamps of every
+item (the UUID v7 id carries the copy time), exact file sizes, which files belong to which pin,
+whether an entry is pinned, the admins of each group, who changed a group key and which devices
+were excluded, group names and invitation code labels (these are administrator notes and are not
+encrypted), and device IP addresses. The full list is in
+[docs/architecture.md](docs/architecture.md#что-видит-администратор-сервера).
+
+When a device is removed, the server immediately erases the
 history and files of the old group, hands the remaining devices the new key (packed separately
 for each one) and tells the removed device that it was excluded. See
 [docs/devices.md](docs/devices.md) and [docs/architecture.md](docs/architecture.md).

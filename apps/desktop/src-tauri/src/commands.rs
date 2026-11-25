@@ -430,19 +430,29 @@ pub fn history_pin(
     let id = parse_id(&id)?;
     let (hash, _, note) =
         pin_info(&state, id).ok_or_else(|| tr("Элемента уже нет в истории").to_string())?;
-    if let Some(pins) = group_pins(&state) {
-        if pinned {
-            pins.pin(hash, &note);
-        } else {
-            pins.unpin(hash);
+    let in_group = match group_pins(&state) {
+        Some(pins) => {
+            if pinned {
+                pins.pin(hash, &note);
+            } else {
+                pins.unpin(hash);
+            }
+            true
+        }
+        None => false,
+    };
+    {
+        let mut h = state.history.lock().unwrap_or_else(|e| e.into_inner());
+        h.set_pinned(id, pinned).map_err(err)?;
+        // Закрепив в группе, человек сам отправил запись: метка «только
+        // здесь» снимается, и закреп потом можно чинить её файлами.
+        if pinned
+            && in_group
+            && let Err(e) = h.clear_local_only(id)
+        {
+            tracing::warn!("метка «только здесь» не снялась: {e:#}");
         }
     }
-    state
-        .history
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .set_pinned(id, pinned)
-        .map_err(err)?;
     let _ = app.emit("clipwire://history-changed", ());
     Ok(())
 }

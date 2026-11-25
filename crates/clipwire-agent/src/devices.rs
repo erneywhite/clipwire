@@ -507,6 +507,50 @@ pub fn decline_offer(paths: &Paths) -> Result<bool> {
     Ok(true)
 }
 
+/// Файл последней смены ключа, сделанной на этом устройстве.
+pub const REKEY_SENT_FILE: &str = "rekey-sent.bin";
+
+/// Смена ключа, сделанная здесь: кому ушёл новый ключ и когда. По ней раздел
+/// «Устройства группы» показывает, кто из получателей уже вошёл в новую
+/// группу (опубликовал там карточку, открывающуюся новым ключом), а кто нет.
+/// Сервер, заодно с исключённым устройством, мог оставить кого-то в старой
+/// группе, и успех смены ключа это не показывает. Лежит на диске защищённым,
+/// как ключ группы: переживает перезапуск.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RekeySent {
+    /// Новая группа.
+    pub group: GroupId,
+    /// Когда сервер принял смену (мс Unix, часы этого устройства).
+    pub at_ms: i64,
+    /// Получатели нового ключа, кроме этого устройства.
+    pub recipients: Vec<DeviceId>,
+}
+
+/// Запомнить смену ключа, сделанную здесь. Прежняя запись заменяется.
+pub fn save_rekey_sent(paths: &Paths, sent: &RekeySent) -> Result<()> {
+    std::fs::create_dir_all(&paths.dir)?;
+    let plain = postcard::to_stdvec(sent)?;
+    crate::state::write_atomic(
+        &paths.dir.join(REKEY_SENT_FILE),
+        &crate::secret::protect(&plain)?,
+    )
+}
+
+/// Последняя смена ключа, сделанная здесь, если она привела к группе
+/// `group`. Другая группа (ключ с тех пор меняли ещё раз) или битый файл —
+/// `None`.
+pub fn load_rekey_sent(paths: &Paths, group: GroupId) -> Option<RekeySent> {
+    let path = paths.dir.join(REKEY_SENT_FILE);
+    let raw = std::fs::read(&path).ok()?;
+    let plain = crate::secret::unprotect_file(&path, &raw)
+        .map_err(|e| tracing::warn!("{REKEY_SENT_FILE} не открылся: {e:#}"))
+        .ok()?;
+    let sent: RekeySent = postcard::from_bytes(&plain)
+        .map_err(|e| tracing::warn!("{REKEY_SENT_FILE} не разобрался: {e}"))
+        .ok()?;
+    (sent.group == group).then_some(sent)
+}
+
 /// Ключ группы сменился, пакет нового ключа открылся. Если ключ сменило это
 /// устройство, движок сообщает `sync::Event::Rekeyed`, и ключ принимается
 /// сразу. Пакет от другого устройства — `sync::Event::RekeyOffered`: ключ
@@ -527,6 +571,9 @@ pub struct RekeyNotice {
     /// Если `by_me` и смена шла в этом же движке: устройства без карточки,
     /// которым ключ не достался.
     pub skipped: Vec<DeviceId>,
+    /// То же условие: кому ушёл новый ключ, кроме этого устройства
+    /// ([`save_rekey_sent`]).
+    pub recipients: Vec<DeviceId>,
 }
 
 /// Новое состояние после смены ключа: тот же сервер и ключ устройства.
@@ -612,6 +659,8 @@ pub struct Rekeyed {
     pub old: GroupId,
     pub key: GroupKey,
     pub skipped: Vec<DeviceId>,
+    /// Получатели нового ключа, кроме этого устройства.
+    pub recipients: Vec<DeviceId>,
 }
 
 /// Как интерфейс обращается к движку: список устройств и смена ключа.
@@ -1106,11 +1155,36 @@ mod tests {
             initiator_os: "macOS".into(),
             by_me: false,
             skipped: Vec::new(),
+            recipients: Vec::new(),
         }
     }
 
     /// Чужая смена ключа ждёт на диске: «Перейти» сохраняет новый ключ,
     /// до ответа ключ на диске прежний.
+    #[test]
+    fn rekey_sent_survives_and_belongs_to_its_group() {
+        let paths = tmp();
+        let g = GroupKey([5; 32]).group_id();
+        assert!(load_rekey_sent(&paths, g).is_none());
+        let sent = RekeySent {
+            group: g,
+            at_ms: 42,
+            recipients: vec![device_id(&dev(3)), device_id(&dev(4))],
+        };
+        save_rekey_sent(&paths, &sent).unwrap();
+        assert_eq!(load_rekey_sent(&paths, g), Some(sent));
+        // Файл защищён, как ключ группы: на Windows (DPAPI есть и в тестах)
+        // id получателей в нём не видны.
+        if cfg!(windows) {
+            let raw = std::fs::read(paths.dir.join(REKEY_SENT_FILE)).unwrap();
+            let id = device_id(&dev(3)).0;
+            assert!(!raw.windows(id.len()).any(|w| w == id));
+        }
+        // Ключ с тех пор сменили ещё раз — запись не про эту группу.
+        assert!(load_rekey_sent(&paths, GroupKey([6; 32]).group_id()).is_none());
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
     #[test]
     fn offer_waits_on_disk_and_accept_adopts_the_key() {
         let paths = tmp();

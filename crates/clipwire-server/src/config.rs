@@ -150,6 +150,21 @@ pub struct Guards {
     /// Квота файлов группы (`CLIPWIRE_BLOB_QUOTA`) закреплённые файлы не
     /// считает, предел сервера (`CLIPWIRE_BLOB_TOTAL_QUOTA`) считает все.
     pub pin_bytes: u64,
+    /// Сколько записей закрепов может быть у группы вместе со снятыми.
+    /// Снятые живут [`crate::store::PIN_UNPINNED_KEEP`], и без предела
+    /// «закрепил — снял» по кругу копило бы строки.
+    pub pin_records: u64,
+    /// Сколько места под записи закрепов на весь сервер (все группы, без
+    /// файлов: файлы закрепов считает `CLIPWIRE_BLOB_TOTAL_QUOTA`).
+    pub pin_total_bytes: u64,
+    /// Предел скорости, с которой relay читает данные от одного клиента,
+    /// байт в секунду; 0 — без предела. Касается и соединения самого сервера
+    /// с relay: всё, что сервер отдаёт через relay, идёт с этой скоростью.
+    pub relay_rate: u64,
+    /// Сколько соединений с relay одновременно могут держать устройства,
+    /// которые сервер не знает как участников живой группы (новые до
+    /// первого входа, исключённые сменой ключа). См. `relay.rs`.
+    pub relay_guests: usize,
 }
 
 /// Через сколько удаляется заброшенная группа: 90 дней.
@@ -171,6 +186,10 @@ impl Default for Guards {
             rotated_keep: ROTATED_KEEP,
             pin_max: 5000,
             pin_bytes: 2 * 1024 * 1024 * 1024,
+            pin_records: 20_000,
+            pin_total_bytes: 4 * 1024 * 1024 * 1024,
+            relay_rate: 16 * 1024 * 1024,
+            relay_guests: 32,
         }
     }
 }
@@ -197,6 +216,10 @@ impl Guards {
             rotated_keep: d.rotated_keep,
             pin_max: parse("CLIPWIRE_PIN_MAX", d.pin_max)?,
             pin_bytes: parse("CLIPWIRE_PIN_BYTES", d.pin_bytes)?,
+            pin_records: parse("CLIPWIRE_PIN_RECORDS", d.pin_records)?,
+            pin_total_bytes: parse("CLIPWIRE_PIN_TOTAL_BYTES", d.pin_total_bytes)?,
+            relay_rate: parse("CLIPWIRE_RELAY_RATE", d.relay_rate)?,
+            relay_guests: parse("CLIPWIRE_RELAY_GUESTS", d.relay_guests)?,
         })
     }
 }

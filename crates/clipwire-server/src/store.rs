@@ -26,7 +26,10 @@ pub use admin::{Create, PENDING_KEEP};
 pub use devices::{RekeyLimits, RekeyOutcome, Rotation};
 pub use groups::DeleteOutcome;
 pub use invites::{INVITE_KEEP, InviteCheck, MAX_ACTIVE_INVITES};
-pub use pins::{PinOutcome, PinQuota, PinWrite};
+pub use pins::{
+    BLOB_REF_OVERHEAD as PIN_BLOB_REF_OVERHEAD, PIN_UNPINNED_KEEP, PinOutcome, PinQuota, PinWrite,
+    RECORD_OVERHEAD as PIN_RECORD_OVERHEAD,
+};
 use pins::{expired_sql, live_sql, unpinned_live_sql};
 
 // shortcut: синхронный rusqlite под std::Mutex прямо из async-кода. Запросы
@@ -902,13 +905,21 @@ impl Store {
         Ok(true)
     }
 
-    /// Зарегистрировано ли устройство хоть в одной группе.
-    #[allow(dead_code)] // понадобится для доступа к relay по endpoint ID (этап 6)
-    pub fn is_known_device(&self, device: &DeviceId) -> Result<bool> {
+    /// Пускать ли устройство в relay без места гостя (`relay.rs`): оно
+    /// участник живой группы или группы со сменённым ключом, для которого
+    /// лежит пакет нового ключа (оно было выключено при смене и ещё не
+    /// забрало ключ). Исключённое сменой ключа устройство участником не
+    /// считается.
+    pub fn is_relay_member(&self, device: &DeviceId) -> Result<bool> {
         Ok(self
             .conn()
             .query_row(
-                "SELECT 1 FROM devices WHERE device_id = ?1 LIMIT 1",
+                "SELECT 1 FROM devices AS d JOIN groups AS g ON g.group_id = d.group_id
+                 WHERE d.device_id = ?1 AND g.deleted_ms IS NULL AND g.idle_ms IS NULL
+                   AND (g.rotated_ms IS NULL
+                        OR EXISTS (SELECT 1 FROM rekeys AS r
+                                   WHERE r.group_id = d.group_id AND r.device_id = d.device_id))
+                 LIMIT 1",
                 params![&device.0[..]],
                 |_| Ok(()),
             )
@@ -1019,8 +1030,8 @@ mod tests {
                 .unwrap(),
             JoinOutcome::Denied
         );
-        assert!(s.is_known_device(&dev).unwrap());
-        assert!(!s.is_known_device(&DeviceId([7; 32])).unwrap());
+        assert!(s.is_relay_member(&dev).unwrap());
+        assert!(!s.is_relay_member(&DeviceId([7; 32])).unwrap());
     }
 
     #[test]
@@ -1551,7 +1562,7 @@ mod tests {
         );
         assert!(!s.bury_idle_group(&key(1).group_id(), 700, 760).unwrap());
         // Устройства ушли вместе с данными группы.
-        assert!(!s.is_known_device(&DeviceId([3; 32])).unwrap());
+        assert!(!s.is_relay_member(&DeviceId([3; 32])).unwrap());
         // Место освободилось: предел групп считается по оставшимся.
         assert_eq!(
             s.join(

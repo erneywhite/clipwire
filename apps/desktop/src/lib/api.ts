@@ -58,6 +58,8 @@ export interface AiClient {
   added_ms: number
   /** Когда последний раз обращался, мс Unix. */
   last_ms: number
+  /** Программа, которая запустила мост (путь); null — ответ дан до 0.10.2 или программа не определилась. */
+  program: string | null
 }
 
 /** Какие виды записей видны ИИ. */
@@ -116,6 +118,23 @@ export interface GroupDevice {
   last_seen_ms: number
   /** Когда это устройство впервые увидело карточку (по своим записям), мс; 0 — давно. */
   first_seen_ms: number
+}
+
+/** Получатель нового ключа после смены, сделанной здесь (`rekey_sent`). */
+export interface RekeyRecipient {
+  /** Полный id, 64 hex: по нему ищется в списке устройств новой группы. */
+  id: string
+  fingerprint: string
+  /** Имя и ОС из карточки, проверенной ещё в старой группе; null — нет. */
+  name: string | null
+  os: string | null
+}
+
+/** Последняя смена ключа, сделанная здесь, если она привела к нынешней группе. */
+export interface RekeySent {
+  /** Когда сервер принял смену, мс. */
+  at_ms: number
+  recipients: RekeyRecipient[]
 }
 
 /** Смена ключа другим устройством, которая ждёт ответа (`group_rekey_offer`). */
@@ -566,6 +585,11 @@ export interface ConsentDto {
   chars: number
   /** Запись для ИИ разрешена в настройках: можно предложить «Чтение и запись». */
   allow_write: boolean
+  /** Программа клиента (путь, невидимые символы — метками); null — не определилась. */
+  program: string | null
+  /** Под этим именем уже отвечали про другую программу, previous — какую (null — не определилась). */
+  program_changed: boolean
+  previous: string | null
 }
 
 /** Ответ на вопрос: read/read_write/deny — о доступе, accept/decline — о буфере. */
@@ -582,6 +606,10 @@ export interface AiLogEntry {
   ids: string[]
   /** Короткий итог: сколько найдено, «скрыто», «отклонено»… */
   result: string
+  /** Программа клиента (путь) или null. */
+  program: string | null
+  /** Сколько одинаковых обращений подряд собрано в строку; at_ms — время последнего. */
+  count: number
 }
 
 export const api = {  settings: () => invoke<Settings>('get_settings'),
@@ -634,6 +662,8 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
   /** Забрать события группы, пришедшие с прошлого раза (в том числе пока настроек не было). */
   groupNoticesTake: () => invoke<GroupNotices>('group_notices_take'),
   devicesList: () => invoke<GroupDevice[]>('devices_list'),
+  /** Кому ушёл новый ключ при последней смене здесь; null — не было. */
+  rekeySent: () => invoke<RekeySent | null>('rekey_sent'),
   statsOverview: () => invoke<StatsOverview>('stats_overview'),
   /** `confirmed` — получатели нового ключа, которых человек видел в диалоге;
    *  `alsoRemove` — те, с кого он снял галочку. */
@@ -713,6 +743,7 @@ export const api = {  settings: () => invoke<Settings>('get_settings'),
    * Доступ запомненного ИИ-клиента и «забыть клиента». Список клиентов
    * save_settings не меняет: новое состояние приходит событием settings-changed.
    */
-  aiClientAccess: (name: string, access: AiAccess) => invoke<void>('ai_client_access', { name, access }),
-  aiClientRemove: (name: string) => invoke<void>('ai_client_remove', { name }),
+  aiClientAccess: (name: string, program: string | null, access: AiAccess) =>
+    invoke<void>('ai_client_access', { name, program, access }),
+  aiClientRemove: (name: string, program: string | null) => invoke<void>('ai_client_remove', { name, program }),
 }

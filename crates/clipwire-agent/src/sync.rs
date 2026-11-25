@@ -378,6 +378,8 @@ const DEVICES_REFRESH_MIN: Duration = Duration::from_secs(30);
 struct PendingRekey {
     key: GroupKey,
     skipped: Vec<DeviceId>,
+    /// Получатели нового ключа, кроме этого устройства.
+    recipients: Vec<DeviceId>,
 }
 
 /// Как сообщить UI, что в канале событий что-то появилось (на Windows —
@@ -487,7 +489,14 @@ pub struct Engine {
     admin_waiters: VecDeque<crate::admin::AdminWaiter>,
     /// Ключ администратора сменили в этой сессии: войти с новым.
     admin_reauth: bool,
+    /// Id элементов, недавно отданных в буфер ([`Event::Incoming`]): повтор
+    /// того же элемента идёт только в историю. Нужен для id из будущего —
+    /// по ним курсор не двигается и повтор им не отсекается.
+    clipped: VecDeque<ItemId>,
 }
+
+/// Сколько id последних элементов для буфера помнит движок (`Engine::clipped`).
+const CLIPPED_KEEP: usize = 256;
 
 impl Engine {
     pub fn new(
@@ -551,6 +560,7 @@ impl Engine {
             ps: Default::default(),
             fix: Default::default(),
             pin_stats_waiters: VecDeque::new(),
+            clipped: VecDeque::new(),
             admin_waiters: VecDeque::new(),
             admin_reauth: false,
         }
@@ -888,9 +898,9 @@ impl Engine {
         pending: Option<PendingRekey>,
     ) -> Option<RekeyNotice> {
         if k.initiator == self.device {
-            let skipped = pending
+            let (skipped, recipients) = pending
                 .filter(|p| p.key == k.key)
-                .map(|p| p.skipped)
+                .map(|p| (p.skipped, p.recipients))
                 .unwrap_or_default();
             return Some(RekeyNotice {
                 old,
@@ -900,6 +910,7 @@ impl Engine {
                 initiator_os: crate::devices::os_name().to_string(),
                 by_me: true,
                 skipped,
+                recipients,
             });
         }
         // shortcut: устройство, вошедшее в группу позже последнего списка
@@ -922,6 +933,7 @@ impl Engine {
             initiator_os: card.os.clone(),
             by_me: false,
             skipped: Vec::new(),
+            recipients: Vec::new(),
         })
     }
 
@@ -1572,9 +1584,16 @@ impl Engine {
         let envelopes =
             crate::devices::seal_envelopes(&new_key, &old_key, &self.state.device_key, &plan)?;
         // С этого момента сервер мог сменить ключ, даже если ответ потеряется.
+        let others: Vec<DeviceId> = plan
+            .recipients
+            .iter()
+            .map(|(d, _)| *d)
+            .filter(|d| *d != self.device)
+            .collect();
         self.pending_rekey = Some(PendingRekey {
             key: new_key.clone(),
             skipped: plan.skipped.clone(),
+            recipients: others.clone(),
         });
         write_msg(
             send,
@@ -1631,6 +1650,7 @@ impl Engine {
             old,
             key: new_key,
             skipped: plan.skipped,
+            recipients: others,
         }))
     }
 
@@ -1881,7 +1901,14 @@ impl Engine {
         if item.history_only() {
             tracing::info!("элемент сохранён без записи в буфер, кладу только в историю");
             self.emit(Event::History(vec![item]));
+        } else if self.clipped.contains(&id) {
+            tracing::info!("элемент уже был в буфере, повтор кладу только в историю");
+            self.emit(Event::History(vec![item]));
         } else if is_fresh(&item, now_ms(), window) {
+            if self.clipped.len() >= CLIPPED_KEEP {
+                self.clipped.pop_front();
+            }
+            self.clipped.push_back(id);
             self.emit(Event::Incoming(item));
         } else {
             tracing::info!("элемент скопирован давно, кладу только в историю");
@@ -2061,7 +2088,10 @@ impl Engine {
 /// Брать ли элемент истории группы при входе: чужой и ещё не виденный.
 /// Обычные элементы не новее курсора уже были у нас. Чужую локальную историю
 /// берём всегда: её id старые, курсор про неё ничего не говорит, а повтор
-/// отсеет история по содержимому.
+/// отсеет история по содержимому. Флаг `backfill` лежит вне шифрования, и
+/// сервер может выдать за локальную историю любой старый элемент: то, что
+/// здесь удалили, история не вернёт по отметкам об удалении
+/// (`History::buried`), так же и для `ServerMsg::Backfill` посреди сессии.
 fn wanted_from_history(
     s: &clipwire_core::SealedItem,
     backfill: bool,
@@ -2086,10 +2116,14 @@ fn ahead_of_clock(id: ItemId, now_ms: u64) -> bool {
 }
 
 /// Скопирован не раньше `window` назад ([`FRESH_LIVE`] или
-/// [`FRESH_FROM_HISTORY`]). Время из будущего (часы источника спешат)
-/// считается свежим.
+/// [`FRESH_FROM_HISTORY`]). Время из будущего свежим считается, только пока
+/// опережает часы не больше чем на [`MAX_CURSOR_AHEAD`] (часы источника
+/// спешат). Дальше — нет: такой элемент не двигает курсор, и сервер мог бы
+/// присылать его снова и снова, каждый раз переписывая буфер.
 fn is_fresh(item: &Item, now_ms: u64, window: Duration) -> bool {
-    item.created_at_ms.saturating_add(window.as_millis() as u64) >= now_ms
+    let ahead = now_ms.saturating_add(MAX_CURSOR_AHEAD.as_millis() as u64);
+    item.created_at_ms <= ahead
+        && item.created_at_ms.saturating_add(window.as_millis() as u64) >= now_ms
 }
 
 /// Подключиться к серверу. Пока идёт подключение, следим за relay: если он
@@ -2519,10 +2553,11 @@ mod tests {
             (future, false),
             (junk, false),
         ]);
-        // Сам элемент из будущего принят, но курсор остался на настоящем.
+        // Сам элемент из будущего принят только в историю (буфер он не
+        // трогает), курсор остался на настоящем.
         let (clip, hist) = drain(&mut rx);
-        assert_eq!(clip, texts(&[Y2099]));
-        assert_eq!(hist, texts(&[now - 1000]));
+        assert!(clip.is_empty(), "{clip:?}");
+        assert_eq!(hist, texts(&[now - 1000, Y2099]));
         assert_eq!(e.cursor, Some(normal.id));
 
         // Следующий элемент приходит как обычно.
@@ -2535,6 +2570,38 @@ mod tests {
         // Сразу разосланный элемент из будущего курсор тоже не двигает.
         e.deliver(&sealed(2, Y2099 + 5000));
         assert_eq!(e.cursor, Some(next.id));
+    }
+
+    /// Элемент с id из будущего курсор не двигает, и сервер может
+    /// присылать его снова. В буфер он идёт один раз, повторы — только в
+    /// историю (там их отсеет id). Время копирования в нём настоящее:
+    /// иначе он и в первый раз в буфер бы не попал.
+    #[test]
+    fn repeated_deliver_of_same_id_reaches_clipboard_once() {
+        let now = now_ms();
+        let (mut e, mut rx) = engine(None);
+        let mut item = Item::backdated(DeviceId([2; 32]), Content::Text("повтор".into()), now);
+        item.id = ItemId::at_ms(now + 3_600_000);
+        let sealed = key().seal(&item).unwrap();
+        for _ in 0..3 {
+            e.deliver(&sealed);
+        }
+        let (clip, hist) = drain(&mut rx);
+        assert_eq!(clip, vec!["повтор".to_string()]);
+        assert_eq!(hist.len(), 2);
+        assert_eq!(e.cursor, None);
+    }
+
+    /// Время копирования из будущего (часы источника спешат больше чем на
+    /// пять минут или время подделано) буфер не трогает: только история.
+    #[test]
+    fn future_dated_item_skips_clipboard() {
+        let now = now_ms();
+        let (mut e, mut rx) = engine(None);
+        e.deliver(&sealed(2, now + 3_600_000));
+        let (clip, hist) = drain(&mut rx);
+        assert!(clip.is_empty(), "{clip:?}");
+        assert_eq!(hist, texts(&[now + 3_600_000]));
     }
 
     #[test]
@@ -2635,11 +2702,13 @@ mod tests {
         e.pending_rekey = Some(PendingRekey {
             key: new.clone(),
             skipped: vec![DeviceId([7; 32])],
+            recipients: vec![DeviceId([8; 32])],
         });
         e.rotated(Some(env(&me_key)));
         let (n, offered) = rotation(&mut rx).expect("свой пакет");
         assert!(n.by_me && !offered, "своя смена подтверждения не требует");
         assert_eq!(n.skipped, vec![DeviceId([7; 32])]);
+        assert_eq!(n.recipients, vec![DeviceId([8; 32])]);
         assert!(e.pending_rekey.is_none());
         // Свой пакет без плана в памяти (приложение перезапускалось) — тоже свой.
         e.rotated(Some(env(&me_key)));
@@ -2707,7 +2776,10 @@ mod tests {
         let i = |ms| Item::backdated(DeviceId([2; 32]), Content::Text(String::new()), ms);
         let (live, hist) = (FRESH_LIVE, FRESH_FROM_HISTORY);
         assert!(is_fresh(&i(now), now, hist));
-        assert!(is_fresh(&i(now + 3_600_000), now, hist));
+        // Часы источника немного спешат — свежий; на час вперёд — нет.
+        assert!(is_fresh(&i(now + 4 * 60_000), now, hist));
+        assert!(!is_fresh(&i(now + 3_600_000), now, hist));
+        assert!(!is_fresh(&i(now + 3_600_000), now, live));
         assert!(is_fresh(&i(now - 9 * 60_000), now, hist));
         assert!(!is_fresh(&i(now - 11 * 60_000), now, hist));
         assert!(is_fresh(&i(now - 11 * 60_000), now, live));

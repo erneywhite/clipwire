@@ -192,16 +192,24 @@ impl Store {
             ),
             params![CHUNK as i64, OVERHEAD as i64],
         )?;
+        // Записи со строками базы, как в квоте закрепов (`pins_used`).
         let pins = per_group(
             &conn,
             "SELECT group_id, SUM(n), SUM(b) FROM (
-                 SELECT group_id, pinned AS n, length(state) + content_len AS b FROM pins
+                 SELECT group_id, pinned AS n, length(state) + content_len + ?3 AS b FROM pins
+                 UNION ALL
+                 SELECT group_id, 0, ?4 FROM pin_blobs
                  UNION ALL
                  SELECT group_id, 0, size + MAX(1, (size + ?1 - 1) / ?1) * ?2 FROM blobs
                  WHERE EXISTS (SELECT 1 FROM pin_blobs AS pb
                                WHERE pb.group_id = blobs.group_id AND pb.blob_id = blobs.blob_id))
              GROUP BY group_id",
-            params![CHUNK as i64, OVERHEAD as i64],
+            params![
+                CHUNK as i64,
+                OVERHEAD as i64,
+                super::pins::RECORD_OVERHEAD as i64,
+                super::pins::BLOB_REF_OVERHEAD as i64
+            ],
         )?;
         let mut stmt = conn.prepare(
             "SELECT group_id, created_ms,

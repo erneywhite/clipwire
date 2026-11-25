@@ -66,7 +66,7 @@
   async function setAccess(c: AiClient, access: AiAccess) {
     if (c.access === access) return
     try {
-      await api.aiClientAccess(c.name, access)
+      await api.aiClientAccess(c.name, c.program, access)
       clientError = ''
     } catch (e) {
       clientError = String(e)
@@ -75,7 +75,7 @@
 
   async function revoke(c: AiClient) {
     try {
-      await api.aiClientRemove(c.name)
+      await api.aiClientRemove(c.name, c.program)
       clientError = ''
     } catch (e) {
       clientError = String(e)
@@ -262,10 +262,11 @@
 <h2>{t('Подключённые клиенты')}</h2>
 {#if clients.length}
   <div class="card list">
-    {#each clients as c (c.name)}
+    {#each clients as c (`${c.name}\n${c.program ?? ''}`)}
       <div class="client">
         <div class="client-info">
           <span class="client-name">{c.name}</span>
+          <span class="mono muted client-program" title={c.program ?? ''}>{c.program ?? t('программа не определена')}</span>
           <span class="mono muted">{t('обращался {when}', { when: ago(c.last_ms) })}</span>
         </div>
         <div class="segmented compact" role="radiogroup" aria-label={t('Доступ для «{client}»', { client: c.name })}>
@@ -278,7 +279,7 @@
     {/each}
   </div>
   {#if clientError}<p class="error outside" role="alert">{clientError}</p>{/if}
-  <p class="hint outside">{t('Отозванный клиент при следующем обращении снова спросит доступ. Клиента узнают по имени, которое он сам сообщает.')}</p>
+  <p class="hint outside">{t('Отозванный клиент при следующем обращении снова спросит доступ. Клиента узнают по имени, которое он сам сообщает, и по программе, которая его запустила: то же имя из другой программы снова спросит доступ.')}</p>
 {:else}
   <div class="card pad">
     <p class="hint">{t('Пока ни один клиент не подключался. Когда ИИ-инструмент обратится впервые, Clipwire спросит, пускать ли его.')}</p>
@@ -300,7 +301,9 @@
       <div class="log-row">
         <span class="mono muted">{when(e.at_ms)}</span>
         <span class="log-main">
-          <span class="log-what"><span class="client-name">{e.client}</span> <span class="mono">{e.tool}</span></span>
+          <span class="log-what" title={e.program ?? t('программа не определена')}
+            ><span class="client-name">{e.client}</span> <span class="mono">{e.tool}</span></span
+          >
           {#if e.query}<span class="log-query mono muted" title={e.query}>{e.query}</span>{/if}
         </span>
         {#if e.ids.length}
@@ -308,10 +311,10 @@
             class="link small mono log-result"
             aria-expanded={open}
             title={open ? t('Скрыть записи') : t('Показать, какие записи получил ИИ')}
-            onclick={() => toggleLog(key, e.ids)}>{e.result} {open ? '▴' : '▾'}</button
+            onclick={() => toggleLog(key, e.ids)}>{e.result}{#if e.count > 1}&nbsp;×{e.count}{/if} {open ? '▴' : '▾'}</button
           >
         {:else}
-          <span class="mono muted log-result" title={e.result}>{e.result}</span>
+          <span class="mono muted log-result" title={e.result}>{e.result}{#if e.count > 1}&nbsp;×{e.count}{/if}</span>
         {/if}
       </div>
       {#if open}
@@ -505,6 +508,12 @@
   }
   .client-name {
     font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Путь целиком — во всплывающей подсказке. */
+  .client-program {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

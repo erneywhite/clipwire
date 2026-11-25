@@ -3,19 +3,21 @@
 //! Мост (`clipwire-desktop --mcp`, его запускает ИИ-клиент) ходит сюда по
 //! локальному каналу ([`channel`]). Здесь вся политика: что видно
 //! (`clipwire_agent::ai_access`), согласие человека ([`consent`], окно
-//! `consent`), запись и журнал обращений ([`handler`]).
+//! `consent`), запись и журнал обращений ([`handler`]), какая программа
+//! подключилась ([`peer`]).
 
 pub mod channel;
 pub mod consent;
 #[cfg(test)]
 mod e2e;
 pub mod handler;
+pub mod peer;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clipwire_agent::history::{AiLogEntry, now_ms};
-use clipwire_agent::settings::{AiClient, AiSettings};
+use clipwire_agent::settings::{AiSettings, same_program};
 use clipwire_core::ai::AiAccess;
 use clipwire_core::{Content, Ext, ItemId};
 use serde::Serialize;
@@ -23,7 +25,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::AppState;
 use consent::{Busy, Choice, ConsentDto, ConsentState};
-use handler::{AppStatus, CONSENT_TIMEOUT, Host, Store};
+use handler::{AppStatus, CONSENT_TIMEOUT, ClientAsk, Host, LogGate, Store};
 
 /// Метка окна согласия.
 pub const CONSENT_WINDOW: &str = "consent";
@@ -54,8 +56,13 @@ pub fn spawn(app: AppHandle) {
         };
         tracing::info!("канал MCP: {}", bound.endpoint());
         *ENDPOINT.lock().unwrap_or_else(|e| e.into_inner()) = Some(bound.endpoint().to_string());
-        let host = Arc::new(AppHost { app });
-        bound.run(move || handler::Conn::new(host.clone())).await;
+        let host = Arc::new(AppHost {
+            app,
+            gate: LogGate::default(),
+        });
+        bound
+            .run(move |pid| handler::Conn::from_peer(host.clone(), pid))
+            .await;
     });
 }
 
@@ -69,6 +76,7 @@ pub fn shutdown(app: &AppHandle) {
 /// Приложение для обработчика запросов.
 struct AppHost {
     app: AppHandle,
+    gate: LogGate,
 }
 
 impl AppHost {
@@ -124,16 +132,16 @@ impl Host for AppHost {
         AppStatus { group, connected }
     }
 
-    async fn ask_client(
-        &self,
-        client: &str,
-        version: &str,
-        allow_write: bool,
-    ) -> Result<Option<AiAccess>, Busy> {
-        let Some(choice) = self
-            .ask(ConsentDto::client(client, version, allow_write))
-            .await?
-        else {
+    async fn ask_client(&self, q: ClientAsk) -> Result<Option<AiAccess>, Busy> {
+        let allow_write = q.allow_write;
+        let dto = ConsentDto::client_from(
+            &q.name,
+            &q.version,
+            allow_write,
+            q.program.as_deref(),
+            q.changed.as_ref().map(|p| p.as_deref()),
+        );
+        let Some(choice) = self.ask(dto).await? else {
             return Ok(None);
         };
         // `ConsentState::answer` уже привёл ответ к вопросу: «чтение и
@@ -152,30 +160,31 @@ impl Host for AppHost {
         Ok(self.ask(ConsentDto::clipboard(client, text)).await? == Some(Choice::Accept))
     }
 
-    fn remember_client(&self, name: &str, access: AiAccess) {
+    fn remember_client(&self, name: &str, program: Option<&str>, access: AiAccess) {
         let now = now_ms();
         update_settings(&self.app, |ai| {
-            match ai.clients.iter_mut().find(|c| c.name == name) {
-                Some(c) => {
-                    c.access = access;
-                    c.last_ms = now;
-                }
-                None => ai.clients.push(AiClient {
-                    name: name.to_string(),
-                    access,
-                    added_ms: now,
-                    last_ms: now,
-                }),
-            }
+            ai.remember_client(name, program, access, now)
         });
     }
 
-    fn touch_client(&self, name: &str) {
+    fn bind_program(&self, name: &str, program: &str) {
+        update_settings(&self.app, |ai| ai.bind_program(name, program));
+    }
+
+    fn log_gate(&self) -> &LogGate {
+        &self.gate
+    }
+
+    fn touch_client(&self, name: &str, program: Option<&str>) {
         let now = now_ms();
         {
             let st = self.state();
             let mut s = st.settings.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(c) = s.ai.clients.iter_mut().find(|c| c.name == name) else {
+            let Some(c) =
+                s.ai.clients
+                    .iter_mut()
+                    .find(|c| c.name == name && same_program(c.program.as_deref(), program))
+            else {
                 return;
             };
             c.last_ms = now;
@@ -346,26 +355,43 @@ fn bridge_args(home: Option<std::path::PathBuf>) -> Vec<String> {
 /// Поменять доступ запомненного клиента. Список клиентов меняют только эта
 /// команда, [`ai_client_remove`] и канал MCP: `save_settings` его не трогает,
 /// чтобы копия окна не затёрла клиента, которого только что добавил канал.
+/// Клиент — имя и программа (`None` — без программы).
 #[tauri::command]
-pub async fn ai_client_access(app: AppHandle, name: String, access: AiAccess) {
+pub async fn ai_client_access(
+    app: AppHandle,
+    name: String,
+    program: Option<String>,
+    access: AiAccess,
+) {
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        update_settings(&app, |ai| set_client_access(ai, &name, access));
+        update_settings(&app, |ai| {
+            set_client_access(ai, &name, program.as_deref(), access)
+        });
     })
     .await;
 }
 
 /// Забыть клиента: при следующем обращении его спросят заново.
 #[tauri::command]
-pub async fn ai_client_remove(app: AppHandle, name: String) {
+pub async fn ai_client_remove(app: AppHandle, name: String, program: Option<String>) {
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        update_settings(&app, |ai| ai.clients.retain(|c| c.name != name));
+        update_settings(&app, |ai| {
+            ai.clients.retain(|c| {
+                !(c.name == name && same_program(c.program.as_deref(), program.as_deref()))
+            })
+        });
     })
     .await;
 }
 
-/// Доступ клиента `name`; клиента, которого нет (его уже забыли), не добавляет.
-fn set_client_access(ai: &mut AiSettings, name: &str, access: AiAccess) {
-    if let Some(c) = ai.clients.iter_mut().find(|c| c.name == name) {
+/// Доступ клиента `name` из программы `program`; клиента, которого нет (его
+/// уже забыли), не добавляет.
+fn set_client_access(ai: &mut AiSettings, name: &str, program: Option<&str>, access: AiAccess) {
+    if let Some(c) = ai
+        .clients
+        .iter_mut()
+        .find(|c| c.name == name && same_program(c.program.as_deref(), program))
+    {
         c.access = access;
     }
 }
@@ -412,15 +438,24 @@ mod tests {
 
     #[test]
     fn set_client_access_changes_only_known_client() {
+        use clipwire_agent::settings::AiClient;
         let mut ai = AiSettings::default();
         ai.clients.push(AiClient {
             name: "codex".into(),
             access: AiAccess::Read,
             added_ms: 1,
             last_ms: 2,
+            program: Some("/usr/bin/codex".into()),
         });
-        set_client_access(&mut ai, "codex", AiAccess::ReadWrite);
-        set_client_access(&mut ai, "gone", AiAccess::ReadWrite);
+        set_client_access(
+            &mut ai,
+            "codex",
+            Some("/usr/bin/codex"),
+            AiAccess::ReadWrite,
+        );
+        set_client_access(&mut ai, "gone", None, AiAccess::ReadWrite);
+        // То же имя из другой программы — другой клиент.
+        set_client_access(&mut ai, "codex", None, AiAccess::Denied);
         assert_eq!(ai.clients.len(), 1);
         assert_eq!(ai.clients[0].access, AiAccess::ReadWrite);
         assert_eq!(ai.clients[0].last_ms, 2);

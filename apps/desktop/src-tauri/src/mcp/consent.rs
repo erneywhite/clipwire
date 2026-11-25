@@ -53,6 +53,12 @@ pub struct ConsentDto {
     pub chars: u32,
     /// Показывать ли «Чтение и запись».
     pub allow_write: bool,
+    /// Программа нового клиента (путь); `None` — не определилась.
+    pub program: Option<String>,
+    /// Под этим именем уже отвечали про другую программу: `previous` —
+    /// какую (`None` — тогда она не определилась).
+    pub program_changed: bool,
+    pub previous: Option<String>,
 }
 
 /// Текст для показа: управляющие символы (кроме перевода строки и
@@ -76,7 +82,20 @@ pub fn visible(text: &str) -> String {
 }
 
 impl ConsentDto {
+    #[cfg(test)]
     pub fn client(client: &str, version: &str, allow_write: bool) -> Self {
+        Self::client_from(client, version, allow_write, None, None)
+    }
+
+    /// Вопрос про клиента из программы `program`. `changed` — под этим
+    /// именем уже отвечали про другую программу (внутри — какую).
+    pub fn client_from(
+        client: &str,
+        version: &str,
+        allow_write: bool,
+        program: Option<&str>,
+        changed: Option<Option<&str>>,
+    ) -> Self {
         Self {
             id: String::new(),
             kind: ConsentKind::Client,
@@ -88,6 +107,9 @@ impl ConsentDto {
             multiline: false,
             chars: 0,
             allow_write,
+            program: program.map(visible),
+            program_changed: changed.is_some(),
+            previous: changed.flatten().map(visible),
         }
     }
 
@@ -116,6 +138,9 @@ impl ConsentDto {
             multiline: text.contains(['\n', '\r']),
             chars: u32::try_from(n).unwrap_or(u32::MAX),
             allow_write: false,
+            program: None,
+            program_changed: false,
+            previous: None,
         }
     }
 }
@@ -175,6 +200,9 @@ impl ConsentState {
                 dto.kind == ConsentKind::Client
                     && p.dto.kind == ConsentKind::Client
                     && p.dto.client == dto.client
+                    // Одно имя из двух программ — два вопроса: ответ про
+                    // одну программу не должен достаться другой.
+                    && p.dto.program == dto.program
             });
             match same {
                 Some(p) => p.waiters.push(tx),
@@ -307,6 +335,46 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Одно имя из двух программ — два вопроса; путь показывается с метками
+    /// невидимых символов.
+    #[tokio::test]
+    async fn same_name_from_two_programs_asks_twice() {
+        let st = Arc::new(ConsentState::default());
+        let ask = |program: &'static str| {
+            let st = st.clone();
+            tokio::spawn(async move {
+                let dto = ConsentDto::client_from(
+                    "claude-code",
+                    "",
+                    false,
+                    Some(program),
+                    Some(Some("/opt/claude")),
+                );
+                st.ask(dto, Duration::from_secs(5), |_| {}).await.unwrap()
+            })
+        };
+        let a = ask("/opt/claude");
+        while st.q.lock().unwrap().items.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let b = ask("/tmp/evil\u{202E}");
+        while st.q.lock().unwrap().items.len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        let first = st.show().unwrap();
+        assert!(first.program_changed);
+        assert_eq!(first.previous.as_deref(), Some("/opt/claude"));
+        assert_eq!(first.program.as_deref(), Some("/opt/claude"));
+        assert!(st.answer(&first.id, Choice::Read));
+        let second = st.show().unwrap();
+        assert!(second.program.as_deref().unwrap().contains("⟨U+202E⟩"));
+        assert!(!st.answer(&second.id, Choice::Deny));
+        assert_eq!(a.await.unwrap(), Some(Choice::Read));
+        assert_eq!(b.await.unwrap(), Some(Choice::Deny));
+        let plain = ConsentDto::client("x", "", false);
+        assert!(!plain.program_changed && plain.program.is_none());
+    }
 
     #[tokio::test]
     async fn queue_answers_one_at_a_time_and_times_out() {

@@ -29,6 +29,8 @@ use blobs::Blobs;
 pub use config::{Config, Guards};
 use session::{ClipwireProtocol, DeviceSlots, Limits, Shared};
 use store::Store;
+/// Сколько места в счёте закрепов стоит строка записи и ссылка на файл.
+pub use store::{PIN_BLOB_REF_OVERHEAD, PIN_RECORD_OVERHEAD};
 
 /// Как часто чистить просроченные элементы и файлы. Если срок резерва
 /// короче, чистка идёт чаще, чтобы брошенный резерв не жил вдвое дольше.
@@ -241,10 +243,13 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
     let info = identity.server_info(&config.public_url);
 
     let admin = admin::AdminState::new(&identity, config);
+    let members = relay::Members::default();
     let relay = relay::spawn(
         config.relay_bind,
         admin.relay_token.clone(),
         identity.secret_key.public(),
+        guards,
+        members.clone(),
     )
     .await?;
     let relay_port = relay
@@ -303,6 +308,8 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
     });
     // Настройки, заданные из клиента, поверх переменных окружения.
     shared.reload_limits()?;
+    // Relay теперь отличает участников групп от гостей.
+    let _ = members.set(Arc::downgrade(&shared));
     let purge_every = PURGE_EVERY
         .min(guards.reserve_ttl)
         .min(guards.group_idle)
@@ -338,6 +345,13 @@ pub async fn start_with(config: &Config, guards: &Guards) -> Result<Running> {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("удалено брошенных групп смены ключа: {n}"),
                     Err(e) => tracing::warn!("очистка групп смены ключа не удалась: {e:#}"),
+                }
+                let unpinned_before =
+                    session::now_ms() - store::PIN_UNPINNED_KEEP.as_millis() as i64;
+                match shared.store.purge_unpinned_pins(unpinned_before) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("удалено давно снятых закрепов: {n}"),
+                    Err(e) => tracing::warn!("очистка снятых закрепов не удалась: {e:#}"),
                 }
                 let invites_before = session::now_ms() - store::INVITE_KEEP.as_millis() as i64;
                 match shared.store.purge_invites(invites_before) {

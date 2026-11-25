@@ -88,7 +88,13 @@ pub fn set(
         }
         PinOutcome::Stale(current) => Ok(Some(ServerMsg::PinRejected { pin_id, current })),
         PinOutcome::TooMany => failed(PinFail::TooMany { max: q.max_pins }),
+        // Отдельных отказов для записей со снятыми и для предела сервера в
+        // протоколе нет: устройство показывает тот предел, в который упёрлось.
+        PinOutcome::TooManyRecords => failed(PinFail::TooMany { max: q.max_records }),
         PinOutcome::NoSpace => failed(PinFail::NoSpace { max: q.max_bytes }),
+        PinOutcome::ServerFull => failed(PinFail::NoSpace {
+            max: q.max_total_bytes,
+        }),
         PinOutcome::NoContent => failed(PinFail::Invalid("новый закреп без содержимого".into())),
         PinOutcome::Rotated => Ok(None),
     }

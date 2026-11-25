@@ -259,6 +259,20 @@ pub const SETTINGS: &[SettingSpec] = &[
         min: MIB,
         max: 64 * TIB,
     },
+    SettingSpec {
+        key: "pin_records",
+        env: "CLIPWIRE_PIN_RECORDS",
+        unit: SettingUnit::Count,
+        min: 1,
+        max: 10_000_000,
+    },
+    SettingSpec {
+        key: "pin_total_bytes",
+        env: "CLIPWIRE_PIN_TOTAL_BYTES",
+        unit: SettingUnit::Bytes,
+        min: MIB,
+        max: 64 * TIB,
+    },
 ];
 
 /// Описание настройки по имени.

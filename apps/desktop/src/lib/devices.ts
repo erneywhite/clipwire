@@ -1,5 +1,5 @@
 // Подписи и тексты подтверждений для раздела «Устройства группы».
-import type { GroupAdmin, GroupDevice, RekeyOffer, StorageKind } from './api'
+import type { GroupAdmin, GroupDevice, RekeyOffer, RekeySent, StorageKind } from './api'
 import type * as format from './format'
 import { t, tn, lang } from './i18n.ts'
 import { deviceName } from './platform.ts'
@@ -374,4 +374,67 @@ export function canClaimAdmin(roles: Roles, list: GroupDevice[], serverAdmin: bo
   if (!serverAdmin || !roles?.supported || roles.admins.length === 0) return false
   const me = list.find((d) => d.me)
   return !!me && !isAdmin(roles, me)
+}
+
+/** Через сколько после смены ключа получатель, который так и не перешёл, выделяется. */
+export const REKEY_STALE_MS = 10 * 60 * 1000
+
+/** Сколько после смены показывать итог, если перешли все. */
+export const REKEY_SHOW_MS = 24 * 60 * 60 * 1000
+
+/** Получатель нового ключа в разделе «Устройства группы». */
+export interface RekeyRow {
+  id: string
+  fingerprint: string
+  title: string
+  os: string | null
+  /** Вошло в новую группу: его карточка открылась новым ключом. */
+  moved: boolean
+  /** Не перешло дольше `REKEY_STALE_MS`. */
+  stale: boolean
+}
+
+/**
+ * Кто из получателей последней смены ключа, сделанной здесь, уже вошёл в
+ * новую группу. Перешедшее устройство есть в списке новой группы с
+ * открывшейся карточкой (`known`): её открывает только новый ключ, сервер её
+ * не подделает. Сервер заодно с исключённым устройством мог оставить
+ * кого-то в старой группе, и успех смены ключа этого не покажет, а здесь
+ * видно. `null` — показывать нечего: смены не было, список недоступен (нет
+ * связи) или все перешли и прошли сутки.
+ */
+export function rekeyProgress(sent: RekeySent | null, list: GroupDevice[], now = Date.now()): RekeyRow[] | null {
+  if (!sent || sent.recipients.length === 0 || list.length === 0) return null
+  const late = now - sent.at_ms >= REKEY_STALE_MS
+  const rows = sent.recipients.map((r) => {
+    const dev = list.find((x) => x.id === r.id && x.known)
+    return {
+      id: r.id,
+      fingerprint: r.fingerprint,
+      title: deviceName(dev?.name ?? r.name ?? '') || t('Неизвестное устройство'),
+      os: dev?.os ?? r.os,
+      moved: !!dev,
+      stale: !dev && late,
+    }
+  })
+  if (rows.every((r) => r.moved) && now - sent.at_ms >= REKEY_SHOW_MS) return null
+  return rows
+}
+
+/** «Ключ группы сменён: 5 мин» над списком получателей. */
+export function rekeyAgoLabel(sent: RekeySent, { ago }: Fmt, now = Date.now()): string {
+  const a = ago(sent.at_ms, now)
+  if (a === t('сейчас')) return t('Ключ группы сменён только что')
+  return lang() === 'en' && /^\d/.test(a) ? t('Ключ группы сменён: {a} назад', { a }) : t('Ключ группы сменён: {a}', { a })
+}
+
+/** Состояние получателя в строке. */
+export function rekeyRowLabel(r: RekeyRow): string {
+  return r.moved ? t('перешло на новый ключ') : t('ещё не перешло')
+}
+
+/** Подсказка под списком, если кто-то не перешёл за `REKEY_STALE_MS`. */
+export function rekeyStaleHint(rows: RekeyRow[]): string {
+  if (!rows.some((r) => r.stale)) return ''
+  return t('Выделенные устройства за 10 минут не перешли на новый ключ. Откройте на них Clipwire: если там вопрос о новом ключе, сверьте отпечаток и переходите. Если устройство в сети, а вопроса нет, сервер мог оставить его в старой группе. Тогда подключите его заново по новому коду приглашения.')
 }

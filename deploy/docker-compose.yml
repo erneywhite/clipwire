@@ -41,6 +41,12 @@ services:
       # CLIPWIRE_MAX_DEVICE_CONNS: 4
       # CLIPWIRE_PIN_MAX: 5000
       # CLIPWIRE_PIN_BYTES: 2147483648
+      # CLIPWIRE_PIN_RECORDS: 20000
+      # CLIPWIRE_PIN_TOTAL_BYTES: 4294967296
+      # Скорость, с которой relay читает от одного клиента, байт/с (0 - без предела):
+      # CLIPWIRE_RELAY_RATE: 16777216
+      # Сколько неизвестных серверу устройств (новых и исключённых) держат relay сразу:
+      # CLIPWIRE_RELAY_GUESTS: 32
       # RUST_LOG: info
       # Печатать код сервера (с ключом администратора) при каждом запуске,
       # а не только при первом:
