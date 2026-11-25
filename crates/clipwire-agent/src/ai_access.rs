@@ -538,6 +538,9 @@ fn url_secret(w: &str) -> bool {
     {
         return true;
     }
+    if one_time_link(rest) {
+        return true;
+    }
     let Some((_, query)) = rest.split_once('?') else {
         return false;
     };
@@ -551,6 +554,52 @@ fn url_secret(w: &str) -> bool {
             && n >= 8
             && (classes(v) >= 2 || n >= 16)
     })
+}
+
+/// Слова пути, по которым ссылка похожа на вход, сброс пароля или
+/// приглашение (как `ONE_TIME` у карточек ссылок в link.rs).
+const ONE_TIME_WORDS: &[&str] = &[
+    "magic",
+    "login",
+    "signin",
+    "auth",
+    "oauth",
+    "sso",
+    "reset",
+    "verify",
+    "verification",
+    "confirm",
+    "activate",
+    "invite",
+    "token",
+    "otp",
+    "session",
+    "password",
+];
+
+/// Ссылка входа или сброса пароля с токеном: в пути есть слово из
+/// [`ONE_TIME_WORDS`], а в пути, параметрах или после `#` — случайная
+/// строка от 16 знаков. Так выглядят magic-link входа
+/// (`claude.ai/magic-link#…`), ссылки сброса пароля и приглашений.
+fn one_time_link(rest: &str) -> bool {
+    let (before_frag, frag) = rest.split_once('#').unwrap_or((rest, ""));
+    let (path, query) = before_frag.split_once('?').unwrap_or((before_frag, ""));
+    let path = path.split_once('/').map_or("", |(_, p)| p);
+    let marked = path
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| ONE_TIME_WORDS.contains(&w));
+    if !marked {
+        return false;
+    }
+    let token = |s: &str| {
+        let n = s.chars().count();
+        n >= 16 && (hex_hash(s) || classes(s) >= 2 && entropy(s) >= 3.0)
+    };
+    path.split('/')
+        .chain(query.split(['&', '=']))
+        .chain(frag.split([':', '&', '=', '/']))
+        .any(token)
 }
 
 /// `user:pass@host` без схемы (`admin:S3cret@10.0.0.5`, строка `rsync`).
@@ -1251,6 +1300,11 @@ mod tests {
             "WJxfSeofSAs0K5PALDsaw/getMe"
         ),
         "redis://:p4ssw0rd@redis.example.com:6379",
+        // Ссылки входа и сброса пароля: токен в пути или после `#`.
+        "https://example.com/magic-link?client=desktop_app#0123456789abcdef0123456789abcdef:dXNlckBleGFtcGxlLmNvbQ==",
+        "https://app.example.com/reset-password/Xk9fL2mQp7RtZ4vB8nW1",
+        "https://example.com/invite/AbCdEf123456GhIjKlMn",
+        "https://example.com/auth/verify#Zx8Kq2Lp9Vt4Rw7Ny1Mb6Hc3",
         "REDIS_URL=redis://:p4ssw0rd@redis.example.com:6379/0",
         // Ключи на других языках и в прозе.
         "Пароль: Tr0ub4dor&3",
@@ -1289,6 +1343,11 @@ mod tests {
         "https://example.com/search?q=Hello%20World&page=2",
         "Привет! Как дела? Встречаемся завтра в 10:30.",
         "«ИИ-инструменты»",
+        "https://example.com/login",
+        "https://example.com/auth/settings/profile",
+        "https://www.ss.lv/msg/ru/electronics/computers/hubs-switch-routers/bjxkxc.html#photo-2",
+        "https://aio.lv/ru/product--hp-enterprise-rp001231596--12651497",
+        "https://docs.rs/iroh/latest/iroh/endpoint/struct.Endpoint.html#method.connect",
         "\"Shift+Enter\"",
         "(Windows11)",
         "The quick brown fox jumps over the lazy dog.",

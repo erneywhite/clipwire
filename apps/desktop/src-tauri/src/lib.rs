@@ -19,6 +19,11 @@ mod updates;
 
 use std::sync::{Arc, Mutex};
 
+// Одна копия программы — только в выпуске (см. `run`): отладочная сборка
+// живёт рядом с установленной. Чтобы cargo не считал зависимость лишней.
+#[cfg(debug_assertions)]
+use tauri_plugin_single_instance as _;
+
 use clipwire_agent::history::{History, now_ms};
 use clipwire_agent::service::{Service, UiEvent};
 use clipwire_agent::settings::Settings;

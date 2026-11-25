@@ -738,8 +738,9 @@ Settings → **AI tools**:
   kinds are visible only if all of them are allowed.
 - **AI sees history for** 1 day, 7 days (default), 30 days or all history. Pinned entries are
   always visible, however old they are.
-- **Hide entries that look like passwords and keys** (on): tokens, API keys, private keys and
-  password-like strings are left out of search and refused on a direct request. Turning it off
+- **Hide entries that look like passwords and keys** (on): tokens, API keys, private keys, sign-in
+  and password-reset links and password-like strings are left out of search and refused on a
+  direct request. Turning it off
   asks for confirmation first.
 - Entries from programs excluded from syncing and files under a **Don't send** rule are never
   shown to the AI.
@@ -830,7 +831,7 @@ everything works through the relay, only slightly slower.
 GitHub Actions builds the image: `ghcr.io/erneywhite/clipwire-server:latest` (the latest `main`)
 and `:X.Y.Z` for releases. The image is rebuilt every Monday so base-image updates reach the
 server even without new commits. `latest` follows `main`, so for a server you rely on, pin the
-version number: `ghcr.io/erneywhite/clipwire-server:0.10.0`.
+version number: `ghcr.io/erneywhite/clipwire-server:0.10.1`.
 
 **Through a Docker control panel or plain `docker compose`:**
 
